@@ -307,7 +307,7 @@ impl Inode {
             mode: be16(buf, 2),
             version,
             format: Format::from_raw(buf[5])?,
-            aformat: Format::from_raw(buf[83] as u8)?,
+            aformat: Format::from_raw(buf[83])?,
             uid: be32(buf, 8),
             gid: be32(buf, 12),
             nlink: be32(buf, 16),

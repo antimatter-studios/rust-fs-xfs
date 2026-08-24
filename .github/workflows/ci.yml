@@ -168,7 +168,14 @@ jobs:
             # shellcheck disable=SC2086 -- $args is a deliberate word split.
             if mkfs.xfs $args -f -q "$img" > "/tmp/mkfs-$name.log" 2>&1; then
               xfs_db -r -c 'sb 0' -c 'print' "$img" > "$share/xfs-$name.sbdump"
-              echo "BUILT  xfs-$name (mkfs.xfs $args)"
+              # Also dump the root inode. tests/oracle_vm_fixtures.rs
+              # compares the inode parser against these, and its
+              # root_inode_agrees_with_xfs_db case fails outright if no
+              # .inodedump files exist -- an unvalidated parser must not
+              # be able to pass by having nothing to compare against.
+              root=$(xfs_db -r -c 'sb 0' -c 'print rootino' "$img" | awk '{print $3}')
+              xfs_db -r -c "inode $root" -c 'print' "$img" > "$share/xfs-$name.inodedump"
+              echo "BUILT  xfs-$name (mkfs.xfs $args, rootino $root)"
               built=$((built + 1))
             else
               # Not every geometry is accepted by every xfsprogs release.
@@ -178,7 +185,7 @@ jobs:
               echo "::warning title=XFS geometry skipped::xfs-$name — the installed mkfs.xfs rejected 'mkfs.xfs $args'"
               echo "SKIP   xfs-$name — mkfs.xfs rejected this geometry:"
               sed 's/^/         /' "/tmp/mkfs-$name.log"
-              rm -f "$img"
+              rm -f "$img" "$share/xfs-$name.inodedump"
               skipped=$((skipped + 1))
             fi
           done
