@@ -1,0 +1,30 @@
+[package]
+name = "am-fs-xfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust XFS filesystem driver. Exposes a C ABI (fs_xfs_*) suitable for FFI from C/C++/Swift/Go."
+repository = "https://github.com/antimatter-studios/rust-fs-xfs"
+
+[lib]
+name = "fs_xfs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# CRC32C (Castagnoli) protects every v5 metadata block. Apache-2.0.
+crc32c = "0.6"
+# Block-device trait surface shared with the sister fs-* drivers and the
+# img-* disk-image readers.
+am-fs-core = { path = "../rust-fs-core", version = "0.2" }
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"  # required for catch_unwind at the FFI boundary
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"

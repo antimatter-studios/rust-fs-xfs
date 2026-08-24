@@ -1,0 +1,44 @@
+# Debian arm64 VM — the real-Linux oracle for this driver.
+#
+# Why a VM at all: mkfs.xfs, loop-mounting with the in-kernel XFS driver,
+# and xfs_repair are Linux-only. macOS cannot run any of them, so the
+# cross-validation gate needs a Linux kernel.
+#
+# Why arm64 Debian under VMware rather than emulated x86_64: on Apple
+# Silicon an x86_64 guest is full CPU emulation, which makes an
+# iterate-and-check loop painfully slow. bento/debian-12.6 is a native
+# arm64 box, so the guest runs at hardware speed.
+#
+# CI does not use this file. GitHub's Linux runners are already Linux --
+# they can mkfs and loop-mount natively, so the CI gate runs directly on
+# the runner. This VM exists purely so the same gate is available locally
+# during development.
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/debian-12.6"
+  config.vm.hostname = "xfs-oracle"
+
+  # No GUI, and enough memory that mkfs on a multi-GiB sparse image and
+  # a parallel cargo build do not fight each other.
+  config.vm.provider "vmware_desktop" do |v|
+    v.gui = false
+    v.vmx["memsize"] = "4096"
+    v.vmx["numvcpus"] = "4"
+  end
+
+  # Images and manifests are exchanged through this directory. The host
+  # writes an image here, the guest mounts and inspects it, or vice
+  # versa. Kept out of the repo by .gitignore.
+  config.vm.synced_folder "../../../.vm-share", "/share", create: true
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    # xfsprogs  -- mkfs.xfs, xfs_repair, xfs_db (the oracle tooling)
+    # btrfs-progs -- present so the same box serves the btrfs driver
+    # attr/acl  -- setfattr/setfacl for building feature-rich fixtures
+    apt-get install -y -qq xfsprogs btrfs-progs attr acl e2fsprogs
+    mkfs.xfs -V
+    echo "provisioned" > /share/.vm-ready
+  SHELL
+end
