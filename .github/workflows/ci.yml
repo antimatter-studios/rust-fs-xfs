@@ -134,72 +134,12 @@ jobs:
       # misread: block and inode size change every log2-derived field,
       # agcount changes the inode-number split, and the feature flags
       # change the AG layout and the feature bitmasks.
-      - name: Build XFS fixtures with mkfs.xfs and dump them with xfs_db
-        run: |
-          set -euo pipefail
-          share="$GITHUB_WORKSPACE/.vm-share"
-          mkdir -p "$share"
-
-          # name:mkfs-args — empty args means "whatever this mkfs.xfs
-          # considers default", which is itself worth pinning down.
-          geometries=(
-            "default:"
-            "1k:-b size=1024"
-            "2k:-b size=2048"
-            "i512:-i size=512"
-            "i1k:-i size=1024"
-            "4ags:-d agcount=4"
-            "8ags:-d agcount=8"
-            "reflink:-m reflink=1,rmapbt=1"
-            "bigtime:-m bigtime=1"
-            "nocrc:-m crc=0"
-          )
-
-          built=0
-          skipped=0
-          for geom in "${geometries[@]}"; do
-            name="${geom%%:*}"
-            args="${geom#*:}"
-            img="$share/xfs-$name.img"
-            rm -f "$img" "$share/xfs-$name.sbdump"
-            # Sparse: 400 MiB of address space, only the metadata mkfs
-            # actually writes costs disk.
-            truncate -s 400M "$img"
-            # shellcheck disable=SC2086 -- $args is a deliberate word split.
-            if mkfs.xfs $args -f -q "$img" > "/tmp/mkfs-$name.log" 2>&1; then
-              xfs_db -r -c 'sb 0' -c 'print' "$img" > "$share/xfs-$name.sbdump"
-              # Also dump the root inode. tests/oracle_vm_fixtures.rs
-              # compares the inode parser against these, and its
-              # root_inode_agrees_with_xfs_db case fails outright if no
-              # .inodedump files exist -- an unvalidated parser must not
-              # be able to pass by having nothing to compare against.
-              root=$(xfs_db -r -c 'sb 0' -c 'print rootino' "$img" | awk '{print $3}')
-              xfs_db -r -c "inode $root" -c 'print' "$img" > "$share/xfs-$name.inodedump"
-              echo "BUILT  xfs-$name (mkfs.xfs $args, rootino $root)"
-              built=$((built + 1))
-            else
-              # Not every geometry is accepted by every xfsprogs release.
-              # Skipping is allowed; skipping *quietly* is not — a fixture
-              # that vanishes without a word is a hole in the gate that
-              # nobody notices.
-              echo "::warning title=XFS geometry skipped::xfs-$name — the installed mkfs.xfs rejected 'mkfs.xfs $args'"
-              echo "SKIP   xfs-$name — mkfs.xfs rejected this geometry:"
-              sed 's/^/         /' "/tmp/mkfs-$name.log"
-              rm -f "$img" "$share/xfs-$name.inodedump"
-              skipped=$((skipped + 1))
-            fi
-          done
-
-          echo
-          echo "fixtures built: $built, skipped: $skipped"
-          ls -lh "$share"
-          # A gate with nothing to compare against is not a gate. Demand a
-          # meaningful spread, so a broken mkfs invocation cannot quietly
-          # turn this job into a no-op that reports success.
-          if [ "$built" -lt 6 ]; then
-            echo "only $built fixtures built — too few to call this validated" >&2
-            exit 1
-          fi
+      # Both this gate and the release gate call the same script.
+      # They previously each carried their own inline copy, the two
+      # drifted, and the release gate silently stopped generating the
+      # inode dumps its own test needed.
+      - name: Build the XFS fixture matrix
+        run: ./scripts/build-fixtures-native.sh
 
       # The comparison itself: parse each image with this driver and
       # require every field to equal what xfs_db reported for it. This

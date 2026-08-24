@@ -90,56 +90,12 @@ jobs:
       # Mirrors scripts/vm-build-fixtures.sh and ci.yml. The fixtures land
       # in .vm-share/ as `xfs-<name>.img` + `xfs-<name>.sbdump`, which is
       # where tests/oracle_vm_fixtures.rs looks for them.
-      - name: build XFS fixtures with mkfs.xfs and dump them with xfs_db
-        run: |
-          set -euo pipefail
-          share="$GITHUB_WORKSPACE/.vm-share"
-          mkdir -p "$share"
-
-          geometries=(
-            "default:"
-            "1k:-b size=1024"
-            "2k:-b size=2048"
-            "i512:-i size=512"
-            "i1k:-i size=1024"
-            "4ags:-d agcount=4"
-            "8ags:-d agcount=8"
-            "reflink:-m reflink=1,rmapbt=1"
-            "bigtime:-m bigtime=1"
-            "nocrc:-m crc=0"
-          )
-
-          built=0
-          skipped=0
-          for geom in "${geometries[@]}"; do
-            name="${geom%%:*}"
-            args="${geom#*:}"
-            img="$share/xfs-$name.img"
-            rm -f "$img" "$share/xfs-$name.sbdump"
-            truncate -s 400M "$img"
-            # shellcheck disable=SC2086 -- $args is a deliberate word split.
-            if mkfs.xfs $args -f -q "$img" > "/tmp/mkfs-$name.log" 2>&1; then
-              xfs_db -r -c 'sb 0' -c 'print' "$img" > "$share/xfs-$name.sbdump"
-              echo "BUILT  xfs-$name (mkfs.xfs $args)"
-              built=$((built + 1))
-            else
-              # Skipping a geometry this xfsprogs rejects is allowed;
-              # skipping it quietly is not.
-              echo "::warning title=XFS geometry skipped::xfs-$name — the installed mkfs.xfs rejected 'mkfs.xfs $args'"
-              echo "SKIP   xfs-$name — mkfs.xfs rejected this geometry:"
-              sed 's/^/         /' "/tmp/mkfs-$name.log"
-              rm -f "$img"
-              skipped=$((skipped + 1))
-            fi
-          done
-
-          echo
-          echo "fixtures built: $built, skipped: $skipped"
-          ls -lh "$share"
-          if [ "$built" -lt 6 ]; then
-            echo "only $built fixtures built — too few to call this validated" >&2
-            exit 1
-          fi
+      # Both this gate and the release gate call the same script.
+      # They previously each carried their own inline copy, the two
+      # drifted, and the release gate silently stopped generating the
+      # inode dumps its own test needed.
+      - name: Build the XFS fixture matrix
+        run: ./scripts/build-fixtures-native.sh
 
       # Must run before the mount step: mounting replays the log and writes
       # back the superblock counters, which would leave the images
