@@ -20,11 +20,80 @@
 //! inode read from the wrong offset is rejected rather than returned as
 //! plausible-looking garbage.
 
+use crate::endian::{be16, be32, be64, le32, uuid_at};
 use crate::error::{Error, Result};
-use crate::superblock::{crc32c_with_zeroed_crc, le32, Superblock};
+use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 
 /// `IN` — inode magic.
 pub const XFS_DINODE_MAGIC: u16 = 0x494e;
+
+/// Byte offsets within the on-disk inode (`xfs_dinode`).
+///
+/// Named for the same reason the superblock's and the AG headers' are.
+/// The inode core is the densest structure in the format — several
+/// fields change position depending on feature flags — so an unnamed
+/// literal here is especially hard to check by eye.
+pub mod offsets {
+    /// `di_magic` — `IN`.
+    pub const MAGIC: usize = 0;
+    /// `di_mode` — file type and permission bits.
+    pub const MODE: usize = 2;
+    /// `di_version` — 1, 2 or 3.
+    pub const VERSION: usize = 4;
+    /// `di_format` — how the data fork stores its contents.
+    pub const FORMAT: usize = 5;
+    /// `di_uid` — owning user.
+    pub const UID: usize = 8;
+    /// `di_gid` — owning group.
+    pub const GID: usize = 12;
+    /// `di_nlink` — hard link count.
+    pub const NLINK: usize = 16;
+    /// `di_big_nextents` — 64-bit data-fork extent count. Only meaningful
+    /// when the NREXT64 feature is set; otherwise this span is padding.
+    pub const BIG_NEXTENTS: usize = 24;
+    /// `di_atime` — last access.
+    pub const ATIME: usize = 32;
+    /// `di_mtime` — last modification.
+    pub const MTIME: usize = 40;
+    /// `di_ctime` — last inode change.
+    pub const CTIME: usize = 48;
+    /// `di_size` — file size in bytes.
+    pub const SIZE: usize = 56;
+    /// `di_nblocks` — blocks allocated across both forks.
+    pub const NBLOCKS: usize = 64;
+    /// `di_extsize` — extent size hint.
+    pub const EXTSIZE: usize = 72;
+    /// `di_nextents` — 32-bit data-fork extent count, without NREXT64.
+    pub const NEXTENTS: usize = 76;
+    /// `di_anextents` — attribute-fork extent count, without NREXT64.
+    pub const ANEXTENTS: usize = 80;
+    /// `di_forkoff` — attribute fork start, in 8-byte units past the core.
+    pub const FORKOFF: usize = 82;
+    /// `di_aformat` — how the attribute fork stores its contents.
+    pub const AFORMAT: usize = 83;
+    /// `di_flags` — inode flags.
+    pub const FLAGS: usize = 90;
+    /// `di_gen` — generation, bumped on reuse.
+    pub const GEN: usize = 92;
+    /// `di_next_unlinked` — next inode in the AGI unlinked list.
+    pub const NEXT_UNLINKED: usize = 96;
+    /// `di_crc` — CRC32C, stored little-endian. v3 only.
+    pub const CRC: usize = 100;
+    /// `di_changecount` — v3 only.
+    pub const CHANGECOUNT: usize = 104;
+    /// `di_lsn` — log sequence number of the last write. v3 only.
+    pub const LSN: usize = 112;
+    /// `di_flags2` — v3 only.
+    pub const FLAGS2: usize = 120;
+    /// `di_cowextsize` — copy-on-write extent size hint. v3 only.
+    pub const COWEXTSIZE: usize = 128;
+    /// `di_crtime` — creation time. v3 only.
+    pub const CRTIME: usize = 144;
+    /// `di_ino` — the inode's own number. v3 only.
+    pub const INO: usize = 152;
+    /// `di_uuid` — owning filesystem. v3 only.
+    pub const UUID: usize = 160;
+}
 
 /// Size of the v3 inode core, in bytes. Fork data begins here.
 pub const XFS_DINODE_V3_SIZE: usize = 176;
@@ -33,7 +102,7 @@ pub const XFS_DINODE_V3_SIZE: usize = 176;
 pub const XFS_DINODE_V2_SIZE: usize = 100;
 
 /// Byte offset of `di_crc` within the inode.
-const DI_CRC_OFFSET: usize = 100;
+const DI_CRC_OFFSET: usize = offsets::CRC;
 
 /// How the data in a fork is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,30 +217,6 @@ pub mod flags2 {
     pub const BIGTIME: u64 = 1 << 3;
 }
 
-#[inline]
-fn be16(b: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes([b[off], b[off + 1]])
-}
-
-#[inline]
-fn be32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-#[inline]
-fn be64(b: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes([
-        b[off],
-        b[off + 1],
-        b[off + 2],
-        b[off + 3],
-        b[off + 4],
-        b[off + 5],
-        b[off + 6],
-        b[off + 7],
-    ])
-}
-
 /// A parsed inode core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inode {
@@ -240,14 +285,14 @@ impl Inode {
             )));
         }
 
-        let magic = be16(buf, 0);
+        let magic = be16(buf, offsets::MAGIC);
         if magic != XFS_DINODE_MAGIC {
             return Err(Error::BadSuperblock(format!(
                 "inode {ino}: magic {magic:#06x}, expected {XFS_DINODE_MAGIC:#06x}"
             )));
         }
 
-        let version = buf[4];
+        let version = buf[offsets::VERSION];
         if !(1..=3).contains(&version) {
             return Err(Error::BadSuperblock(format!(
                 "inode {ino}: version {version} is not 1, 2 or 3"
@@ -271,7 +316,7 @@ impl Inode {
             // one left behind by a previous filesystem — neither of
             // which the checksum can detect, since such a block is
             // internally perfect.
-            let self_ino = be64(buf, 152);
+            let self_ino = be64(buf, offsets::INO);
             if self_ino != ino {
                 return Err(Error::BlockIdentityMismatch {
                     what: "inode",
@@ -279,7 +324,7 @@ impl Inode {
                     found: self_ino,
                 });
             }
-            let uuid: [u8; 16] = buf[160..176].try_into().expect("16 bytes");
+            let uuid = uuid_at(buf, offsets::UUID);
             if uuid != sb.meta_uuid {
                 return Err(Error::BlockIdentityMismatch {
                     what: "inode",
@@ -289,7 +334,7 @@ impl Inode {
             }
         }
 
-        let flags2 = if is_v3 { be64(buf, 120) } else { 0 };
+        let flags2 = if is_v3 { be64(buf, offsets::FLAGS2) } else { 0 };
         let bigtime = flags2 & flags2::BIGTIME != 0;
 
         // With the 64-bit extent counter feature the fields at 24 and 76
@@ -297,34 +342,40 @@ impl Inode {
         // padding and the counts sit at 76 and 80.
         let nrext64 = sb.features_incompat & crate::superblock::incompat::NREXT64 != 0;
         let (nextents, anextents) = if nrext64 {
-            (be64(buf, 24), be32(buf, 76))
+            (
+                be64(buf, offsets::BIG_NEXTENTS),
+                be32(buf, offsets::NEXTENTS),
+            )
         } else {
-            (u64::from(be32(buf, 76)), u32::from(be16(buf, 80)))
+            (
+                u64::from(be32(buf, offsets::NEXTENTS)),
+                u32::from(be16(buf, offsets::ANEXTENTS)),
+            )
         };
 
         let inode = Inode {
             ino,
-            mode: be16(buf, 2),
+            mode: be16(buf, offsets::MODE),
             version,
-            format: Format::from_raw(buf[5])?,
-            aformat: Format::from_raw(buf[83])?,
-            uid: be32(buf, 8),
-            gid: be32(buf, 12),
-            nlink: be32(buf, 16),
-            size: be64(buf, 56),
-            nblocks: be64(buf, 64),
+            format: Format::from_raw(buf[offsets::FORMAT])?,
+            aformat: Format::from_raw(buf[offsets::AFORMAT])?,
+            uid: be32(buf, offsets::UID),
+            gid: be32(buf, offsets::GID),
+            nlink: be32(buf, offsets::NLINK),
+            size: be64(buf, offsets::SIZE),
+            nblocks: be64(buf, offsets::NBLOCKS),
             nextents,
             anextents,
-            forkoff: buf[82],
-            flags: be16(buf, 90),
+            forkoff: buf[offsets::FORKOFF],
+            flags: be16(buf, offsets::FLAGS),
             flags2,
-            gen: be32(buf, 92),
-            next_unlinked: be32(buf, 96),
-            atime: Timestamp::parse(buf, 32, bigtime),
-            mtime: Timestamp::parse(buf, 40, bigtime),
-            ctime: Timestamp::parse(buf, 48, bigtime),
+            gen: be32(buf, offsets::GEN),
+            next_unlinked: be32(buf, offsets::NEXT_UNLINKED),
+            atime: Timestamp::parse(buf, offsets::ATIME, bigtime),
+            mtime: Timestamp::parse(buf, offsets::MTIME, bigtime),
+            ctime: Timestamp::parse(buf, offsets::CTIME, bigtime),
             crtime: if is_v3 {
-                Timestamp::parse(buf, 144, bigtime)
+                Timestamp::parse(buf, offsets::CRTIME, bigtime)
             } else {
                 Timestamp { sec: 0, nsec: 0 }
             },

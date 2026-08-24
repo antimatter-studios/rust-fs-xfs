@@ -22,8 +22,9 @@
 //! the block is internally perfect. Every header parsed here is checked
 //! against the address it was read from.
 
+use crate::endian::{be32, be64, le32, uuid_at};
 use crate::error::{Error, Result};
-use crate::superblock::{crc32c_with_zeroed_crc, le32, Superblock};
+use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 
 /// `XAGF` — AGF magic.
 pub const XFS_AGF_MAGIC: u32 = 0x5841_4746;
@@ -40,8 +41,87 @@ pub const XFS_AGI_SIZE: usize = 344;
 /// Number of unlinked-inode hash buckets in the AGI.
 pub const XFS_AGI_UNLINKED_BUCKETS: usize = 64;
 
-const AGF_CRC_OFFSET: usize = 216;
-const AGI_CRC_OFFSET: usize = 312;
+const AGF_CRC_OFFSET: usize = offsets::agf::CRC;
+const AGI_CRC_OFFSET: usize = offsets::agi::CRC;
+
+/// Byte offsets within the on-disk AGF and AGI structures.
+///
+/// Named for the same reason the superblock's are: a bare numeric
+/// literal in a parse expression gives a reader no way to distinguish a
+/// correct offset from a typo.
+pub mod offsets {
+    /// Fields shared by both headers, at the same offset in each.
+    pub mod common {
+        /// Structure magic.
+        pub const MAGIC: usize = 0;
+        /// Format version.
+        pub const VERSIONNUM: usize = 4;
+        /// Which allocation group this header describes.
+        pub const SEQNO: usize = 8;
+        /// Size of this AG in filesystem blocks.
+        pub const LENGTH: usize = 12;
+    }
+
+    /// `xfs_agf` — free space management.
+    pub mod agf {
+        /// `agf_roots` — free-space B+tree roots, 3 x u32.
+        pub const ROOTS: usize = 16;
+        /// `agf_levels` — depths of those B+trees, 3 x u32.
+        pub const LEVELS: usize = 28;
+        /// `agf_flfirst` — first valid free-list entry.
+        pub const FLFIRST: usize = 40;
+        /// `agf_fllast` — last valid free-list entry.
+        pub const FLLAST: usize = 44;
+        /// `agf_flcount` — blocks currently on the free list.
+        pub const FLCOUNT: usize = 48;
+        /// `agf_freeblks` — total free blocks in this AG.
+        pub const FREEBLKS: usize = 52;
+        /// `agf_longest` — longest contiguous free extent.
+        pub const LONGEST: usize = 56;
+        /// `agf_btreeblks` — blocks held by the free-space B+trees.
+        pub const BTREEBLKS: usize = 60;
+        /// `agf_uuid` — owning filesystem. v5 only.
+        pub const UUID: usize = 64;
+        /// `agf_rmap_blocks` — blocks held by the reverse-map B+tree.
+        pub const RMAP_BLOCKS: usize = 80;
+        /// `agf_refcount_root` — reference-count B+tree root.
+        pub const REFCOUNT_ROOT: usize = 88;
+        /// `agf_refcount_level` — reference-count B+tree depth.
+        pub const REFCOUNT_LEVEL: usize = 92;
+        /// `agf_lsn` — log sequence number of the last write. v5 only.
+        pub const LSN: usize = 208;
+        /// `agf_crc` — CRC32C, stored little-endian. v5 only.
+        pub const CRC: usize = 216;
+    }
+
+    /// `xfs_agi` — inode management.
+    pub mod agi {
+        /// `agi_count` — allocated inodes in this AG.
+        pub const COUNT: usize = 16;
+        /// `agi_root` — inode B+tree root.
+        pub const ROOT: usize = 20;
+        /// `agi_level` — inode B+tree depth.
+        pub const LEVEL: usize = 24;
+        /// `agi_freecount` — free inodes in this AG.
+        pub const FREECOUNT: usize = 28;
+        /// `agi_newino` — most recently allocated inode chunk.
+        pub const NEWINO: usize = 32;
+        /// `agi_dirino` — unused in modern XFS.
+        pub const DIRINO: usize = 36;
+        /// `agi_unlinked` — hash buckets of unlinked-but-open inodes.
+        pub const UNLINKED: usize = 40;
+        /// `agi_uuid` — owning filesystem. v5 only.
+        pub const UUID: usize = 296;
+        /// `agi_crc` — CRC32C, stored little-endian. v5 only.
+        pub const CRC: usize = 312;
+        /// `agi_lsn` — log sequence number of the last write. v5 only.
+        pub const LSN: usize = 320;
+        /// `agi_free_root` — free-inode B+tree root.
+        pub const FREE_ROOT: usize = 328;
+        /// `agi_free_level` — free-inode B+tree depth.
+        pub const FREE_LEVEL: usize = 332;
+    }
+}
 
 /// Index of each free-space B+tree root within `agf_roots` / `agf_levels`.
 pub mod agf_btree {
@@ -51,25 +131,6 @@ pub mod agf_btree {
     pub const CNT: usize = 1;
     /// Reverse-mapping B+tree (only present with the `rmapbt` feature).
     pub const RMAP: usize = 2;
-}
-
-#[inline]
-fn be32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-#[inline]
-fn be64(b: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes([
-        b[off],
-        b[off + 1],
-        b[off + 2],
-        b[off + 3],
-        b[off + 4],
-        b[off + 5],
-        b[off + 6],
-        b[off + 7],
-    ])
 }
 
 /// Shared identity validation for a v5 metadata header.
@@ -86,7 +147,7 @@ fn check_identity(
     seqno_off: usize,
     expected_ag: u32,
 ) -> Result<()> {
-    let uuid: [u8; 16] = buf[uuid_off..uuid_off + 16].try_into().expect("16 bytes");
+    let uuid = uuid_at(buf, uuid_off);
     if uuid != sb.meta_uuid {
         return Err(Error::BlockIdentityMismatch {
             what,
@@ -146,7 +207,7 @@ impl Agf {
                 buf.len()
             )));
         }
-        let magic = be32(buf, 0);
+        let magic = be32(buf, offsets::common::MAGIC);
         if magic != XFS_AGF_MAGIC {
             return Err(Error::BadSuperblock(format!(
                 "AGF for ag {expected_ag} has magic {magic:#010x}, expected {XFS_AGF_MAGIC:#010x}"
@@ -160,23 +221,38 @@ impl Agf {
                 AGF_CRC_OFFSET,
                 expected_ag,
             )?;
-            check_identity("AGF", buf, sb, 64, 8, expected_ag)?;
+            check_identity(
+                "AGF",
+                buf,
+                sb,
+                offsets::agf::UUID,
+                offsets::common::SEQNO,
+                expected_ag,
+            )?;
         }
 
         let agf = Agf {
-            seqno: be32(buf, 8),
-            length: be32(buf, 12),
-            roots: [be32(buf, 16), be32(buf, 20), be32(buf, 24)],
-            levels: [be32(buf, 28), be32(buf, 32), be32(buf, 36)],
-            flfirst: be32(buf, 40),
-            fllast: be32(buf, 44),
-            flcount: be32(buf, 48),
-            freeblks: be32(buf, 52),
-            longest: be32(buf, 56),
-            btreeblks: be32(buf, 60),
-            rmap_blocks: be32(buf, 80),
-            refcount_root: be32(buf, 88),
-            refcount_level: be32(buf, 92),
+            seqno: be32(buf, offsets::common::SEQNO),
+            length: be32(buf, offsets::common::LENGTH),
+            roots: [
+                be32(buf, offsets::agf::ROOTS),
+                be32(buf, offsets::agf::ROOTS + 4),
+                be32(buf, offsets::agf::ROOTS + 8),
+            ],
+            levels: [
+                be32(buf, offsets::agf::LEVELS),
+                be32(buf, offsets::agf::LEVELS + 4),
+                be32(buf, offsets::agf::LEVELS + 8),
+            ],
+            flfirst: be32(buf, offsets::agf::FLFIRST),
+            fllast: be32(buf, offsets::agf::FLLAST),
+            flcount: be32(buf, offsets::agf::FLCOUNT),
+            freeblks: be32(buf, offsets::agf::FREEBLKS),
+            longest: be32(buf, offsets::agf::LONGEST),
+            btreeblks: be32(buf, offsets::agf::BTREEBLKS),
+            rmap_blocks: be32(buf, offsets::agf::RMAP_BLOCKS),
+            refcount_root: be32(buf, offsets::agf::REFCOUNT_ROOT),
+            refcount_level: be32(buf, offsets::agf::REFCOUNT_LEVEL),
         };
 
         // An AG can never be longer than the geometry the superblock
@@ -245,7 +321,7 @@ impl Agi {
                 buf.len()
             )));
         }
-        let magic = be32(buf, 0);
+        let magic = be32(buf, offsets::common::MAGIC);
         if magic != XFS_AGI_MAGIC {
             return Err(Error::BadSuperblock(format!(
                 "AGI for ag {expected_ag} has magic {magic:#010x}, expected {XFS_AGI_MAGIC:#010x}"
@@ -259,24 +335,31 @@ impl Agi {
                 AGI_CRC_OFFSET,
                 expected_ag,
             )?;
-            check_identity("AGI", buf, sb, 296, 8, expected_ag)?;
+            check_identity(
+                "AGI",
+                buf,
+                sb,
+                offsets::agi::UUID,
+                offsets::common::SEQNO,
+                expected_ag,
+            )?;
         }
 
         let mut unlinked = [0u32; XFS_AGI_UNLINKED_BUCKETS];
         for (i, slot) in unlinked.iter_mut().enumerate() {
-            *slot = be32(buf, 40 + i * 4);
+            *slot = be32(buf, offsets::agi::UNLINKED + i * 4);
         }
 
         let agi = Agi {
-            seqno: be32(buf, 8),
-            length: be32(buf, 12),
-            count: be32(buf, 16),
-            root: be32(buf, 20),
-            level: be32(buf, 24),
-            freecount: be32(buf, 28),
-            newino: be32(buf, 32),
-            free_root: be32(buf, 328),
-            free_level: be32(buf, 332),
+            seqno: be32(buf, offsets::common::SEQNO),
+            length: be32(buf, offsets::common::LENGTH),
+            count: be32(buf, offsets::agi::COUNT),
+            root: be32(buf, offsets::agi::ROOT),
+            level: be32(buf, offsets::agi::LEVEL),
+            freecount: be32(buf, offsets::agi::FREECOUNT),
+            newino: be32(buf, offsets::agi::NEWINO),
+            free_root: be32(buf, offsets::agi::FREE_ROOT),
+            free_level: be32(buf, offsets::agi::FREE_LEVEL),
             unlinked,
         };
 
@@ -318,12 +401,12 @@ fn verify_crc(what: &'static str, buf: &[u8], size: usize, crc_off: usize, ag: u
 
 /// Read the log sequence number from a v5 AGF.
 pub fn agf_lsn(buf: &[u8]) -> u64 {
-    be64(buf, 208)
+    be64(buf, offsets::agf::LSN)
 }
 
 /// Read the log sequence number from a v5 AGI.
 pub fn agi_lsn(buf: &[u8]) -> u64 {
-    be64(buf, 320)
+    be64(buf, offsets::agi::LSN)
 }
 
 #[cfg(test)]

@@ -16,13 +16,22 @@
 //!
 //! Architecture:
 //! - [`error`] — driver error type, mapped to errno by the C ABI
+//! - [`endian`] — on-disk integer decoding; the byte-order rule lives here
 //! - [`superblock`] — superblock parse + validation, geometry helpers
 //! - [`ag`] — allocation group headers (AGF/AGI), with v5 identity checks
+//! - [`inode`] — on-disk inode core, forks, timestamps
+//! - [`extent`] — data fork extent records and the bmbt
+//! - [`dir`] — directory formats (short form, block, leaf, node)
+//! - [`fs`] — mounted filesystem handle: lookup, read, iterate
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ag;
+pub mod dir;
+pub mod endian;
 pub mod error;
+pub mod extent;
+pub mod fs;
 pub mod inode;
 pub mod superblock;
 

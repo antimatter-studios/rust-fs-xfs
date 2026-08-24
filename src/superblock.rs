@@ -21,6 +21,7 @@
 //! on-disk structure is 264 bytes: a v4 prefix of 208 bytes followed by
 //! the v5 extension (feature masks, CRC, metadata UUID, LSN).
 
+use crate::endian::{be16, be32, be64, le32, uuid_at};
 use crate::error::{Error, Result};
 
 /// `XFSB` — the superblock magic, big-endian at offset 0.
@@ -36,7 +37,90 @@ pub const XFS_SB_SIZE: usize = 264;
 
 /// Byte offset of `sb_crc` within the superblock. The CRC is computed
 /// over the whole structure with these four bytes treated as zero.
-pub(crate) const SB_CRC_OFFSET: usize = 224;
+pub(crate) const SB_CRC_OFFSET: usize = offsets::CRC;
+
+/// Byte offsets of each field within the on-disk superblock.
+///
+/// Named rather than inlined at the call site for the same reason the
+/// sibling Btrfs driver names its own: a numeric literal in a parse
+/// expression carries no way to tell a correct offset from a typo, and
+/// two of the three bugs this crate has shipped were exactly that — a
+/// value read from the wrong place or with the wrong span. A name can be
+/// checked against the format documentation by eye; `56` cannot.
+pub mod offsets {
+    /// `sb_magicnum` — `XFSB`.
+    pub const MAGIC: usize = 0;
+    /// `sb_blocksize` — filesystem block size in bytes.
+    pub const BLOCKSIZE: usize = 4;
+    /// `sb_dblocks` — total data-section blocks.
+    pub const DBLOCKS: usize = 8;
+    /// `sb_rblocks` — total real-time section blocks.
+    pub const RBLOCKS: usize = 16;
+    /// `sb_uuid` — filesystem UUID.
+    pub const UUID: usize = 32;
+    /// `sb_logstart` — first block of the internal log, 0 if external.
+    pub const LOGSTART: usize = 48;
+    /// `sb_rootino` — root directory inode number.
+    pub const ROOTINO: usize = 56;
+    /// `sb_agblocks` — blocks per allocation group.
+    pub const AGBLOCKS: usize = 84;
+    /// `sb_agcount` — number of allocation groups.
+    pub const AGCOUNT: usize = 88;
+    /// `sb_logblocks` — log length in filesystem blocks.
+    pub const LOGBLOCKS: usize = 96;
+    /// `sb_versionnum` — version plus the v4-era feature bits.
+    pub const VERSIONNUM: usize = 100;
+    /// `sb_sectsize` — sector size in bytes.
+    pub const SECTSIZE: usize = 102;
+    /// `sb_inodesize` — inode size in bytes.
+    pub const INODESIZE: usize = 104;
+    /// `sb_inopblock` — inodes per filesystem block.
+    pub const INOPBLOCK: usize = 106;
+    /// `sb_fname` — volume label.
+    pub const FNAME: usize = 108;
+    /// Length of `sb_fname`.
+    pub const FNAME_LEN: usize = 12;
+    /// `sb_blocklog` — log2 of the block size.
+    pub const BLOCKLOG: usize = 120;
+    /// `sb_sectlog` — log2 of the sector size.
+    pub const SECTLOG: usize = 121;
+    /// `sb_inodelog` — log2 of the inode size.
+    pub const INODELOG: usize = 122;
+    /// `sb_inopblog` — log2 of inodes per block.
+    pub const INOPBLOG: usize = 123;
+    /// `sb_agblklog` — log2 of blocks per AG, rounded up.
+    pub const AGBLKLOG: usize = 124;
+    /// `sb_inprogress` — non-zero while mkfs is still writing.
+    pub const INPROGRESS: usize = 126;
+    /// `sb_icount` — allocated inodes.
+    pub const ICOUNT: usize = 128;
+    /// `sb_ifree` — free inodes.
+    pub const IFREE: usize = 136;
+    /// `sb_fdblocks` — free data blocks.
+    pub const FDBLOCKS: usize = 144;
+    /// `sb_inoalignmt` — inode alignment in blocks.
+    pub const INOALIGNMT: usize = 180;
+    /// `sb_dirblklog` — log2 of directory block size over block size.
+    pub const DIRBLKLOG: usize = 192;
+    /// `sb_logsunit` — log stripe unit in bytes.
+    pub const LOGSUNIT: usize = 196;
+    /// `sb_features2`.
+    pub const FEATURES2: usize = 200;
+    /// `sb_features_compat` — v5 only.
+    pub const FEATURES_COMPAT: usize = 208;
+    /// `sb_features_ro_compat` — v5 only.
+    pub const FEATURES_RO_COMPAT: usize = 212;
+    /// `sb_features_incompat` — v5 only.
+    pub const FEATURES_INCOMPAT: usize = 216;
+    /// `sb_features_log_incompat` — v5 only.
+    pub const FEATURES_LOG_INCOMPAT: usize = 220;
+    /// `sb_crc` — CRC32C, stored little-endian. v5 only.
+    pub const CRC: usize = 224;
+    /// `sb_spino_align` — sparse inode chunk alignment. v5 only.
+    pub const SPINO_ALIGN: usize = 228;
+    /// `sb_meta_uuid` — UUID stamped into metadata blocks. v5 only.
+    pub const META_UUID: usize = 248;
+}
 
 /// Mask selecting the version number from `sb_versionnum`.
 const XFS_SB_VERSION_NUMBITS: u16 = 0x000f;
@@ -168,46 +252,8 @@ pub struct Superblock {
     pub fname: String,
 }
 
-/// Read a big-endian `u16` at `off`.
-#[inline]
-fn be16(b: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes([b[off], b[off + 1]])
-}
-
-/// Read a big-endian `u32` at `off`.
-#[inline]
-fn be32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-/// Read a big-endian `u64` at `off`.
-#[inline]
-fn be64(b: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes([
-        b[off],
-        b[off + 1],
-        b[off + 2],
-        b[off + 3],
-        b[off + 4],
-        b[off + 5],
-        b[off + 6],
-        b[off + 7],
-    ])
-}
-
 /// Read a **little-endian** `u32` at `off`.
 ///
-/// Used only for checksum fields. XFS is big-endian everywhere else, but
-/// its CRCs are stored little-endian — the kernel's `xfs_end_cksum()`
-/// returns `~cpu_to_le32(crc)`. Reading a CRC big-endian like the rest of
-/// the structure makes every real filesystem look corrupt while
-/// hand-built fixtures pass, because they would be written with the same
-/// mistake.
-#[inline]
-pub(crate) fn le32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
 impl Superblock {
     /// Parse and validate a superblock from the first [`XFS_SB_SIZE`]
     /// bytes of `buf`.
@@ -228,12 +274,12 @@ impl Superblock {
             )));
         }
 
-        let magic = be32(buf, 0);
+        let magic = be32(buf, offsets::MAGIC);
         if magic != XFS_SB_MAGIC {
             return Err(Error::NotXfs { magic });
         }
 
-        let versionnum = be16(buf, 100);
+        let versionnum = be16(buf, offsets::VERSIONNUM);
         let version = versionnum & XFS_SB_VERSION_NUMBITS;
         if !(4..=5).contains(&version) {
             return Err(Error::BadSuperblock(format!(
@@ -256,93 +302,78 @@ impl Superblock {
         // is unavoidable (the length is needed to compute the sum) so it
         // is range-checked first; a wild value is rejected as a bad
         // superblock rather than used to index memory.
-        let sectsize = be16(buf, 102);
+        let sectsize = be16(buf, offsets::SECTSIZE);
         if !(512..=32768).contains(&sectsize) || !sectsize.is_power_of_two() {
             return Err(Error::BadSuperblock(format!(
                 "sectsize {sectsize} is not a sane power of two"
             )));
         }
         if is_v5 {
-            let end = usize::from(sectsize);
-            if buf.len() < end {
-                return Err(Error::BadSuperblock(format!(
-                    "need a full {sectsize}-byte sector to verify the superblock checksum, got {}",
-                    buf.len()
-                )));
-            }
-            let stored = le32(buf, SB_CRC_OFFSET);
-            let computed = crc32c_with_zeroed_crc(&buf[..end], SB_CRC_OFFSET);
-            if stored != computed {
-                return Err(Error::ChecksumMismatch {
-                    what: "superblock",
-                    block: 0,
-                });
-            }
+            verify_checksum(buf, sectsize)?;
         }
 
         let (features_compat, features_ro_compat, features_incompat, features_log_incompat) =
             if is_v5 {
                 (
-                    be32(buf, 208),
-                    be32(buf, 212),
-                    be32(buf, 216),
-                    be32(buf, 220),
+                    be32(buf, offsets::FEATURES_COMPAT),
+                    be32(buf, offsets::FEATURES_RO_COMPAT),
+                    be32(buf, offsets::FEATURES_INCOMPAT),
+                    be32(buf, offsets::FEATURES_LOG_INCOMPAT),
                 )
             } else {
                 (0, 0, 0, 0)
             };
 
-        let unknown_incompat = features_incompat & !incompat::SUPPORTED;
-        if unknown_incompat != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "incompatible feature bits {unknown_incompat:#010x} not implemented"
-            )));
-        }
+        reject_unsupported_features(features_incompat)?;
 
-        let uuid: [u8; 16] = buf[32..48].try_into().expect("16 bytes");
+        let uuid = uuid_at(buf, offsets::UUID);
         let meta_uuid: [u8; 16] = if is_v5 && features_incompat & incompat::META_UUID != 0 {
-            buf[248..264].try_into().expect("16 bytes")
+            uuid_at(buf, offsets::META_UUID)
         } else {
             uuid
         };
 
-        let fname_raw = &buf[108..120];
+        let fname_raw = &buf[offsets::FNAME..offsets::FNAME + offsets::FNAME_LEN];
         let fname = String::from_utf8_lossy(fname_raw)
             .trim_end_matches('\0')
             .to_string();
 
         let sb = Superblock {
-            blocksize: be32(buf, 4),
-            dblocks: be64(buf, 8),
-            rblocks: be64(buf, 16),
+            blocksize: be32(buf, offsets::BLOCKSIZE),
+            dblocks: be64(buf, offsets::DBLOCKS),
+            rblocks: be64(buf, offsets::RBLOCKS),
             uuid,
-            logstart: be64(buf, 48),
-            rootino: be64(buf, 56),
-            agblocks: be32(buf, 84),
-            agcount: be32(buf, 88),
-            logblocks: be32(buf, 96),
+            logstart: be64(buf, offsets::LOGSTART),
+            rootino: be64(buf, offsets::ROOTINO),
+            agblocks: be32(buf, offsets::AGBLOCKS),
+            agcount: be32(buf, offsets::AGCOUNT),
+            logblocks: be32(buf, offsets::LOGBLOCKS),
             versionnum,
-            sectsize: be16(buf, 102),
-            inodesize: be16(buf, 104),
-            inopblock: be16(buf, 106),
-            blocklog: buf[120],
-            sectlog: buf[121],
-            inodelog: buf[122],
-            inopblog: buf[123],
-            agblklog: buf[124],
-            inprogress: buf[126],
-            icount: be64(buf, 128),
-            ifree: be64(buf, 136),
-            fdblocks: be64(buf, 144),
-            inoalignmt: be32(buf, 180),
-            dirblklog: buf[192],
-            logsunit: be32(buf, 196),
-            features2: be32(buf, 200),
+            sectsize: be16(buf, offsets::SECTSIZE),
+            inodesize: be16(buf, offsets::INODESIZE),
+            inopblock: be16(buf, offsets::INOPBLOCK),
+            blocklog: buf[offsets::BLOCKLOG],
+            sectlog: buf[offsets::SECTLOG],
+            inodelog: buf[offsets::INODELOG],
+            inopblog: buf[offsets::INOPBLOG],
+            agblklog: buf[offsets::AGBLKLOG],
+            inprogress: buf[offsets::INPROGRESS],
+            icount: be64(buf, offsets::ICOUNT),
+            ifree: be64(buf, offsets::IFREE),
+            fdblocks: be64(buf, offsets::FDBLOCKS),
+            inoalignmt: be32(buf, offsets::INOALIGNMT),
+            dirblklog: buf[offsets::DIRBLKLOG],
+            logsunit: be32(buf, offsets::LOGSUNIT),
+            features2: be32(buf, offsets::FEATURES2),
             features_compat,
             features_ro_compat,
             features_incompat,
             features_log_incompat,
-            spino_align: if is_v5 { be32(buf, 228) } else { 0 },
+            spino_align: if is_v5 {
+                be32(buf, offsets::SPINO_ALIGN)
+            } else {
+                0
+            },
             meta_uuid,
             fname,
         };
@@ -495,6 +526,49 @@ impl Superblock {
     pub fn has_ftype(&self) -> bool {
         self.features_incompat & incompat::FTYPE != 0
     }
+}
+
+/// Verify the v5 superblock checksum.
+///
+/// The sum covers the whole sector, not the 264-byte structure: XFS
+/// hands the full buffer length to its verifier, so the trailing zero
+/// padding is included. Checksumming only the struct passes on fixtures
+/// built by this crate and fails on every real filesystem — a bug this
+/// driver has already shipped once.
+fn verify_checksum(buf: &[u8], sectsize: u16) -> Result<()> {
+    let end = usize::from(sectsize);
+    if buf.len() < end {
+        return Err(Error::BadSuperblock(format!(
+            "need a full {sectsize}-byte sector to verify the superblock checksum, got {}",
+            buf.len()
+        )));
+    }
+    let stored = le32(buf, SB_CRC_OFFSET);
+    let computed = crc32c_with_zeroed_crc(&buf[..end], SB_CRC_OFFSET);
+    if stored != computed {
+        return Err(Error::ChecksumMismatch {
+            what: "superblock",
+            block: 0,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a volume that sets an incompatible feature bit this driver
+/// does not implement.
+///
+/// Incompatible means exactly that: the on-disk layout differs in a way
+/// that makes reading unsafe, so guessing is worse than declining.
+/// Read-only-compatible bits are deliberately not checked here — an
+/// unknown one still permits the read-only mount this driver performs.
+fn reject_unsupported_features(features_incompat: u32) -> Result<()> {
+    let unknown = features_incompat & !incompat::SUPPORTED;
+    if unknown != 0 {
+        return Err(Error::UnsupportedFeature(format!(
+            "incompatible feature bits {unknown:#010x} not implemented"
+        )));
+    }
+    Ok(())
 }
 
 /// CRC32C over `buf` with the four checksum bytes at `crc_off` treated
