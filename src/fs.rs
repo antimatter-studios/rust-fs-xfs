@@ -275,10 +275,14 @@ impl Filesystem {
     /// List a directory's entries.
     ///
     /// Handles the short-form case inline and reads directory data
-    /// blocks through the extent list for every other format. `.` and
-    /// `..` are not returned as entries; the parent is available from
-    /// the short-form header and from `..` in the block formats, but
-    /// callers overwhelmingly want the real children.
+    /// blocks through the extent list for every other format.
+    ///
+    /// `.` and `..` are never returned, in any format. Short form does
+    /// not store them at all — the parent lives in its header — while
+    /// the block and leaf formats do, so returning whatever the format
+    /// happened to hold would make a directory's listing change shape as
+    /// it grew past short form. A caller should not have to know how a
+    /// directory is stored.
     pub fn read_dir(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<DirEntry>> {
         if !inode.is_dir() {
             return Err(Error::NotADirectory);
@@ -321,7 +325,17 @@ impl Filesystem {
                 // rather than entries. parse_data_block rejects those by
                 // magic, and that rejection is not fatal to the listing.
                 if let Ok(entries) = dir::parse_data_block(&block, &self.sb) {
-                    out.extend(entries);
+                    // Block and leaf formats store `.` and `..` as real
+                    // entries; short form keeps the parent in its header
+                    // and never materialises either. Filtering here keeps
+                    // the contract uniform, so a caller does not see a
+                    // directory's listing change shape purely because it
+                    // grew past short form.
+                    out.extend(
+                        entries
+                            .into_iter()
+                            .filter(|e| e.name != b"." && e.name != b".."),
+                    );
                 }
                 file_block += blocks_per_dir_block;
             }

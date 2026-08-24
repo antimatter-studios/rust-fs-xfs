@@ -23,10 +23,12 @@
 //! - [`extent`] — data fork extent records and the bmbt
 //! - [`dir`] — directory formats (short form, block, leaf, node)
 //! - [`fs`] — mounted filesystem handle: lookup, read, iterate
+//! - [`capi`] — C ABI exports matching `include/fs_xfs.h`
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ag;
+pub mod capi;
 pub mod dir;
 pub mod endian;
 pub mod error;
