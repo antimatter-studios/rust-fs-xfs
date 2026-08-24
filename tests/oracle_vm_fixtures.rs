@@ -280,3 +280,180 @@ fn real_ag_headers_reject_wrong_index() {
         "{label}: AG 0's AGF was accepted as AG 1's — the identity check is not working"
     );
 }
+
+// ---------------------------------------------------------------------
+// Inode cross-validation
+//
+// `xfs_db -c 'inode <n>' -c print` output uses its own conventions: hex
+// with an `0x` prefix, octal with a leading zero for `core.mode`, and a
+// trailing parenthesised label on enum fields (`1 (local)`). Timestamps
+// are rendered as human-readable dates and so are not compared here.
+// ---------------------------------------------------------------------
+
+/// Parse an `xfs_db ... inode print` dump into a field map.
+fn parse_inodedump(text: &str) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim().to_string();
+        let mut v = v.trim();
+        // Strip a trailing enum label: "1 (local)" -> "1".
+        if let Some(paren) = v.find(" (") {
+            v = &v[..paren];
+        }
+        let parsed = if let Some(hex) = v.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else if k == "core.mode" {
+            // Rendered octal with a leading zero, e.g. "040755". A mode
+            // of plain "0" trims to the empty string, which is zero.
+            let digits = v.trim_start_matches('0');
+            if digits.is_empty() {
+                Some(0)
+            } else {
+                u64::from_str_radix(digits, 8).ok()
+            }
+        } else {
+            v.parse::<u64>().ok()
+        };
+        if let Some(n) = parsed {
+            map.insert(k, n);
+        }
+    }
+    map
+}
+
+/// Byte offset of an inode within the image, derived from its number.
+fn inode_offset(sb: &Superblock, ino: u64) -> usize {
+    let (ag, ag_block, offset) = sb.split_ino(ino);
+    let bytes = u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize)
+        + u64::from(ag_block) * u64::from(sb.blocksize)
+        + u64::from(offset) * u64::from(sb.inodesize);
+    bytes as usize
+}
+
+/// The root inode of every real filesystem must parse, and every field
+/// must match what xfs_db reports for the same inode.
+#[test]
+fn root_inode_agrees_with_xfs_db() {
+    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
+    let Ok(entries) = std::fs::read_dir(&share) else {
+        eprintln!("no .vm-share — skipping");
+        return;
+    };
+
+    let mut examined = 0usize;
+    let mut total_fields = 0usize;
+    for e in entries.flatten() {
+        let img = e.path();
+        if img.extension().and_then(|s| s.to_str()) != Some("img") {
+            continue;
+        }
+        let dump_path = img.with_extension("inodedump");
+        if !dump_path.exists() {
+            continue;
+        }
+        let label = img.file_stem().unwrap().to_string_lossy().into_owned();
+
+        let bytes = std::fs::read(&img).expect("read image");
+        let sb = Superblock::parse(&bytes).expect("parse superblock");
+        let off = inode_offset(&sb, sb.rootino);
+        let inode = fs_xfs::inode::Inode::parse(&bytes[off..], &sb, sb.rootino)
+            .unwrap_or_else(|e| panic!("{label}: failed to parse the root inode: {e}"));
+
+        let oracle = parse_inodedump(&std::fs::read_to_string(&dump_path).unwrap());
+        let mut checked = 0usize;
+
+        expect(&oracle, "core.magic", 0x494e, &label, &mut checked);
+        expect(
+            &oracle,
+            "core.mode",
+            inode.mode.into(),
+            &label,
+            &mut checked,
+        );
+        expect(
+            &oracle,
+            "core.version",
+            inode.version.into(),
+            &label,
+            &mut checked,
+        );
+        expect(&oracle, "core.uid", inode.uid.into(), &label, &mut checked);
+        expect(&oracle, "core.gid", inode.gid.into(), &label, &mut checked);
+        expect(
+            &oracle,
+            "core.nlinkv2",
+            inode.nlink.into(),
+            &label,
+            &mut checked,
+        );
+        expect(&oracle, "core.size", inode.size, &label, &mut checked);
+        expect(&oracle, "core.nblocks", inode.nblocks, &label, &mut checked);
+        expect(
+            &oracle,
+            "core.nextents",
+            inode.nextents,
+            &label,
+            &mut checked,
+        );
+        expect(
+            &oracle,
+            "core.naextents",
+            inode.anextents.into(),
+            &label,
+            &mut checked,
+        );
+        expect(
+            &oracle,
+            "core.forkoff",
+            inode.forkoff.into(),
+            &label,
+            &mut checked,
+        );
+        expect(&oracle, "core.gen", inode.gen.into(), &label, &mut checked);
+
+        // The root inode is always a directory, on every filesystem.
+        assert!(
+            inode.is_dir(),
+            "{label}: root inode is not a directory (mode {:#o})",
+            inode.mode
+        );
+
+        assert!(
+            checked >= 8,
+            "{label}: only {checked} inode fields compared — not enough to call this validated"
+        );
+        eprintln!("  {label}: root inode, {checked} fields agree with xfs_db");
+        examined += 1;
+        total_fields += checked;
+    }
+
+    assert!(
+        examined > 0,
+        "no .inodedump fixtures found — the inode parser is unvalidated"
+    );
+    eprintln!("{examined} root inodes, {total_fields} field comparisons against xfs_db");
+}
+
+/// An inode read at the wrong offset must be rejected. A v3 inode
+/// records its own number, so this is detectable even though the block
+/// is internally perfect and its checksum is valid.
+#[test]
+fn real_inode_rejects_wrong_number() {
+    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
+    let img = share.join("xfs-default.img");
+    if !img.exists() {
+        eprintln!("no xfs-default.img — skipping");
+        return;
+    }
+    let bytes = std::fs::read(&img).unwrap();
+    let sb = Superblock::parse(&bytes).unwrap();
+    let off = inode_offset(&sb, sb.rootino);
+    let res = fs_xfs::inode::Inode::parse(&bytes[off..], &sb, sb.rootino + 1);
+    assert!(
+        matches!(res, Err(fs_xfs::Error::BlockIdentityMismatch { .. })),
+        "the root inode was accepted under the wrong inode number"
+    );
+}

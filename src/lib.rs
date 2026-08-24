@@ -23,6 +23,7 @@
 
 pub mod ag;
 pub mod error;
+pub mod inode;
 pub mod superblock;
 
 pub use error::{Error, Result};

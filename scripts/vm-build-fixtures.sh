@@ -40,6 +40,10 @@ for geom in "${GEOMETRIES[@]}"; do
         truncate -s 400M xfs-$name.img
         if mkfs.xfs $args -f -q xfs-$name.img >/dev/null 2>&1; then
             xfs_db -r -c 'sb 0' -c 'print' xfs-$name.img > xfs-$name.sbdump
+            # Also dump the root inode, so the inode parser is validated
+            # against the reference debugger and not only against itself.
+            root=\$(xfs_db -r -c 'sb 0' -c 'print rootino' xfs-$name.img | awk '{print \$3}')
+            xfs_db -r -c \"inode \$root\" -c 'print' xfs-$name.img > xfs-$name.inodedump
             echo 'BUILT $name'
         else
             # Not every geometry is accepted by every xfsprogs version.
