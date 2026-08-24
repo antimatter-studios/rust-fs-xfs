@@ -1,0 +1,298 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
+  # (`am-fs-core = { path = "../rust-fs-core", version = "0.2" }`). Must match
+  # the `am-fs-core` version recorded in Cargo.lock, or `--locked` will refuse
+  # to build. Bump in lockstep with the constraint in Cargo.toml.
+  FS_CORE_REF: v0.2.2
+
+jobs:
+  test:
+    name: test-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # The crate has a path dep on am-fs-core (../rust-fs-core).
+      # Clone the sibling repo alongside so cargo can resolve it.
+      # Anonymous HTTPS clone — rust-fs-core is public.
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      # Pinned to the same channel as rust-toolchain.toml. The toml wins
+      # regardless (rustup honours it and would download that channel on
+      # first cargo invocation); naming it here just avoids fetching two
+      # toolchains. Move both together, and in lockstep with the sister
+      # fs-* crates — a mixed toolchain across statically linked crates
+      # duplicates _rust_eh_personality at link time downstream.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # The oracle tests are #[ignore]-gated so this stays green without
+      # xfsprogs installed; the validate-kernel-xfs job below opts them in.
+      - run: cargo test --locked --release
+
+  # ---------------------------------------------------------------------
+  # Real-kernel cross-validation gate. This job BLOCKS — it is not
+  # advisory, and it is not continue-on-error.
+  #
+  # WHY THIS EXISTS
+  #
+  # The unit tests in src/ parse superblocks and AG headers that this
+  # crate constructed itself. That proves the parser is self-consistent.
+  # It does not prove the parser reads XFS the way the rest of the world
+  # reads it: when the fixture and the parser share a misunderstanding,
+  # the test passes and the bug is invisible.
+  #
+  # Three real bugs were shipped into this crate and caught only by
+  # comparing against xfs_db — every one of them passed the unit tests:
+  #
+  #   1. The superblock magic was transposed. Our fixtures were written
+  #      with the same transposition, so the round-trip agreed with
+  #      itself and no real XFS volume would ever have been recognised.
+  #   2. Several checksum fields were read little-endian in a format that
+  #      is otherwise big-endian throughout. Self-built fixtures encoded
+  #      them the same wrong way, so verification "succeeded".
+  #   3. Checksums were computed over the whole sector instead of over
+  #      the struct. Again symmetric, again invisible, again wrong
+  #      against every filesystem a real mkfs.xfs produces.
+  #
+  # The only defence against that class of bug is an independent oracle.
+  # So on every PR and push we build real filesystems with the canonical
+  # mkfs.xfs, dump each superblock with xfs_db, and require this driver's
+  # reading of every field to match the reference debugger's. Then we
+  # loop-mount the images with the in-kernel XFS driver, which is the
+  # final proof the bytes are a filesystem Linux itself accepts, and we
+  # scrape dmesg afterwards because the kernel will complain about
+  # metadata it tolerates but dislikes — a successful mount alone is not
+  # a clean bill of health.
+  #
+  # GitHub's Linux runners are already Linux, so unlike the macOS
+  # developer workflow (scripts/vm.sh drives a Debian VM for mkfs.xfs and
+  # xfs_db) no VM is needed here. The fixtures land in the same
+  # .vm-share/ directory that tests/oracle_vm_fixtures.rs reads, using the
+  # same `xfs-<name>.img` + `xfs-<name>.sbdump` pairing, so CI and the
+  # local loop exercise byte-identical code paths.
+  # ---------------------------------------------------------------------
+  validate-kernel-xfs:
+    name: validate against xfs_db + in-kernel XFS driver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      # xfsprogs provides mkfs.xfs (builds the fixtures) and xfs_db (the
+      # oracle we grade ourselves against). Print the version: which
+      # geometries and feature flags are accepted depends on it, and the
+      # skip messages below are only readable next to it.
+      - name: Install xfsprogs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs
+          mkfs.xfs -V
+          xfs_db -V
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-kxfs-${{ hashFiles('**/Cargo.lock') }}
+
+      # Mirrors scripts/vm-build-fixtures.sh. Keep the geometry list in
+      # sync with that script: the two must produce the same fixture set,
+      # or CI and a developer's local run stop meaning the same thing.
+      #
+      # The geometries are chosen to move the fields most likely to be
+      # misread: block and inode size change every log2-derived field,
+      # agcount changes the inode-number split, and the feature flags
+      # change the AG layout and the feature bitmasks.
+      - name: Build XFS fixtures with mkfs.xfs and dump them with xfs_db
+        run: |
+          set -euo pipefail
+          share="$GITHUB_WORKSPACE/.vm-share"
+          mkdir -p "$share"
+
+          # name:mkfs-args — empty args means "whatever this mkfs.xfs
+          # considers default", which is itself worth pinning down.
+          geometries=(
+            "default:"
+            "1k:-b size=1024"
+            "2k:-b size=2048"
+            "i512:-i size=512"
+            "i1k:-i size=1024"
+            "4ags:-d agcount=4"
+            "8ags:-d agcount=8"
+            "reflink:-m reflink=1,rmapbt=1"
+            "bigtime:-m bigtime=1"
+            "nocrc:-m crc=0"
+          )
+
+          built=0
+          skipped=0
+          for geom in "${geometries[@]}"; do
+            name="${geom%%:*}"
+            args="${geom#*:}"
+            img="$share/xfs-$name.img"
+            rm -f "$img" "$share/xfs-$name.sbdump"
+            # Sparse: 400 MiB of address space, only the metadata mkfs
+            # actually writes costs disk.
+            truncate -s 400M "$img"
+            # shellcheck disable=SC2086 -- $args is a deliberate word split.
+            if mkfs.xfs $args -f -q "$img" > "/tmp/mkfs-$name.log" 2>&1; then
+              xfs_db -r -c 'sb 0' -c 'print' "$img" > "$share/xfs-$name.sbdump"
+              echo "BUILT  xfs-$name (mkfs.xfs $args)"
+              built=$((built + 1))
+            else
+              # Not every geometry is accepted by every xfsprogs release.
+              # Skipping is allowed; skipping *quietly* is not — a fixture
+              # that vanishes without a word is a hole in the gate that
+              # nobody notices.
+              echo "::warning title=XFS geometry skipped::xfs-$name — the installed mkfs.xfs rejected 'mkfs.xfs $args'"
+              echo "SKIP   xfs-$name — mkfs.xfs rejected this geometry:"
+              sed 's/^/         /' "/tmp/mkfs-$name.log"
+              rm -f "$img"
+              skipped=$((skipped + 1))
+            fi
+          done
+
+          echo
+          echo "fixtures built: $built, skipped: $skipped"
+          ls -lh "$share"
+          # A gate with nothing to compare against is not a gate. Demand a
+          # meaningful spread, so a broken mkfs invocation cannot quietly
+          # turn this job into a no-op that reports success.
+          if [ "$built" -lt 6 ]; then
+            echo "only $built fixtures built — too few to call this validated" >&2
+            exit 1
+          fi
+
+      # The comparison itself: parse each image with this driver and
+      # require every field to equal what xfs_db reported for it. This
+      # MUST run before the mount step below — mounting replays the log
+      # and writes back the superblock's free-space and inode counters,
+      # which would leave the images disagreeing with the dumps that were
+      # taken straight out of mkfs.
+      - name: Cross-validate every superblock field against xfs_db
+        run: cargo test --locked --release --test oracle_vm_fixtures -- --nocapture
+
+      # The #[ignore]-gated oracle suite in tests/oracle_mkfs.rs does the
+      # same field-by-field comparison, but builds its own images inline
+      # rather than reading .vm-share. It is ignored by default so a
+      # checkout without xfsprogs stays green; xfsprogs is installed here,
+      # so opt it in.
+      - name: Run the xfsprogs-gated oracle tests
+        run: cargo test --locked --release -- --ignored
+
+      # Mounting is the end of the argument. xfs_db agreeing with us
+      # proves we read the metadata correctly; the kernel mounting the
+      # image proves the image was a genuine XFS filesystem in the first
+      # place and not something only our tooling believes in.
+      #
+      # Mount copies, not the fixtures: a mount is a write, and the
+      # fixtures are the evidence the previous step was graded on. Keeping
+      # them pristine means the steps can be reordered or re-run without
+      # silently invalidating each other.
+      - name: Loop-mount the fixtures with the in-kernel XFS driver
+        run: |
+          set -euo pipefail
+          share="$GITHUB_WORKSPACE/.vm-share"
+          # Start from a clean kernel ring buffer so the scrape below can
+          # attribute every XFS line to the mounts this job performed.
+          sudo dmesg -C
+
+          mounted=0
+          for img in "$share"/xfs-*.img; do
+            name="$(basename "$img" .img)"
+            work="/tmp/$name.mnt.img"
+            mnt="/tmp/mnt-$name"
+            cp --sparse=always "$img" "$work"
+            sudo mkdir -p "$mnt"
+
+            if sudo mount -t xfs -o loop "$work" "$mnt"; then
+              # Prove the mount is live, not just attached: write, sync,
+              # read back, and confirm the driver-visible root directory
+              # actually holds something.
+              echo "kernel-mount smoke test" | sudo tee "$mnt/ci-probe.txt" > /dev/null
+              sudo sync
+              sudo grep -q "kernel-mount smoke test" "$mnt/ci-probe.txt"
+              sudo ls -la "$mnt"
+              sudo umount "$mnt"
+              echo "MOUNTED $name — the in-kernel XFS driver accepted this image"
+              mounted=$((mounted + 1))
+            elif [ "$name" = "xfs-nocrc" ]; then
+              # crc=0 is the deprecated V4 format. Kernels built without
+              # CONFIG_XFS_SUPPORT_V4 refuse it outright, and that is the
+              # kernel's choice rather than a defect in the image — the
+              # xfs_db comparison above already validated our reading of
+              # it. Loud, not fatal.
+              echo "::warning title=V4 image not mounted::$name (crc=0, deprecated V4) was refused by this kernel; the xfs_db comparison still covered it"
+            else
+              echo "$name: the in-kernel XFS driver refused to mount this image" >&2
+              exit 1
+            fi
+            sudo rm -f "$work"
+          done
+
+          # The default geometry is the one image that must always mount.
+          # If it did not, either mkfs skipped it or the kernel rejected
+          # it, and both mean this gate proved nothing.
+          if [ ! -f "$share/xfs-default.img" ]; then
+            echo "xfs-default.img was never built — the mount gate proved nothing" >&2
+            exit 1
+          fi
+          echo "images accepted by the in-kernel XFS driver: $mounted"
+
+      # A mount that succeeds can still have made the kernel unhappy:
+      # corrupt-but-tolerated metadata, geometry it dislikes, log recovery
+      # it had to do. Those land in dmesg at warning level or above and
+      # are exactly the signal that something in our fixture pipeline is
+      # off, so treat them as failures rather than noise.
+      - name: Fail on XFS complaints in dmesg
+        run: |
+          set -euo pipefail
+          echo "--- all XFS kernel messages from this job ---"
+          sudo dmesg | grep -i 'XFS' || echo "(none)"
+          echo "---------------------------------------------"
+          # Informational mount chatter ("Mounting V5 Filesystem", "Ending
+          # clean mount") is emitted at notice/info level and filtered out
+          # by --level. The V4 deprecation notice is a schedule
+          # announcement about the format, not a complaint about our
+          # image, and is the one warning allowed through.
+          sudo dmesg --level=warn,err,crit,alert,emerg \
+            | grep -i 'XFS' \
+            | grep -v -i 'Deprecated V4 format' \
+            > /tmp/xfs-dmesg-warnings.txt || true
+          if [ -s /tmp/xfs-dmesg-warnings.txt ]; then
+            echo "the kernel complained about the XFS images:" >&2
+            cat /tmp/xfs-dmesg-warnings.txt >&2
+            exit 1
+          fi
+          echo "no XFS warnings or errors in dmesg."
