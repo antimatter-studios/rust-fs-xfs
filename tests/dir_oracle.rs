@@ -732,14 +732,20 @@ fn real_root_directory_rejects_wrong_claims() {
 /// The file-type feature must be read from the right place on both
 /// on-disk versions.
 ///
-/// This is the check that caught the one real bug in writing this
-/// module. `Superblock::has_ftype` tests only the v5 incompatible
-/// feature bit, but a **v4** filesystem advertises the same feature in
+/// Regression test for a real bug, now fixed.
+///
+/// `Superblock::has_ftype` used to test only the v5 incompatible feature
+/// bit, but a **v4** filesystem advertises the same feature in
 /// `sb_features2`. The `xfs-nocrc` fixture is v4 with
 /// `features_incompat = 0` and `features2 = 0x28a`, bit `0x200` of which
-/// is the file-type flag. A directory parser trusting `has_ftype()`
-/// alone would read every one of its entries one byte short, and every
-/// inode number would come out shifted.
+/// is the file-type flag. A directory parser trusting the old
+/// `has_ftype()` would read every one of its entries one byte short, and
+/// every inode number would come out shifted.
+///
+/// This fixture is the only one in the matrix that can catch it, so the
+/// test pins the fixture's own properties too — if `xfs-nocrc` ever
+/// stops being a v4 filesystem carrying the flag, the coverage is gone
+/// and the assertions below say so rather than passing vacuously.
 #[test]
 fn v4_fixture_advertises_ftype_outside_the_incompat_mask() {
     let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
@@ -757,8 +763,9 @@ fn v4_fixture_advertises_ftype_outside_the_incompat_mask() {
         "a v4 filesystem has no incompatible feature mask"
     );
     assert!(
-        !sb.has_ftype(),
-        "has_ftype() looks only at the v5 mask, so it cannot see this filesystem's ftype"
+        sb.has_ftype(),
+        "has_ftype() must see the file-type flag a v4 filesystem carries in \
+         sb_features2, not only the v5 incompatible bit"
     );
     assert_ne!(
         sb.features2 & 0x200,

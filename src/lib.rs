@@ -36,4 +36,5 @@ pub mod inode;
 pub mod superblock;
 
 pub use error::{Error, Result};
+pub use fs::Filesystem;
 pub use superblock::Superblock;

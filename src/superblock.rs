@@ -163,6 +163,20 @@ pub mod incompat {
     pub const SUPPORTED: u32 = FTYPE | SPINODES | META_UUID | BIGTIME | NREXT64;
 }
 
+/// `sb_features2` bits. Only meaningful when `MOREBITSBIT` is set in
+/// `sb_versionnum`.
+pub mod features2_flags {
+    /// Directory entries carry a file type byte. This is how a v4
+    /// filesystem advertises the feature; v5 uses the incompatible mask.
+    pub const FTYPE: u32 = 0x0000_0200;
+    /// Lazy superblock counters.
+    pub const LAZYSBCOUNT: u32 = 0x0000_0002;
+    /// Extended attributes version 2.
+    pub const ATTR2: u32 = 0x0000_0008;
+    /// 32-bit project identifiers.
+    pub const PROJID32BIT: u32 = 0x0000_0080;
+}
+
 /// `sb_features_ro_compat` bits. Unknown bits here still permit a
 /// read-only mount, which is exactly what this driver does today.
 pub mod ro_compat {
@@ -505,6 +519,27 @@ impl Superblock {
         (ag, ag_block, offset)
     }
 
+    /// Split a filesystem block number into `(ag_index, ag_block)`.
+    ///
+    /// An XFS block number is not a linear index into the device. Like an
+    /// inode number it is packed: the low `agblklog` bits give the block
+    /// within its allocation group, the remainder the group itself.
+    /// Treating one as linear reads from the wrong place on any
+    /// filesystem with more than one allocation group — which is every
+    /// filesystem of consequential size.
+    pub fn split_fsblock(&self, fsblock: u64) -> (u32, u32) {
+        let mask = (1u64 << self.agblklog) - 1;
+        let ag = (fsblock >> self.agblklog) as u32;
+        let ag_block = (fsblock & mask) as u32;
+        (ag, ag_block)
+    }
+
+    /// Byte offset of a filesystem block within the device.
+    pub fn fsblock_offset(&self, fsblock: u64) -> u64 {
+        let (ag, ag_block) = self.split_fsblock(fsblock);
+        (u64::from(ag) * u64::from(self.agblocks) + u64::from(ag_block)) * u64::from(self.blocksize)
+    }
+
     /// Whether the free inode B+tree is present.
     pub fn has_finobt(&self) -> bool {
         self.features_ro_compat & ro_compat::FINOBT != 0
@@ -523,8 +558,21 @@ impl Superblock {
     }
 
     /// Whether directory entries carry a file-type byte.
+    ///
+    /// Two independent conditions, because the feature predates v5. A v5
+    /// filesystem advertises it through the incompatible feature mask; a
+    /// v4 one advertises it in `sb_features2`, which is only meaningful
+    /// when `MOREBITSBIT` is set in the version number.
+    ///
+    /// Checking only the v5 bit reads every entry on a v4 filesystem one
+    /// byte short, which shifts the inode number that follows the name
+    /// and corrupts the whole listing.
     pub fn has_ftype(&self) -> bool {
-        self.features_incompat & incompat::FTYPE != 0
+        if self.features_incompat & incompat::FTYPE != 0 {
+            return true;
+        }
+        self.versionnum & version_flags::MOREBITSBIT != 0
+            && self.features2 & features2_flags::FTYPE != 0
     }
 }
 
