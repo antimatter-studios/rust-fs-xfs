@@ -290,12 +290,19 @@ jobs:
           echo "---------------------------------------------"
           # Informational mount chatter ("Mounting V5 Filesystem", "Ending
           # clean mount") is emitted at notice/info level and filtered out
-          # by --level. The V4 deprecation notice is a schedule
-          # announcement about the format, not a complaint about our
-          # image, and is the one warning allowed through.
+          # by --level. Two warnings are allowed through, both of which
+          # describe the V4 format itself rather than any defect in the
+          # image we produced:
+          #   - the deprecation notice, a schedule announcement;
+          #   - the 2038 timestamp ceiling, which is simply what V4 is
+          #     without the bigtime feature. A V4 fixture is deliberate
+          #     coverage, so the kernel stating its limits is expected.
+          # Keep both patterns narrow. Widening this allowlist is how a
+          # gate quietly stops being a gate.
           sudo dmesg --level=warn,err,crit,alert,emerg \
             | grep -i 'XFS' \
             | grep -v -i 'Deprecated V4 format' \
+            | grep -v -i 'supports timestamps until' \
             > /tmp/xfs-dmesg-warnings.txt || true
           if [ -s /tmp/xfs-dmesg-warnings.txt ]; then
             echo "the kernel complained about the XFS images:" >&2
