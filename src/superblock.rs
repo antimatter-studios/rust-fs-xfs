@@ -24,14 +24,19 @@
 use crate::error::{Error, Result};
 
 /// `XFSB` — the superblock magic, big-endian at offset 0.
-pub const XFS_SB_MAGIC: u32 = 0x5842_5346;
+///
+/// The bytes are `X`, `F`, `S`, `B` in that order on disk. Written as a
+/// big-endian u32 that is 0x5846_5342 — note the ASCII, not an intuitive
+/// grouping: an earlier transposition here parsed every hand-built test
+/// fixture happily and rejected every real filesystem.
+pub const XFS_SB_MAGIC: u32 = 0x5846_5342;
 
 /// Size of the on-disk superblock structure in bytes.
 pub const XFS_SB_SIZE: usize = 264;
 
 /// Byte offset of `sb_crc` within the superblock. The CRC is computed
 /// over the whole structure with these four bytes treated as zero.
-const SB_CRC_OFFSET: usize = 224;
+pub(crate) const SB_CRC_OFFSET: usize = 224;
 
 /// Mask selecting the version number from `sb_versionnum`.
 const XFS_SB_VERSION_NUMBITS: u16 = 0x000f;
@@ -190,6 +195,19 @@ fn be64(b: &[u8], off: usize) -> u64 {
     ])
 }
 
+/// Read a **little-endian** `u32` at `off`.
+///
+/// Used only for checksum fields. XFS is big-endian everywhere else, but
+/// its CRCs are stored little-endian — the kernel's `xfs_end_cksum()`
+/// returns `~cpu_to_le32(crc)`. Reading a CRC big-endian like the rest of
+/// the structure makes every real filesystem look corrupt while
+/// hand-built fixtures pass, because they would be written with the same
+/// mistake.
+#[inline]
+pub(crate) fn le32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
 impl Superblock {
     /// Parse and validate a superblock from the first [`XFS_SB_SIZE`]
     /// bytes of `buf`.
@@ -227,9 +245,33 @@ impl Superblock {
         // v5 superblocks are CRC32C protected. Verify before trusting any
         // other field: a bad CRC means the values below are meaningless,
         // and reporting "bad geometry" for a corrupt block misleads.
+        //
+        // The checksum covers the WHOLE SECTOR, not the 264-byte
+        // structure -- XFS's verifier hands the full buffer length to
+        // xfs_verify_cksum, so the trailing zero padding is included.
+        // Checksumming only the struct passes on fixtures we build
+        // ourselves and fails on every real filesystem.
+        //
+        // sb_sectsize is read before the checksum that protects it. That
+        // is unavoidable (the length is needed to compute the sum) so it
+        // is range-checked first; a wild value is rejected as a bad
+        // superblock rather than used to index memory.
+        let sectsize = be16(buf, 102);
+        if !(512..=32768).contains(&sectsize) || !sectsize.is_power_of_two() {
+            return Err(Error::BadSuperblock(format!(
+                "sectsize {sectsize} is not a sane power of two"
+            )));
+        }
         if is_v5 {
-            let stored = be32(buf, SB_CRC_OFFSET);
-            let computed = crc32c_with_zeroed_crc(&buf[..XFS_SB_SIZE], SB_CRC_OFFSET);
+            let end = usize::from(sectsize);
+            if buf.len() < end {
+                return Err(Error::BadSuperblock(format!(
+                    "need a full {sectsize}-byte sector to verify the superblock checksum, got {}",
+                    buf.len()
+                )));
+            }
+            let stored = le32(buf, SB_CRC_OFFSET);
+            let computed = crc32c_with_zeroed_crc(&buf[..end], SB_CRC_OFFSET);
             if stored != computed {
                 return Err(Error::ChecksumMismatch {
                     what: "superblock",
@@ -471,7 +513,9 @@ mod tests {
     /// Build a syntactically valid v4 superblock for tests: 4 KiB blocks,
     /// 512-byte sectors, 512-byte inodes, 4 AGs.
     fn v4_superblock() -> Vec<u8> {
-        let mut b = vec![0u8; XFS_SB_SIZE];
+        // A full 512-byte sector, not just the 264-byte struct: the v5
+        // checksum covers the whole sector.
+        let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&XFS_SB_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&4096u32.to_be_bytes()); // blocksize
         b[8..16].copy_from_slice(&4000u64.to_be_bytes()); // dblocks
@@ -496,7 +540,7 @@ mod tests {
         let mut b = v4_superblock();
         b[100..102].copy_from_slice(&5u16.to_be_bytes());
         let crc = crc32c_with_zeroed_crc(&b, SB_CRC_OFFSET);
-        b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         b
     }
 
@@ -591,7 +635,7 @@ mod tests {
         b[100..102].copy_from_slice(&5u16.to_be_bytes());
         b[216..220].copy_from_slice(&(1u32 << 20).to_be_bytes()); // undefined bit
         let crc = crc32c_with_zeroed_crc(&b, SB_CRC_OFFSET);
-        b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             Superblock::parse(&b),
             Err(Error::UnsupportedFeature(_))

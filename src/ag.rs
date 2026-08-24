@@ -23,7 +23,7 @@
 //! against the address it was read from.
 
 use crate::error::{Error, Result};
-use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
+use crate::superblock::{crc32c_with_zeroed_crc, le32, Superblock};
 
 /// `XAGF` — AGF magic.
 pub const XFS_AGF_MAGIC: u32 = 0x5841_4746;
@@ -153,7 +153,13 @@ impl Agf {
             )));
         }
         if sb.is_v5() {
-            verify_crc("AGF", buf, XFS_AGF_SIZE, AGF_CRC_OFFSET, expected_ag)?;
+            verify_crc(
+                "AGF",
+                buf,
+                usize::from(sb.sectsize),
+                AGF_CRC_OFFSET,
+                expected_ag,
+            )?;
             check_identity("AGF", buf, sb, 64, 8, expected_ag)?;
         }
 
@@ -246,7 +252,13 @@ impl Agi {
             )));
         }
         if sb.is_v5() {
-            verify_crc("AGI", buf, XFS_AGI_SIZE, AGI_CRC_OFFSET, expected_ag)?;
+            verify_crc(
+                "AGI",
+                buf,
+                usize::from(sb.sectsize),
+                AGI_CRC_OFFSET,
+                expected_ag,
+            )?;
             check_identity("AGI", buf, sb, 296, 8, expected_ag)?;
         }
 
@@ -292,7 +304,8 @@ impl Agi {
 
 /// Verify the CRC32C of a v5 metadata block.
 fn verify_crc(what: &'static str, buf: &[u8], size: usize, crc_off: usize, ag: u32) -> Result<()> {
-    let stored = be32(buf, crc_off);
+    // Checksums are little-endian; see `superblock::le32`.
+    let stored = le32(buf, crc_off);
     let computed = crc32c_with_zeroed_crc(&buf[..size], crc_off);
     if stored != computed {
         return Err(Error::ChecksumMismatch {
@@ -316,11 +329,10 @@ pub fn agi_lsn(buf: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::superblock::XFS_SB_SIZE;
 
     /// Minimal v5 superblock matching the geometry the AG fixtures use.
     fn sb_v5() -> Superblock {
-        let mut b = vec![0u8; XFS_SB_SIZE];
+        let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&4096u32.to_be_bytes());
         b[8..16].copy_from_slice(&4000u64.to_be_bytes());
@@ -342,12 +354,12 @@ mod tests {
             *slot = i as u8;
         }
         let crc = crc32c_with_zeroed_crc(&b, 224);
-        b[224..228].copy_from_slice(&crc.to_be_bytes());
+        b[224..228].copy_from_slice(&crc.to_le_bytes());
         Superblock::parse(&b).unwrap()
     }
 
     fn build_agf(sb: &Superblock, ag: u32) -> Vec<u8> {
-        let mut b = vec![0u8; XFS_AGF_SIZE];
+        let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&XFS_AGF_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&1u32.to_be_bytes()); // versionnum
         b[8..12].copy_from_slice(&ag.to_be_bytes()); // seqno
@@ -360,12 +372,12 @@ mod tests {
         b[56..60].copy_from_slice(&800u32.to_be_bytes()); // longest
         b[64..80].copy_from_slice(&sb.meta_uuid);
         let crc = crc32c_with_zeroed_crc(&b, AGF_CRC_OFFSET);
-        b[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        b[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         b
     }
 
     fn build_agi(sb: &Superblock, ag: u32) -> Vec<u8> {
-        let mut b = vec![0u8; XFS_AGI_SIZE];
+        let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&XFS_AGI_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&1u32.to_be_bytes());
         b[8..12].copy_from_slice(&ag.to_be_bytes());
@@ -380,7 +392,7 @@ mod tests {
         }
         b[296..312].copy_from_slice(&sb.meta_uuid);
         let crc = crc32c_with_zeroed_crc(&b, AGI_CRC_OFFSET);
-        b[AGI_CRC_OFFSET..AGI_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        b[AGI_CRC_OFFSET..AGI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         b
     }
 
@@ -441,7 +453,7 @@ mod tests {
         let mut buf = build_agf(&sb, 0);
         buf[64] ^= 0xFF; // corrupt the UUID
         let crc = crc32c_with_zeroed_crc(&buf, AGF_CRC_OFFSET);
-        buf[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        buf[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             Agf::parse(&buf, &sb, 0),
             Err(Error::BlockIdentityMismatch { .. })
@@ -465,7 +477,7 @@ mod tests {
         let mut buf = build_agf(&sb, 0);
         buf[52..56].copy_from_slice(&5000u32.to_be_bytes()); // > length
         let crc = crc32c_with_zeroed_crc(&buf, AGF_CRC_OFFSET);
-        buf[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        buf[AGF_CRC_OFFSET..AGF_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             Agf::parse(&buf, &sb, 0),
             Err(Error::BadSuperblock(_))
@@ -489,7 +501,7 @@ mod tests {
         let mut buf = build_agi(&sb, 0);
         buf[40..44].copy_from_slice(&42u32.to_be_bytes()); // bucket 0 occupied
         let crc = crc32c_with_zeroed_crc(&buf, AGI_CRC_OFFSET);
-        buf[AGI_CRC_OFFSET..AGI_CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        buf[AGI_CRC_OFFSET..AGI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         let agi = Agi::parse(&buf, &sb, 0).unwrap();
         assert!(agi.has_unlinked_inodes());
     }
