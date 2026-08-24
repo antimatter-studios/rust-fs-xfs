@@ -105,3 +105,127 @@ impl From<fs_core::Error> for Error {
 
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    //! The `Display` text here is not decoration. It is what reaches a
+    //! user when a volume will not mount, and what a maintainer reads in
+    //! a bug report, so each message is required to name the values that
+    //! identify the problem. A message that says "checksum mismatch"
+    //! without saying *where* costs an afternoon.
+
+    use super::*;
+
+    #[test]
+    fn not_xfs_names_the_magic_it_found() {
+        let e = Error::NotXfs { magic: 0x1234_5678 };
+        let s = e.to_string();
+        assert!(s.contains("0x12345678"), "magic missing from: {s}");
+        assert!(s.contains("not an XFS volume"), "unclear message: {s}");
+    }
+
+    #[test]
+    fn checksum_mismatch_names_the_structure_and_block() {
+        let e = Error::ChecksumMismatch {
+            what: "AGF",
+            block: 42,
+        };
+        let s = e.to_string();
+        assert!(s.contains("AGF"), "structure missing from: {s}");
+        assert!(s.contains("42"), "block missing from: {s}");
+    }
+
+    #[test]
+    fn identity_mismatch_names_both_addresses() {
+        let e = Error::BlockIdentityMismatch {
+            what: "inode",
+            expected: 128,
+            found: 129,
+        };
+        let s = e.to_string();
+        assert!(s.contains("inode"), "structure missing from: {s}");
+        assert!(
+            s.contains("128") && s.contains("129"),
+            "addresses missing: {s}"
+        );
+    }
+
+    #[test]
+    fn bad_superblock_carries_its_detail() {
+        let e = Error::BadSuperblock("blocksize 7 is not a power of two".into());
+        assert!(e.to_string().contains("blocksize 7"));
+    }
+
+    #[test]
+    fn unsupported_feature_carries_its_detail() {
+        let e = Error::UnsupportedFeature("bmbt walker is not implemented".into());
+        assert!(e.to_string().contains("bmbt walker"));
+    }
+
+    #[test]
+    fn io_carries_the_underlying_message() {
+        let e = Error::Io("device went away".into());
+        assert!(e.to_string().contains("device went away"));
+    }
+
+    /// The unit-like variants still have to say something useful.
+    #[test]
+    fn unit_variants_render_meaningfully() {
+        for (e, expect) in [
+            (Error::DirtyLog, "replay"),
+            (Error::NotFound, "no such file"),
+            (Error::NotADirectory, "not a directory"),
+            (Error::NotAFile, "not a regular file"),
+            (Error::ReadOnly, "read-only"),
+        ] {
+            let s = e.to_string();
+            assert!(
+                s.contains(expect),
+                "{e:?} rendered as {s:?}, which does not mention {expect:?}"
+            );
+        }
+    }
+
+    /// Every variant must render as non-empty text, so a future variant
+    /// added without a match arm cannot slip through as a blank message.
+    #[test]
+    fn every_variant_renders_non_empty() {
+        let all = [
+            Error::Io("x".into()),
+            Error::NotXfs { magic: 0 },
+            Error::BadSuperblock("x".into()),
+            Error::ChecksumMismatch {
+                what: "x",
+                block: 0,
+            },
+            Error::BlockIdentityMismatch {
+                what: "x",
+                expected: 0,
+                found: 1,
+            },
+            Error::UnsupportedFeature("x".into()),
+            Error::DirtyLog,
+            Error::NotFound,
+            Error::NotADirectory,
+            Error::NotAFile,
+            Error::ReadOnly,
+        ];
+        for e in all {
+            assert!(!e.to_string().is_empty(), "{e:?} rendered as empty text");
+        }
+    }
+
+    #[test]
+    fn wraps_a_device_error() {
+        let inner = fs_core::Error::ReadOnly;
+        let e: Error = inner.into();
+        assert!(matches!(e, Error::Io(_)), "device errors become Io");
+        assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn implements_std_error() {
+        fn assert_is_error<T: std::error::Error>() {}
+        assert_is_error::<Error>();
+    }
+}
