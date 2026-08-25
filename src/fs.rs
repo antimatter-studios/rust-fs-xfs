@@ -193,7 +193,7 @@ impl Filesystem {
     }
 
     /// Byte offset of an inode, derived from its number.
-    fn inode_offset(&self, ino: u64) -> Result<u64> {
+    pub(crate) fn inode_offset(&self, ino: u64) -> Result<u64> {
         let (ag, ag_block, offset) = self.sb.split_ino(ino);
         if ag >= self.sb.agcount {
             return Err(Error::BadSuperblock(format!(

@@ -41,7 +41,8 @@
 
 use crate::error::{Error, Result};
 use crate::extent;
-use crate::inode::{Format, Inode};
+use crate::inode::{offsets as inode_offsets, Format, Inode, Timestamp};
+use crate::superblock::crc32c_with_zeroed_crc;
 use crate::Filesystem;
 
 impl Filesystem {
@@ -174,6 +175,171 @@ impl Filesystem {
             done += chunk;
         }
         Ok(plan)
+    }
+}
+
+/// A change to an inode's core fields.
+///
+/// Every field is optional and `None` means "leave it alone", so a
+/// caller changing one thing does not have to read and restate the
+/// others — restating them is how a concurrent change gets reverted by
+/// a caller that never intended to touch it.
+#[derive(Debug, Default, Clone)]
+pub struct AttrChange {
+    /// Permission bits only. The file-type bits are preserved from the
+    /// inode as it stands: changing a file into a directory is not an
+    /// attribute change, it is a different filesystem entirely, and
+    /// accepting it here would let a caller do it by accident.
+    pub permissions: Option<u16>,
+    /// Owning user.
+    pub uid: Option<u32>,
+    /// Owning group.
+    pub gid: Option<u32>,
+    /// Last access time.
+    pub atime: Option<Timestamp>,
+    /// Last modification time.
+    pub mtime: Option<Timestamp>,
+    /// Inode change time. Normally left `None` and set automatically to
+    /// the greatest of the times supplied, since it exists to record
+    /// when the inode itself last changed — which is now, by definition.
+    pub ctime: Option<Timestamp>,
+}
+
+impl AttrChange {
+    fn is_empty(&self) -> bool {
+        self.permissions.is_none()
+            && self.uid.is_none()
+            && self.gid.is_none()
+            && self.atime.is_none()
+            && self.mtime.is_none()
+            && self.ctime.is_none()
+    }
+}
+
+/// Permission bits within `di_mode`; everything above them is the type.
+const MODE_PERM_MASK: u16 = 0o7777;
+
+impl Filesystem {
+    /// Change an inode's timestamps, permissions or ownership.
+    ///
+    /// # Why this needs no log entry, and what that does not cover
+    ///
+    /// XFS journals metadata so that a change spanning several
+    /// structures either happens completely or not at all. An inode core
+    /// field is not such a change: a timestamp or a permission bit
+    /// belongs to one inode and is referenced by nothing else. There is
+    /// no second structure that must agree with it, so there is no
+    /// inconsistent intermediate state for a log to protect against —
+    /// unlike an allocation, where two free-space trees must be updated
+    /// together, or a rename, which touches two directories and a link
+    /// count.
+    ///
+    /// The mount already refuses a volume whose log holds unapplied
+    /// records, so there is also no pending logged version of this inode
+    /// that a direct write could overwrite.
+    ///
+    /// **What it does not cover is a torn write.** The inode is written
+    /// as one sector with a recomputed CRC, so a machine that dies
+    /// mid-write leaves an inode whose checksum fails, and the volume
+    /// then needs repair. Real devices write a sector atomically and
+    /// XFS relies on that for its own superblock, so this is a narrow
+    /// window — but it is a real one, and it is the window the log
+    /// closes. Until the log writer exists, this is a metadata write
+    /// that cannot leave the filesystem *inconsistent* but can leave one
+    /// inode *unreadable*.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`].
+    /// [`Error::UnsupportedFeature`] for a v1 or v2 inode, which has no
+    /// CRC and predates the fields this writes.
+    pub fn set_attributes(&self, inode: &Inode, change: &AttrChange) -> Result<()> {
+        let Some(device) = self.writable.as_ref() else {
+            return Err(Error::ReadOnly);
+        };
+        if change.is_empty() {
+            return Ok(());
+        }
+        if inode.version < 3 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} is version {}, which has no CRC and stores a different core",
+                inode.ino, inode.version
+            )));
+        }
+        if let Some(perms) = change.permissions {
+            if perms & !MODE_PERM_MASK != 0 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {}: {perms:#o} sets bits outside the permission mask, which                      would change the file's type",
+                    inode.ino
+                )));
+            }
+        }
+
+        // Read the inode afresh rather than trusting a caller-supplied
+        // copy: everything not being changed is written back verbatim,
+        // so a stale buffer would silently revert whatever else has
+        // happened to this inode since it was read.
+        let at = self.inode_offset(inode.ino)?;
+        let mut raw = vec![0u8; usize::from(self.sb.inodesize)];
+        device.read_at(at, &mut raw)?;
+        let current = Inode::parse(&raw, &self.sb, inode.ino)?;
+
+        let bigtime = current.flags2 & crate::inode::flags2::BIGTIME != 0;
+
+        if let Some(perms) = change.permissions {
+            let kept_type = current.mode & !MODE_PERM_MASK;
+            let mode = kept_type | perms;
+            raw[inode_offsets::MODE..inode_offsets::MODE + 2].copy_from_slice(&mode.to_be_bytes());
+        }
+        if let Some(uid) = change.uid {
+            raw[inode_offsets::UID..inode_offsets::UID + 4].copy_from_slice(&uid.to_be_bytes());
+        }
+        if let Some(gid) = change.gid {
+            raw[inode_offsets::GID..inode_offsets::GID + 4].copy_from_slice(&gid.to_be_bytes());
+        }
+        if let Some(t) = change.atime {
+            t.encode(&mut raw, inode_offsets::ATIME, bigtime);
+        }
+        if let Some(t) = change.mtime {
+            t.encode(&mut raw, inode_offsets::MTIME, bigtime);
+        }
+
+        // `di_ctime` records when the inode last changed, which is now.
+        // Taking the caller's value when they gave one, and otherwise the
+        // latest time they set, keeps it from being older than the fields
+        // it is supposed to be describing the change to.
+        if let Some(t) = derived_ctime(change) {
+            t.encode(&mut raw, inode_offsets::CTIME, bigtime);
+        }
+
+        // The CRC covers the whole inode with its own field zeroed, so it
+        // has to be recomputed after every other change and written last.
+        let isize_bytes = usize::from(self.sb.inodesize);
+        raw[inode_offsets::CRC..inode_offsets::CRC + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let crc = crc32c_with_zeroed_crc(&raw[..isize_bytes], inode_offsets::CRC);
+        raw[inode_offsets::CRC..inode_offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+
+        device.write_at(at, &raw)?;
+        device.flush()?;
+        Ok(())
+    }
+}
+
+/// What `di_ctime` should become for a given change.
+///
+/// It records when the inode last changed, which is now — so a caller's
+/// explicit value wins, and otherwise it takes the latest of the times
+/// being set. Leaving it behind the fields it describes would say the
+/// inode was modified before its own modification time.
+fn derived_ctime(change: &AttrChange) -> Option<Timestamp> {
+    if let Some(c) = change.ctime {
+        return Some(c);
+    }
+    match (change.mtime, change.atime) {
+        (Some(m), Some(a)) => Some(if m.sec >= a.sec { m } else { a }),
+        (Some(m), None) => Some(m),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
     }
 }
 
@@ -359,6 +525,113 @@ mod tests {
         inode.mode = 0o040755;
         let err = fs.write_at(&inode, &[], 0, b"x").unwrap_err();
         assert!(matches!(err, Error::NotAFile), "got {err}");
+    }
+
+    fn ts(sec: i64) -> Timestamp {
+        Timestamp { sec, nsec: 0 }
+    }
+
+    #[test]
+    fn a_read_only_mount_refuses_an_attribute_change() {
+        let fs = fs_over(dev(), false);
+        let inode = regular_inode(4096);
+        let change = AttrChange {
+            permissions: Some(0o600),
+            ..Default::default()
+        };
+        let err = fs.set_attributes(&inode, &change).unwrap_err();
+        assert!(matches!(err, Error::ReadOnly), "got {err}");
+    }
+
+    /// A v1 or v2 inode has no CRC and a different core, so writing one
+    /// with the v3 layout would corrupt it.
+    #[test]
+    fn an_older_inode_version_is_refused() {
+        let fs = fs_over(dev(), true);
+        let mut inode = regular_inode(4096);
+        inode.version = 2;
+        let change = AttrChange {
+            permissions: Some(0o600),
+            ..Default::default()
+        };
+        let err = fs.set_attributes(&inode, &change).unwrap_err();
+        assert!(format!("{err}").contains("version 2"), "got {err}");
+    }
+
+    /// The type bits are not a permission, and accepting them here would
+    /// let a caller turn a file into a directory by arithmetic.
+    #[test]
+    fn a_mode_carrying_type_bits_is_refused() {
+        let fs = fs_over(dev(), true);
+        let inode = regular_inode(4096);
+        let change = AttrChange {
+            permissions: Some(0o040755),
+            ..Default::default()
+        };
+        let err = fs.set_attributes(&inode, &change).unwrap_err();
+        assert!(
+            format!("{err}").contains("outside the permission mask"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_attribute_change_touches_nothing() {
+        let d = dev();
+        let fs = fs_over(d.clone(), true);
+        let inode = regular_inode(4096);
+        fs.set_attributes(&inode, &AttrChange::default()).unwrap();
+        assert!(d.bytes.lock().unwrap().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn ctime_follows_the_latest_time_being_set() {
+        let m = ts(200);
+        let a = ts(100);
+        assert_eq!(
+            derived_ctime(&AttrChange {
+                mtime: Some(m),
+                atime: Some(a),
+                ..Default::default()
+            }),
+            Some(m),
+            "the later of the two should win"
+        );
+        assert_eq!(
+            derived_ctime(&AttrChange {
+                mtime: Some(a),
+                atime: Some(m),
+                ..Default::default()
+            }),
+            Some(m),
+            "and it should not depend on which field it came from"
+        );
+    }
+
+    #[test]
+    fn an_explicit_ctime_wins_over_the_derived_one() {
+        let explicit = ts(5);
+        assert_eq!(
+            derived_ctime(&AttrChange {
+                mtime: Some(ts(999)),
+                ctime: Some(explicit),
+                ..Default::default()
+            }),
+            Some(explicit)
+        );
+    }
+
+    /// A change that sets no time leaves ctime alone rather than
+    /// inventing one — this driver has no clock it should be trusting.
+    #[test]
+    fn a_permissions_only_change_derives_no_ctime() {
+        assert_eq!(
+            derived_ctime(&AttrChange {
+                permissions: Some(0o600),
+                ..Default::default()
+            }),
+            None
+        );
     }
 
     /// An empty write is a no-op rather than an error, and must not be
