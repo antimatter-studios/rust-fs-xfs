@@ -156,12 +156,17 @@ fn iterates_a_directory_to_completion() {
 
     let mut names = Vec::new();
     loop {
-        let mut e: fs_xfs_dirent_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { fs_xfs_dir_next(iter, &mut e) };
-        assert!(rc >= 0, "dir_next failed: {}", last_error());
-        if rc == 0 {
+        let ptr = unsafe { fs_xfs_dir_next(iter) };
+        if ptr.is_null() {
+            assert_eq!(
+                fs_xfs_last_errno(),
+                0,
+                "a clean end of directory must not set an errno: {}",
+                last_error()
+            );
             break;
         }
+        let e = unsafe { &*ptr };
         let name = unsafe { CStr::from_ptr(e.name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -176,8 +181,7 @@ fn iterates_a_directory_to_completion() {
 
     // A second call after the end must keep returning 0 rather than
     // wrapping around or erroring.
-    let mut e: fs_xfs_dirent_t = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { fs_xfs_dir_next(iter, &mut e) }, 0);
+    assert!(unsafe { fs_xfs_dir_next(iter) }.is_null());
 
     unsafe { fs_xfs_dir_close(iter) };
 
@@ -199,8 +203,7 @@ fn iterates_a_large_directory() {
 
     let mut count = 0;
     loop {
-        let mut e: fs_xfs_dirent_t = unsafe { std::mem::zeroed() };
-        if unsafe { fs_xfs_dir_next(iter, &mut e) } != 1 {
+        if unsafe { fs_xfs_dir_next(iter) }.is_null() {
             break;
         }
         count += 1;
@@ -221,8 +224,8 @@ fn reads_file_contents() {
         fs_xfs_read_file(
             fs,
             cstr("/small.txt").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -235,8 +238,8 @@ fn reads_file_contents() {
         fs_xfs_read_file(
             fs,
             cstr("/small.txt").as_ptr(),
-            6,
             tail.as_mut_ptr().cast::<c_void>(),
+            6,
             tail.len() as u64,
         )
     };
@@ -247,8 +250,8 @@ fn reads_file_contents() {
         fs_xfs_read_file(
             fs,
             cstr("/small.txt").as_ptr(),
-            n as u64,
             buf.as_mut_ptr().cast::<c_void>(),
+            n as u64,
             buf.len() as u64,
         )
     };
@@ -356,8 +359,8 @@ fn reading_a_directory_as_a_file_reports_eisdir() {
         fs_xfs_read_file(
             fs,
             cstr("/sub").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };
@@ -401,7 +404,6 @@ fn mounting_a_missing_path_fails() {
 fn null_pointers_fail_instead_of_crashing() {
     let mut attr = zeroed_attr();
     let mut info: fs_xfs_volume_info_t = unsafe { std::mem::zeroed() };
-    let mut dirent: fs_xfs_dirent_t = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 8];
     let mut cbuf = [0 as c_char; 8];
     let p = cstr("/x");
@@ -414,13 +416,13 @@ fn null_pointers_fail_instead_of_crashing() {
         assert_eq!(fs_xfs_stat(std::ptr::null_mut(), p.as_ptr(), &mut attr), -1);
         assert_eq!(fs_xfs_stat_ino(std::ptr::null_mut(), 1, &mut attr), -1);
         assert!(fs_xfs_dir_open(std::ptr::null_mut(), p.as_ptr()).is_null());
-        assert_eq!(fs_xfs_dir_next(std::ptr::null_mut(), &mut dirent), -1);
+        assert!(fs_xfs_dir_next(std::ptr::null_mut()).is_null());
         assert_eq!(
             fs_xfs_read_file(
                 std::ptr::null_mut(),
                 p.as_ptr(),
-                0,
                 buf.as_mut_ptr().cast::<c_void>(),
+                0,
                 buf.len() as u64
             ),
             -1
@@ -455,7 +457,7 @@ fn null_output_pointers_fail_instead_of_crashing() {
         );
         assert_eq!(fs_xfs_stat_ino(fs, 1, std::ptr::null_mut()), -1);
         assert_eq!(
-            fs_xfs_read_file(fs, cstr("/small.txt").as_ptr(), 0, std::ptr::null_mut(), 8),
+            fs_xfs_read_file(fs, cstr("/small.txt").as_ptr(), std::ptr::null_mut(), 0, 8),
             -1
         );
         assert_eq!(
@@ -536,8 +538,8 @@ fn mounts_over_a_caller_supplied_reader() {
         fs_xfs_read_file(
             fs,
             cstr("/small.txt").as_ptr(),
-            0,
             buf.as_mut_ptr().cast::<c_void>(),
+            0,
             buf.len() as u64,
         )
     };

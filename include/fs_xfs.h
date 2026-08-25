@@ -28,6 +28,8 @@ extern "C" {
 #endif
 
 /* Opaque mounted-filesystem handle. */
+struct FsCoreDevice;
+
 typedef struct fs_xfs_fs fs_xfs_fs_t;
 
 /* Opaque directory iterator. */
@@ -121,6 +123,13 @@ fs_xfs_fs_t *fs_xfs_mount(const char *device_path);
 /* Mount over a caller-supplied reader. NULL on failure. */
 fs_xfs_fs_t *fs_xfs_mount_with_callbacks(const fs_xfs_blockdev_cfg_t *cfg);
 
+/*
+ * Mount over an existing fs_core device handle. This is how a caller
+ * mounts a PARTITION rather than a whole disk: wrap the block device
+ * as an FsCoreDevice, slice the partition out, and pass the slice.
+ */
+fs_xfs_fs_t *fs_xfs_mount_with_fs_core_device(struct FsCoreDevice *handle);
+
 /* Release a handle. Safe to call with NULL. */
 void fs_xfs_umount(fs_xfs_fs_t *fs);
 
@@ -144,10 +153,13 @@ int fs_xfs_stat_ino(fs_xfs_fs_t *fs, uint64_t inode, fs_xfs_attr_t *out);
 fs_xfs_dir_iter_t *fs_xfs_dir_open(fs_xfs_fs_t *fs, const char *path);
 
 /*
- * Next entry. Returns 1 when `out` was filled, 0 at end of directory,
- * and -1 on failure.
+ * Next entry, or NULL at end of directory (and on failure — check
+ * fs_xfs_last_errno to tell them apart; it is 0 at a clean end).
+ *
+ * The returned pointer is owned by the iterator and stays valid only
+ * until the next call on it, matching the sibling drivers.
  */
-int fs_xfs_dir_next(fs_xfs_dir_iter_t *iter, fs_xfs_dirent_t *out);
+const fs_xfs_dirent_t *fs_xfs_dir_next(fs_xfs_dir_iter_t *iter);
 
 /* Release an iterator. Safe to call with NULL. */
 void fs_xfs_dir_close(fs_xfs_dir_iter_t *iter);
@@ -163,7 +175,7 @@ void fs_xfs_dir_close(fs_xfs_dir_iter_t *iter);
  * would disclose whatever previously occupied them.
  */
 int64_t fs_xfs_read_file(fs_xfs_fs_t *fs, const char *path,
-                         uint64_t offset, void *buf, uint64_t length);
+                         void *buf, uint64_t offset, uint64_t length);
 
 /*
  * Target of a symbolic link, NUL-terminated, truncated to `bufsize`.
