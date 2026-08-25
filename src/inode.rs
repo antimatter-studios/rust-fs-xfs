@@ -197,6 +197,29 @@ impl Timestamp {
             }
         }
     }
+
+    /// Encode into `buf` at `off`, in whichever representation the
+    /// inode uses — the exact inverse of [`Timestamp::parse`].
+    ///
+    /// A time outside the range the chosen representation can hold is
+    /// clamped rather than wrapped. Wrapping would store a date decades
+    /// away from the one asked for and look entirely plausible on the
+    /// way back out; a clamp is wrong by a knowable amount and shows up
+    /// as an extreme value rather than a believable one.
+    pub(crate) fn encode(&self, buf: &mut [u8], off: usize, bigtime: bool) {
+        if bigtime {
+            let from_epoch = self.sec.saturating_sub(BIGTIME_EPOCH_OFFSET_SECS);
+            let ns = from_epoch
+                .saturating_mul(NSEC_PER_SEC as i64)
+                .saturating_add(i64::from(self.nsec))
+                .max(0) as u64;
+            buf[off..off + 8].copy_from_slice(&ns.to_be_bytes());
+        } else {
+            let sec = self.sec.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            buf[off..off + 4].copy_from_slice(&sec.to_be_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&self.nsec.to_be_bytes());
+        }
+    }
 }
 
 /// Inode flags (`di_flags`) this driver acts on.

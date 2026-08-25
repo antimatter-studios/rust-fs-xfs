@@ -236,3 +236,116 @@ fn a_read_only_mount_of_a_real_volume_refuses_to_write() {
     };
     assert_eq!(before, after, "a refused write still changed the image");
 }
+
+/// Changing an inode's timestamps and permissions must be visible to
+/// Linux and must leave the volume sound.
+///
+/// The same two-sided check as the data write, for the same reason:
+/// reading the change back through this driver would prove only that it
+/// wrote what it meant to, not that Linux agrees the result is an inode.
+/// A wrong CRC, a wrong timestamp encoding, or a field written at the
+/// wrong offset would all read back perfectly here and fail there.
+#[test]
+fn an_attribute_change_survives_the_kernel_and_the_checker() {
+    use fs_xfs::inode::Timestamp;
+    use fs_xfs::write::AttrChange;
+
+    let source = share().join("xfsdata-default.img");
+    if !source.exists() {
+        eprintln!("no xfsdata-default fixture — skipping");
+        return;
+    }
+    let scratch = Scratch::from(&source, "xfsattr.img");
+    let img = scratch.path();
+
+    // A time far enough from any the fixture already holds that a field
+    // written to the wrong offset cannot coincidentally look right, and
+    // a permission set no fixture file uses.
+    let when = Timestamp {
+        sec: 1_700_000_000,
+        nsec: 123_456_789,
+    };
+    let perms = 0o741u16;
+
+    {
+        let dev = FileDevice::open_rw(img).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        let (inode, _) = resolve(&fs, TARGET).expect("resolve the target");
+        fs.set_attributes(
+            &inode,
+            &AttrChange {
+                permissions: Some(perms),
+                mtime: Some(when),
+                ..Default::default()
+            },
+        )
+        .expect("the attribute change must be accepted");
+    }
+
+    let script = format!(
+        r#"
+        set -e
+        cp /share/xfsattr.img /tmp/a.img
+        echo "REPAIR_BEGIN"
+        xfs_repair -n /tmp/a.img 2>&1 || true
+        echo "REPAIR_END"
+        mnt=$(mktemp -d)
+        mount -o ro,loop /tmp/a.img "$mnt"
+        echo "MODE $(stat -c%a "$mnt{TARGET}")"
+        echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
+        echo "MTIME_NS $(stat -c%y "$mnt{TARGET}")"
+        umount "$mnt"; rmdir "$mnt"; rm -f /tmp/a.img
+        "#
+    );
+    let Some(out) = vm_run(&script) else {
+        eprintln!("oracle VM unavailable — skipping verification");
+        return;
+    };
+
+    let field = |k: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k} ")))
+            .unwrap_or_else(|| panic!("the VM did not report {k}:\n{out}"))
+            .trim()
+            .to_string()
+    };
+
+    assert_eq!(
+        field("MODE"),
+        format!("{perms:o}"),
+        "the kernel sees different permissions than were written\n{out}"
+    );
+    assert_eq!(
+        field("MTIME"),
+        when.sec.to_string(),
+        "the kernel sees a different modification time than was written\n{out}"
+    );
+    // The nanoseconds matter separately: a timestamp encoded in the wrong
+    // representation can land on the right second and the wrong fraction.
+    assert!(
+        field("MTIME_NS").contains("123456789"),
+        "the sub-second part was not stored: {}\n{out}",
+        field("MTIME_NS")
+    );
+
+    let report: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
+        .take_while(|l| !l.starts_with("REPAIR_END"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for bad in [
+        "valuable metadata changes in a log",
+        "corrupt",
+        "bad ",
+        "would fix",
+        "would reset",
+        "would rebuild",
+        "inconsistent",
+    ] {
+        assert!(
+            !report.to_lowercase().contains(bad),
+            "the checker objected after an attribute change ({bad:?}):\n{report}"
+        );
+    }
+}
