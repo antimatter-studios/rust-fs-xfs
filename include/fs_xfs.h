@@ -189,6 +189,79 @@ int64_t fs_xfs_read_file(fs_xfs_fs_t *fs, const char *path,
 int fs_xfs_readlink(fs_xfs_fs_t *fs, const char *path,
                     char *buf, size_t bufsize);
 
+/* ---- writing ---- */
+
+/*
+ * Every function below needs a handle from fs_xfs_mount_rw. One from
+ * fs_xfs_mount refuses with EROFS, so a volume cannot be written to by
+ * accident: the decision is made once, when it is opened.
+ *
+ * What can be written is bounded by this driver having no journal. XFS
+ * records metadata changes in a log so that a change spanning several
+ * structures either happens completely or not at all; without one, only
+ * changes that span a single structure are safe. That covers rewriting
+ * bytes that already exist, changing an inode's own fields, and
+ * shortening a file. It does not cover anything that allocates or frees
+ * blocks, or that touches a directory.
+ *
+ * Everything outside that boundary is refused with ENOTSUP rather than
+ * approximated.
+ */
+
+/*
+ * Mount for reading and writing. Returns NULL if the device cannot be
+ * written, if the volume's log holds unapplied records, or for any
+ * reason fs_xfs_mount would.
+ */
+fs_xfs_fs_t *fs_xfs_mount_rw(const char *device_path);
+
+/* Whether this handle can write. Ask rather than discover. */
+int fs_xfs_is_writable(fs_xfs_fs_t *fs);
+
+/*
+ * Overwrite `length` bytes of an existing file at `offset`. Returns the
+ * number written, or -1.
+ *
+ * The whole range is written or none of it is. Only bytes that already
+ * exist can be rewritten: writing past the end of the file, into a hole,
+ * or into an extent allocated but never written is refused with ENOTSUP,
+ * because each would change metadata.
+ */
+int64_t fs_xfs_write_file(fs_xfs_fs_t *fs, const char *path,
+                          const void *buf, uint64_t offset, uint64_t length);
+
+/*
+ * Shorten a file to `new_size`. Returns 0 or -1. Growing is refused with
+ * ENOTSUP: it needs blocks that are not allocated.
+ *
+ * The file's blocks are NOT released — freeing them is allocation work
+ * that needs a journal — so a shortened file still occupies what it did.
+ *
+ * `mtime_sec` sets the modification and inode-change times; pass a
+ * negative value to leave both alone.
+ */
+int fs_xfs_truncate(fs_xfs_fs_t *fs, const char *path, uint64_t new_size,
+                    int64_t mtime_sec, uint32_t mtime_nsec);
+
+/* Pass for any field of fs_xfs_set_attributes that should not change. */
+#define FS_XFS_LEAVE ((int64_t)-1)
+
+/*
+ * Change timestamps, permissions or ownership. Each parameter is either
+ * a value to set or FS_XFS_LEAVE. Fields left alone keep whatever they
+ * hold, including anything changed by something else in the meantime.
+ *
+ * `mode` takes permission bits only. A value carrying file-type bits is
+ * refused with ENOTSUP rather than masked: turning a file into a
+ * directory is not an attribute change.
+ *
+ * Returns 0 or -1.
+ */
+int fs_xfs_set_attributes(fs_xfs_fs_t *fs, const char *path,
+                          int64_t mode, int64_t uid, int64_t gid,
+                          int64_t atime_sec, uint32_t atime_nsec,
+                          int64_t mtime_sec, uint32_t mtime_nsec);
+
 #ifdef __cplusplus
 }
 #endif

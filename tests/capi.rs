@@ -624,3 +624,240 @@ fn a_non_utf8_path_is_rejected() {
     assert!(!last_error().is_empty());
     unsafe { fs_xfs_umount(fs) };
 }
+
+// ---------------------------------------------------------------------
+// Writing
+//
+// These work on a copy, because they change it. The copy lives beside
+// the fixtures and is removed when the guard drops, including on a
+// panic: every other suite here treats each `.img` in `.vm-share` as a
+// fixture to check, so one left behind fails unrelated tests.
+// ---------------------------------------------------------------------
+
+const EROFS: i32 = 30;
+const ENOTSUP: i32 = if cfg!(target_os = "macos") { 45 } else { 95 };
+
+struct WritableCopy(PathBuf);
+
+impl WritableCopy {
+    fn new(name: &str) -> Option<Self> {
+        let src = fixture()?;
+        let dst = src.with_file_name(name);
+        std::fs::copy(&src, &dst).ok()?;
+        Some(WritableCopy(dst))
+    }
+    fn open_rw(&self) -> *mut fs_xfs_fs {
+        let c = cstr(self.0.to_str().unwrap());
+        let fs = unsafe { fs_xfs_mount_rw(c.as_ptr()) };
+        assert!(!fs.is_null(), "mount_rw failed: {}", last_error());
+        fs
+    }
+}
+
+impl Drop for WritableCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A read-only handle must report that it cannot write, and must refuse.
+///
+/// The pairing is the point: a caller that trusts `is_writable` should
+/// never be surprised by the refusal, and a caller that ignores it
+/// should still be stopped.
+#[test]
+fn a_read_only_handle_says_so_and_refuses() {
+    let Some(fs) = mount() else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    assert_eq!(unsafe { fs_xfs_is_writable(fs) }, 0);
+
+    let data = b"nope";
+    let n = unsafe {
+        fs_xfs_write_file(
+            fs,
+            cstr("/large.bin").as_ptr(),
+            data.as_ptr().cast::<c_void>(),
+            0,
+            data.len() as u64,
+        )
+    };
+    assert_eq!(n, -1, "a read-only handle wrote something");
+    assert_eq!(fs_xfs_last_errno(), EROFS, "{}", last_error());
+    unsafe { fs_xfs_umount(fs) };
+}
+
+#[test]
+fn a_read_write_handle_says_so() {
+    let Some(copy) = WritableCopy::new("xfscapi-rw.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    assert_eq!(unsafe { fs_xfs_is_writable(fs) }, 1);
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// A write through the ABI must be readable back through it.
+#[test]
+fn a_write_round_trips_through_the_abi() {
+    let Some(copy) = WritableCopy::new("xfscapi-write.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let path = cstr("/large.bin");
+    let payload = b"written through the C ABI";
+
+    let n = unsafe {
+        fs_xfs_write_file(
+            fs,
+            path.as_ptr(),
+            payload.as_ptr().cast::<c_void>(),
+            8192,
+            payload.len() as u64,
+        )
+    };
+    assert_eq!(n, payload.len() as i64, "{}", last_error());
+
+    let mut back = vec![0u8; payload.len()];
+    let r = unsafe {
+        fs_xfs_read_file(
+            fs,
+            path.as_ptr(),
+            back.as_mut_ptr().cast::<c_void>(),
+            8192,
+            back.len() as u64,
+        )
+    };
+    assert_eq!(r, payload.len() as i64, "{}", last_error());
+    assert_eq!(
+        &back, payload,
+        "the bytes read back are not the ones written"
+    );
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// Writing past the end of a file needs metadata this driver cannot
+/// change, and the ABI must say which kind of refusal that is.
+#[test]
+fn writing_past_the_end_is_enotsup() {
+    let Some(copy) = WritableCopy::new("xfscapi-past-end.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let data = b"beyond";
+    let n = unsafe {
+        fs_xfs_write_file(
+            fs,
+            cstr("/small.txt").as_ptr(),
+            data.as_ptr().cast::<c_void>(),
+            1 << 20,
+            data.len() as u64,
+        )
+    };
+    assert_eq!(n, -1);
+    assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// Truncate through the ABI, and the size visible afterwards.
+#[test]
+fn a_truncate_is_visible_through_the_abi() {
+    let Some(copy) = WritableCopy::new("xfscapi-trunc.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let path = cstr("/large.bin");
+
+    let rc = unsafe { fs_xfs_truncate(fs, path.as_ptr(), 1234, -1, 0) };
+    assert_eq!(rc, 0, "{}", last_error());
+
+    let mut st = zeroed_attr();
+    assert_eq!(
+        unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut st) },
+        0,
+        "{}",
+        last_error()
+    );
+    assert_eq!(st.size, 1234);
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// Growing is refused, and named as unsupported rather than as an error
+/// in the arguments.
+#[test]
+fn growing_by_truncate_is_enotsup() {
+    let Some(copy) = WritableCopy::new("xfscapi-grow.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let rc = unsafe { fs_xfs_truncate(fs, cstr("/small.txt").as_ptr(), 1 << 20, -1, 0) };
+    assert_eq!(rc, -1);
+    assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// Attributes set through the ABI, and read back through it.
+#[test]
+fn attributes_round_trip_through_the_abi() {
+    let Some(copy) = WritableCopy::new("xfscapi-attrs.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let path = cstr("/small.txt");
+
+    let rc = unsafe {
+        fs_xfs_set_attributes(
+            fs,
+            path.as_ptr(),
+            0o640,
+            FS_XFS_LEAVE,
+            FS_XFS_LEAVE,
+            FS_XFS_LEAVE,
+            0,
+            1_500_000_000,
+            42,
+        )
+    };
+    assert_eq!(rc, 0, "{}", last_error());
+
+    let mut st = zeroed_attr();
+    assert_eq!(unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut st) }, 0);
+    assert_eq!(st.mode & 0o7777, 0o640, "the mode did not take");
+    assert_eq!(st.mtime, 1_500_000_000, "the mtime did not take");
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// A mode carrying file-type bits must be refused, not masked — this is
+/// the ABI's one chance to stop a caller turning a file into a directory
+/// by arithmetic.
+#[test]
+fn a_mode_with_type_bits_is_refused_through_the_abi() {
+    let Some(copy) = WritableCopy::new("xfscapi-badmode.img") else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let fs = copy.open_rw();
+    let rc = unsafe {
+        fs_xfs_set_attributes(
+            fs,
+            cstr("/small.txt").as_ptr(),
+            0o040755,
+            FS_XFS_LEAVE,
+            FS_XFS_LEAVE,
+            FS_XFS_LEAVE,
+            0,
+            FS_XFS_LEAVE,
+            0,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
+    unsafe { fs_xfs_umount(fs) };
+}

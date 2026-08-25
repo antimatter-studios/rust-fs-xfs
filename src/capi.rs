@@ -29,7 +29,8 @@
 use crate::dir::DirEntry;
 use crate::error::Error;
 use crate::fs::Filesystem;
-use crate::inode::{FileType, Inode};
+use crate::inode::{FileType, Inode, Timestamp};
+use crate::write::AttrChange;
 use fs_core::{BlockRead, FileDevice};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -702,4 +703,252 @@ pub unsafe extern "C" fn fs_xfs_readlink(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------
+// Writing
+//
+// Every entry point here needs a handle opened by `fs_xfs_mount_rw`.
+// One opened by `fs_xfs_mount` refuses with EROFS, so a caller cannot
+// write to a volume by accident — the decision is made once, when the
+// filesystem is opened, rather than at each call.
+// ---------------------------------------------------------------------
+
+/// Mount the image or device at `device_path` for reading **and
+/// writing**.
+///
+/// Returns NULL if the device cannot be written, if the volume's log
+/// holds unapplied records, or for any reason [`fs_xfs_mount`] would.
+///
+/// # Safety
+///
+/// `device_path` must be NULL or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_mount_rw(device_path: *const c_char) -> *mut fs_xfs_fs {
+    guard(std::ptr::null_mut(), || {
+        let Some(path) = (unsafe { borrow_str(device_path, "device_path") }) else {
+            return std::ptr::null_mut();
+        };
+        match FileDevice::open_rw(path) {
+            Ok(dev) => match Filesystem::mount_rw(Arc::new(dev)) {
+                Ok(fs) => Box::into_raw(Box::new(fs_xfs_fs { fs })),
+                Err(e) => {
+                    record(&e);
+                    std::ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_error(
+                    format!("opening {path} for writing failed: {e}"),
+                    libc_eio(),
+                );
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Whether this handle can write.
+///
+/// Lets a caller ask rather than discover: presenting a volume as
+/// writable and then failing every write is worse than knowing up front.
+///
+/// # Safety
+///
+/// `fs` must be a live handle or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_is_writable(fs: *mut fs_xfs_fs) -> c_int {
+    guard(0, || {
+        if fs.is_null() {
+            return 0;
+        }
+        c_int::from(unsafe { &*fs }.fs.is_writable())
+    })
+}
+
+/// Overwrite `length` bytes of an existing file at `offset`.
+///
+/// Returns the number of bytes written, or −1 with the error recorded.
+/// The whole range is written or none of it is; a short write is not
+/// possible.
+///
+/// Only bytes that already exist can be rewritten. Writing past the end
+/// of the file, into a hole, or into an extent that was allocated but
+/// never written is refused with ENOTSUP, because each would change the
+/// filesystem's metadata and this driver has no journal to do that
+/// safely.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `path` NUL-terminated; `buf` readable for
+/// `length` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_write_file(
+    fs: *mut fs_xfs_fs,
+    path: *const c_char,
+    buf: *const c_void,
+    offset: u64,
+    length: u64,
+) -> i64 {
+    guard(-1, || {
+        if fs.is_null() || buf.is_null() {
+            set_error("fs or buf is NULL".into(), libc_eio());
+            return -1;
+        }
+        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+            return -1;
+        };
+        let fs = &unsafe { &*fs }.fs;
+        let Some((inode, raw)) = resolve_for_write(fs, path) else {
+            return -1;
+        };
+        let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), length as usize) };
+        match fs.write_at(&inode, &raw, offset, data) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Shorten a file to `new_size`.
+///
+/// Returns 0, or −1 with the error recorded. Growing is refused with
+/// ENOTSUP: it needs blocks that are not allocated.
+///
+/// The file's blocks are **not** released. Freeing them is allocation
+/// work that needs a journal, so a shortened file still occupies what it
+/// did before.
+///
+/// `mtime_sec` and `mtime_nsec` set the modification and inode-change
+/// times; pass a negative `mtime_sec` to leave both alone.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_truncate(
+    fs: *mut fs_xfs_fs,
+    path: *const c_char,
+    new_size: u64,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+) -> c_int {
+    guard(-1, || {
+        if fs.is_null() {
+            set_error("fs is NULL".into(), libc_eio());
+            return -1;
+        }
+        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+            return -1;
+        };
+        let fs = &unsafe { &*fs }.fs;
+        let Some((inode, _)) = resolve_for_write(fs, path) else {
+            return -1;
+        };
+        let when = (mtime_sec >= 0).then_some(Timestamp {
+            sec: mtime_sec,
+            nsec: mtime_nsec,
+        });
+        match fs.truncate(&inode, new_size, when) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Sentinel meaning "leave this field alone" for the setters below.
+///
+/// A negative value cannot be a real time, uid, gid or mode, so one
+/// signed parameter can carry both "set it to this" and "do not touch
+/// it" without a second flags argument for the caller to get wrong.
+pub const FS_XFS_LEAVE: i64 = -1;
+
+/// Change a file's timestamps, permissions or ownership.
+///
+/// Each parameter is either a value to set or [`FS_XFS_LEAVE`]. Fields
+/// left alone keep whatever they hold, including anything changed by
+/// something else since the caller last looked.
+///
+/// `mode` takes permission bits only. A value with file-type bits set is
+/// refused with ENOTSUP rather than silently masked: changing a file
+/// into a directory is not an attribute change.
+///
+/// Returns 0, or −1 with the error recorded.
+///
+/// # Safety
+///
+/// `fs` must be a live handle and `path` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_set_attributes(
+    fs: *mut fs_xfs_fs,
+    path: *const c_char,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    atime_sec: i64,
+    atime_nsec: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+) -> c_int {
+    guard(-1, || {
+        if fs.is_null() {
+            set_error("fs is NULL".into(), libc_eio());
+            return -1;
+        }
+        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+            return -1;
+        };
+        let fs = &unsafe { &*fs }.fs;
+        let Some((inode, _)) = resolve_for_write(fs, path) else {
+            return -1;
+        };
+        let change = AttrChange {
+            permissions: (mode >= 0).then_some(mode as u16),
+            uid: (uid >= 0).then_some(uid as u32),
+            gid: (gid >= 0).then_some(gid as u32),
+            atime: (atime_sec >= 0).then_some(Timestamp {
+                sec: atime_sec,
+                nsec: atime_nsec,
+            }),
+            mtime: (mtime_sec >= 0).then_some(Timestamp {
+                sec: mtime_sec,
+                nsec: mtime_nsec,
+            }),
+            ctime: None,
+        };
+        match fs.set_attributes(&inode, &change) {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Resolve a path to the inode and its bytes, recording any error.
+///
+/// Shared by the write entry points so a failure to find the file is
+/// reported the same way whichever one a caller reached for.
+fn resolve_for_write(fs: &Filesystem, path: &str) -> Option<(Inode, Vec<u8>)> {
+    let found = match fs.lookup_path(path) {
+        Ok(i) => i,
+        Err(e) => {
+            record(&e);
+            return None;
+        }
+    };
+    match fs.read_inode_raw(found.ino) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            record(&e);
+            None
+        }
+    }
 }
