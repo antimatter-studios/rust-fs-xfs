@@ -158,6 +158,14 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Whether this mount can write.
+    ///
+    /// Asked by callers deciding what to offer, rather than discovered
+    /// by attempting a write and being refused.
+    pub fn is_writable(&self) -> bool {
+        self.writable.is_some()
+    }
+
     /// Byte offset of a filesystem block.
     ///
     /// Delegates to the superblock because an XFS block number is packed
