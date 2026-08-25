@@ -60,6 +60,14 @@ for geom in "${GEOMETRIES[@]}"; do
         # 400 entries pushes this directory out of short form.
         mkdir \$mnt/manyfiles
         for i in \$(seq 1 400); do echo \$i > \$mnt/manyfiles/entry-\$i.txt; done
+        # A file with more extents than fit in the inode, which is what
+        # pushes its data fork from an inline list into a B+tree. Each
+        # block is written with a hole in front of it so the extents
+        # cannot be merged back into a shorter list.
+        for i in \$(seq 0 199); do
+            dd if=/dev/urandom of=\$mnt/fragmented.bin bs=4096 count=1 \
+               seek=\$((i * 2)) conv=notrunc status=none
+        done
         setfattr -n user.testattr -v testvalue \$mnt/small.txt 2>/dev/null || true
         sync
         umount \$mnt; rmdir \$mnt
@@ -70,7 +78,7 @@ for geom in "${GEOMETRIES[@]}"; do
         mount -o ro,norecovery \$img \$mnt
         ( cd \$mnt
           find . -mindepth 1 | sort | while read -r p; do
-            rel=\"\\\${p#.}\"
+            rel=\"\${p#.}\"
             if [ -L \"\$p\" ]; then
               printf '%s\\tlink\\t0\\t%s\\n' \"\$rel\" \"\$(readlink \"\$p\")\"
             elif [ -d \"\$p\" ]; then
@@ -82,7 +90,33 @@ for geom in "${GEOMETRIES[@]}"; do
         ) > xfsdata-$name.manifest
         umount \$mnt; rmdir \$mnt
 
-        echo \"BUILT $name (\$(wc -l < xfsdata-$name.manifest) entries)\"
+        # The root directory dump that tests/dir_oracle.rs compares
+        # against, regenerated here so it can never describe an older
+        # image than the one beside it. A stale dump is worse than a
+        # missing one: it fails on a change that was intended, and passes
+        # on one that was not.
+        rootino=\$(xfs_db -r -c 'sb 0' -c 'print rootino' \$img 2>/dev/null | \
+                  sed -n 's/^rootino = //p')
+        {
+            echo \"ROOTINO \$rootino\"
+            xfs_db -r -c \"inode \$rootino\" -c print \$img 2>/dev/null
+        } > xfsdata-$name.rootdump
+
+        # Record which inodes ended up in B+tree format, straight from
+        # the reference debugger. tests/endtoend_oracle.rs requires this
+        # list to be non-empty: if a future mkfs or kernel keeps
+        # fragmented.bin as an inline extent list, the fixture has
+        # stopped exercising the bmbt walker and must say so rather than
+        # passing quietly.
+        : > xfsdata-$name.bmbt
+        for f in fragmented.bin large.bin medium.bin; do
+            ino=\$(xfs_db -r -c \"path /\$f\" -c \"print core.format\" \$img 2>/dev/null | \
+                   sed -n 's/^core.format = //p')
+            [ -n \"\$ino\" ] || continue
+            printf '%s\\t%s\\n' \"/\$f\" \"\$ino\" >> xfsdata-$name.bmbt
+        done
+
+        echo \"BUILT $name (\$(wc -l < xfsdata-$name.manifest) entries, forks: \$(tr '\\n' ' ' < xfsdata-$name.bmbt))\"
     "
 done
 

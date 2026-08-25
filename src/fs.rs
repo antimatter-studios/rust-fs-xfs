@@ -26,6 +26,7 @@
 //! is an edge case to be tidied up later — see [`Filesystem::read_at`].
 
 use crate::ag::{Agf, Agi};
+use crate::bmbt;
 use crate::dir::{self, DirEntry};
 use crate::error::{Error, Result};
 use crate::extent::{self, Extent};
@@ -170,11 +171,14 @@ impl Filesystem {
 
     /// The data fork's extent list.
     ///
+    /// A fork holds its extents inline while they fit in the inode and
+    /// moves them into a B+tree once they do not; both are read here, so
+    /// callers never need to know which one a given file happens to use.
+    ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] for a B+tree-format fork, which
-    /// needs the bmbt walker, or for a real-time inode, whose extents
-    /// are on a device this driver does not have.
+    /// [`Error::UnsupportedFeature`] for a real-time inode, whose extents
+    /// live on a device this driver does not have.
     fn data_extents(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
         if inode.is_realtime() {
             return Err(Error::UnsupportedFeature(format!(
@@ -182,20 +186,28 @@ impl Filesystem {
                 inode.ino
             )));
         }
+        let (start, end) = inode.data_fork_range(usize::from(self.sb.inodesize));
         match inode.format {
-            Format::Extents => {
-                let (start, end) = inode.data_fork_range(usize::from(self.sb.inodesize));
-                extent::parse_list(&raw[start..end], inode.nextents)
-            }
-            Format::Btree => Err(Error::UnsupportedFeature(format!(
-                "inode {} has a B+tree-format data fork; the bmbt walker is not implemented",
-                inode.ino
-            ))),
+            Format::Extents => extent::parse_list(&raw[start..end], inode.nextents),
+            Format::Btree => bmbt::walk(
+                &raw[start..end],
+                inode.nextents,
+                &self.sb,
+                inode.ino,
+                |fsblock| self.read_fsblock(fsblock),
+            ),
             other => Err(Error::UnsupportedFeature(format!(
                 "inode {} has a {other:?}-format data fork, which holds no extents",
                 inode.ino
             ))),
         }
+    }
+
+    /// Read one whole filesystem block by its packed (AG, block) number.
+    fn read_fsblock(&self, fsblock: u64) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.sb.blocksize as usize];
+        self.device.read_at(self.block_offset(fsblock), &mut buf)?;
+        Ok(buf)
     }
 
     /// Read `buf.len()` bytes from `inode` starting at byte `offset`.

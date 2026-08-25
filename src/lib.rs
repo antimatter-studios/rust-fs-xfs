@@ -28,6 +28,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ag;
+pub mod bmbt;
 pub mod capi;
 pub mod dir;
 pub mod endian;
