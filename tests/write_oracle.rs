@@ -349,3 +349,115 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         );
     }
 }
+
+/// Shortening a file must be visible to Linux and leave the volume sound.
+///
+/// The interesting part is not the size — it is that the file keeps its
+/// blocks, so the inode ends up claiming fewer bytes than it has space
+/// for. That state has to be one the checker accepts and the kernel
+/// reads correctly, and neither can be established from this side.
+#[test]
+fn a_truncate_survives_the_kernel_and_the_checker() {
+    use fs_xfs::inode::Timestamp;
+
+    let source = share().join("xfsdata-default.img");
+    if !source.exists() {
+        eprintln!("no xfsdata-default fixture — skipping");
+        return;
+    }
+    let scratch = Scratch::from(&source, "xfstrunc.img");
+    let img = scratch.path();
+
+    // Deliberately not block-aligned, so the partial-block tail has to be
+    // cleared rather than left holding what it held.
+    let new_size = 5000u64;
+    let when = Timestamp {
+        sec: 1_600_000_000,
+        nsec: 0,
+    };
+
+    let old_size = {
+        let dev = FileDevice::open_rw(img).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        let (inode, _) = resolve(&fs, TARGET).expect("resolve the target");
+        let old = inode.size;
+        assert!(
+            old > new_size,
+            "the fixture file must be longer than the target"
+        );
+        fs.truncate(&inode, new_size, Some(when))
+            .expect("the truncate must be accepted");
+        old
+    };
+
+    let script = format!(
+        r#"
+        set -e
+        cp /share/xfstrunc.img /tmp/t.img
+        echo "REPAIR_BEGIN"
+        xfs_repair -n /tmp/t.img 2>&1 || true
+        echo "REPAIR_END"
+        mnt=$(mktemp -d)
+        mount -o ro,loop /tmp/t.img "$mnt"
+        echo "SIZE $(stat -c%s "$mnt{TARGET}")"
+        echo "BLOCKS $(stat -c%b "$mnt{TARGET}")"
+        echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
+        umount "$mnt"; rmdir "$mnt"; rm -f /tmp/t.img
+        "#
+    );
+    let Some(out) = vm_run(&script) else {
+        eprintln!("oracle VM unavailable — skipping verification");
+        return;
+    };
+
+    let field = |k: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k} ")))
+            .unwrap_or_else(|| panic!("the VM did not report {k}:\n{out}"))
+            .trim()
+            .to_string()
+    };
+
+    assert_eq!(
+        field("SIZE"),
+        new_size.to_string(),
+        "the kernel sees a different size than was written\n{out}"
+    );
+    assert_eq!(
+        field("MTIME"),
+        when.sec.to_string(),
+        "the modification time did not move with the truncate\n{out}"
+    );
+
+    // The blocks are deliberately still there. Asserting it keeps the
+    // limitation honest: if a later change starts freeing them, this
+    // fails and the documentation has to be revisited with it.
+    let blocks: u64 = field("BLOCKS").parse().expect("a block count");
+    assert!(
+        blocks * 512 >= old_size,
+        "the file's blocks were freed, which this path does not do and cannot do \
+         without the log — {} bytes of blocks for a file that was {old_size}\n{out}",
+        blocks * 512
+    );
+
+    let report: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
+        .take_while(|l| !l.starts_with("REPAIR_END"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for bad in [
+        "valuable metadata changes in a log",
+        "corrupt",
+        "bad ",
+        "would fix",
+        "would reset",
+        "would rebuild",
+        "inconsistent",
+    ] {
+        assert!(
+            !report.to_lowercase().contains(bad),
+            "the checker objected after a truncate ({bad:?}):\n{report}"
+        );
+    }
+}
