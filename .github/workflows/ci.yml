@@ -6,6 +6,13 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  # Callable so the release workflow runs THIS gate rather than keeping
+  # its own copy. The two previously duplicated ~150 lines of kernel
+  # validation and drifted three separate times — the release gate lost
+  # the inode dumps its own test needed, then the dmesg allowlist, then
+  # the shared fixture builder. A release gate weaker than the branch
+  # gate is worse than none, because it still reports green.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
