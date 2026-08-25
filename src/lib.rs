@@ -38,6 +38,7 @@ pub mod fs;
 pub mod inode;
 pub mod log;
 pub mod superblock;
+pub mod write;
 
 pub use error::{Error, Result};
 pub use fs::Filesystem;

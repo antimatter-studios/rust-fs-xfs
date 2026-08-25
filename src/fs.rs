@@ -33,7 +33,7 @@ use crate::extent::{self, Extent};
 use crate::inode::{Format, Inode};
 use crate::log;
 use crate::superblock::Superblock;
-use fs_core::BlockRead;
+use fs_core::{BlockDevice, BlockRead};
 use std::sync::Arc;
 
 /// File byte offset at which a directory's leaf blocks begin.
@@ -50,8 +50,14 @@ const DIR_LEAF_FILE_OFFSET: u64 = 1 << 35;
 
 /// A mounted XFS filesystem.
 pub struct Filesystem {
-    device: Arc<dyn BlockRead>,
-    sb: Superblock,
+    pub(crate) device: Arc<dyn BlockRead>,
+    /// The same device again, present only when the volume was opened
+    /// for writing. Held separately rather than as one `BlockDevice`
+    /// handle so that "can this mount write" is a property of the type
+    /// rather than a flag someone has to remember to check — the write
+    /// path cannot compile without going through this field.
+    pub(crate) writable: Option<Arc<dyn BlockDevice>>,
+    pub(crate) sb: Superblock,
 }
 
 impl Filesystem {
@@ -70,7 +76,44 @@ impl Filesystem {
         device.read_at(0, &mut buf)?;
         let sb = Superblock::parse(&buf)?;
 
-        let fs = Filesystem { device, sb };
+        let fs = Filesystem {
+            device,
+            writable: None,
+            sb,
+        };
+        fs.check_log_is_clean()?;
+        Ok(fs)
+    }
+
+    /// Open `device` for reading **and writing**.
+    ///
+    /// Writing is opt-in rather than inferred from the device being
+    /// writable: a driver that is able to write should not do so merely
+    /// because nothing stopped it. A caller that wants a read-only view
+    /// of a writable device keeps [`Filesystem::mount`].
+    ///
+    /// The log check applies here as it does to a read-only mount, and
+    /// matters more: a volume holding unapplied log records is one whose
+    /// metadata is already out of date, and writing to it would layer
+    /// new data on top of state the log was about to replace.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] if the device reports that it cannot be
+    /// written, and everything [`Filesystem::mount`] can return.
+    pub fn mount_rw(device: Arc<dyn BlockDevice>) -> Result<Self> {
+        if !device.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut buf = vec![0u8; 4096];
+        device.read_at(0, &mut buf)?;
+        let sb = Superblock::parse(&buf)?;
+
+        let fs = Filesystem {
+            device: device.clone(),
+            writable: Some(device),
+            sb,
+        };
         fs.check_log_is_clean()?;
         Ok(fs)
     }
@@ -120,7 +163,7 @@ impl Filesystem {
     /// Delegates to the superblock because an XFS block number is packed
     /// as (allocation group, block within group) rather than being a
     /// linear device index.
-    fn block_offset(&self, block: u64) -> u64 {
+    pub(crate) fn block_offset(&self, block: u64) -> u64 {
         self.sb.fsblock_offset(block)
     }
 
@@ -194,7 +237,7 @@ impl Filesystem {
     ///
     /// [`Error::UnsupportedFeature`] for a real-time inode, whose extents
     /// live on a device this driver does not have.
-    fn data_extents(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
+    pub(crate) fn data_extents(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
         if inode.is_realtime() {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {} keeps its data on the real-time device",

@@ -18,6 +18,10 @@ crc32c = "0.6"
 am-fs-core = { path = "../rust-fs-core", version = "0.2" }
 
 [dev-dependencies]
+# Test-only. The write oracle compares a whole file against the hash the
+# Linux kernel computes for it, so both sides have to agree on SHA-256.
+# MIT OR Apache-2.0, and it never reaches a consumer of this crate.
+sha2 = "0.10"
 
 [profile.release]
 lto = true
