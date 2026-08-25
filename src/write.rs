@@ -275,45 +275,176 @@ impl Filesystem {
             }
         }
 
-        // Read the inode afresh rather than trusting a caller-supplied
-        // copy: everything not being changed is written back verbatim,
-        // so a stale buffer would silently revert whatever else has
-        // happened to this inode since it was read.
-        let at = self.inode_offset(inode.ino)?;
+        let _ = device;
+        self.update_inode(inode.ino, |raw, current, bigtime| {
+            if let Some(perms) = change.permissions {
+                let kept_type = current.mode & !MODE_PERM_MASK;
+                let mode = kept_type | perms;
+                raw[inode_offsets::MODE..inode_offsets::MODE + 2]
+                    .copy_from_slice(&mode.to_be_bytes());
+            }
+            if let Some(uid) = change.uid {
+                raw[inode_offsets::UID..inode_offsets::UID + 4].copy_from_slice(&uid.to_be_bytes());
+            }
+            if let Some(gid) = change.gid {
+                raw[inode_offsets::GID..inode_offsets::GID + 4].copy_from_slice(&gid.to_be_bytes());
+            }
+            if let Some(t) = change.atime {
+                t.encode(raw, inode_offsets::ATIME, bigtime);
+            }
+            if let Some(t) = change.mtime {
+                t.encode(raw, inode_offsets::MTIME, bigtime);
+            }
+            // `di_ctime` records when the inode last changed, which is
+            // now. The caller's value wins; otherwise the latest time
+            // being set, so it is never older than the fields it is
+            // describing the change to.
+            if let Some(t) = derived_ctime(change) {
+                t.encode(raw, inode_offsets::CTIME, bigtime);
+            }
+            Ok(())
+        })
+    }
+
+    /// Shorten a file, leaving its blocks allocated.
+    ///
+    /// # Why this needs no log entry either
+    ///
+    /// `di_size` is one inode field, and lowering it breaks no
+    /// cross-structure invariant — the same argument as
+    /// [`Filesystem::set_attributes`], with one extra step worth
+    /// checking rather than assuming: it leaves the file's extents in
+    /// place, so the inode now claims fewer bytes than it has blocks
+    /// for.
+    ///
+    /// That is a legal XFS state. Blocks past end-of-file are ordinary —
+    /// XFS keeps them routinely as speculative preallocation — and it
+    /// was confirmed against the reference checker and a kernel mount
+    /// before this was written, not reasoned about and hoped for.
+    ///
+    /// # What it does not do
+    ///
+    /// **It does not reclaim the space.** Freeing the blocks means
+    /// returning them to the free-space trees and rewriting the extent
+    /// list, which is the allocation work that does need the log. So a
+    /// truncated file still occupies what it did before, and `du` will
+    /// say so while `ls` does not.
+    ///
+    /// Growing is refused for the same reason: it needs blocks that are
+    /// not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
+    /// [`Error::NotAFile`] for anything but a regular file, and
+    /// [`Error::UnsupportedFeature`] for a grow, an inline file, a
+    /// reflinked inode or a real-time inode.
+    pub fn truncate(&self, inode: &Inode, new_size: u64, when: Option<Timestamp>) -> Result<()> {
+        if self.writable.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        if !inode.is_regular_file() {
+            return Err(Error::NotAFile);
+        }
+        if inode.version < 3 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} is version {}, which has no CRC and stores a different core",
+                inode.ino, inode.version
+            )));
+        }
+        if inode.is_realtime() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} keeps its data on the real-time device",
+                inode.ino
+            )));
+        }
+        if inode.has_shared_extents() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} has reflinked extents; zeroing the tail of one in place would \
+                 change what another inode reads",
+                inode.ino
+            )));
+        }
+        if inode.format == Format::Local {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} stores its data inside the inode, so its length is part of the \
+                 fork rather than a size to lower",
+                inode.ino
+            )));
+        }
+        if new_size > inode.size {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {}: growing from {} to {new_size} needs blocks that are not \
+                 allocated",
+                inode.ino, inode.size
+            )));
+        }
+        if new_size == inode.size {
+            return Ok(());
+        }
+
+        // Clear what is left of the final partial block before lowering
+        // the size. Those bytes stop being visible now, but they are
+        // still on disk and the block is still the file's — so anything
+        // that later extends the file over them, this driver or the
+        // kernel, would expose data the file is no longer supposed to
+        // hold. Zeroing costs one block write and closes that.
+        let block_size = u64::from(self.sb.blocksize);
+        let tail = new_size % block_size;
+        if tail != 0 {
+            let raw = self.read_inode_raw(inode.ino)?.1;
+            let zeros = vec![0u8; (block_size - tail) as usize];
+            match self.write_at(inode, &raw, new_size, &zeros) {
+                Ok(_) => {}
+                // A hole or an unwritten extent at the tail holds nothing
+                // to leak, so there is nothing to clear and no reason to
+                // refuse the truncate.
+                Err(Error::UnsupportedFeature(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.update_inode(inode.ino, |raw, _current, bigtime| {
+            raw[inode_offsets::SIZE..inode_offsets::SIZE + 8]
+                .copy_from_slice(&new_size.to_be_bytes());
+            // Shortening a file modifies it and changes the inode, so
+            // both times move when the caller supplies one.
+            if let Some(t) = when {
+                t.encode(raw, inode_offsets::MTIME, bigtime);
+                t.encode(raw, inode_offsets::CTIME, bigtime);
+            }
+            Ok(())
+        })
+    }
+
+    /// Read one inode, let `edit` change its bytes, and write it back
+    /// with a recomputed checksum.
+    ///
+    /// The inode is read here rather than taken from a caller's copy,
+    /// because everything `edit` does not touch is written back verbatim
+    /// — a stale buffer would silently revert whatever else had happened
+    /// to that inode since it was read.
+    ///
+    /// The checksum is the reason this is one function rather than a
+    /// pattern each caller repeats. It covers the whole inode with its
+    /// own field zeroed, so it has to be recomputed after every other
+    /// change and written last; a second copy of that sequence is a
+    /// second place for it to drift.
+    fn update_inode<F>(&self, ino: u64, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut [u8], &Inode, bool) -> Result<()>,
+    {
+        let Some(device) = self.writable.as_ref() else {
+            return Err(Error::ReadOnly);
+        };
+        let at = self.inode_offset(ino)?;
         let mut raw = vec![0u8; usize::from(self.sb.inodesize)];
         device.read_at(at, &mut raw)?;
-        let current = Inode::parse(&raw, &self.sb, inode.ino)?;
-
+        let current = Inode::parse(&raw, &self.sb, ino)?;
         let bigtime = current.flags2 & crate::inode::flags2::BIGTIME != 0;
 
-        if let Some(perms) = change.permissions {
-            let kept_type = current.mode & !MODE_PERM_MASK;
-            let mode = kept_type | perms;
-            raw[inode_offsets::MODE..inode_offsets::MODE + 2].copy_from_slice(&mode.to_be_bytes());
-        }
-        if let Some(uid) = change.uid {
-            raw[inode_offsets::UID..inode_offsets::UID + 4].copy_from_slice(&uid.to_be_bytes());
-        }
-        if let Some(gid) = change.gid {
-            raw[inode_offsets::GID..inode_offsets::GID + 4].copy_from_slice(&gid.to_be_bytes());
-        }
-        if let Some(t) = change.atime {
-            t.encode(&mut raw, inode_offsets::ATIME, bigtime);
-        }
-        if let Some(t) = change.mtime {
-            t.encode(&mut raw, inode_offsets::MTIME, bigtime);
-        }
+        edit(&mut raw, &current, bigtime)?;
 
-        // `di_ctime` records when the inode last changed, which is now.
-        // Taking the caller's value when they gave one, and otherwise the
-        // latest time they set, keeps it from being older than the fields
-        // it is supposed to be describing the change to.
-        if let Some(t) = derived_ctime(change) {
-            t.encode(&mut raw, inode_offsets::CTIME, bigtime);
-        }
-
-        // The CRC covers the whole inode with its own field zeroed, so it
-        // has to be recomputed after every other change and written last.
         let isize_bytes = usize::from(self.sb.inodesize);
         raw[inode_offsets::CRC..inode_offsets::CRC + 4].copy_from_slice(&[0, 0, 0, 0]);
         let crc = crc32c_with_zeroed_crc(&raw[..isize_bytes], inode_offsets::CRC);
@@ -582,6 +713,64 @@ mod tests {
         let inode = regular_inode(4096);
         fs.set_attributes(&inode, &AttrChange::default()).unwrap();
         assert!(d.bytes.lock().unwrap().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_read_only_mount_refuses_a_truncate() {
+        let fs = fs_over(dev(), false);
+        let inode = regular_inode(4096);
+        let err = fs.truncate(&inode, 100, None).unwrap_err();
+        assert!(matches!(err, Error::ReadOnly), "got {err}");
+    }
+
+    /// Growing needs blocks that are not allocated, which is allocation
+    /// work and therefore needs the log.
+    #[test]
+    fn growing_is_refused() {
+        let fs = fs_over(dev(), true);
+        let inode = regular_inode(4096);
+        let err = fs.truncate(&inode, 8192, None).unwrap_err();
+        assert!(format!("{err}").contains("needs blocks"), "got {err}");
+    }
+
+    /// Truncating to the size it already is changes nothing, and must
+    /// not be an error — a caller normalising a length should not have
+    /// to check first.
+    #[test]
+    fn truncating_to_the_current_size_touches_nothing() {
+        let d = dev();
+        let fs = fs_over(d.clone(), true);
+        let inode = regular_inode(4096);
+        fs.truncate(&inode, 4096, None).unwrap();
+        assert!(d.bytes.lock().unwrap().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_directory_cannot_be_truncated() {
+        let fs = fs_over(dev(), true);
+        let mut inode = regular_inode(4096);
+        inode.mode = 0o040755;
+        let err = fs.truncate(&inode, 0, None).unwrap_err();
+        assert!(matches!(err, Error::NotAFile), "got {err}");
+    }
+
+    /// An inline file's length is part of its fork, not a size to lower.
+    #[test]
+    fn an_inline_file_cannot_be_truncated() {
+        let fs = fs_over(dev(), true);
+        let mut inode = regular_inode(64);
+        inode.format = Format::Local;
+        let err = fs.truncate(&inode, 16, None).unwrap_err();
+        assert!(format!("{err}").contains("inside the inode"), "got {err}");
+    }
+
+    #[test]
+    fn a_reflinked_inode_cannot_be_truncated() {
+        let fs = fs_over(dev(), true);
+        let mut inode = regular_inode(4096);
+        inode.flags2 |= crate::inode::flags2::REFLINK;
+        let err = fs.truncate(&inode, 100, None).unwrap_err();
+        assert!(format!("{err}").contains("reflinked"), "got {err}");
     }
 
     #[test]
