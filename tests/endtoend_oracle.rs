@@ -331,3 +331,44 @@ fn partial_reads_agree_with_whole_file_reads() {
         eprintln!("  {label}: partial reads agree with the whole-file read");
     }
 }
+
+/// The fixture must actually contain a B+tree-format data fork.
+///
+/// `reads_back_what_the_kernel_wrote` covers the bmbt walker only
+/// because one file in the tree is fragmented enough to have outgrown an
+/// inline extent list. Nothing about that is guaranteed: a different
+/// mkfs default, a larger inode, or a kernel that packs extents more
+/// tightly could keep the same file inline, and the end-to-end test
+/// would still pass — while quietly no longer exercising the walker at
+/// all. So the fixture builder records each candidate's fork format
+/// straight out of the reference debugger, and this requires at least
+/// one of them to be a B+tree.
+#[test]
+fn the_fixture_still_contains_a_btree_fork() {
+    let fixtures = fixtures();
+    if fixtures.is_empty() {
+        eprintln!("no xfsdata-* fixtures in .vm-share — skipping");
+        return;
+    }
+    for (label, img, _) in &fixtures {
+        let forks = img.with_extension("bmbt");
+        let Ok(text) = std::fs::read_to_string(&forks) else {
+            panic!(
+                "{label}: no {} — regenerate the fixtures with \
+                 ./scripts/vm-build-data-fixtures.sh",
+                forks.display()
+            );
+        };
+        let btree: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("btree"))
+            .map(|l| l.split('\t').next().unwrap_or(l))
+            .collect();
+        assert!(
+            !btree.is_empty(),
+            "{label}: no file in this fixture has a B+tree data fork, so nothing here \
+             exercises the bmbt walker. The debugger reported:\n{text}"
+        );
+        eprintln!("{label}: B+tree data forks: {}", btree.join(", "));
+    }
+}
