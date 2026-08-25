@@ -120,5 +120,69 @@ for geom in "${GEOMETRIES[@]}"; do
     "
 done
 
+# ---------------------------------------------------------------------
+# A filesystem whose log was never replayed.
+#
+# Everything above is unmounted cleanly, so it can only ever check that
+# a clean log is recognised as clean — which a check that always said
+# "clean" would also pass. This one is shut down mid-flight with
+# `xfs_io -c shutdown`, the supported way to simulate a crash, so its
+# log still holds work the filesystem itself has not seen.
+#
+# The verdict comes from xfs_repair, not from us: it is the tool that
+# decides whether a log needs replaying, and tests/log_oracle.rs
+# requires this driver to agree with it.
+# ---------------------------------------------------------------------
+"$REPO/scripts/vm.sh" run "
+    set -e
+    cd /share
+    # Two files: one is mounted and crashed, the other is the snapshot
+    # taken of it mid-flight and kept as the fixture. Keeping them
+    # separate avoids replacing a file a loop device still holds open,
+    # which leaves xfs_repair unable to open it at all.
+    work=xfsdirty-work.img
+    img=xfsdirty.img
+    rm -f \$work \$img xfsdirty.verdict xfsdirty.repair
+    truncate -s 300M \$work
+    mkfs.xfs -f -q \$work >/dev/null 2>&1
+    mnt=\$(mktemp -d)
+    mount -o loop \$work \$mnt
+
+    # Work that leaves no unlinked inode behind, which is precisely the
+    # case the old unlinked-list check could not see: renames, attribute
+    # changes and fresh allocations, all still owned by the log.
+    mkdir -p \$mnt/d
+    for i in \$(seq 1 200); do echo \$i > \$mnt/d/f-\$i; done
+    for i in \$(seq 1 200); do mv \$mnt/d/f-\$i \$mnt/d/renamed-\$i; done
+    chmod 0600 \$mnt/d/renamed-1
+
+    # Force a shutdown so nothing further reaches the disk, then take the
+    # image while it is STILL MOUNTED. Unmounting first writes the
+    # unmount record and leaves a clean log however the filesystem was
+    # shut down -- which is what the first attempt at this fixture did,
+    # and why it has to be a snapshot rather than a copy afterwards.
+    xfs_io -x -c 'shutdown -f' \$mnt || true
+    cp --sparse=always \$work \$img
+    umount -l \$mnt 2>/dev/null || umount \$mnt 2>/dev/null || true
+    rmdir \$mnt 2>/dev/null || true
+    rm -f \$work
+
+    # What the reference tool says about this log. Its whole output is
+    # kept: a verdict of CLEAN means the fixture is not testing what it
+    # claims, and the reason needs to be readable.
+    # xfs_repair cannot work on a file in the shared folder -- it wants
+    # the host filesystem's geometry and gets ENOTDIR from 9p -- so it
+    # runs on a copy in the guest's own filesystem.
+    cp \$img /tmp/repair-check.img
+    xfs_repair -n /tmp/repair-check.img > xfsdirty.repair 2>&1 || true
+    rm -f /tmp/repair-check.img
+    if grep -qi 'valuable metadata changes in a log\|needs to be replayed\|log which needs' xfsdirty.repair; then
+        echo DIRTY > xfsdirty.verdict
+    else
+        echo CLEAN > xfsdirty.verdict
+    fi
+    echo \"BUILT xfsdirty (xfs_repair says \$(cat xfsdirty.verdict))\"
+"
+
 echo
-echo "Now run: cargo test --test endtoend_oracle -- --nocapture"
+echo "Now run: cargo test --test endtoend_oracle --test log_oracle -- --nocapture"

@@ -31,6 +31,7 @@ use crate::dir::{self, DirEntry};
 use crate::error::{Error, Result};
 use crate::extent::{self, Extent};
 use crate::inode::{Format, Inode};
+use crate::log;
 use crate::superblock::Superblock;
 use fs_core::BlockRead;
 use std::sync::Arc;
@@ -81,16 +82,30 @@ impl Filesystem {
 
     /// Refuse a volume whose log holds unapplied transactions.
     ///
-    /// Detected through the AGI unlinked lists rather than by reading
-    /// the log itself: an inode that is unlinked but still open is
-    /// recorded there, and on a cleanly unmounted filesystem every
-    /// bucket is empty. This is a conservative check — it catches the
-    /// case that matters for correctness (metadata the log still owns)
-    /// without pretending to understand log records.
+    /// This asks the log itself. It used to infer the answer from the
+    /// AGI unlinked lists instead — an inode unlinked but still open is
+    /// recorded there, and a cleanly unmounted filesystem has none — and
+    /// that inference was described as conservative. It is the opposite.
+    /// Plenty of interrupted work leaves a dirty log and no unlinked
+    /// inode: a rename, an attribute change, a block allocation. Such a
+    /// volume passed the old check and mounted as though it were clean,
+    /// which is the one failure that produces no symptom at all — every
+    /// structure parses and verifies, and the contents are simply stale.
     ///
-    /// A full implementation replays the log instead of refusing. Until
-    /// that exists, refusing is the honest behaviour.
+    /// The unlinked-list check is kept as well. A clean log with a
+    /// non-empty unlinked list means inodes are pending destruction, and
+    /// while that is not stale metadata, it is still a filesystem
+    /// mid-operation; refusing costs nothing this driver can offer.
+    ///
+    /// A full implementation replays the log rather than refusing. That
+    /// needs a write path this driver does not have, so refusing remains
+    /// the honest behaviour — but it is now refusing for the right
+    /// reason, and accepting for one too.
     fn check_log_is_clean(&self) -> Result<()> {
+        match log::inspect(self.device.as_ref(), &self.sb)? {
+            log::LogState::Empty | log::LogState::CleanlyUnmounted => {}
+            log::LogState::NeedsReplay => return Err(Error::DirtyLog),
+        }
         for ag in 0..self.sb.agcount {
             let agi = self.read_agi(ag)?;
             if agi.has_unlinked_inodes() {
