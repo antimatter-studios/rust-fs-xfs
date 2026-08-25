@@ -178,8 +178,13 @@ int64_t fs_xfs_read_file(fs_xfs_fs_t *fs, const char *path,
                          void *buf, uint64_t offset, uint64_t length);
 
 /*
- * Target of a symbolic link, NUL-terminated, truncated to `bufsize`.
+ * Target of a symbolic link, written NUL-terminated into `buf`.
  * Returns the length written excluding the terminator, or -1.
+ *
+ * A buffer too small for the target plus its terminator is REFUSED with
+ * ERANGE rather than truncated: a truncated target is a path to
+ * somewhere else, and a caller following it could not tell. Retry with a
+ * buffer of at least the returned requirement.
  */
 int fs_xfs_readlink(fs_xfs_fs_t *fs, const char *path,
                     char *buf, size_t bufsize);

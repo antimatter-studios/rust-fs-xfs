@@ -29,6 +29,7 @@ const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
+const ERANGE: i32 = 34;
 
 fn fixture() -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -58,6 +59,10 @@ fn last_error() -> String {
     unsafe { CStr::from_ptr(fs_xfs_last_error()) }
         .to_string_lossy()
         .into_owned()
+}
+
+fn last_errno_erange() -> i32 {
+    fs_xfs_last_errno()
 }
 
 fn zeroed_attr() -> fs_xfs_attr_t {
@@ -282,10 +287,14 @@ fn reads_a_symlink_target() {
     unsafe { fs_xfs_umount(fs) };
 }
 
-/// A buffer shorter than the target must truncate and stay
-/// NUL-terminated rather than overrun.
+/// A buffer too small for the target is REFUSED rather than truncated.
+///
+/// A truncated symlink target is a path to somewhere else, and a caller
+/// following it has no way to tell. ERANGE tells it to retry with a
+/// larger buffer, which is the standard idiom — and matches the sibling
+/// EROFS driver, so the family agrees.
 #[test]
-fn readlink_truncates_into_a_short_buffer() {
+fn readlink_refuses_a_buffer_too_small_for_the_target() {
     let Some(fs) = mount() else {
         eprintln!("no fixture — skipping");
         return;
@@ -299,10 +308,17 @@ fn readlink_truncates_into_a_short_buffer() {
             buf.len(),
         )
     };
-    assert_eq!(n, 4, "must fill bufsize - 1 bytes and terminate");
-    assert_eq!(buf[4], 0, "the buffer must remain NUL-terminated");
-    let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
-    assert_eq!(s, "smal");
+    assert_eq!(n, -1, "a target that does not fit must be refused");
+    assert_eq!(
+        last_errno_erange(),
+        ERANGE,
+        "a buffer too small is ERANGE, got {}",
+        last_errno_erange()
+    );
+    assert!(
+        buf.iter().all(|&c| c as u8 == 0x7F),
+        "a refused readlink must not have written into the buffer"
+    );
     unsafe { fs_xfs_umount(fs) };
 }
 
