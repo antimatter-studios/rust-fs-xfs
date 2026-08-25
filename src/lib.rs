@@ -36,6 +36,7 @@ pub mod error;
 pub mod extent;
 pub mod fs;
 pub mod inode;
+pub mod log;
 pub mod superblock;
 
 pub use error::{Error, Result};
