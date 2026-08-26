@@ -88,14 +88,22 @@ arm64 under QEMU, hardware-accelerated via HVF, so there is no emulation penalty
 ./scripts/vm.sh up                   # boot (first run provisions)
 ./scripts/vm-build-fixtures.sh       # the geometry matrix, for the superblock tests
 ./scripts/vm-build-log-fixtures.sh   # populated filesystems, for the log tests
+./scripts/vm-build-stress-fixtures.sh  # trees built by a stress generator
 cargo test --test oracle_vm_fixtures -- --nocapture
 ```
 
-The two fixture scripts build different things. `vm-build-fixtures.sh` formats a
+The fixture scripts build different things. `vm-build-fixtures.sh` formats a
 filesystem per geometry and never mounts it, which is what the superblock and inode
 parsers need. `vm-build-log-fixtures.sh` mounts, writes and unmounts, so the log keeps
 the records that were written along the way — a log with nothing in it cannot disagree
 with us about how an item is written.
+
+`vm-build-stress-fixtures.sh` is the one whose contents nobody chose. It runs the two
+stress generators from the filesystem test suite against a mounted filesystem and keeps
+what they leave behind, with a manifest of every path generated inside Linux by the
+kernel's own driver. The generators are built in the guest from a pinned release tag and
+their binaries are only ever executed — see `tests/vagrant/debian/provision-stress-tools.sh`,
+which records why.
 
 The comparison runs on the host, so the VM is only needed when fixtures are
 regenerated — not on every `cargo test`. In CI no VM is involved at all: GitHub's Linux

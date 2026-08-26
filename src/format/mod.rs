@@ -70,3 +70,4 @@
 pub mod attr;
 pub mod dir;
 pub mod log_items;
+pub mod symlink;
