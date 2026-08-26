@@ -268,6 +268,29 @@ pub fn ftype_from_raw(raw: u8) -> Result<Option<FileType>> {
     })
 }
 
+/// The on-disk byte for a file type, the inverse of
+/// [`ftype_from_raw`].
+///
+/// `None` becomes zero — `XFS_DIR3_FT_UNKNOWN`, which is what an entry
+/// on a filesystem without the feature effectively carries, and what a
+/// reader is told to resolve by reading the inode.
+///
+/// Written as a match rather than a cast because the enum's own
+/// discriminants are not these values, and a cast would compile, produce
+/// plausible bytes, and label every entry wrongly.
+pub fn ftype_to_raw(ftype: Option<FileType>) -> u8 {
+    match ftype {
+        None => 0,
+        Some(FileType::Regular) => 1,
+        Some(FileType::Directory) => 2,
+        Some(FileType::CharDevice) => 3,
+        Some(FileType::BlockDevice) => 4,
+        Some(FileType::Fifo) => 5,
+        Some(FileType::Socket) => 6,
+        Some(FileType::Symlink) => 7,
+    }
+}
+
 /// One name in a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {

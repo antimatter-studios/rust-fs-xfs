@@ -31,6 +31,7 @@ pub mod ag;
 pub mod bmbt;
 pub mod capi;
 pub mod dir;
+pub mod dir_write;
 pub mod endian;
 pub mod error;
 pub mod extent;
