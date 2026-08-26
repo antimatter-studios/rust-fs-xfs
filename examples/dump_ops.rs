@@ -102,8 +102,17 @@ fn main() {
                     le32(b, 48),
                     le32(b, 52)
                 );
-            } else if oplen >= 2 && le16(b, 0) == 0x123c {
-                note = format!("BUF size {} ", le16(b, 2));
+            } else if oplen >= 20 && le16(b, 0) == 0x123c {
+                let flags = le16(b, 4);
+                note = format!(
+                    "BUF size {} type {} flags {:#05x} len {} blkno {} map_size {}",
+                    le16(b, 2),
+                    flags >> 11,
+                    flags & 0x7ff,
+                    le16(b, 6),
+                    le64(b, 8),
+                    le32(b, 16)
+                );
             } else if oplen == 176 || oplen == 96 {
                 note = format!("core? di_mode {:#o}", le16(b, 2));
             } else if oplen > 0 && oplen <= 64 {
