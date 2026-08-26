@@ -539,3 +539,135 @@ mod tests {
         assert_eq!(&Which::WithFreeInodes.magic(false).to_be_bytes(), b"FIBT");
     }
 }
+
+// ---------------------------------------------------------------------
+// Taking an inode, and giving one back
+// ---------------------------------------------------------------------
+
+/// What taking an inode did to its chunk.
+///
+/// Named rather than left for a caller to work out, because it decides
+/// whether the free-inode tree changes membership: a chunk that still
+/// has something free stays in it, and one that does not has to be
+/// removed from it. Getting that wrong leaves a tree claiming free
+/// inodes that are in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// The chunk has free inodes left, so the free-inode tree keeps it.
+    ChunkStillHasFree,
+    /// That was the chunk's last free inode, so it leaves the
+    /// free-inode tree.
+    ChunkNowFull,
+}
+
+/// What giving an inode back did to its chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Given {
+    /// The chunk already had free inodes, so the free-inode tree
+    /// already held it.
+    ChunkAlreadyHadFree,
+    /// The chunk was full, so it now joins the free-inode tree.
+    ChunkWasFull,
+}
+
+impl InodeChunk {
+    /// Mark inode `n` of this chunk in use.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptLog`] if that inode is already in use or is a
+    /// hole. Handing out an inode twice gives two files the same inode
+    /// number, and handing out a hole gives a file blocks that were
+    /// never allocated.
+    pub fn take(&mut self, n: u8) -> Result<Taken> {
+        if n >= INODES_PER_CHUNK {
+            return Err(Error::CorruptLog(format!(
+                "inode {n} of the chunk at {}, which holds {INODES_PER_CHUNK}",
+                self.startino
+            )));
+        }
+        if !self.exists(n) {
+            return Err(Error::CorruptLog(format!(
+                "inode {n} of the chunk at {} is a hole — the chunk has no blocks behind it",
+                self.startino
+            )));
+        }
+        if !self.is_free(n) {
+            return Err(Error::CorruptLog(format!(
+                "inode {n} of the chunk at {} is already in use",
+                self.startino
+            )));
+        }
+
+        self.free &= !(1u64 << n);
+        self.freecount -= 1;
+        Ok(if self.freecount == 0 {
+            Taken::ChunkNowFull
+        } else {
+            Taken::ChunkStillHasFree
+        })
+    }
+
+    /// Mark inode `n` of this chunk free again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptLog`] if that inode is already free or is a hole.
+    /// Freeing one twice makes the count disagree with the bitmap, which
+    /// is the disagreement every check downstream relies on.
+    pub fn give_back(&mut self, n: u8) -> Result<Given> {
+        if n >= INODES_PER_CHUNK {
+            return Err(Error::CorruptLog(format!(
+                "inode {n} of the chunk at {}, which holds {INODES_PER_CHUNK}",
+                self.startino
+            )));
+        }
+        if !self.exists(n) {
+            return Err(Error::CorruptLog(format!(
+                "inode {n} of the chunk at {} is a hole, so it was never in use",
+                self.startino
+            )));
+        }
+        if self.is_free(n) {
+            return Err(Error::CorruptLog(format!(
+                "inode {n} of the chunk at {} is already free",
+                self.startino
+            )));
+        }
+
+        let was_full = self.freecount == 0;
+        self.free |= 1u64 << n;
+        self.freecount += 1;
+        Ok(if was_full {
+            Given::ChunkWasFull
+        } else {
+            Given::ChunkAlreadyHadFree
+        })
+    }
+}
+
+/// Choose the inode a create should take: the lowest free one, in the
+/// lowest chunk that has one.
+///
+/// Returns the chunk's index in `chunks` and the inode's position within
+/// it, or `None` when no chunk has a free inode — which means a create
+/// has to allocate a whole new chunk, and that allocates blocks as well.
+///
+/// # Where this policy comes from
+///
+/// The lowest free inode is what the kernel was observed to take: a
+/// chunk whose free mask read `fc00000000000000` came back
+/// `f800000000000000`, which is the lowest set bit cleared.
+///
+/// **Which chunk it prefers when more than one has room is not
+/// established.** Every fixture has a single chunk with free inodes in
+/// it, so the choice between chunks has never been observed. Lowest-first
+/// is this driver's, and like the extent policy it affects layout rather
+/// than correctness — any free inode produces a filesystem the kernel
+/// accepts.
+pub fn choose_free_inode(chunks: &[InodeChunk]) -> Option<(usize, u8)> {
+    chunks
+        .iter()
+        .enumerate()
+        .find_map(|(i, chunk)| chunk.first_free().map(|n| (i, n)))
+}
