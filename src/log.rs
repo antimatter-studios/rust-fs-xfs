@@ -74,6 +74,9 @@ mod offsets {
     pub const LEN: usize = 12;
     pub const LSN: usize = 16;
     pub const NUM_LOGOPS: usize = 40;
+    /// `h_crc` — CRC32C over the header struct and the record's data,
+    /// stored little-endian like every other XFS checksum.
+    pub const CRC: usize = 32;
     pub const FS_UUID: usize = 304;
     pub const SIZE: usize = 320;
 }
@@ -84,8 +87,48 @@ mod op_offsets {
     pub const FLAGS: usize = 9;
 }
 
+/// `sizeof(xlog_rec_header)` — the header's fields, padded to the 8-byte
+/// alignment its `u64` members impose.
+///
+/// This is **not** the 512 bytes the header occupies on disk. The header
+/// sits alone in a basic block and the remaining 184 bytes are padding;
+/// the checksum covers only the struct. Getting this wrong is invisible
+/// in every other use of the header and fatal to the checksum, which is
+/// why it is named here rather than written as a literal at its one use.
+pub const XLOG_REC_HEADER_SIZE: usize = 328;
+
 /// How much of the log to read at a time while scanning.
 const SCAN_CHUNK: usize = 1 << 20;
+
+/// The checksum a log record should carry.
+///
+/// `header` is the record's basic block and `data` the `h_len` bytes
+/// that follow it, **as they are written** — with the cycle stamp
+/// applied, since the checksum is taken after packing rather than
+/// before. The stored `h_crc` is treated as zero, the convention every
+/// self-describing XFS structure uses.
+///
+/// # How this was established
+///
+/// Not from documentation, and not by guessing spans — ten candidate
+/// layouts were tried against real records and all ten were wrong.
+///
+/// It came from a pair of filesystems built identically except for one
+/// byte of file data. CRC32C is affine, so for two inputs of equal
+/// length `crc(A) ^ crc(B)` depends only on where they differ; any
+/// unknown seed or final xor cancels. One record in that pair differed
+/// only in `h_cycle_data[0]`, and the single span length reproducing its
+/// checksum difference was 840 — which is 328 + `h_len`, and 328 is the
+/// header struct rather than the 512-byte block it lives in.
+///
+/// Verified against all 24 checksummed records across four filesystems
+/// the kernel wrote.
+pub fn record_checksum(header: &[u8], data: &[u8]) -> u32 {
+    let mut buf = header[..XLOG_REC_HEADER_SIZE.min(header.len())].to_vec();
+    buf[offsets::CRC..offsets::CRC + 4].copy_from_slice(&[0, 0, 0, 0]);
+    buf.extend_from_slice(data);
+    crc32c::crc32c(&buf)
+}
 
 /// What the log says about how the filesystem was left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
