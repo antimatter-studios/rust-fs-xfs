@@ -41,77 +41,20 @@ use crate::error::{Error, Result};
 use crate::inode::{FileType, Format, Inode};
 use crate::superblock::{crc32c_with_zeroed_crc, version_flags, Superblock};
 
-/// `XD2B` — v4 single-block directory.
-pub const XFS_DIR2_BLOCK_MAGIC: u32 = 0x5844_3242;
-/// `XDB3` — v5 single-block directory.
-pub const XFS_DIR3_BLOCK_MAGIC: u32 = 0x5844_4233;
-/// `XD2D` — v4 directory data block.
-pub const XFS_DIR2_DATA_MAGIC: u32 = 0x5844_3244;
-/// `XDD3` — v5 directory data block.
-pub const XFS_DIR3_DATA_MAGIC: u32 = 0x5844_4433;
-/// `XD2F` — v4 free-space index block, used by node-form directories.
-pub const XFS_DIR2_FREE_MAGIC: u32 = 0x5844_3246;
-/// `XDF3` — v5 free-space index block, used by node-form directories.
-pub const XFS_DIR3_FREE_MAGIC: u32 = 0x5844_4633;
-
-/// v4 leaf block of a leaf-form directory (single index block).
-pub const XFS_DIR2_LEAF1_MAGIC: u16 = 0xd2f1;
-/// v5 leaf block of a leaf-form directory (single index block).
-pub const XFS_DIR3_LEAF1_MAGIC: u16 = 0x3df1;
-/// v4 leaf block hanging off a node-form directory's B-tree.
-pub const XFS_DIR2_LEAFN_MAGIC: u16 = 0xd2ff;
-/// v5 leaf block hanging off a node-form directory's B-tree.
-pub const XFS_DIR3_LEAFN_MAGIC: u16 = 0x3dff;
-/// v4 directory/attribute B-tree interior node.
-pub const XFS_DA_NODE_MAGIC: u16 = 0xfebe;
-/// v5 directory/attribute B-tree interior node.
-pub const XFS_DA3_NODE_MAGIC: u16 = 0x3ebe;
-
-/// Marks a free region inside a directory data block, in place of the
-/// first two bytes of an inode number. A real inode number can never
-/// begin with `0xffff` because XFS caps inode numbers at 56 bits.
-pub const XFS_DIR2_DATA_FREE_TAG: u16 = 0xffff;
-
-/// Every entry in a directory data block, used or free, starts on an
-/// 8-byte boundary and occupies a whole multiple of 8 bytes.
-pub const XFS_DIR2_DATA_ALIGN: usize = 8;
-
-/// Size of the v5 (`xfs_dir3_data_hdr`) directory data block header:
-/// the 48-byte self-describing block header, three 4-byte "best free"
-/// records, and 4 bytes of padding.
-pub const XFS_DIR3_DATA_HDR_SIZE: usize = 64;
-/// Size of the v4 (`xfs_dir2_data_hdr`) directory data block header:
-/// a 4-byte magic and three 4-byte "best free" records.
-pub const XFS_DIR2_DATA_HDR_SIZE: usize = 16;
-
-/// Size of the v5 (`xfs_dir3_leaf_hdr`) leaf block header: the 56-byte
-/// self-describing `xfs_da3_blkinfo`, count, stale, and 4 bytes padding.
-pub const XFS_DIR3_LEAF_HDR_SIZE: usize = 64;
-/// Size of the v4 (`xfs_dir2_leaf_hdr`) leaf block header: the 12-byte
-/// `xfs_da_blkinfo`, count and stale.
-pub const XFS_DIR2_LEAF_HDR_SIZE: usize = 16;
-
-/// Size of the v5 (`xfs_da3_node_hdr`) B-tree node header.
-pub const XFS_DA3_NODE_HDR_SIZE: usize = 64;
-/// Size of the v4 (`xfs_da_node_hdr`) B-tree node header.
-pub const XFS_DA_NODE_HDR_SIZE: usize = 16;
-
-/// Size of one hash-index record, in a leaf block or in the tail of a
-/// block-form directory.
-pub const XFS_DIR2_LEAF_ENTRY_SIZE: usize = 8;
-/// Size of one B-tree node record.
-pub const XFS_DA_NODE_ENTRY_SIZE: usize = 8;
-
-/// Size of the `xfs_dir2_block_tail` at the very end of a block-form
-/// directory: the index entry count and the stale count.
-pub const XFS_DIR2_BLOCK_TAIL_SIZE: usize = 8;
-/// Size of the `xfs_dir2_leaf_tail` at the very end of a leaf-form
-/// directory's index block: the "best free" array length.
-pub const XFS_DIR2_LEAF_TAIL_SIZE: usize = 4;
-
-/// Smallest a used entry in a data block can be: name offset, one byte
-/// of name, the 2-byte back tag, rounded up to the 8-byte alignment.
-const DATA_ENTRY_MIN_SIZE: usize = 16;
+/// The directory and B-tree-node layout constants this module parses
+/// with. They are defined once, in [`crate::format::dir`], alongside the
+/// rest of the format — including the structures nothing here reads yet
+/// — so that a value can be checked against its neighbours rather than
+/// against a second copy that happens to agree.
+pub use crate::format::dir::{
+    DATA_ENTRY_MIN_SIZE, XFS_DA3_NODE_HDR_SIZE, XFS_DA3_NODE_MAGIC, XFS_DA_NODE_ENTRY_SIZE,
+    XFS_DA_NODE_HDR_SIZE, XFS_DA_NODE_MAGIC, XFS_DA_NODE_MAXDEPTH, XFS_DIR2_BLOCK_MAGIC,
+    XFS_DIR2_BLOCK_TAIL_SIZE, XFS_DIR2_DATA_ALIGN, XFS_DIR2_DATA_FREE_TAG, XFS_DIR2_DATA_HDR_SIZE,
+    XFS_DIR2_DATA_MAGIC, XFS_DIR2_FREE_MAGIC, XFS_DIR2_LEAF1_MAGIC, XFS_DIR2_LEAFN_MAGIC,
+    XFS_DIR2_LEAF_ENTRY_SIZE, XFS_DIR2_LEAF_HDR_SIZE, XFS_DIR2_LEAF_TAIL_SIZE,
+    XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_HDR_SIZE, XFS_DIR3_DATA_MAGIC, XFS_DIR3_FREE_MAGIC,
+    XFS_DIR3_LEAF1_MAGIC, XFS_DIR3_LEAFN_MAGIC, XFS_DIR3_LEAF_HDR_SIZE,
+};
 
 /// An index entry whose address is this has been removed but not yet
 /// compacted away (`XFS_DIR2_NULL_DATAPTR`).
@@ -125,11 +68,6 @@ const MAX_SHORT_INUM: u64 = 0xffff_ffff;
 /// XFS inode numbers are capped at 56 bits (`XFS_MAXINUMBER`), so the
 /// top byte of an 8-byte inode number on disk is always zero.
 const MAX_INUMBER: u64 = (1u64 << 56) - 1;
-
-/// Deepest a directory's B-tree index is allowed to be
-/// (`XFS_DA_NODE_MAXDEPTH`). Leaves are level 0, so an interior node's
-/// level is somewhere in `1..=5`.
-pub const XFS_DA_NODE_MAXDEPTH: u16 = 5;
 
 /// Deepest index this driver will descend. One interior level indexes
 /// roughly a million names and two indexes far more than any directory

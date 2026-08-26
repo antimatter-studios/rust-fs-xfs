@@ -40,9 +40,9 @@ use crate::error::{Error, Result};
 use crate::superblock::Superblock;
 use fs_core::BlockRead;
 
-/// A log basic block. The log is addressed in these regardless of the
-/// filesystem's block size.
-pub const BBSIZE: usize = 512;
+/// A log basic block. Defined once in [`crate::format::log_items`],
+/// with the rest of the log's layout.
+pub use crate::format::log_items::BBSIZE;
 
 /// `XLOG_HEADER_MAGIC_NUM`, at the start of every log record header.
 pub const XLOG_HEADER_MAGIC: u32 = 0xFEED_BABE;

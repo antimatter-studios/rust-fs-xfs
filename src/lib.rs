@@ -34,6 +34,7 @@ pub mod dir;
 pub mod endian;
 pub mod error;
 pub mod extent;
+pub mod format;
 pub mod fs;
 pub mod inode;
 pub mod log;
