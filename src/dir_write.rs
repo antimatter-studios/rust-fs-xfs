@@ -33,7 +33,7 @@
 //! Those offsets are readdir cookies rather than positions in the fork,
 //! so reusing one would hand the same cookie to a different entry.
 
-use crate::dir::{self, DirEntry};
+use crate::dir;
 use crate::error::{Error, Result};
 use crate::format::dir::{XFS_DIR2_DATA_ALIGN, XFS_DIR2_SF_HDR_SIZE_4, XFS_DIR2_SF_HDR_SIZE_8};
 use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
@@ -76,6 +76,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] naming which restriction was met
     /// for a directory this cannot yet rewrite.
     pub fn rename_in_directory(&self, dir_ino: u64, from: &[u8], to: &[u8]) -> Result<u64> {
+        self.begin_checkpoint()?;
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -199,74 +200,162 @@ impl Filesystem {
         fork_space: usize,
     ) -> Result<Vec<u8>> {
         let has_ftype = self.sb.has_ftype();
-        let wide = parsed.i8count != 0;
-
-        let mut next_cookie = 0u32;
-        let mut kept: Vec<&DirEntry> = Vec::with_capacity(parsed.entries.len());
-        for e in &parsed.entries {
-            next_cookie = next_cookie.max(e.offset + cookie_span(e.name.len(), has_ftype));
-            if e.name != from {
-                kept.push(e);
-            }
-        }
-
-        let header = if wide {
-            XFS_DIR2_SF_HDR_SIZE_8
-        } else {
-            XFS_DIR2_SF_HDR_SIZE_4
-        };
-        let mut out = Vec::with_capacity(fork_space);
-        out.push(parsed.entries.len() as u8);
-        out.push(parsed.i8count);
-        if wide {
-            out.extend_from_slice(&parsed.parent_ino.to_be_bytes());
-        } else {
-            out.extend_from_slice(&(parsed.parent_ino as u32).to_be_bytes());
-        }
-        debug_assert_eq!(out.len(), header);
-
-        let mut put = |name: &[u8], ino: u64, ftype: u8, cookie: u32| {
-            out.push(name.len() as u8);
-            out.extend_from_slice(&(cookie as u16).to_be_bytes());
-            out.extend_from_slice(name);
-            if has_ftype {
-                out.push(ftype);
-            }
-            if wide {
-                out.extend_from_slice(&ino.to_be_bytes());
-            } else {
-                out.extend_from_slice(&(ino as u32).to_be_bytes());
-            }
-        };
+        let next = next_cookie(parsed, has_ftype);
 
         let moved = parsed
             .entries
             .iter()
             .find(|e| e.name == from)
             .expect("the caller checked this");
-        for e in &kept {
-            put(&e.name, e.ino, dir::ftype_to_raw(e.ftype), e.offset);
-        }
-        put(to, moved.ino, dir::ftype_to_raw(moved.ftype), next_cookie);
 
+        let mut entries: Vec<SfEntry> = parsed
+            .entries
+            .iter()
+            .filter(|e| e.name != from)
+            .map(|e| SfEntry {
+                name: &e.name,
+                ino: e.ino,
+                ftype: dir::ftype_to_raw(e.ftype),
+                cookie: e.offset,
+            })
+            .collect();
+        entries.push(SfEntry {
+            name: to,
+            ino: moved.ino,
+            ftype: dir::ftype_to_raw(moved.ftype),
+            cookie: next,
+        });
+
+        encode_short_form(parsed, has_ftype, &entries, fork_space)
+    }
+
+    /// The directory's fork with `name` added at the end.
+    ///
+    /// The new entry goes last with a fresh cookie, the same as a
+    /// rename's replacement does, because a cookie is a reader's place
+    /// in the directory and handing out one that has been used before
+    /// would send a reader that is part-way through back to an entry it
+    /// has already seen.
+    pub(crate) fn short_form_with_entry(
+        &self,
+        parsed: &dir::ShortFormDir,
+        name: &[u8],
+        ino: u64,
+        ftype: u8,
+        fork_space: usize,
+    ) -> Result<Vec<u8>> {
+        let has_ftype = self.sb.has_ftype();
+        let next = next_cookie(parsed, has_ftype);
+
+        let mut entries: Vec<SfEntry> = parsed
+            .entries
+            .iter()
+            .map(|e| SfEntry {
+                name: &e.name,
+                ino: e.ino,
+                ftype: dir::ftype_to_raw(e.ftype),
+                cookie: e.offset,
+            })
+            .collect();
+        entries.push(SfEntry {
+            name,
+            ino,
+            ftype,
+            cookie: next,
+        });
+
+        encode_short_form(parsed, has_ftype, &entries, fork_space)
+    }
+}
+
+/// One entry, as the encoder below wants it.
+struct SfEntry<'a> {
+    name: &'a [u8],
+    ino: u64,
+    ftype: u8,
+    cookie: u32,
+}
+
+/// The cookie the next entry appended to this directory should carry.
+///
+/// One past the highest any existing entry reaches, so it can never
+/// collide with one already handed out.
+fn next_cookie(parsed: &dir::ShortFormDir, has_ftype: bool) -> u32 {
+    parsed
+        .entries
+        .iter()
+        .map(|e| e.offset + cookie_span(e.name.len(), has_ftype))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Encode a short-form directory from its header and a final list of
+/// entries.
+///
+/// Shared by rename and create because the encoding is the same work:
+/// what differs is only which entries end up in the list. The entry
+/// count comes from the list rather than from `parsed`, which is the one
+/// thing that would otherwise be right for a rename and wrong for
+/// everything else.
+fn encode_short_form(
+    parsed: &dir::ShortFormDir,
+    has_ftype: bool,
+    entries: &[SfEntry],
+    fork_space: usize,
+) -> Result<Vec<u8>> {
+    let wide = parsed.i8count != 0;
+    let header = if wide {
+        XFS_DIR2_SF_HDR_SIZE_8
+    } else {
+        XFS_DIR2_SF_HDR_SIZE_4
+    };
+
+    let mut out = Vec::with_capacity(fork_space);
+    out.push(u8::try_from(entries.len()).map_err(|_| {
+        Error::UnsupportedFeature(format!(
+            "a short-form directory cannot hold {} entries",
+            entries.len()
+        ))
+    })?);
+    out.push(parsed.i8count);
+    if wide {
+        out.extend_from_slice(&parsed.parent_ino.to_be_bytes());
+    } else {
+        out.extend_from_slice(&(parsed.parent_ino as u32).to_be_bytes());
+    }
+    debug_assert_eq!(out.len(), header);
+
+    for e in entries {
         // A cookie is two bytes, so a directory can outgrow the range
         // before it outgrows the inode. Refusing is the only correct
         // answer: a truncated cookie collides with an existing entry's.
-        if next_cookie > u32::from(u16::MAX) {
+        if e.cookie > u32::from(u16::MAX) {
             return Err(Error::UnsupportedFeature(format!(
-                "the next directory offset would be {next_cookie}, past what the \
-                 two-byte field holds"
+                "a directory offset of {} is past what the two-byte field holds",
+                e.cookie
             )));
         }
-        if out.len() > fork_space {
-            return Err(Error::UnsupportedFeature(format!(
-                "the renamed directory needs {} bytes and the inode's fork holds {fork_space}; \
-                 growing it past the inode is not implemented",
-                out.len()
-            )));
+        out.push(e.name.len() as u8);
+        out.extend_from_slice(&(e.cookie as u16).to_be_bytes());
+        out.extend_from_slice(e.name);
+        if has_ftype {
+            out.push(e.ftype);
         }
-        Ok(out)
+        if wide {
+            out.extend_from_slice(&e.ino.to_be_bytes());
+        } else {
+            out.extend_from_slice(&(e.ino as u32).to_be_bytes());
+        }
     }
+
+    if out.len() > fork_space {
+        return Err(Error::UnsupportedFeature(format!(
+            "the directory needs {} bytes and the inode's fork holds {fork_space}; \
+             growing it past the inode is not implemented",
+            out.len()
+        )));
+    }
+    Ok(out)
 }
 
 /// Set `di_size` in an on-disk inode's bytes.

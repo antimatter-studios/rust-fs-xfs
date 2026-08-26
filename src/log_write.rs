@@ -572,6 +572,7 @@ impl Filesystem {
     /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
     /// and as [`append`] otherwise.
     pub fn log_inode_core(&self, ino: u64, disk_core: &[u8]) -> Result<u64> {
+        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };

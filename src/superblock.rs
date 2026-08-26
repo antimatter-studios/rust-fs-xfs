@@ -561,6 +561,17 @@ impl Superblock {
         (ag, ag_block, offset)
     }
 
+    /// Rebuild an inode number from its allocation group and its
+    /// group-relative number.
+    ///
+    /// The inverse of [`Superblock::split_ino`] for the case where the
+    /// group-relative part is already combined — which is the form the
+    /// inode B+trees store, since a chunk's `ir_startino` is relative to
+    /// the group rather than to the filesystem.
+    pub fn join_ino(&self, ag: u32, agino: u32) -> u64 {
+        (u64::from(ag) << (self.inopblog + self.agblklog)) | u64::from(agino)
+    }
+
     /// Split a filesystem block number into `(ag_index, ag_block)`.
     ///
     /// An XFS block number is not a linear index into the device. Like an

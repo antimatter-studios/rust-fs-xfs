@@ -59,9 +59,55 @@ pub struct Filesystem {
     /// path cannot compile without going through this field.
     pub(crate) writable: Option<Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
+    /// Whether this mount has already written a checkpoint into the log.
+    ///
+    /// See [`Filesystem::begin_checkpoint`] for why a second one is
+    /// refused rather than written.
+    pub(crate) checkpointed: std::sync::atomic::AtomicBool,
 }
 
 impl Filesystem {
+    /// Claim the right to write one checkpoint, or refuse.
+    ///
+    /// # Why a mount writes at most one
+    ///
+    /// A journalled operation here writes a record and **touches nothing
+    /// on disk**. That is what makes each one checkable — a filesystem
+    /// that came out different is one something replayed — but it means
+    /// a second operation would read the same disk the first one read,
+    /// as though the first had never happened. Two creates in a row hand
+    /// out the same inode; a truncate followed by an allocation hands
+    /// out blocks that are still recorded as in use.
+    ///
+    /// It is not only the reads. `h_tail_lsn` is written as the record's
+    /// own sequence number, which is true precisely while there is one
+    /// outstanding checkpoint and false the moment there are two, and a
+    /// tail that points past a record recovery still needs is how a
+    /// filesystem loses a transaction it was told had committed.
+    ///
+    /// Supporting more means keeping the changed metadata in memory and
+    /// building each transaction on the last — a real dirty-block
+    /// overlay, which this does not have. Until it does, the second
+    /// attempt is refused, because a wrong answer here is one nothing
+    /// downstream would catch.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] if a checkpoint has already been
+    /// written by this mount.
+    pub(crate) fn begin_checkpoint(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.checkpointed.swap(true, Ordering::SeqCst) {
+            return Err(Error::UnsupportedFeature(
+                "this mount has already written a checkpoint, and a second would be built \
+                 from a disk that does not yet reflect the first — mount again after the \
+                 log has been replayed"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Open `device` as an XFS filesystem.
     ///
     /// # Errors
@@ -81,6 +127,7 @@ impl Filesystem {
             device,
             writable: None,
             sb,
+            checkpointed: std::sync::atomic::AtomicBool::new(false),
         };
         fs.check_log_is_clean()?;
         Ok(fs)
@@ -114,6 +161,7 @@ impl Filesystem {
             device: device.clone(),
             writable: Some(device),
             sb,
+            checkpointed: std::sync::atomic::AtomicBool::new(false),
         };
         fs.check_log_is_clean()?;
         Ok(fs)

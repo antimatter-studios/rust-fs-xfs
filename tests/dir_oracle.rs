@@ -417,13 +417,18 @@ fn root_directory_parses_on_real_images() {
             inode.mode
         );
 
-        // A root with enough in it has outgrown its inode, and the
+        // A directory with enough in it has outgrown its inode, and the
         // assertions below are about the short form specifically. Rather
         // than skip those images — which would quietly drop the largest
         // directories from the only test that reads every fixture's root
         // — they go through the driver's real lookup path, which is the
         // one a caller would use and the one that has to follow the
         // extent map to find the blocks.
+        //
+        // A fixture's root is not always the big directory: the create
+        // fixtures keep their filler in a subdirectory precisely so the
+        // root stays short form, so the descent below is what reaches
+        // the spilled one there.
         if inode.format != Format::Local {
             let fs =
                 fs_xfs::Filesystem::mount(Arc::new(FileDevice::open(img).expect("open the image")))
@@ -480,6 +485,11 @@ fn root_directory_parses_on_real_images() {
             continue;
         }
 
+        // The root is short form. One of the directories it names may
+        // not be — and if none is ever checked, the extent-map path goes
+        // untested however many images there are.
+        spilled += check_subdirectories(img, label);
+
         let parsed = dir::read_short_form(&inode, &bytes[fork], &sb)
             .unwrap_or_else(|e| panic!("{label}: failed to parse the root directory: {e}"));
 
@@ -528,10 +538,80 @@ fn root_directory_parses_on_real_images() {
     eprintln!("{examined} real root directories parsed ({spilled} of them past the short form)");
     assert!(
         spilled > 0,
-        "every fixture's root is short form, so the path that follows an extent map to \
-         find a directory's blocks is never taken here — build the create fixtures, \
-         whose roots hold enough files to have spilled"
+        "no fixture holds a directory past the short form, so the path that follows an \
+         extent map to find a directory's blocks is never taken here — build the create \
+         fixtures, whose `fill` directory holds enough entries to have spilled"
     );
+}
+
+/// Check any directory the root names that has outgrown its inode.
+///
+/// Returns how many were found, so the caller can tell whether the
+/// extent-map path was exercised at all.
+///
+/// The checks are the same as the root's: a listing that omits `.` and
+/// `..`, and entries that name inodes which actually read. What differs
+/// is only how the directory was reached.
+fn check_subdirectories(img: &Path, label: &str) -> usize {
+    // A fixture with work still in its log cannot be mounted, and that
+    // is the driver behaving correctly rather than a failure here. Any
+    // other error is real and is raised.
+    let fs =
+        match fs_xfs::Filesystem::mount(Arc::new(FileDevice::open(img).expect("open the image"))) {
+            Ok(fs) => fs,
+            Err(fs_xfs::Error::DirtyLog) => return 0,
+            Err(e) => panic!("{label}: {e}"),
+        };
+    let sb = fs.superblock().clone();
+
+    let (root, root_raw) = fs
+        .read_inode_raw(sb.rootino)
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+    let entries = fs
+        .read_dir(&root, &root_raw)
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+
+    let mut found = 0usize;
+    for entry in &entries {
+        let Ok((child, child_raw)) = fs.read_inode_raw(entry.ino) else {
+            continue;
+        };
+        if !child.is_dir() || child.format == Format::Local {
+            continue;
+        }
+        let listing = fs.read_dir(&child, &child_raw).unwrap_or_else(|e| {
+            panic!(
+                "{label}: failed to read {:?}, which has outgrown its inode: {e}",
+                String::from_utf8_lossy(&entry.name)
+            )
+        });
+        assert!(
+            !listing.iter().any(|e| e.name == b"." || e.name == b".."),
+            "{label}: `.` and `..` should not appear in a listing"
+        );
+        assert!(
+            !listing.is_empty(),
+            "{label}: a directory past the short form should hold entries"
+        );
+        for e in listing.iter().take(8) {
+            fs.read_inode(e.ino).unwrap_or_else(|why| {
+                panic!(
+                    "{label}: {:?} lists {:?} as inode {}, which does not read: {why}",
+                    String::from_utf8_lossy(&entry.name),
+                    String::from_utf8_lossy(&e.name),
+                    e.ino
+                )
+            });
+        }
+        eprintln!(
+            "  {label}: {:?} is {:?}, {} entries",
+            String::from_utf8_lossy(&entry.name),
+            child.format,
+            listing.len()
+        );
+        found += 1;
+    }
+    found
 }
 
 /// A directory data block found by scanning, and what it held.

@@ -32,6 +32,7 @@ pub mod alloc_btree;
 pub mod bmbt;
 pub mod buf_write;
 pub mod capi;
+pub mod create;
 pub mod dir;
 pub mod dir_write;
 pub mod endian;

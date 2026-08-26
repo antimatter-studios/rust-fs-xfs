@@ -24,13 +24,14 @@ corrupt.
 | Superblock | geometry, feature masks, CRC32C, inode-number splitting |
 | Allocation groups | AGF, AGI, with v5 self-describing identity checks |
 | Free-space B+trees | both trees read and edited; extents freed and allocated |
+| Inode B+trees | both trees read; inodes taken and given back |
 | Inodes | v1/v2/v3 cores, `bigtime` and 64-bit extent counts |
 | Directories | short form, block, leaf and node; rename within short form |
 | Extents / bmbt | inline extent lists and the block-map B+tree |
 | Symlinks | inline and remote (`XSLM`), across multiple extents |
 | Extended attributes | on-disk shapes documented; reading not yet |
 | Log replay | not yet — a dirty volume is refused, not silently misread |
-| Log **writing** | inode cores, rename, truncate, allocating write |
+| Log **writing** | inode cores, rename, truncate, allocating write, create |
 | Write path | overwrite in place, plus the journalled operations above |
 
 ### What the write path can do
@@ -44,6 +45,7 @@ record the Linux kernel replays:
 | rename within a short-form directory | 8 | 2 |
 | truncate a file to nothing | 11 | 4 |
 | write into an empty file, allocating | 12 | 4 |
+| create an empty file | 14 | 5 |
 
 Those op and item counts are not this driver's choice. They were measured from
 filesystems the kernel wrote, recorded in `docs/transaction-shapes.md`, and the encoder
@@ -54,9 +56,14 @@ what makes the result checkable: a filesystem that came out different is one som
 replayed, and `xfs_repair -n` afterwards is what catches metadata that is plausible on
 its own and inconsistent with the rest.
 
-Each operation refuses by name what it cannot do rather than attempting it. See
-`docs/transaction-shapes.md` for the list and for the shapes not yet written — create,
-unlink and mkdir all need the AGI and the inode B+trees.
+**A mount writes at most one checkpoint.** A journalled operation touches nothing on
+disk, so a second would be built from a disk that does not yet reflect the first — two
+creates in a row would hand out the same inode. The second attempt is refused rather
+than answered wrongly; supporting more needs a dirty-block overlay this does not have.
+
+Each operation also refuses by name what it cannot do rather than attempting it. See
+`docs/transaction-shapes.md` for the list and for the shapes not yet written — unlink
+and mkdir remain.
 
 Features recognised in the superblock and gated rather than guessed: `finobt`,
 `rmapbt`, `reflink`, `inobtcnt`, `ftype`, `sparse inodes`, `metadata UUID`, `bigtime`,
