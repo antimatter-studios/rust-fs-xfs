@@ -42,6 +42,7 @@
 //! ./scripts/vm-build-fixtures.sh
 //! ```
 
+use fs_core::FileDevice;
 use fs_xfs::dir::{self, DirEntry};
 use fs_xfs::endian::be64;
 use fs_xfs::inode::{FileType, Format, Inode};
@@ -49,6 +50,7 @@ use fs_xfs::superblock::Superblock;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Locate every `.img` in `.vm-share`, paired with its `.rootdump` when
 /// one exists. Images without a dump have an empty root directory.
@@ -404,6 +406,7 @@ fn root_directory_parses_on_real_images() {
     }
 
     let mut examined = 0usize;
+    let mut spilled = 0usize;
     for (label, img, _dump_path) in &images {
         let bytes = std::fs::read(img).expect("read image");
         let (sb, inode, fork) = root_dir_fork(&bytes, label);
@@ -413,13 +416,69 @@ fn root_directory_parses_on_real_images() {
             "{label}: the root inode is not a directory (mode {:#o})",
             inode.mode
         );
-        assert_eq!(
-            inode.format,
-            Format::Local,
-            "{label}: the root directory is not short form. That is not a failure of \
-             the parser, but this test's assertions assume short form and need \
-             rewriting rather than relaxing"
-        );
+
+        // A root with enough in it has outgrown its inode, and the
+        // assertions below are about the short form specifically. Rather
+        // than skip those images — which would quietly drop the largest
+        // directories from the only test that reads every fixture's root
+        // — they go through the driver's real lookup path, which is the
+        // one a caller would use and the one that has to follow the
+        // extent map to find the blocks.
+        if inode.format != Format::Local {
+            let fs =
+                fs_xfs::Filesystem::mount(Arc::new(FileDevice::open(img).expect("open the image")))
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let (root, raw) = fs
+                .read_inode_raw(sb.rootino)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let entries = fs
+                .read_dir(&root, &raw)
+                .unwrap_or_else(|e| panic!("{label}: failed to read the root directory: {e}"));
+
+            // `.` and `..` become real entries once a directory leaves
+            // the inode, where the short form keeps the parent in its
+            // header and materialises neither. `read_dir` filters them
+            // so a caller does not see a listing change shape purely
+            // because the directory grew — and this is the only test
+            // that reaches a directory where there is something to
+            // filter.
+            assert!(
+                !entries.iter().any(|e| e.name == b"." || e.name == b".."),
+                "{label}: `.` and `..` should not appear in a listing, so that a \
+                 directory past the short form lists the same way as one inside it"
+            );
+            assert!(
+                !entries.is_empty(),
+                "{label}: a root that has outgrown its inode should hold entries"
+            );
+
+            // Every entry must name an inode that can actually be read.
+            // That is what says the extent map was followed to real
+            // directory blocks rather than to something that merely
+            // parsed — a wrong block would give names and inode numbers
+            // that go nowhere.
+            for entry in entries.iter().take(8) {
+                fs.read_inode(entry.ino).unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: the root lists {:?} as inode {}, which does not read: {e}",
+                        String::from_utf8_lossy(&entry.name),
+                        entry.ino
+                    )
+                });
+            }
+
+            eprintln!(
+                "  {label}: v{}, ftype {}, {:?} root, {} bytes, {} entries",
+                sb.version(),
+                if sb.has_ftype() { "on" } else { "off/v4" },
+                inode.format,
+                inode.size,
+                entries.len()
+            );
+            examined += 1;
+            spilled += 1;
+            continue;
+        }
 
         let parsed = dir::read_short_form(&inode, &bytes[fork], &sb)
             .unwrap_or_else(|e| panic!("{label}: failed to parse the root directory: {e}"));
@@ -466,7 +525,13 @@ fn root_directory_parses_on_real_images() {
         );
         examined += 1;
     }
-    eprintln!("{examined} real root directories parsed");
+    eprintln!("{examined} real root directories parsed ({spilled} of them past the short form)");
+    assert!(
+        spilled > 0,
+        "every fixture's root is short form, so the path that follows an extent map to \
+         find a directory's blocks is never taken here — build the create fixtures, \
+         whose roots hold enough files to have spilled"
+    );
 }
 
 /// A directory data block found by scanning, and what it held.
