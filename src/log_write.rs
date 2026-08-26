@@ -25,7 +25,7 @@
 //!
 //! # Two things that are easy to get wrong
 //!
-//! **The logged inode is little-endian.** The on-disk inode is
+//! **The logged inode is native-endian.** The on-disk inode is
 //! big-endian throughout; the copy in the log is not. It is the same
 //! 176-byte shape with the same field offsets, byte-swapped. Writing the
 //! on-disk form into a record produces something that parses and is
@@ -184,4 +184,189 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
     out.extend_from_slice(&data);
     debug_assert!(out.len() >= XLOG_REC_HEADER_SIZE);
     out
+}
+
+/// Convert an inode's on-disk bytes into the form the log stores.
+///
+/// The two are the same structure at the same offsets. They differ in
+/// exactly two ways, and both are easy to get wrong in a way that parses
+/// cleanly and is entirely incorrect:
+///
+/// - **Byte order.** The on-disk inode is big-endian throughout. The log
+///   copy is **native**-endian — the published format document says so
+///   outright: *"All on-disk values are in big-endian format except the
+///   journaling log which is in native endian format."* So this is a
+///   swap on a little-endian host and a copy on a big-endian one, which
+///   is why it goes through `to_native` rather than reversing
+///   unconditionally. Only the UUID and the padding are carried across
+///   untouched in either case.
+/// - **The checksum is blank.** `di_crc` is a real value on disk and
+///   always zero in the log. Whatever replays the record recomputes it,
+///   so copying the disk value across would be wrong even though nothing
+///   would complain.
+///
+/// A version-2 inode logs a **96-byte** core rather than 176, so the
+/// length is taken from `di_version` rather than assumed.
+///
+/// Two features move fields, and both are read from `di_flags2` in the
+/// inode itself rather than from the superblock, because it is the
+/// inode's own encoding that matters:
+///
+/// - `bigtime` stores each timestamp as one 64-bit count; without it
+///   they are a pair of 32-bit halves, which swap differently.
+/// - `nrext64` moves the data-extent count to offset 24 as a 64-bit
+///   field and the attribute count to 76, leaving 80 as padding.
+pub fn log_dinode_from_disk(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if raw.len() < V2_LOG_DINODE_SIZE {
+        return Err("inode is shorter than a v2 core");
+    }
+    let version = raw[offsets::VERSION];
+    let size = match version {
+        1 | 2 => V2_LOG_DINODE_SIZE,
+        3 => LOG_DINODE_SIZE,
+        _ => return Err("unrecognised inode version"),
+    };
+    if raw.len() < size {
+        return Err("inode is shorter than its version's core");
+    }
+
+    let flags2 = if version >= 3 {
+        u64::from_be_bytes(
+            raw[offsets::FLAGS2..offsets::FLAGS2 + 8]
+                .try_into()
+                .unwrap(),
+        )
+    } else {
+        0
+    };
+    let bigtime = flags2 & DI_FLAGS2_BIGTIME != 0;
+    let nrext64 = flags2 & DI_FLAGS2_NREXT64 != 0;
+
+    let mut out = raw[..size].to_vec();
+    if cfg!(target_endian = "little") {
+        // The disk is big-endian and the log is native, so on a
+        // little-endian host every multi-byte field is reversed. On a
+        // big-endian host the two agree and the copy stands as it is.
+        for &(at, width) in field_layout(version, bigtime, nrext64) {
+            if at + width > size {
+                continue;
+            }
+            out[at..at + width].reverse();
+        }
+    }
+    if version >= 3 {
+        out[offsets::CRC..offsets::CRC + 4].copy_from_slice(&[0, 0, 0, 0]);
+    }
+    Ok(out)
+}
+
+/// Size of the core a version-1 or -2 inode logs.
+pub const V2_LOG_DINODE_SIZE: usize = 96;
+
+/// `XFS_DIFLAG2_BIGTIME`.
+const DI_FLAGS2_BIGTIME: u64 = 0x08;
+/// `XFS_DIFLAG2_NREXT64`.
+const DI_FLAGS2_NREXT64: u64 = 0x10;
+
+/// Offsets within the inode core, shared by the on-disk and logged forms.
+mod offsets {
+    pub const VERSION: usize = 4;
+    pub const CRC: usize = 100;
+    pub const FLAGS2: usize = 120;
+}
+
+/// Every multi-byte field, as `(offset, width)`.
+///
+/// Padding and the UUID are absent deliberately: they are the only spans
+/// carried across without swapping, so leaving them out of the table is
+/// what makes them stay put.
+fn field_layout(version: u8, bigtime: bool, nrext64: bool) -> &'static [(usize, usize)] {
+    // The core up to offset 96, which is all a v2 inode has.
+    const COMMON: &[(usize, usize)] = &[
+        (0, 2),  // di_magic
+        (2, 2),  // di_mode
+        (6, 2),  // unused
+        (8, 4),  // di_uid
+        (12, 4), // di_gid
+        (16, 4), // di_nlink
+        (20, 2), // di_projid_lo
+        (22, 2), // di_projid_hi
+        (56, 8), // di_size
+        (64, 8), // di_nblocks
+        (72, 4), // di_extsize
+        (84, 4), // di_dmevmask
+        (88, 2), // di_dmstate
+        (90, 2), // di_flags
+        (92, 4), // di_gen
+    ];
+    // v3 adds everything past di_next_unlinked.
+    const V3_TAIL: &[(usize, usize)] = &[
+        (96, 4),  // di_next_unlinked
+        (104, 8), // di_changecount
+        (112, 8), // di_lsn
+        (120, 8), // di_flags2
+        (128, 4), // di_cowextsize
+        (152, 8), // di_ino
+    ];
+
+    // Built once per shape rather than per call. The combinations are
+    // few and fixed, so the alternative is allocating on every inode.
+    macro_rules! shape {
+        ($name:ident, $extra:expr) => {{
+            static TABLE: std::sync::OnceLock<Vec<(usize, usize)>> = std::sync::OnceLock::new();
+            TABLE
+                .get_or_init(|| {
+                    let mut v = COMMON.to_vec();
+                    v.extend_from_slice($extra);
+                    v
+                })
+                .as_slice()
+        }};
+    }
+
+    // Timestamps: one 64-bit count under bigtime, two 32-bit halves
+    // otherwise. They swap differently, so the shape has to know.
+    let times: &[(usize, usize)] = if bigtime {
+        &[(32, 8), (40, 8), (48, 8), (144, 8)]
+    } else {
+        &[
+            (32, 4),
+            (36, 4),
+            (40, 4),
+            (44, 4),
+            (48, 4),
+            (52, 4),
+            (144, 4),
+            (148, 4),
+        ]
+    };
+    // Extent counts move under nrext64.
+    let counts: &[(usize, usize)] = if nrext64 {
+        &[(24, 8), (76, 4)]
+    } else {
+        &[(76, 4), (80, 2)]
+    };
+
+    match (version >= 3, bigtime, nrext64) {
+        (false, _, _) => {
+            // A v2 core stops at 96 and has no bigtime or nrext64.
+            shape!(
+                v2,
+                &[
+                    (32, 4),
+                    (36, 4),
+                    (40, 4),
+                    (44, 4),
+                    (48, 4),
+                    (52, 4),
+                    (76, 4),
+                    (80, 2)
+                ]
+            )
+        }
+        (true, true, false) => shape!(v3_bt, &[V3_TAIL, times, counts].concat()),
+        (true, true, true) => shape!(v3_bt_nr, &[V3_TAIL, times, counts].concat()),
+        (true, false, false) => shape!(v3_lt, &[V3_TAIL, times, counts].concat()),
+        (true, false, true) => shape!(v3_lt_nr, &[V3_TAIL, times, counts].concat()),
+    }
 }
