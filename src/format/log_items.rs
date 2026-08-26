@@ -436,8 +436,13 @@ pub mod inode_log_format {
         /// logging its core is `2`: the format, then the core.
         pub const SIZE: usize = 2;
         /// `ilf_fields`, `u32` — a bitmask of which parts of the inode
-        /// follow. See [`super::XFS_ILOG_CORE`].
+        /// follow. See [`super::XFS_ILOG_CORE`] and
+        /// [`super::XFS_ILOG_DDATA`].
         pub const FIELDS: usize = 4;
+        /// `ilf_asize`, `u16` — bytes of attribute fork logged.
+        pub const ASIZE: usize = 8;
+        /// `ilf_dsize`, `u16` — bytes of data fork logged, unpadded.
+        pub const DSIZE: usize = 10;
         /// `ilf_ino`, `u64` — the inode number, which matches `di_ino`
         /// at offset 152 of the core operation that follows it. That
         /// agreement is how the core's own `di_ino` was pinned.
@@ -478,13 +483,51 @@ pub mod inode_log_format {
     pub mod addressing {}
 
     /// `XFS_ILOG_CORE` in `ilf_fields` — the item logs the inode core,
-    /// which then follows as the next operation.
-    ///
-    /// This is the only `ilf_fields` bit established here. The mask
-    /// plainly has more bits — a fork's data has to be logged somehow —
-    /// but no workload in the corpus isolated one, so the rest are
-    /// unknown rather than merely unnamed.
+    /// which follows as the next operation.
     pub const XFS_ILOG_CORE: u32 = 0x01;
+
+    /// `XFS_ILOG_DDATA` in `ilf_fields` — the item logs the data fork's
+    /// **inline** contents, which follow as a further operation after
+    /// the core.
+    ///
+    /// This is what a short-form directory's entries are logged as.
+    /// Isolated by renaming one file inside a two-entry directory and
+    /// reading the record: `ilf_fields` was `0x0003`, the item occupied
+    /// three operations rather than two, and the third held the
+    /// directory's entries.
+    pub const XFS_ILOG_DDATA: u32 = 0x02;
+
+    /// # What the sizes mean, and how the fork operation is framed
+    ///
+    /// Measured on a rename inside a short-form directory — 8 operations,
+    /// 2 items, the smallest shape that logs a fork at all.
+    ///
+    /// - [`offsets::SIZE`] counts this item's **operations**, the format
+    ///   itself included. Two for a bare core; three when a fork follows.
+    /// - [`offsets::DSIZE`] is the data fork's length in bytes, and it is
+    ///   the *unpadded* length: a 30-byte short-form directory reads 30
+    ///   here while its operation is 32 bytes long. Operations are padded
+    ///   to a multiple of four, and the padding is not part of the fork.
+    /// - [`offsets::ASIZE`] is the same for the attribute fork.
+    ///
+    /// # The fork stays big-endian
+    ///
+    /// The core beside it is native-endian; the fork is not. In the
+    /// measured record the short-form header read `02 00 00 00 00 80` —
+    /// a count of 2 and a parent inode of 128 stored big-endian —
+    /// surrounded by a little-endian core. A writer converts the core
+    /// and copies the fork.
+    ///
+    /// # A rename appends, it does not replace
+    ///
+    /// Worth knowing before writing one. Each short-form entry carries an
+    /// offset, and those increase through the list. Renaming `aaaa` to
+    /// `cccc` in a directory holding `aaaa` at `0x60` and `bbbb` at
+    /// `0x70` left `bbbb` at `0x70` and `cccc` at `0x80` — the old entry
+    /// removed and a new one appended with a fresh higher offset, even
+    /// though the replacement name was the same length and would have fit
+    /// exactly where the old one was.
+    pub mod sizes {}
 }
 
 // ---------------------------------------------------------------------
