@@ -28,6 +28,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ag;
+pub mod alloc_btree;
 pub mod bmbt;
 pub mod buf_write;
 pub mod capi;
