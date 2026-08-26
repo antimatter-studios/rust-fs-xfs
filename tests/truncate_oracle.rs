@@ -35,7 +35,8 @@
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::ag::Agf;
 use fs_xfs::alloc_btree::{
-    free_extent, longest, total_free, walk_from_agf, FreeExtent, Freed, Order,
+    alloc_extent, free_extent, longest, total_free, walk_from_agf, Allocated, FreeExtent, Freed,
+    Order,
 };
 use fs_xfs::error::Result;
 use fs_xfs::superblock::Superblock;
@@ -239,4 +240,148 @@ fn freeing_an_extent_reproduces_what_the_kernel_did() {
         CASES.len()
     );
     eprintln!("all {ran} truncate cases match what the kernel wrote");
+}
+
+/// Read the other way round, the same pair says what allocating an
+/// extent does.
+///
+/// The after-image is the filesystem without the file; the before-image
+/// is the same filesystem with it. So taking the victim's extents *out*
+/// of the after-image's free space has to produce the before-image's —
+/// which is the allocation the kernel performed when the fixture script
+/// created the file in the first place.
+///
+/// One oracle, both directions. An allocator and a deallocator that were
+/// each self-consistent but disagreed with the other about what a run is
+/// would pass one of these and fail the other.
+#[test]
+fn allocating_an_extent_is_the_inverse_of_freeing_one() {
+    let mut ran = 0usize;
+
+    for &(case, _) in CASES {
+        let before_path = share().join(format!("xfstrunc-{case}-before.img"));
+        let after_path = share().join(format!("xfstrunc-{case}-after.img"));
+        if !before_path.exists() || !after_path.exists() {
+            continue;
+        }
+
+        let before_dev = FileDevice::open(&before_path).expect("open before");
+        let mut sbb = vec![0u8; 4096];
+        before_dev.read_at(0, &mut sbb).expect("read");
+        let sb = Superblock::parse(&sbb).expect("superblock");
+        let after_dev = FileDevice::open(&after_path).expect("open after");
+
+        let extents = victim_extents(&before_path);
+
+        for agno in 0..sb.agcount {
+            let before = read_group(&before_dev, &sb, agno);
+            let after = read_group(&after_dev, &sb, agno);
+
+            // Start from the filesystem without the file and take the
+            // file's blocks back out.
+            let mut predicted = after.by_block.clone();
+            let mut outcomes = Vec::new();
+            for (owner, extent) in extents.iter().filter(|(owner, _)| *owner == agno) {
+                outcomes.push(
+                    alloc_extent(&mut predicted, *extent)
+                        .unwrap_or_else(|e| panic!("{case} AG {owner}: {e}")),
+                );
+            }
+            if outcomes.is_empty() {
+                continue;
+            }
+
+            assert_eq!(
+                predicted, before.by_block,
+                "{case} AG {agno}: allocating the victim's blocks out of the truncated \
+                 filesystem does not give the filesystem it came from.\n \
+                 predicted: {predicted:?}\n original:  {:?}",
+                before.by_block
+            );
+            assert_eq!(
+                total_free(&predicted),
+                u64::from(before.freeblks),
+                "{case} AG {agno}: predicted {} free blocks, the original had {}",
+                total_free(&predicted),
+                before.freeblks
+            );
+            assert_eq!(
+                longest(&predicted),
+                before.longest,
+                "{case} AG {agno}: predicted a longest run of {}, the original had {}",
+                longest(&predicted),
+                before.longest
+            );
+
+            let mut sorted = predicted.clone();
+            sorted.sort_by_key(|e| (e.blockcount, e.startblock));
+            assert_eq!(
+                sorted, before.by_count,
+                "{case} AG {agno}: the by-length tree disagrees with the prediction"
+            );
+        }
+        ran += 1;
+    }
+
+    if ran == 0 {
+        eprintln!("no truncate fixtures; nothing to check");
+        return;
+    }
+    eprintln!("allocation inverts freeing on all {ran} cases");
+}
+
+/// Freeing and allocating the same extent leaves the group exactly as it
+/// was, for every arrangement either operation can meet.
+///
+/// A round trip is a weaker claim than matching the kernel, but it
+/// covers arrangements the fixtures do not contain — and it is the
+/// property that actually matters when a driver does both.
+#[test]
+fn freeing_then_allocating_leaves_no_trace() {
+    let arrangements: &[&[(u32, u32)]] = &[
+        &[],
+        &[(100, 8)],
+        &[(10, 6), (1304, 24296)],
+        &[(10, 6), (792, 256), (1304, 24296)],
+        &[(10, 6), (280, 256), (1304, 24296)],
+        &[(10, 6), (280, 256), (792, 256), (1304, 24296)],
+    ];
+
+    for original in arrangements {
+        let start: Vec<FreeExtent> = original
+            .iter()
+            .map(|&(startblock, blockcount)| FreeExtent {
+                startblock,
+                blockcount,
+            })
+            .collect();
+
+        let extent = FreeExtent {
+            startblock: 536,
+            blockcount: 256,
+        };
+
+        let mut list = start.clone();
+        let freed = free_extent(&mut list, extent).expect("free");
+        let taken = alloc_extent(&mut list, extent).expect("allocate it back");
+
+        assert_eq!(
+            list, start,
+            "freeing then allocating changed the group: {freed:?} then {taken:?}, \
+             from {start:?}"
+        );
+
+        // The two enumerations line up: what merging did, splitting
+        // undoes.
+        let expected = match freed {
+            Freed::Inserted => Allocated::ConsumedWhole,
+            Freed::MergedWithFollowing => Allocated::TookFront,
+            Freed::MergedWithPreceding => Allocated::TookBack,
+            Freed::JoinedTwo => Allocated::SplitInTwo,
+        };
+        assert_eq!(
+            taken, expected,
+            "{freed:?} should be undone by {expected:?}, not {taken:?}"
+        );
+    }
 }
