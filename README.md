@@ -23,12 +23,40 @@ corrupt.
 | On-disk version | v5 (primary target), v4 parsed |
 | Superblock | geometry, feature masks, CRC32C, inode-number splitting |
 | Allocation groups | AGF, AGI, with v5 self-describing identity checks |
-| Inodes | not yet |
-| Directories | not yet |
-| Extents / bmbt | not yet |
-| Extended attributes | not yet |
+| Free-space B+trees | both trees read and edited; extents freed and allocated |
+| Inodes | v1/v2/v3 cores, `bigtime` and 64-bit extent counts |
+| Directories | short form, block, leaf and node; rename within short form |
+| Extents / bmbt | inline extent lists and the block-map B+tree |
+| Symlinks | inline and remote (`XSLM`), across multiple extents |
+| Extended attributes | on-disk shapes documented; reading not yet |
 | Log replay | not yet — a dirty volume is refused, not silently misread |
-| Write path | not yet |
+| Log **writing** | inode cores, rename, truncate, allocating write |
+| Write path | overwrite in place, plus the journalled operations above |
+
+### What the write path can do
+
+An overwrite of bytes that already exist touches no metadata, so it needs no journal and
+is done directly. Everything else goes through the log, and each of these produces a
+record the Linux kernel replays:
+
+| operation | ops | items |
+|---|---|---|
+| rename within a short-form directory | 8 | 2 |
+| truncate a file to nothing | 11 | 4 |
+| write into an empty file, allocating | 12 | 4 |
+
+Those op and item counts are not this driver's choice. They were measured from
+filesystems the kernel wrote, recorded in `docs/transaction-shapes.md`, and the encoder
+reproduced them without being fitted to them.
+
+Nothing on disk is touched by a journalled operation — the record is the change. That is
+what makes the result checkable: a filesystem that came out different is one something
+replayed, and `xfs_repair -n` afterwards is what catches metadata that is plausible on
+its own and inconsistent with the rest.
+
+Each operation refuses by name what it cannot do rather than attempting it. See
+`docs/transaction-shapes.md` for the list and for the shapes not yet written — create,
+unlink and mkdir all need the AGI and the inode B+trees.
 
 Features recognised in the superblock and gated rather than guessed: `finobt`,
 `rmapbt`, `reflink`, `inobtcnt`, `ftype`, `sparse inodes`, `metadata UUID`, `bigtime`,
