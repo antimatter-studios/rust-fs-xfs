@@ -37,6 +37,7 @@ pub mod extent;
 pub mod fs;
 pub mod inode;
 pub mod log;
+pub mod log_write;
 pub mod superblock;
 pub mod write;
 
