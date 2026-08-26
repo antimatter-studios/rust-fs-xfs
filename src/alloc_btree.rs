@@ -563,6 +563,81 @@ mod tests {
         assert_eq!(list, free(&[(100, 8)]));
     }
 
+    /// The four ways an extent can come out of a run, and the one that
+    /// leaves the group holding more records than it started with.
+    #[test]
+    fn an_extent_can_be_taken_from_anywhere_in_a_run() {
+        let take = |list: &mut Vec<FreeExtent>, startblock, blockcount| {
+            alloc_extent(
+                list,
+                FreeExtent {
+                    startblock,
+                    blockcount,
+                },
+            )
+            .expect("a legal allocation")
+        };
+
+        // The whole run.
+        let mut list = free(&[(10, 6), (100, 8)]);
+        assert_eq!(take(&mut list, 100, 8), Allocated::ConsumedWhole);
+        assert_eq!(list, free(&[(10, 6)]));
+
+        // Its start, so the record keeps its end.
+        let mut list = free(&[(100, 8)]);
+        assert_eq!(take(&mut list, 100, 2), Allocated::TookFront);
+        assert_eq!(list, free(&[(102, 6)]));
+
+        // Its end, so the record keeps its start.
+        let mut list = free(&[(100, 8)]);
+        assert_eq!(take(&mut list, 104, 4), Allocated::TookBack);
+        assert_eq!(list, free(&[(100, 4)]));
+
+        // Its middle, which is the one case that adds a record — an
+        // allocation can need more room in a tree than it began with.
+        let mut list = free(&[(100, 8)]);
+        assert_eq!(take(&mut list, 102, 2), Allocated::SplitInTwo);
+        assert_eq!(list, free(&[(100, 2), (104, 4)]));
+    }
+
+    /// Blocks that are not free cannot be handed out, and an extent
+    /// spanning two runs would mean the space between them was allocated
+    /// and free at the same time.
+    #[test]
+    fn allocating_what_is_not_free_is_refused() {
+        /// A group's free space, the extent to ask for, and why it must
+        /// be refused.
+        type Case = (&'static str, &'static [(u32, u32)], (u32, u32));
+
+        let cases: &[Case] = &[
+            ("nothing is free at all", &[], (100, 4)),
+            ("before every run", &[(100, 8)], (90, 4)),
+            ("after every run", &[(100, 8)], (200, 4)),
+            ("running past the end of a run", &[(100, 8)], (104, 8)),
+            (
+                "spanning two runs with a gap between",
+                &[(100, 8), (200, 8)],
+                (100, 108),
+            ),
+            ("no blocks at all", &[(100, 8)], (100, 0)),
+        ];
+        for (why, start, (startblock, blockcount)) in cases {
+            let mut list = free(start);
+            assert!(
+                alloc_extent(
+                    &mut list,
+                    FreeExtent {
+                        startblock: *startblock,
+                        blockcount: *blockcount,
+                    },
+                )
+                .is_err(),
+                "allocating {startblock}+{blockcount} was allowed, {why}"
+            );
+            assert_eq!(list, free(start), "the list was changed anyway, {why}");
+        }
+    }
+
     /// The two totals the group header carries, which an allocator reads
     /// before it looks at a tree at all.
     #[test]
@@ -716,4 +791,104 @@ pub fn longest(free: &[FreeExtent]) -> u32 {
 /// records.
 pub fn total_free(free: &[FreeExtent]) -> u64 {
     free.iter().map(|e| u64::from(e.blockcount)).sum()
+}
+
+// ---------------------------------------------------------------------
+// Taking an extent out
+// ---------------------------------------------------------------------
+
+/// What taking an extent out of a group's free space did to it.
+///
+/// The four cases are the mirror of [`Freed`], with one asymmetry worth
+/// knowing: taking blocks out of the middle of a run **adds** a record,
+/// so an allocation can need more room in a tree than it started with,
+/// while freeing never needs more than one extra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allocated {
+    /// The run was consumed exactly: its record is gone from both trees.
+    ConsumedWhole,
+    /// Taken from the start of a run, so its record keeps its end and
+    /// its start moves up.
+    TookFront,
+    /// Taken from the end of a run, so its record keeps its start and
+    /// its length shrinks.
+    TookBack,
+    /// Taken from the middle, so one record becomes two.
+    SplitInTwo,
+}
+
+/// Take `extent` out of a group's free space.
+///
+/// `free` must be the group's extents ordered by start block, as
+/// [`walk`] returns them for [`Order::ByBlock`]; it is updated in place
+/// and stays ordered.
+///
+/// This is the inverse of [`free_extent`], and is checked as one: the
+/// same before-and-after image pairs that show what the kernel does when
+/// it frees an extent show, read the other way round, what it does when
+/// it allocates one.
+///
+/// # Errors
+///
+/// [`Error::CorruptLog`] if the extent is not wholly inside a single
+/// free run. Blocks that are not free cannot be handed out, and an
+/// extent spanning two runs would mean the run between them was
+/// allocated and free at once.
+pub fn alloc_extent(free: &mut Vec<FreeExtent>, extent: FreeExtent) -> Result<Allocated> {
+    if extent.blockcount == 0 {
+        return Err(Error::CorruptLog(
+            "an extent of no blocks cannot be allocated".into(),
+        ));
+    }
+
+    // The only candidate is the last run starting at or before it.
+    let at = free
+        .partition_point(|e| e.startblock <= extent.startblock)
+        .checked_sub(1)
+        .ok_or_else(|| {
+            Error::CorruptLog(format!(
+                "allocating {}+{} but no free run starts at or before it",
+                extent.startblock, extent.blockcount
+            ))
+        })?;
+
+    let run = free[at];
+    if extent.end() > run.end() {
+        return Err(Error::CorruptLog(format!(
+            "allocating {}+{} runs past the free space at {}+{}, so part of it is \
+             not free",
+            extent.startblock, extent.blockcount, run.startblock, run.blockcount
+        )));
+    }
+
+    let at_front = extent.startblock == run.startblock;
+    let at_back = extent.end() == run.end();
+
+    match (at_front, at_back) {
+        (true, true) => {
+            free.remove(at);
+            Ok(Allocated::ConsumedWhole)
+        }
+        (true, false) => {
+            let run = &mut free[at];
+            run.startblock += extent.blockcount;
+            run.blockcount -= extent.blockcount;
+            Ok(Allocated::TookFront)
+        }
+        (false, true) => {
+            free[at].blockcount -= extent.blockcount;
+            Ok(Allocated::TookBack)
+        }
+        (false, false) => {
+            // The tail becomes a record of its own, so the group holds
+            // one more than it did.
+            let tail = FreeExtent {
+                startblock: (extent.end()) as u32,
+                blockcount: (run.end() - extent.end()) as u32,
+            };
+            free[at].blockcount = extent.startblock - run.startblock;
+            free.insert(at + 1, tail);
+            Ok(Allocated::SplitInTwo)
+        }
+    }
 }
