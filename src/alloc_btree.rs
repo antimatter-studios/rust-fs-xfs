@@ -447,6 +447,136 @@ mod tests {
         assert_eq!(offsets::CRC + 4, V5_HEADER_LEN);
     }
 
+    fn free(pairs: &[(u32, u32)]) -> Vec<FreeExtent> {
+        pairs
+            .iter()
+            .map(|&(startblock, blockcount)| FreeExtent {
+                startblock,
+                blockcount,
+            })
+            .collect()
+    }
+
+    fn put(list: &mut Vec<FreeExtent>, startblock: u32, blockcount: u32) -> Freed {
+        free_extent(
+            list,
+            FreeExtent {
+                startblock,
+                blockcount,
+            },
+        )
+        .expect("a legal free")
+    }
+
+    /// The four outcomes, which are the four the kernel was observed to
+    /// produce for the same four arrangements.
+    #[test]
+    fn an_extent_merges_with_whatever_it_touches() {
+        // Nothing adjoins it.
+        let mut list = free(&[(10, 6), (1304, 24296)]);
+        assert_eq!(put(&mut list, 536, 256), Freed::Inserted);
+        assert_eq!(list, free(&[(10, 6), (536, 256), (1304, 24296)]));
+
+        // Free space begins where it ends, so that record grows
+        // downwards — its start moves back as well as its length.
+        let mut list = free(&[(10, 6), (792, 256), (1304, 24296)]);
+        assert_eq!(put(&mut list, 536, 256), Freed::MergedWithFollowing);
+        assert_eq!(list, free(&[(10, 6), (536, 512), (1304, 24296)]));
+
+        // Free space ends where it begins, so that record grows upwards.
+        let mut list = free(&[(10, 6), (280, 256), (1304, 24296)]);
+        assert_eq!(put(&mut list, 536, 256), Freed::MergedWithPreceding);
+        assert_eq!(list, free(&[(10, 6), (280, 512), (1304, 24296)]));
+
+        // Both sides, so two records become one and the second is gone.
+        let mut list = free(&[(10, 6), (280, 256), (792, 256), (1304, 24296)]);
+        assert_eq!(put(&mut list, 536, 256), Freed::JoinedTwo);
+        assert_eq!(list, free(&[(10, 6), (280, 768), (1304, 24296)]));
+    }
+
+    /// Freeing into an empty group, and freeing at either end of the
+    /// list — the positions an insertion is most likely to get wrong.
+    #[test]
+    fn an_extent_can_be_freed_at_either_end() {
+        let mut list = Vec::new();
+        assert_eq!(put(&mut list, 100, 8), Freed::Inserted);
+        assert_eq!(list, free(&[(100, 8)]));
+
+        // Before everything.
+        let mut list = free(&[(100, 8)]);
+        assert_eq!(put(&mut list, 10, 8), Freed::Inserted);
+        assert_eq!(list, free(&[(10, 8), (100, 8)]));
+
+        // After everything.
+        let mut list = free(&[(10, 8)]);
+        assert_eq!(put(&mut list, 100, 8), Freed::Inserted);
+        assert_eq!(list, free(&[(10, 8), (100, 8)]));
+
+        // Touching the very first record from below.
+        let mut list = free(&[(100, 8)]);
+        assert_eq!(put(&mut list, 92, 8), Freed::MergedWithFollowing);
+        assert_eq!(list, free(&[(92, 16)]));
+    }
+
+    /// Freeing blocks that are already free means the group's accounting
+    /// is wrong, and carrying on would hand the same blocks to two
+    /// files. It is refused in every direction the overlap can come
+    /// from.
+    #[test]
+    fn overlapping_free_space_is_refused() {
+        let cases: &[(&str, (u32, u32))] = &[
+            ("exactly on an existing record", (100, 8)),
+            ("starting inside one", (104, 8)),
+            ("ending inside one", (96, 8)),
+            ("covering one entirely", (96, 24)),
+        ];
+        for (why, (startblock, blockcount)) in cases {
+            let mut list = free(&[(100, 8)]);
+            assert!(
+                free_extent(
+                    &mut list,
+                    FreeExtent {
+                        startblock: *startblock,
+                        blockcount: *blockcount,
+                    },
+                )
+                .is_err(),
+                "freeing {startblock}+{blockcount} was allowed, {why}"
+            );
+            assert_eq!(list, free(&[(100, 8)]), "the list was changed anyway");
+        }
+    }
+
+    /// An extent of no blocks is not an extent, and inserting one would
+    /// leave a record no allocator could ever satisfy from.
+    #[test]
+    fn an_empty_extent_is_refused() {
+        let mut list = free(&[(100, 8)]);
+        assert!(free_extent(
+            &mut list,
+            FreeExtent {
+                startblock: 200,
+                blockcount: 0,
+            },
+        )
+        .is_err());
+        assert_eq!(list, free(&[(100, 8)]));
+    }
+
+    /// The two totals the group header carries, which an allocator reads
+    /// before it looks at a tree at all.
+    #[test]
+    fn the_headers_totals_come_from_the_records() {
+        let list = free(&[(10, 6), (280, 768), (1304, 24296)]);
+        assert_eq!(total_free(&list), 6 + 768 + 24296);
+        assert_eq!(longest(&list), 24296);
+
+        // A group with nothing free states zero rather than whatever it
+        // said last.
+        assert_eq!(longest(&[]), 0);
+        assert_eq!(total_free(&[]), 0);
+    }
+
     /// A block holds as many records as fit, and an internal node holds
     /// fewer because each entry carries a pointer as well as a key.
     #[test]
@@ -455,4 +585,135 @@ mod tests {
         assert_eq!(maxrecs(space, RECORD_LEN), 505);
         assert_eq!(maxrecs(space, KEY_LEN + PTR_LEN), 336);
     }
+}
+
+// ---------------------------------------------------------------------
+// Putting an extent back
+// ---------------------------------------------------------------------
+
+/// What freeing an extent did to a group's free space.
+///
+/// Named rather than returned as a bare list because *which* of the four
+/// things happened decides what the transaction has to log, and a caller
+/// that only sees the new list has to work it out again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freed {
+    /// Nothing adjoined it: a new record in both trees.
+    Inserted,
+    /// Free space began where the extent ended: one record grew
+    /// downwards, keeping its length key but changing its start.
+    MergedWithFollowing,
+    /// Free space ended where the extent began: one record grew upwards,
+    /// keeping its start but changing its length.
+    MergedWithPreceding,
+    /// Free space on both sides: two records became one, so one of them
+    /// is removed from both trees.
+    JoinedTwo,
+}
+
+/// Put `extent` back into a group's free space, merging it with whatever
+/// it adjoins.
+///
+/// `free` must be the group's extents ordered by start block, as
+/// [`walk`] returns them for [`Order::ByBlock`]; it is updated in place
+/// and stays ordered.
+///
+/// # Why merging is not optional
+///
+/// Two free extents that touch are one free extent. XFS keeps them
+/// merged, and a group left holding `280+256` and `536+256` side by side
+/// is not merely untidy — it can no longer satisfy a request for 512
+/// contiguous blocks that it plainly has room for, and `agf_longest`
+/// then disagrees with the tree beneath it.
+///
+/// This was not assumed. The same filesystem was captured before and
+/// after the kernel truncated a file, four times over, with the freed
+/// extent adjoining nothing, the extent after it, the extent before it,
+/// and both. The kernel produced exactly the four outcomes above.
+///
+/// # Errors
+///
+/// [`Error::CorruptLog`] if the extent overlaps free space, which means
+/// either it was already free or the caller is freeing blocks that were
+/// never allocated. Both are serious enough that carrying on would put
+/// the same blocks into two files.
+pub fn free_extent(free: &mut Vec<FreeExtent>, extent: FreeExtent) -> Result<Freed> {
+    if extent.blockcount == 0 {
+        return Err(Error::CorruptLog(
+            "an extent of no blocks cannot be freed".into(),
+        ));
+    }
+
+    // Where it belongs, by start block.
+    let at = free.partition_point(|e| e.startblock < extent.startblock);
+
+    // Overlap in either direction means the group's accounting is
+    // already wrong, and freeing on top of it would make two files own
+    // the same blocks.
+    if let Some(before) = at.checked_sub(1).and_then(|i| free.get(i)) {
+        if before.end() > u64::from(extent.startblock) {
+            return Err(Error::CorruptLog(format!(
+                "freeing {}+{} overlaps free space at {}+{}",
+                extent.startblock, extent.blockcount, before.startblock, before.blockcount
+            )));
+        }
+    }
+    if let Some(after) = free.get(at) {
+        if extent.end() > u64::from(after.startblock) {
+            return Err(Error::CorruptLog(format!(
+                "freeing {}+{} overlaps free space at {}+{}",
+                extent.startblock, extent.blockcount, after.startblock, after.blockcount
+            )));
+        }
+    }
+
+    let touches_preceding = at
+        .checked_sub(1)
+        .and_then(|i| free.get(i))
+        .is_some_and(|e| e.end() == u64::from(extent.startblock));
+    let touches_following = free
+        .get(at)
+        .is_some_and(|e| extent.end() == u64::from(e.startblock));
+
+    match (touches_preceding, touches_following) {
+        (true, true) => {
+            // The preceding record absorbs the extent and the one after
+            // it, and the latter goes away.
+            let following = free.remove(at);
+            let preceding = &mut free[at - 1];
+            preceding.blockcount += extent.blockcount + following.blockcount;
+            Ok(Freed::JoinedTwo)
+        }
+        (true, false) => {
+            free[at - 1].blockcount += extent.blockcount;
+            Ok(Freed::MergedWithPreceding)
+        }
+        (false, true) => {
+            // The record keeps its end and moves its start backwards, so
+            // its start block changes as well as its length.
+            let following = &mut free[at];
+            following.startblock = extent.startblock;
+            following.blockcount += extent.blockcount;
+            Ok(Freed::MergedWithFollowing)
+        }
+        (false, false) => {
+            free.insert(at, extent);
+            Ok(Freed::Inserted)
+        }
+    }
+}
+
+/// The longest run in a group's free space, which is what
+/// `agf_longest` records.
+///
+/// Zero for a group with nothing free, which is what XFS writes rather
+/// than leaving the previous value in place.
+pub fn longest(free: &[FreeExtent]) -> u32 {
+    free.iter().map(|e| e.blockcount).max().unwrap_or(0)
+}
+
+/// The total free blocks in a group, which is what `agf_freeblks`
+/// records.
+pub fn total_free(free: &[FreeExtent]) -> u64 {
+    free.iter().map(|e| u64::from(e.blockcount)).sum()
 }

@@ -266,7 +266,7 @@ impl Filesystem {
     ///
     /// [`Error::UnsupportedFeature`] for a real-time inode, whose extents
     /// live on a device this driver does not have.
-    pub(crate) fn data_extents(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
+    pub fn data_extents(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
         if inode.is_realtime() {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {} keeps its data on the real-time device",
