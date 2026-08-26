@@ -84,6 +84,12 @@ pub mod offsets {
         pub const UUID: usize = 64;
         /// `agf_rmap_blocks` — blocks held by the reverse-map B+tree.
         pub const RMAP_BLOCKS: usize = 80;
+        /// `agf_refcount_blocks` — blocks held by the reference-count
+        /// B+tree. Named because the offsets around it are only
+        /// checkable against the format documentation when the fields
+        /// between them are there to count off against; nothing reads it
+        /// yet.
+        pub const REFCOUNT_BLOCKS: usize = 84;
         /// `agf_refcount_root` — reference-count B+tree root.
         pub const REFCOUNT_ROOT: usize = 88;
         /// `agf_refcount_level` — reference-count B+tree depth.
