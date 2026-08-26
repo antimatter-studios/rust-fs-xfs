@@ -55,6 +55,13 @@ for geom in "${GEOMETRIES[@]}"; do
         # exercises the cluster boundary rather than only its start.
         mkdir -p \"\$m/logged\"
         for n in \$(seq 1 200); do echo \"entry \$n\" > \"\$m/logged/f\$n\"; done
+        # A directory small enough to stay inside its inode, for the
+        # tests that rewrite a short-form directory. Two entries of
+        # equal name length, so a rename between them changes nothing
+        # but the name and cannot be passed by accident.
+        mkdir -p \"\$m/sf\"
+        echo one > \"\$m/sf/aaaa\"
+        echo two > \"\$m/sf/bbbb\"
         sync
         umount \"\$m\"; rmdir \"\$m\"
         echo 'BUILT b=$bsize i=$isize'

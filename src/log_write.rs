@@ -481,6 +481,14 @@ pub fn append_at(
         )));
     }
 
+    // `h_len` is the operations rounded up to a whole basic block, not
+    // their exact length. The kernel writes it that way — a record of
+    // 608 bytes of operations records 1024 — and the trailing zeros read
+    // back as nothing, because `h_num_logops` says when to stop.
+    let padded = payload.len().div_ceil(BBSIZE) * BBSIZE;
+    let mut payload = payload;
+    payload.resize(padded, 0);
+
     let lsn = (u64::from(head.cycle) << 32) | u64::from(head.block);
     let placement = Placement {
         block: head.block,

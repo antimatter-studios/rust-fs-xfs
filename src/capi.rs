@@ -51,6 +51,7 @@ thread_local! {
 fn errno_for(e: &Error) -> c_int {
     match e {
         Error::NotFound => libc_enoent(),
+        Error::AlreadyExists => libc_eexist(),
         Error::NotADirectory => libc_enotdir(),
         Error::NotAFile => libc_eisdir(),
         Error::ReadOnly => libc_erofs(),
@@ -76,6 +77,10 @@ const fn libc_enoent() -> c_int {
 }
 const fn libc_eio() -> c_int {
     5
+}
+/// `EEXIST` — 17 on both Darwin and Linux.
+const fn libc_eexist() -> c_int {
+    17
 }
 const fn libc_eisdir() -> c_int {
     21

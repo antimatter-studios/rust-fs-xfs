@@ -61,6 +61,9 @@ pub enum Error {
     /// A path component was not found.
     NotFound,
 
+    /// The name a write would create is already taken.
+    AlreadyExists,
+
     /// A path component exists but is not a directory.
     NotADirectory,
 
@@ -95,6 +98,7 @@ impl fmt::Display for Error {
             Error::CorruptLog(m) => write!(f, "XFS log is malformed: {m}"),
             Error::DirtyLog => f.write_str("XFS log is dirty and needs replay before mount"),
             Error::NotFound => f.write_str("no such file or directory"),
+            Error::AlreadyExists => f.write_str("a file of that name already exists"),
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
@@ -181,6 +185,7 @@ mod tests {
         for (e, expect) in [
             (Error::DirtyLog, "replay"),
             (Error::NotFound, "no such file"),
+            (Error::AlreadyExists, "already exists"),
             (Error::NotADirectory, "not a directory"),
             (Error::NotAFile, "not a regular file"),
             (Error::ReadOnly, "read-only"),
@@ -214,6 +219,7 @@ mod tests {
             Error::CorruptLog("x".into()),
             Error::DirtyLog,
             Error::NotFound,
+            Error::AlreadyExists,
             Error::NotADirectory,
             Error::NotAFile,
             Error::ReadOnly,
