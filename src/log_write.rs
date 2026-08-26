@@ -49,35 +49,20 @@
 
 use crate::log::{record_checksum, BBSIZE, XLOG_HEADER_MAGIC, XLOG_REC_HEADER_SIZE};
 
-/// `xlog_op_header` — the 12 bytes in front of every operation.
-pub const OP_HEADER_SIZE: usize = 12;
+/// The log's own layout constants, defined once in
+/// [`crate::format::log_items`] alongside the structures this encoder
+/// does not write yet. Re-exported rather than restated: a magic number
+/// that appears twice is a magic number that can disagree with itself.
+pub use crate::format::log_items::{
+    inode_log_format::{INODE_LOG_FORMAT_SIZE, XFS_ILOG_CORE},
+    item_types::XFS_LI_INODE,
+    log_dinode::{LOG_DINODE_SIZE, V2_LOG_DINODE_SIZE},
+    op_header::{OP_HEADER_SIZE, XFS_TRANSACTION, XLOG_COMMIT_TRANS, XLOG_START_TRANS},
+    trans_header::{TRANS_HEADER_SIZE, XFS_TRANS_HEADER_MAGIC},
+};
 
-/// `XFS_TRANSACTION` — the client id every filesystem transaction uses.
-pub const XFS_TRANSACTION: u8 = 0x69;
-
-/// `XLOG_START_TRANS`.
-pub const XLOG_START_TRANS: u8 = 0x01;
-/// `XLOG_COMMIT_TRANS`.
-pub const XLOG_COMMIT_TRANS: u8 = 0x02;
-
-/// `XFS_TRANS_HEADER_MAGIC`, stored little-endian — "TRAN".
-pub const XFS_TRANS_HEADER_MAGIC: u32 = 0x5452_414e;
-/// Size of `xfs_trans_header`.
-pub const TRANS_HEADER_SIZE: usize = 16;
-
-/// `XFS_LI_INODE` — the log item type for an inode.
-pub const XFS_LI_INODE: u16 = 0x123b;
-/// Size of `xfs_inode_log_format`.
-pub const INODE_LOG_FORMAT_SIZE: usize = 56;
-/// `XFS_ILOG_CORE` — the item logs the inode core.
-pub const XFS_ILOG_CORE: u32 = 0x01;
-/// Size of the inode core as the log stores it.
-pub const LOG_DINODE_SIZE: usize = 176;
-
-/// `XLOG_VERSION_2`.
-const XLOG_VERSION_2: u32 = 2;
-/// `XLOG_FMT_LINUX_LE`.
-const XLOG_FMT_LINUX_LE: u32 = 1;
+use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
+use crate::format::log_items::rec_header::{XLOG_FMT_LINUX_LE, XLOG_VERSION_2};
 
 /// One operation: its flags and its payload.
 pub struct Op {
@@ -277,14 +262,6 @@ pub fn log_dinode_from_disk(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
     }
     Ok(out)
 }
-
-/// Size of the core a version-1 or -2 inode logs.
-pub const V2_LOG_DINODE_SIZE: usize = 96;
-
-/// `XFS_DIFLAG2_BIGTIME`.
-const DI_FLAGS2_BIGTIME: u64 = 0x08;
-/// `XFS_DIFLAG2_NREXT64`.
-const DI_FLAGS2_NREXT64: u64 = 0x10;
 
 /// Offsets within the inode core, shared by the on-disk and logged forms.
 mod offsets {
