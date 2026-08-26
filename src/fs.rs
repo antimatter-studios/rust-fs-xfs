@@ -200,8 +200,28 @@ impl Filesystem {
         Agi::parse(&buf, &self.sb, ag)
     }
 
-    /// Byte offset of an inode, derived from its number.
-    pub(crate) fn inode_offset(&self, ino: u64) -> Result<u64> {
+    /// The device this filesystem was mounted from.
+    ///
+    /// Exposed for the log functions, which take a device rather than a
+    /// filesystem: reading the log has to work on a volume this driver
+    /// has decided it will not mount, so it cannot be reached through
+    /// one.
+    pub fn device(&self) -> &dyn BlockRead {
+        self.device.as_ref()
+    }
+
+    /// Byte offset of an inode on the device, derived from its number.
+    ///
+    /// Public because an inode's address is a fact about the volume,
+    /// not an implementation detail, and reaching it any other way means
+    /// re-deriving the allocation-group arithmetic — which is the part
+    /// worth having in one place.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadSuperblock`] if the number names an allocation group
+    /// the filesystem does not have.
+    pub fn inode_offset(&self, ino: u64) -> Result<u64> {
         let (ag, ag_block, offset) = self.sb.split_ino(ino);
         if ag >= self.sb.agcount {
             return Err(Error::BadSuperblock(format!(

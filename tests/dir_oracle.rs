@@ -404,7 +404,7 @@ fn root_directory_parses_on_real_images() {
     }
 
     let mut examined = 0usize;
-    for (label, img, dump_path) in &images {
+    for (label, img, _dump_path) in &images {
         let bytes = std::fs::read(img).expect("read image");
         let (sb, inode, fork) = root_dir_fork(&bytes, label);
 
@@ -431,18 +431,29 @@ fn root_directory_parses_on_real_images() {
             parsed.parent_ino, sb.rootino
         );
 
-        if dump_path.is_none() {
-            // A root nothing was ever created in: the header alone, two
-            // counts and a 32-bit parent inode number. `xfs_db` reports
-            // core.size = 6 for exactly this shape.
+        // A root nothing was ever created in is the header alone: two
+        // counts and a 32-bit parent inode number, which `xfs_db`
+        // reports as core.size = 6.
+        //
+        // Which fixtures are empty is a property of how each was built,
+        // not something this test can infer — it used to key off whether
+        // an `xfs_db` dump existed alongside, and started failing the
+        // moment a populated fixture arrived without one. So the size is
+        // checked against what the directory actually holds.
+        const EMPTY_SHORT_FORM_SIZE: u64 = 6;
+        if parsed.entries.is_empty() {
             assert_eq!(
-                inode.size, 6,
-                "{label}: an empty short-form root directory should be exactly 6 bytes"
+                inode.size, EMPTY_SHORT_FORM_SIZE,
+                "{label}: a short-form root with no entries should be exactly \
+                 {EMPTY_SHORT_FORM_SIZE} bytes"
             );
+        } else {
             assert!(
-                parsed.entries.is_empty(),
-                "{label}: a freshly made root directory holds {} entries",
-                parsed.entries.len()
+                inode.size > EMPTY_SHORT_FORM_SIZE,
+                "{label}: a root holding {} entries reports {} bytes, which is not \
+                 even the empty header",
+                parsed.entries.len(),
+                inode.size
             );
         }
 

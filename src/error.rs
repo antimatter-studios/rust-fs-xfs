@@ -47,6 +47,12 @@ pub enum Error {
     /// we simply cannot honour it safely.
     UnsupportedFeature(String),
 
+    /// The log itself is malformed: a record that ends outside the ring,
+    /// or a head that cannot be located. Distinct from [`Error::DirtyLog`],
+    /// which describes a perfectly well-formed log that simply has work
+    /// outstanding — this one cannot be trusted to say anything.
+    CorruptLog(String),
+
     /// The volume's log is dirty — it holds committed transactions that
     /// have not been applied to the metadata. Mounting without replaying
     /// it would present a stale, internally inconsistent filesystem.
@@ -86,6 +92,7 @@ impl fmt::Display for Error {
                 "{what} read from block {expected} claims to be block {found}"
             ),
             Error::UnsupportedFeature(m) => write!(f, "unsupported XFS feature: {m}"),
+            Error::CorruptLog(m) => write!(f, "XFS log is malformed: {m}"),
             Error::DirtyLog => f.write_str("XFS log is dirty and needs replay before mount"),
             Error::NotFound => f.write_str("no such file or directory"),
             Error::NotADirectory => f.write_str("not a directory"),
@@ -204,6 +211,7 @@ mod tests {
                 found: 1,
             },
             Error::UnsupportedFeature("x".into()),
+            Error::CorruptLog("x".into()),
             Error::DirtyLog,
             Error::NotFound,
             Error::NotADirectory,

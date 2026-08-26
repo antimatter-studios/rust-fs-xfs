@@ -47,7 +47,10 @@
 //! is checked against records the kernel wrote rather than against its
 //! own output.
 
-use crate::log::{record_checksum, BBSIZE, XLOG_HEADER_MAGIC, XLOG_REC_HEADER_SIZE};
+use crate::error::{Error, Result};
+use crate::fs::Filesystem;
+use crate::log::{record_checksum, Head, BBSIZE, XLOG_HEADER_MAGIC, XLOG_REC_HEADER_SIZE};
+use crate::superblock::Superblock;
 
 /// The log's own layout constants, defined once in
 /// [`crate::format::log_items`] alongside the structures this encoder
@@ -62,7 +65,7 @@ pub use crate::format::log_items::{
 };
 
 use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
-use crate::format::log_items::rec_header::{XLOG_FMT_LINUX_LE, XLOG_VERSION_2};
+use crate::format::log_items::rec_header::XLOG_VERSION_2;
 
 /// One operation: its flags and its payload.
 pub struct Op {
@@ -93,14 +96,60 @@ pub fn trans_header(tid: u32, kind: u32, item_ops: u32) -> Vec<u8> {
     v
 }
 
-/// `xfs_inode_log_format` — which inode is being logged, and which parts.
-pub fn inode_log_format(ino: u64, fields: u32) -> Vec<u8> {
+/// Where an inode's cluster buffer is, which is how a logged inode is
+/// addressed.
+///
+/// A logged inode does not name its own disk address. It names the
+/// cluster that holds it and its offset inside that cluster, and the
+/// replayer reads the whole cluster to apply the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InodeBuffer {
+    /// Basic-block address of the cluster.
+    pub blkno: u64,
+    /// Length of the cluster, in basic blocks.
+    pub len: u32,
+    /// The inode's byte offset within the cluster.
+    pub boffset: u32,
+}
+
+impl InodeBuffer {
+    /// Locate the cluster holding the inode at device offset `at`.
+    ///
+    /// The alignment is absolute — the inode's offset on the device
+    /// truncated to a whole cluster — rather than relative to the
+    /// allocation group, which is the thing worth checking against
+    /// intuition. Confirmed across all four allocation groups of a
+    /// multi-group filesystem.
+    pub fn containing(at: u64, cluster_bytes: u32) -> Self {
+        let cluster = u64::from(cluster_bytes);
+        let start = at - at % cluster;
+        InodeBuffer {
+            blkno: start / BBSIZE as u64,
+            len: cluster_bytes / BBSIZE as u32,
+            boffset: (at - start) as u32,
+        }
+    }
+}
+
+/// `xfs_inode_log_format` — which inode is being logged, which parts of
+/// it, and where its cluster buffer lives.
+///
+/// The buffer is not decoration. With those three fields zero the record
+/// checksums, is found, is trusted, and fails in recovery reading block
+/// zero for zero bytes — an I/O error that names neither the inode nor
+/// the record.
+pub fn inode_log_format(ino: u64, fields: u32, buffer: &InodeBuffer) -> Vec<u8> {
+    use crate::format::log_items::inode_log_format::offsets as at;
+
     let mut v = vec![0u8; INODE_LOG_FORMAT_SIZE];
-    v[0..2].copy_from_slice(&XFS_LI_INODE.to_le_bytes());
+    v[at::TYPE..at::TYPE + 2].copy_from_slice(&XFS_LI_INODE.to_le_bytes());
     // The item spans two operations: this format, then the core.
-    v[2..4].copy_from_slice(&2u16.to_le_bytes());
-    v[4..8].copy_from_slice(&fields.to_le_bytes());
-    v[16..24].copy_from_slice(&ino.to_le_bytes());
+    v[at::SIZE..at::SIZE + 2].copy_from_slice(&2u16.to_le_bytes());
+    v[at::FIELDS..at::FIELDS + 4].copy_from_slice(&fields.to_le_bytes());
+    v[at::INO..at::INO + 8].copy_from_slice(&ino.to_le_bytes());
+    v[at::BLKNO..at::BLKNO + 8].copy_from_slice(&buffer.blkno.to_le_bytes());
+    v[at::LEN..at::LEN + 4].copy_from_slice(&buffer.len.to_le_bytes());
+    v[at::BOFFSET..at::BOFFSET + 4].copy_from_slice(&buffer.boffset.to_le_bytes());
     v
 }
 
@@ -157,7 +206,11 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
     header[24..32].copy_from_slice(&placement.tail_lsn.to_be_bytes());
     header[36..40].copy_from_slice(&placement.prev_block.to_be_bytes());
     header[40..44].copy_from_slice(&num_logops.to_be_bytes());
-    header[300..304].copy_from_slice(&XLOG_FMT_LINUX_LE.to_be_bytes());
+    // `h_fmt`, and it must be this machine's order rather than a
+    // constant: the items below are memory images, and a reader on the
+    // other byte order has to be able to tell that it may not replay
+    // them. `crate::log::inspect` refuses on exactly this field.
+    header[300..304].copy_from_slice(&crate::log::format::native().to_be_bytes());
     header[304..320].copy_from_slice(&placement.uuid);
     header[320..324].copy_from_slice(&placement.iclog_size.to_be_bytes());
 
@@ -219,7 +272,7 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
 ///   they are a pair of 32-bit halves, which swap differently.
 /// - `nrext64` moves the data-extent count to offset 24 as a 64-bit
 ///   field and the attribute count to 76, leaving 80 as padding.
-pub fn log_dinode_from_disk(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+pub fn log_dinode_from_disk(raw: &[u8]) -> std::result::Result<Vec<u8>, &'static str> {
     if raw.len() < V2_LOG_DINODE_SIZE {
         return Err("inode is shorter than a v2 core");
     }
@@ -363,5 +416,222 @@ fn field_layout(version: u8, bigtime: bool, nrext64: bool) -> &'static [(usize, 
         (true, true, true) => shape!(v3_bt_nr, &[V3_TAIL, times, counts].concat()),
         (true, false, false) => shape!(v3_lt, &[V3_TAIL, times, counts].concat()),
         (true, false, true) => shape!(v3_lt_nr, &[V3_TAIL, times, counts].concat()),
+    }
+}
+
+/// The transaction header's type field.
+///
+/// It read `0x28` in all 53 transactions measured, across twelve
+/// different filesystem operations, so it does not identify the
+/// operation. It identifies the checkpoint — see
+/// [`crate::log_write`]'s note on what a record actually contains.
+pub const XFS_TRANS_CHECKPOINT: u32 = 0x28;
+
+/// Write one checkpoint into the log at `head`.
+///
+/// Returns the sequence number the record was given, which is what
+/// orders it against everything already there.
+///
+/// # What this does not do
+///
+/// It does not wrap. A record that will not fit between `head.block`
+/// and the end of the ring is refused rather than split, because the
+/// two halves would need separate cycle numbers and a reader that gets
+/// that wrong replays a record that was never committed. A log with
+/// room only past the wrap therefore reports full.
+///
+/// It also does not move the tail. `h_tail_lsn` is set to the record's
+/// own sequence number, which is correct precisely while this is the
+/// only outstanding checkpoint — the case a driver that commits one
+/// operation at a time is always in, and a claim that stops being true
+/// the moment it commits two without an intervening replay.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the record does not fit before the
+/// wrap or exceeds the in-core buffer size, and [`Error::Io`] from the
+/// device.
+pub fn append_at(
+    device: &dyn fs_core::BlockDevice,
+    sb: &Superblock,
+    head: &Head,
+    tid: u32,
+    ops: &[Op],
+) -> Result<u64> {
+    let payload = payload(tid, ops);
+
+    // The kernel sizes its in-core buffers from `h_size` and reads a
+    // record into one of them, so a payload larger than a buffer less
+    // its header block cannot be read back however well it is written.
+    let max_payload = head.iclog_size as usize - BBSIZE;
+    if payload.len() > max_payload {
+        return Err(Error::UnsupportedFeature(format!(
+            "the checkpoint is {} bytes and the log's records hold at most {max_payload}; \
+             splitting one across records is not implemented",
+            payload.len()
+        )));
+    }
+
+    let record_blocks = 1 + payload.len().div_ceil(BBSIZE);
+    if record_blocks > head.free_blocks as usize {
+        return Err(Error::UnsupportedFeature(format!(
+            "the checkpoint needs {record_blocks} basic blocks and only {} remain before \
+             the log wraps; writing across the wrap is not implemented",
+            head.free_blocks
+        )));
+    }
+
+    let lsn = (u64::from(head.cycle) << 32) | u64::from(head.block);
+    let placement = Placement {
+        block: head.block,
+        cycle: head.cycle,
+        prev_block: head.prev_block,
+        tail_lsn: lsn,
+        uuid: sb.uuid,
+        iclog_size: head.iclog_size,
+    };
+    let bytes = encode_record(&placement, ops.len() as u32, &payload);
+
+    let at = sb.fsblock_offset(sb.logstart) + u64::from(head.block) * BBSIZE as u64;
+    device.write_at(at, &bytes)?;
+    device.flush()?;
+    Ok(lsn)
+}
+
+/// Find the head and write one checkpoint there.
+///
+/// `build` receives the transaction id, because the id has to be woven
+/// into every operation and is derived from where the record lands —
+/// which is not known until the head has been found.
+///
+/// # Errors
+///
+/// As [`crate::log::head`] and [`append_at`].
+pub fn append<F>(device: &dyn fs_core::BlockDevice, sb: &Superblock, build: F) -> Result<u64>
+where
+    F: FnOnce(u32) -> Vec<Op>,
+{
+    let head = crate::log::head(device, sb)?;
+    let tid = transaction_id(&head);
+    append_at(device, sb, &head, tid, &build(tid))
+}
+
+/// A transaction id for a checkpoint written at `head`.
+///
+/// The id only has to tie a checkpoint's operations to each other and
+/// differ from its neighbours', so deriving it from the position gives
+/// both properties without a counter to keep. The high bit is set so it
+/// can never come out zero, which the kernel treats as no transaction at
+/// all.
+fn transaction_id(head: &Head) -> u32 {
+    0x8000_0000 | (head.cycle.rotate_left(16) ^ head.block) & 0x7fff_ffff
+}
+
+impl Filesystem {
+    /// Log a new core for `ino` without writing it to the inode itself.
+    ///
+    /// `disk_core` is the core in its **on-disk** big-endian form, as
+    /// [`Filesystem::read_inode_raw`] returns it; the conversion to
+    /// what the log stores happens here.
+    ///
+    /// The inode on disk is deliberately left alone. That is what the
+    /// log is for: the record is the durable statement of the change,
+    /// and whatever mounts the filesystem next applies it. It also makes
+    /// the operation checkable — if the core on disk changes, something
+    /// replayed the record, and if it does not, nothing did.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
+    /// and as [`append`] otherwise.
+    pub fn log_inode_core(&self, ino: u64, disk_core: &[u8]) -> Result<u64> {
+        let Some(device) = self.writable.as_ref() else {
+            return Err(Error::ReadOnly);
+        };
+        let core = log_dinode_from_disk(disk_core).map_err(|why| {
+            Error::UnsupportedFeature(format!("inode {ino} cannot be logged: {why}"))
+        })?;
+        let buffer =
+            InodeBuffer::containing(self.inode_offset(ino)?, self.sb.inode_cluster_bytes());
+
+        append(device.as_ref(), &self.sb, |tid| {
+            vec![
+                Op {
+                    flags: XLOG_START_TRANS,
+                    data: Vec::new(),
+                },
+                Op {
+                    flags: 0,
+                    data: trans_header(tid, XFS_TRANS_CHECKPOINT, 2),
+                },
+                Op {
+                    flags: 0,
+                    data: inode_log_format(ino, XFS_ILOG_CORE, &buffer),
+                },
+                Op {
+                    flags: 0,
+                    data: core,
+                },
+                Op {
+                    flags: XLOG_COMMIT_TRANS,
+                    data: Vec::new(),
+                },
+            ]
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The buffer is the inode's address truncated to a whole cluster,
+    /// with the remainder becoming the offset inside it — and the
+    /// truncation is against the device, not the allocation group.
+    #[test]
+    fn the_cluster_contains_the_inode_at_its_own_offset() {
+        // 16 KiB clusters: what a v5 filesystem with 512-byte inodes has.
+        const CLUSTER: u32 = 16384;
+
+        for (at, blkno, boffset) in [
+            (0x10000u64, 128u64, 0u32), // exactly on a cluster boundary
+            (0x10a00, 128, 2560),       // the 6th inode of that cluster
+            (0x13e00, 128, 15872),      // the last inode that still fits
+            (0x14000, 160, 0),          // the next cluster along
+        ] {
+            let got = InodeBuffer::containing(at, CLUSTER);
+            assert_eq!(
+                got,
+                InodeBuffer {
+                    blkno,
+                    len: CLUSTER / BBSIZE as u32,
+                    boffset,
+                },
+                "inode at {at:#x}"
+            );
+            assert_eq!(
+                got.blkno * BBSIZE as u64 + u64::from(got.boffset),
+                at,
+                "the buffer and the offset within it must add back up to the inode"
+            );
+        }
+    }
+
+    /// An identifier that ties a checkpoint's operations together, and
+    /// which the kernel treats as absent if it is zero.
+    #[test]
+    fn a_transaction_id_is_never_zero() {
+        for cycle in [0u32, 1, 0xffff_ffff] {
+            for block in [0u32, 1, 0xffff_ffff] {
+                let head = Head {
+                    block,
+                    cycle,
+                    prev_block: 0,
+                    free_blocks: 1024,
+                    iclog_size: 32768,
+                };
+                assert_ne!(transaction_id(&head), 0, "cycle {cycle}, block {block}");
+            }
+        }
     }
 }

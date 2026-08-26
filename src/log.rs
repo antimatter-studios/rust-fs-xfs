@@ -187,6 +187,8 @@ struct Record {
     /// first, which is exactly the intended ordering.
     lsn: u64,
     num_logops: u32,
+    /// `h_len` — payload bytes following the header blocks.
+    len: u32,
     /// Basic blocks this record's header occupies before its data.
     header_blocks: u64,
     /// The record's header block, kept so its format field can be
@@ -211,13 +213,7 @@ pub fn inspect(device: &dyn BlockRead, sb: &Superblock) -> Result<LogState> {
         ));
     }
 
-    let log_start = sb.fsblock_offset(sb.logstart);
-    let log_bytes = u64::from(sb.logblocks) * u64::from(sb.blocksize);
-    if log_bytes == 0 {
-        return Err(Error::BadSuperblock(
-            "superblock places an internal log of zero length".into(),
-        ));
-    }
+    let (log_start, log_bytes) = extent(sb)?;
 
     let Some(newest) = scan_for_newest_record(device, sb, log_start, log_bytes)? else {
         // No record anywhere in the ring. A log that has never been
@@ -239,7 +235,9 @@ pub fn inspect(device: &dyn BlockRead, sb: &Superblock) -> Result<LogState> {
     let fmt = be32(&newest.header, offsets::FMT);
     if fmt != format::native() {
         return Err(Error::UnsupportedFeature(format!(
-            "the log was written in format {fmt}, and this machine writes              {}; a log holding unapplied records can only be read by a machine              of matching byte order",
+            "the log was written in format {fmt}, and this machine writes {}; a log \
+             holding unapplied records can only be read by a machine of matching byte \
+             order",
             format::native()
         )));
     }
@@ -263,6 +261,124 @@ pub fn inspect(device: &dyn BlockRead, sb: &Superblock) -> Result<LogState> {
     } else {
         Ok(LogState::NeedsReplay)
     }
+}
+
+/// Where the log lives on the device, as (byte offset, byte length).
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for an external log, whose blocks this
+/// driver has no handle for, and [`Error::BadSuperblock`] for a length
+/// of zero, which no filesystem has.
+fn extent(sb: &Superblock) -> Result<(u64, u64)> {
+    if !sb.has_internal_log() {
+        return Err(Error::UnsupportedFeature(
+            "the log is on a separate device, so this driver cannot address it".into(),
+        ));
+    }
+    let bytes = u64::from(sb.logblocks) * u64::from(sb.blocksize);
+    if bytes == 0 {
+        return Err(Error::BadSuperblock(
+            "superblock places an internal log of zero length".into(),
+        ));
+    }
+    Ok((sb.fsblock_offset(sb.logstart), bytes))
+}
+
+/// Where the next record would go, and what it has to say about the one
+/// before it.
+///
+/// The log is a ring, and a record's position in it is not recorded
+/// anywhere: it is worked out from the newest record's own start, header
+/// length and payload length. That makes this the counterpart of
+/// [`inspect`] — the same scan, reporting where writing may continue
+/// rather than what the last writer left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head {
+    /// Basic block within the log at which the next record starts.
+    pub block: u32,
+    /// Cycle the next record belongs to. It increments each time the
+    /// head passes the end of the ring, which is what lets a reader
+    /// order records that sit at lower addresses but were written
+    /// later.
+    pub cycle: u32,
+    /// Where the newest record starts, for the next one's
+    /// `h_prev_block`, or `u32::MAX` when the log holds no records.
+    pub prev_block: u32,
+    /// Basic blocks between [`Head::block`] and the end of the ring.
+    ///
+    /// A record may not straddle the wrap, so this — not the log's total
+    /// free space — is what a record has to fit inside.
+    pub free_blocks: u32,
+    /// The in-core log buffer size every record repeats in `h_size`. A
+    /// record's payload may not exceed it, less the header block.
+    pub iclog_size: u32,
+}
+
+/// The `h_size` to assume for a log nothing has ever written to.
+///
+/// The kernel's default, and the only value that can be right when
+/// there is no existing record to read one from. `mkfs` leaves the log
+/// zeroed, so this case is a filesystem being written to for the first
+/// time.
+const DEFAULT_ICLOG_SIZE: u32 = 32 * 1024;
+
+/// Find where the next record may be written.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for an external log and
+/// [`Error::BadSuperblock`] for a log of zero length, as [`inspect`],
+/// plus [`Error::CorruptLog`] if the newest record claims to end beyond
+/// the ring — which is not a head this driver will guess its way past.
+pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
+    let (log_start, log_bytes) = extent(sb)?;
+    let total = (log_bytes / BBSIZE as u64) as u32;
+
+    let Some(newest) = scan_for_newest_record(device, sb, log_start, log_bytes)? else {
+        return Ok(Head {
+            block: 0,
+            cycle: 1,
+            prev_block: u32::MAX,
+            free_blocks: total,
+            iclog_size: DEFAULT_ICLOG_SIZE,
+        });
+    };
+
+    let cycle = (newest.lsn >> 32) as u32;
+    let iclog_size = be32(&newest.header, offsets::SIZE);
+    let data_blocks = u64::from(newest.len).div_ceil(BBSIZE as u64);
+    let next = newest.bb + newest.header_blocks + data_blocks;
+
+    if next > u64::from(total) {
+        return Err(Error::CorruptLog(format!(
+            "the newest log record starts at block {} and claims {} header blocks and \
+             {} bytes, which ends past the {total}-block ring",
+            newest.bb, newest.header_blocks, newest.len
+        )));
+    }
+
+    // Exactly at the end is a wrap, not an overrun: the next record
+    // starts over at zero, in the following cycle. That increment is the
+    // whole mechanism by which a reader tells a fresh record at block 0
+    // from the stale one it overwrote.
+    if next == u64::from(total) {
+        return Ok(Head {
+            block: 0,
+            cycle: cycle + 1,
+            prev_block: newest.bb as u32,
+            free_blocks: total,
+            iclog_size,
+        });
+    }
+
+    Ok(Head {
+        block: next as u32,
+        cycle,
+        prev_block: newest.bb as u32,
+        free_blocks: total - next as u32,
+        iclog_size,
+    })
 }
 
 /// Walk the ring and return the record with the greatest sequence
@@ -302,6 +418,7 @@ fn scan_for_newest_record(
                 bb,
                 lsn,
                 num_logops: be32(block, offsets::NUM_LOGOPS),
+                len: be32(block, offsets::LEN),
                 header_blocks: header_blocks(block),
                 header: block.to_vec(),
             });
@@ -415,6 +532,87 @@ mod tests {
         let mut b = dev.0.lock().unwrap();
         let at = (log_at + (bb + 1) * BBSIZE as u64) as usize;
         b[at + op_offsets::FLAGS] = flags;
+    }
+
+    /// Total basic blocks in the test log, so the wrap arithmetic below
+    /// is checkable rather than asserted against a number.
+    const RING_BLOCKS: u32 = LOGBLOCKS * BLOCKSIZE / BBSIZE as u32;
+
+    /// Overwrite a record's `h_len`, to place its end precisely.
+    fn set_len(dev: &MemDev, log_at: u64, bb: u64, len: u32) {
+        let mut b = dev.0.lock().unwrap();
+        let at = (log_at + bb * BBSIZE as u64) as usize;
+        b[at + offsets::LEN..at + offsets::LEN + 4].copy_from_slice(&len.to_be_bytes());
+    }
+
+    /// Nothing written yet: the first record goes to the start of the
+    /// ring, in cycle 1. Cycle 0 is not used — a zeroed block would be
+    /// indistinguishable from a record of cycle 0.
+    #[test]
+    fn the_head_of_an_empty_log_is_its_start() {
+        let sb = sb();
+        let (dev, _) = device(&sb);
+        let h = head(&dev, &sb).unwrap();
+        assert_eq!(h.block, 0);
+        assert_eq!(h.cycle, 1);
+        assert_eq!(h.prev_block, u32::MAX, "there is no previous record");
+        assert_eq!(h.free_blocks, RING_BLOCKS);
+        assert_eq!(h.iclog_size, DEFAULT_ICLOG_SIZE);
+    }
+
+    /// The head is past the newest record's header *and* its payload.
+    /// Reading only the header's own block would put the next record on
+    /// top of the previous one's data.
+    #[test]
+    fn the_head_clears_the_newest_record_entirely() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        put_record(&dev, log_at, 3, 1, 3, 5);
+        set_len(&dev, log_at, 3, 2000); // four basic blocks of payload
+
+        let h = head(&dev, &sb).unwrap();
+        assert_eq!(h.block, 3 + 1 + 4, "one header block, then ceil(2000/512)");
+        assert_eq!(h.cycle, 1);
+        assert_eq!(h.prev_block, 3);
+        assert_eq!(h.free_blocks, RING_BLOCKS - 8);
+        assert_eq!(h.iclog_size, XLOG_HEADER_CYCLE_SIZE);
+    }
+
+    /// A record ending exactly at the ring's end wraps to the start, in
+    /// the next cycle. The increment is the only thing distinguishing a
+    /// fresh record at block 0 from the stale one it overwrites, so
+    /// getting it wrong loses the newer of the two.
+    #[test]
+    fn a_record_ending_at_the_ring_end_wraps_into_the_next_cycle() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        let bb = u64::from(RING_BLOCKS) - 2;
+        put_record(&dev, log_at, bb, 7, bb as u32, 5);
+        set_len(&dev, log_at, bb, 512); // header block + one data block
+
+        let h = head(&dev, &sb).unwrap();
+        assert_eq!(h.block, 0);
+        assert_eq!(h.cycle, 8, "past the end of the ring is a new cycle");
+        assert_eq!(h.prev_block, bb as u32);
+        assert_eq!(h.free_blocks, RING_BLOCKS);
+    }
+
+    /// A record claiming to end past the ring is corruption, not a
+    /// wrap. Treating it as one would put the next record at a position
+    /// derived from a length that is already known to be wrong.
+    #[test]
+    fn a_record_ending_past_the_ring_is_refused() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        let bb = u64::from(RING_BLOCKS) - 2;
+        put_record(&dev, log_at, bb, 7, bb as u32, 5);
+        set_len(&dev, log_at, bb, 4096); // eight data blocks, only one fits
+
+        let err = head(&dev, &sb).expect_err("this log cannot be appended to");
+        assert!(
+            matches!(err, Error::CorruptLog(_)),
+            "expected a corrupt-log error, got {err:?}"
+        );
     }
 
     #[test]

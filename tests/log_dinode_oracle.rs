@@ -37,6 +37,7 @@ fn logged_cores_match_the_inodes_on_disk() {
     };
 
     let mut compared = 0usize;
+    let mut skipped_stale = 0usize;
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) != Some("img") {
@@ -140,6 +141,10 @@ fn logged_cores_match_the_inodes_on_disk() {
         }
 
         let mut here = 0usize;
+        // Inodes whose newest visible record is older than the disk.
+        // Counted rather than ignored: if it were ever most of them,
+        // this test would be asserting almost nothing.
+        let mut stale = 0usize;
         for (ino, (_, logged)) in &newest {
             // Read the inode as it now sits on disk.
             let mut raw = vec![0u8; usize::from(sb.inodesize)];
@@ -188,6 +193,28 @@ fn logged_cores_match_the_inodes_on_disk() {
                 b[96..100].fill(0);
                 a[112..120].fill(0);
                 b[112..120].fill(0);
+
+                // The record may simply predate the disk.
+                //
+                // This walk frames operations within a single record, so
+                // a checkpoint whose items spill into the next one is
+                // invisible to it. When that happens the newest record
+                // found for an inode is not the newest there is, and the
+                // disk has moved on — which shows up as a different
+                // ctime and nothing else obviously wrong, and would
+                // otherwise be read as a conversion fault.
+                //
+                // `di_changecount` says so exactly: it counts the
+                // changes to this inode, so a logged value below the
+                // disk's means the two describe different states and
+                // comparing them proves nothing either way.
+                const CHANGECOUNT: usize = 104;
+                let disk = u64::from_ne_bytes(a[CHANGECOUNT..CHANGECOUNT + 8].try_into().unwrap());
+                let log = u64::from_ne_bytes(b[CHANGECOUNT..CHANGECOUNT + 8].try_into().unwrap());
+                if log < disk {
+                    stale += 1;
+                    continue;
+                }
             }
             assert_eq!(
                 a,
@@ -198,9 +225,10 @@ fn logged_cores_match_the_inodes_on_disk() {
             );
             here += 1;
         }
-        if here > 0 {
-            eprintln!("{name}: {here} inodes matched");
+        if here > 0 || stale > 0 {
+            eprintln!("{name}: {here} inodes matched, {stale} records older than disk");
             compared += here;
+            skipped_stale += stale;
         }
     }
 
@@ -208,5 +236,15 @@ fn logged_cores_match_the_inodes_on_disk() {
         eprintln!("no comparable logged inodes — skipping");
         return;
     }
-    eprintln!("{compared} inode cores reproduced from disk");
+    eprintln!("{compared} inode cores reproduced from disk, {skipped_stale} skipped as stale");
+
+    // A conversion fault that happened to shift `di_changecount` would
+    // otherwise be filed as staleness and disappear. Requiring most
+    // comparisons to actually happen keeps that from going quiet.
+    assert!(
+        compared > skipped_stale,
+        "{skipped_stale} of {} logged inodes were skipped as older than the disk, \
+         which is too many for the rest to mean much",
+        compared + skipped_stale
+    );
 }

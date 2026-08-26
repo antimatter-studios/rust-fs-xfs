@@ -442,7 +442,40 @@ pub mod inode_log_format {
         /// at offset 152 of the core operation that follows it. That
         /// agreement is how the core's own `di_ino` was pinned.
         pub const INO: usize = 16;
+        /// `ilf_blkno`, `i64` — the **inode cluster buffer's** address in
+        /// 512-byte basic blocks, not the inode's own.
+        pub const BLKNO: usize = 40;
+        /// `ilf_len`, `i32` — that buffer's length, in basic blocks.
+        pub const LEN: usize = 48;
+        /// `ilf_boffset`, `i32` — the inode's byte offset inside it.
+        pub const BOFFSET: usize = 52;
     }
+
+    /// # Addressing the inode, which is the part that is not obvious
+    ///
+    /// A logged inode never names its own disk address. It names the
+    /// cluster buffer that holds it, and its offset within that buffer:
+    /// [`offsets::BLKNO`], [`offsets::LEN`] and [`offsets::BOFFSET`].
+    /// The cluster's size comes from the geometry, not from the record —
+    /// see `Superblock::inode_cluster_bytes`.
+    ///
+    /// Leaving the three at zero costs more than it looks like it should.
+    /// The record still checksums, the kernel still finds it, trusts it
+    /// and begins recovery — and then fails reading block 0 for 0 bytes,
+    /// refusing the mount with an I/O error that names no inode and no
+    /// record. It is worth recognising that error for what it is.
+    ///
+    /// Measured over 7,260 inode items the kernel wrote, across four
+    /// allocation groups and four geometries:
+    ///
+    /// - `ilf_blkno * 512` is the inode's device offset truncated to a
+    ///   whole cluster — an absolute alignment, not one relative to the
+    ///   allocation group;
+    /// - `ilf_len * 512` is the cluster size, the same for every inode
+    ///   on a filesystem;
+    /// - `ilf_boffset` is exactly the difference between the two, and
+    ///   always less than the cluster.
+    pub mod addressing {}
 
     /// `XFS_ILOG_CORE` in `ilf_fields` — the item logs the inode core,
     /// which then follows as the next operation.
