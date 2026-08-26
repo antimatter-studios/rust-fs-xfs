@@ -42,6 +42,7 @@ pub mod format;
 pub mod fs;
 pub mod group_write;
 pub mod inode;
+pub mod inode_btree;
 pub mod log;
 pub mod log_write;
 pub mod superblock;
