@@ -129,3 +129,68 @@ the same checkpoint never reaches the log at all. That is **inferred**. No case 
 constructed that produced one, so where the boundary lies is unknown — a writer emitting
 one self-contained checkpoint per operation appears never to need them, but that is an
 observation over twelve operations rather than a proof.
+
+
+## The rename record, read off a disk
+
+Measured after the rest of this document, by renaming one file in a two-entry
+short-form directory and dumping the checkpoint. It is here because it is the shape a
+writer needs first, and because reading it settled three things guessing would not
+have.
+
+```
+record: h_len 1024, 8 ops
+  op 0  len   0  flags 0x01   START
+  op 1  len  16               TRANS type 0x28, item-ops 5
+  op 2  len  56               INODE ino 131  ilf_size 3  fields 0x0003  dsize 30
+  op 3  len 176               the directory's core, mode 040755
+  op 4  len  32               the directory's short-form entries
+  op 5  len  56               INODE ino 132  ilf_size 2  fields 0x0001
+  op 6  len 176               the renamed file's core, mode 0100644
+  op 7  len   0  flags 0x02   COMMIT
+```
+
+8 ops, 2 items, 5 item operations — exactly the shape predicted above, which is some
+evidence the table is right about the others too.
+
+### `ilf_fields` has a second bit
+
+`0x0003`, against `0x0001` for the file beside it. So `XFS_ILOG_DDATA` is **`0x02`**:
+the item logs the data fork's inline contents, which follow the core as a third
+operation. `ilf_size` reads 3 rather than 2 for exactly that reason — it counts the
+item's operations.
+
+### `ilf_dsize` is unpadded
+
+30, while the operation carrying the fork is 32 bytes. Operations are padded to a
+multiple of four and the padding is not part of the fork. A writer that sets `dsize`
+from the operation's length is wrong by up to three bytes, in a structure where three
+bytes is most of an entry's header.
+
+### The fork stays big-endian inside a native-endian record
+
+The short-form header read `02 00 00 00 00 80` — a count of 2 and a parent inode of
+128, big-endian — surrounded by a little-endian core. Already known from the logged
+core work; confirmed here in the one place it matters for a writer, which converts the
+core and copies the fork.
+
+### A rename appends rather than replacing
+
+The part that would not have been guessed. Before:
+
+```
+aaaa  offset 0x60  ino 132
+bbbb  offset 0x70  ino 133
+```
+
+after renaming `aaaa` to `cccc`:
+
+```
+bbbb  offset 0x70  ino 133
+cccc  offset 0x80  ino 132
+```
+
+The old entry is removed and a new one appended with a **fresh, higher** offset — even
+though the replacement name is the same length and would have fit exactly where the
+old one was. The offsets increase through the list; they are readdir cookies, not byte
+positions, and reusing one would hand the same cookie to a different entry.
