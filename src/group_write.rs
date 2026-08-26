@@ -63,6 +63,23 @@ pub mod inode {
 ///
 /// The checksum covers the block with its own checksum field zeroed, so
 /// it cannot be computed until everything else is final.
+///
+/// # Why almost nothing here calls this
+///
+/// **A logged block does not carry a correct checksum, and must not.**
+/// Recovery recomputes it when it writes the block out, which is after
+/// the log has been applied — so the checksum in a record is stale by
+/// construction, and the kernel's own records carry stale ones.
+///
+/// Stamping a correct one anyway is not wrong, but it makes the record
+/// *bigger*: the checksum of an allocation-group header sits in a
+/// 128-byte chunk nothing else in the transaction touches, so writing it
+/// turns one dirty run into two and adds an operation to the record. The
+/// kernel's own group-header items are one run in 619 of the 620 in the
+/// corpus, which is what says it does not stamp them either.
+///
+/// Left here because a block written outside a transaction — where
+/// nothing will recompute it — does need one.
 pub fn restamp_crc(buf: &mut [u8], crc_off: usize) {
     buf[crc_off..crc_off + 4].copy_from_slice(&[0; 4]);
     let crc = crc32c_with_zeroed_crc(buf, crc_off);
@@ -104,8 +121,8 @@ pub fn leaf_records(buf: &[u8], numrecs: u16) -> Vec<FreeExtent> {
         .collect()
 }
 
-/// A tree root rewritten to hold `records`, with its count and checksum
-/// brought up to date.
+/// A tree root rewritten to hold `records`, with its count brought up to
+/// date.
 ///
 /// Records past the new count are left as they are rather than cleared.
 /// They are unreachable — `bb_numrecs` says where the records stop — and
@@ -120,7 +137,7 @@ pub fn rebuild_leaf(original: &[u8], records: &[FreeExtent]) -> Vec<u8> {
         out[at..at + 4].copy_from_slice(&record.startblock.to_be_bytes());
         out[at + 4..at + 8].copy_from_slice(&record.blockcount.to_be_bytes());
     }
-    restamp_crc(&mut out, btree::CRC);
+    // The checksum is deliberately left stale; see `restamp_crc`.
     out
 }
 
@@ -191,10 +208,12 @@ mod tests {
         assert_eq!(unchanged.ops().len(), 1);
     }
 
-    /// A rebuilt root carries the new count, the new records, and a
-    /// checksum that covers them.
+    /// A rebuilt root carries the new count and the new records — and
+    /// deliberately *not* a checksum that covers them, because a logged
+    /// block's checksum is recomputed by recovery and stamping one here
+    /// would only make the record bigger.
     #[test]
-    fn a_rebuilt_root_checksums() {
+    fn a_rebuilt_root_carries_the_records_and_a_stale_checksum() {
         let mut original = vec![0u8; 4096];
         original[0..4].copy_from_slice(&0x4142_3342u32.to_be_bytes());
         restamp_crc(&mut original, btree::CRC);
@@ -219,8 +238,18 @@ mod tests {
         assert_eq!(numrecs, 2);
         assert_eq!(leaf_records(&rebuilt, numrecs), records);
 
-        let stored = u32::from_le_bytes(rebuilt[btree::CRC..btree::CRC + 4].try_into().unwrap());
-        assert_eq!(stored, crc32c_with_zeroed_crc(&rebuilt, btree::CRC));
+        // The original's checksum survives untouched: it no longer
+        // matches the block, and that is the point.
+        assert_eq!(
+            rebuilt[btree::CRC..btree::CRC + 4],
+            original[btree::CRC..btree::CRC + 4],
+            "the checksum should be carried across, not recomputed"
+        );
+        assert_ne!(
+            u32::from_le_bytes(rebuilt[btree::CRC..btree::CRC + 4].try_into().unwrap()),
+            crc32c_with_zeroed_crc(&rebuilt, btree::CRC),
+            "and it should no longer cover the block, which is what recovery fixes"
+        );
     }
 
     /// The records past the new count are left alone, so removing one

@@ -52,7 +52,7 @@ use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
 use crate::fs::Filesystem;
 use crate::group_write::{
     agf, btree, changed_chunks, emptied_core, leaf_capacity, leaf_records, rebuild_leaf,
-    restamp_crc, split_fsblock,
+    split_fsblock,
 };
 use crate::log::BBSIZE;
 use crate::log_write::{
@@ -76,6 +76,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
+        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
@@ -197,7 +198,9 @@ impl Filesystem {
         })?;
         new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
         new_agf[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&longest(&by_block).to_be_bytes());
-        restamp_crc(&mut new_agf, agf::CRC);
+        // The checksum is left stale on purpose — recovery recomputes it,
+        // and writing it here would dirty a chunk nothing else touches and
+        // add an operation to the record. See `group_write::restamp_crc`.
 
         // Addresses are in 512-byte basic blocks, absolute on the
         // device. The group header is its second sector.

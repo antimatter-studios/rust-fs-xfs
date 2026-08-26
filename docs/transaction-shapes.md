@@ -19,8 +19,8 @@ against.
 | rename in one directory | 8 | 2 | written, replayed by the kernel |
 | truncate to zero | 11 | 4 | written, replayed by the kernel |
 | write 4 KiB (allocating) | 12 | 4 | written, kernel reads the file back |
-| create empty file | 14 | 5 | not yet — needs the AGI and the inode B+trees |
-| unlink | 14 | 5 | not yet — same, plus the unlinked list |
+| create empty file | 14 | 5 | written, kernel opens and writes the file |
+| unlink | 14 | 5 | not yet — needs the unlinked list |
 | mkdir | 15 | 5 | not yet |
 | shortform to block directory | 23 | 9 | not yet |
 
@@ -38,8 +38,25 @@ other.
 
 Named here so the gap between what is measured and what is written stays visible:
 extents spanning more than one allocation group; a data fork in B+tree format; a
-free-space tree more than one level deep, or a root with no room for another record; a
-file too large for a single extent; real-time files; and v4 filesystems.
+free-space or inode tree more than one level deep, or a root with no room for another
+record; a file too large for a single extent; a group with no free inode, which needs a
+whole new chunk and so needs to allocate blocks; a directory that has outgrown its
+inode; real-time files; and v4 filesystems.
+
+### One checkpoint per mount
+
+A journalled operation writes a record and touches nothing on disk. That is what makes
+each one checkable — a filesystem that came out different is one something replayed —
+but it means a second operation would read the same disk the first one read, as though
+the first had never happened. Two creates in a row hand out the same inode.
+
+It is not only the reads. `h_tail_lsn` is written as the record's own sequence number,
+true precisely while there is one outstanding checkpoint and false the moment there are
+two.
+
+So a mount writes at most one, and the second attempt is refused. Supporting more means
+keeping the changed metadata in memory and building each transaction on the last — a
+dirty-block overlay, which this does not have.
 
 ## The framing fact that changes everything
 

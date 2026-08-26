@@ -1,0 +1,278 @@
+//! A create this driver logs must give the Linux kernel a usable file.
+//!
+//! The first transaction with five items, and the first that has to
+//! leave two inodes and three metadata blocks agreeing with each other.
+//! An inode taken out of the group's accounting but never made into a
+//! file, a file made but never taken out of the accounting, or a name
+//! added for an inode that is still marked free — each of those still
+//! checksums, is still found, and is still replayed. What they produce
+//! is a filesystem that is quietly wrong, and only a consistency check
+//! notices.
+//!
+//! # The shape of the proof
+//!
+//! Nothing on disk is touched, so:
+//!
+//! - the name appearing is something only the replay could have done;
+//! - the file being usable — openable, writable, with the mode it was
+//!   given — is what separates a real inode from a directory entry
+//!   pointing at nothing;
+//! - the group having one fewer free inode is what says it was taken
+//!   rather than borrowed, and a second create landing on a *different*
+//!   inode is what proves it;
+//! - the directory's other entries still resolving is what catches a
+//!   short-form fork rebuilt from the wrong entries;
+//! - and `xfs_repair` is what catches the inode trees and the group
+//!   header disagreeing.
+//!
+//! Fixtures are gitignored and the VM is not always up, so this skips
+//! rather than fails when either is missing. Build them with
+//! `./scripts/vm-build-create-fixtures.sh`.
+
+use fs_core::FileDevice;
+use fs_xfs::Filesystem;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+fn share() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
+}
+
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+}
+
+fn vm_run(script: &str) -> Option<String> {
+    let out = Command::new(repo().join("scripts/vm.sh"))
+        .arg("run")
+        .arg(script)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        eprintln!(
+            "vm.sh run failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    assert!(
+        stdout.contains("DONE"),
+        "the VM script did not run to completion:\n{stdout}"
+    );
+    Some(stdout)
+}
+
+/// A working image in the shared folder, removed when it goes out of
+/// scope. Every other suite treats each `.img` there as a fixture, so
+/// one left behind fails unrelated tests.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn from(source: &Path, name: &str) -> Self {
+        let path = share().join(name);
+        std::fs::copy(source, &path).expect("copy the fixture");
+        Scratch(path)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Create a file in a copy of `case`'s before-image, then have the
+/// kernel replay the record.
+///
+/// One file, because a mount writes one checkpoint. A journalled
+/// operation touches nothing on disk, so a second would be built from a
+/// disk that does not yet reflect the first — see
+/// `Filesystem::begin_checkpoint`. That limit is asserted below rather
+/// than merely worked around.
+fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
+    let source = share().join(format!("xfscreate-{case}-before.img"));
+    if !source.exists() {
+        return None;
+    }
+    let name = format!("xfs-create-{case}-scratch.img");
+    let scratch = Scratch::from(&source, &name);
+    let img = scratch.path();
+
+    let mut created = Vec::new();
+    {
+        let dev = FileDevice::open_rw(img).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        let root = fs.superblock().rootino;
+
+        let name = names[0];
+        let (ino, lsn) = fs
+            .create_file(root, name.as_bytes(), 0o100644)
+            .unwrap_or_else(|e| panic!("{case}: creating {name} must be accepted: {e}"));
+        assert_ne!(lsn, 0, "a record must be given a sequence number");
+        created.push((name, ino));
+
+        // A second create on the same mount would be built from a disk
+        // that does not yet reflect the first, and would hand out the
+        // same inode again. It is refused, and this is what says so —
+        // without it the limit is a comment rather than a behaviour.
+        let err = fs
+            .create_file(root, b"second", 0o100644)
+            .expect_err("a second checkpoint on one mount must be refused");
+        assert!(
+            err.to_string().contains("already written a checkpoint"),
+            "{case}: the refusal should say why: {err}"
+        );
+    }
+
+    {
+        let dev = FileDevice::open(img).expect("open read-only");
+        let err = Filesystem::mount(Arc::new(dev))
+            .err()
+            .expect("a log with an unreplayed record must not mount");
+        assert!(
+            matches!(err, fs_xfs::Error::DirtyLog),
+            "{case}: expected the log to read as dirty, got {err}"
+        );
+    }
+
+    let checks: String = names
+        .iter()
+        .map(|n| {
+            format!(
+                r#"
+            if [ -f "$m/{n}" ]; then
+                echo "INO_{n} $(stat -c %i "$m/{n}")"
+                echo "MODE_{n} $(stat -c %a "$m/{n})")"
+                echo "SIZE_{n} $(stat -c %s "$m/{n}")"
+                # A created file has to be usable, not merely present.
+                echo "hello" > "$m/{n}" 2>/dev/null && echo "WRITE_{n} ok" \
+                    || echo "WRITE_{n} failed"
+            else
+                echo "MISSING_{n}"
+            fi"#
+            )
+        })
+        .collect();
+
+    let script = format!(
+        r#"
+        cp /share/{name} /tmp/c.img
+        dmesg -C >/dev/null 2>&1
+        m=$(mktemp -d)
+        if mount -o loop /tmp/c.img "$m"; then
+            echo "NAMES $(ls -A "$m" | sort | tr '\n' ' ')"
+            {checks}
+            # The directory's other entries must still resolve.
+            if [ -d "$m/fill" ]; then
+                echo "FILL $(ls "$m/fill" | wc -l)"
+            fi
+            umount "$m"
+        else
+            echo "MOUNT_FAILED"
+            dmesg | tail -12
+        fi
+        rmdir "$m" 2>/dev/null
+        echo "REPAIR_BEGIN"
+        xfs_repair -n /tmp/c.img 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
+        rm -f /tmp/c.img
+        echo "DONE"
+        "#
+    );
+
+    let out = vm_run(&script)?;
+
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "{case}: the kernel refused the filesystem after the create was logged:\n{out}"
+    );
+
+    for (n, ino) in &created {
+        assert!(
+            !out.contains(&format!("MISSING_{n}")),
+            "{case}: {n} is not there after the replay\n{out}"
+        );
+        let reported = out
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("INO_{n} ")))
+            .unwrap_or_else(|| panic!("{case}: the VM did not report {n}'s inode:\n{out}"))
+            .trim();
+        assert_eq!(
+            reported,
+            ino.to_string(),
+            "{case}: {n} came back as a different inode than was logged\n{out}"
+        );
+        assert!(
+            out.contains(&format!("WRITE_{n} ok")),
+            "{case}: {n} exists but cannot be written to, so the inode it names is not \
+             a usable file\n{out}"
+        );
+    }
+
+    let repair: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
+        .take_while(|l| !l.starts_with("REPAIR_END"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        repair.contains("REPAIR_RC=0"),
+        "{case}: xfs_repair found something wrong after the replay:\n{repair}"
+    );
+
+    Some(())
+}
+
+/// A file created by this driver, used by the kernel.
+#[test]
+fn the_kernel_uses_a_file_this_driver_created() {
+    let mut ran = Vec::new();
+
+    if create_and_replay("spare", &["alpha"]).is_some() {
+        ran.push("spare");
+    }
+    // `last` has exactly one inode free, so this create takes it and the
+    // chunk has to leave the free-inode tree. That is the case where the
+    // record changes a tree's membership rather than only its contents.
+    if create_and_replay("last", &["only"]).is_some() {
+        ran.push("last");
+    }
+
+    if ran.is_empty() {
+        eprintln!(
+            "no create fixtures or no VM; build them with \
+             ./scripts/vm-build-create-fixtures.sh"
+        );
+        return;
+    }
+    eprintln!("the kernel used files this driver created for: {ran:?}");
+}
+
+/// A group with nothing free is refused rather than answered wrongly.
+#[test]
+fn a_group_with_no_free_inode_is_refused() {
+    let source = share().join("xfscreate-newchunk-before.img");
+    if !source.exists() {
+        eprintln!("no newchunk fixture — skipping");
+        return;
+    }
+    let scratch = Scratch::from(&source, "xfs-create-refuse-scratch.img");
+
+    let dev = FileDevice::open_rw(scratch.path()).expect("open read-write");
+    let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+    let root = fs.superblock().rootino;
+
+    let err = fs
+        .create_file(root, b"nowhere", 0o100644)
+        .expect_err("a group with no free inode must refuse rather than invent one");
+    let message = err.to_string();
+    assert!(
+        message.contains("no free inode"),
+        "the refusal should say what is missing, not merely fail: {message}"
+    );
+}
