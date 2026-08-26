@@ -266,6 +266,38 @@ impl Filesystem {
 
         encode_short_form(parsed, has_ftype, &entries, fork_space)
     }
+
+    /// The directory's fork with `name` taken out.
+    ///
+    /// The entries that remain keep their cookies. A cookie is a
+    /// reader's place in the directory, and shuffling the survivors down
+    /// would move entries a reader part-way through has already passed,
+    /// so it would see them twice.
+    pub(crate) fn short_form_without_entry(
+        &self,
+        parsed: &dir::ShortFormDir,
+        name: &[u8],
+        fork_space: usize,
+    ) -> Result<Vec<u8>> {
+        let has_ftype = self.sb.has_ftype();
+        if !parsed.entries.iter().any(|e| e.name == name) {
+            return Err(Error::NotFound);
+        }
+
+        let entries: Vec<SfEntry> = parsed
+            .entries
+            .iter()
+            .filter(|e| e.name != name)
+            .map(|e| SfEntry {
+                name: &e.name,
+                ino: e.ino,
+                ftype: dir::ftype_to_raw(e.ftype),
+                cookie: e.offset,
+            })
+            .collect();
+
+        encode_short_form(parsed, has_ftype, &entries, fork_space)
+    }
 }
 
 /// One entry, as the encoder below wants it.

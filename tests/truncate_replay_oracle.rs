@@ -136,10 +136,11 @@ fn replay_case(case: &str) -> Option<()> {
 
     let script = format!(
         r#"
-        cp /share/{name} /tmp/t.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/{name} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
-        if mount -o loop /tmp/t.img "$m"; then
+        if mount -o loop,nouuid "$img" "$m"; then
             echo "SIZE $(stat -c %s "$m/victim")"
             echo "BLOCKS $(stat -c %b "$m/victim")"
             # The neighbours must still read back whole. Free space
@@ -160,9 +161,9 @@ fn replay_case(case: &str) -> Option<()> {
         fi
         rmdir "$m" 2>/dev/null
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/t.img 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
-        rm -f /tmp/t.img
+        rm -f "$img"
         echo "DONE"
         "#
     );

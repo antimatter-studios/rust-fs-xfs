@@ -31,7 +31,7 @@ corrupt.
 | Symlinks | inline and remote (`XSLM`), across multiple extents |
 | Extended attributes | on-disk shapes documented; reading not yet |
 | Log replay | not yet — a dirty volume is refused, not silently misread |
-| Log **writing** | inode cores, rename, truncate, allocating write, create |
+| Log **writing** | inode cores, rename, truncate, allocating write, create, unlink |
 | Write path | overwrite in place, plus the journalled operations above |
 
 ### What the write path can do
@@ -46,6 +46,7 @@ record the Linux kernel replays:
 | truncate a file to nothing | 11 | 4 |
 | write into an empty file, allocating | 12 | 4 |
 | create an empty file | 14 | 5 |
+| remove an empty file | 14 | 5 |
 
 Those op and item counts are not this driver's choice. They were measured from
 filesystems the kernel wrote, recorded in `docs/transaction-shapes.md`, and the encoder
@@ -62,8 +63,8 @@ creates in a row would hand out the same inode. The second attempt is refused ra
 than answered wrongly; supporting more needs a dirty-block overlay this does not have.
 
 Each operation also refuses by name what it cannot do rather than attempting it. See
-`docs/transaction-shapes.md` for the list and for the shapes not yet written — unlink
-and mkdir remain.
+`docs/transaction-shapes.md` for the list and for the shapes not yet written — mkdir and
+the short-form-to-block directory conversion remain.
 
 Features recognised in the superblock and gated rather than guessed: `finobt`,
 `rmapbt`, `reflink`, `inobtcnt`, `ftype`, `sparse inodes`, `metadata UUID`, `bigtime`,

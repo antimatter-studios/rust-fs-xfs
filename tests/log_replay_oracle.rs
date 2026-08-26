@@ -208,10 +208,11 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
     // about it, rather than killing the script and looking like an
     // unavailable VM.
     let script = r#"
-        cp /share/xfs-log-replay.img /tmp/r.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/xfs-log-replay.img "$img"
         dmesg -C >/dev/null 2>&1
         mnt=$(mktemp -d)
-        if mount -o loop /tmp/r.img "$mnt"; then
+        if mount -o loop,nouuid "$img" "$mnt"; then
             echo "MODE $(stat -c %a "$mnt")"
             umount "$mnt"
         else
@@ -220,9 +221,9 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
         fi
         rmdir "$mnt" 2>/dev/null
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/r.img 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
-        rm -f /tmp/r.img
+        rm -f "$img"
         echo "DONE"
         "#;
     let Some(out) = vm_run(script) else {

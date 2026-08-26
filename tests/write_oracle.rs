@@ -151,14 +151,15 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
     let script = format!(
         r#"
         set -e
-        cp /share/xfswrite.img /tmp/w.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/xfswrite.img "$img"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/w.img 2>&1 || true
+        xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
         mnt=$(mktemp -d)
-        mount -o ro,loop /tmp/w.img "$mnt"
+        mount -o ro,loop "$img" "$mnt"
         echo "SHA $(sha256sum "$mnt{TARGET}" | cut -d' ' -f1)"
-        umount "$mnt"; rmdir "$mnt"; rm -f /tmp/w.img
+        umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         "#
     );
     let Some(out) = vm_run(&script) else {
@@ -285,16 +286,17 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
     let script = format!(
         r#"
         set -e
-        cp /share/xfsattr.img /tmp/a.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/xfsattr.img "$img"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/a.img 2>&1 || true
+        xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
         mnt=$(mktemp -d)
-        mount -o ro,loop /tmp/a.img "$mnt"
+        mount -o ro,loop "$img" "$mnt"
         echo "MODE $(stat -c%a "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
         echo "MTIME_NS $(stat -c%y "$mnt{TARGET}")"
-        umount "$mnt"; rmdir "$mnt"; rm -f /tmp/a.img
+        umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         "#
     );
     let Some(out) = vm_run(&script) else {
@@ -393,16 +395,17 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
     let script = format!(
         r#"
         set -e
-        cp /share/xfstrunc.img /tmp/t.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/xfstrunc.img "$img"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/t.img 2>&1 || true
+        xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
         mnt=$(mktemp -d)
-        mount -o ro,loop /tmp/t.img "$mnt"
+        mount -o ro,loop "$img" "$mnt"
         echo "SIZE $(stat -c%s "$mnt{TARGET}")"
         echo "BLOCKS $(stat -c%b "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
-        umount "$mnt"; rmdir "$mnt"; rm -f /tmp/t.img
+        umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         "#
     );
     let Some(out) = vm_run(&script) else {

@@ -31,7 +31,7 @@
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::ag::Agi;
 use fs_xfs::error::Result;
-use fs_xfs::inode_btree::{choose_free_inode, walk_from_agi, InodeChunk, Taken, Which};
+use fs_xfs::inode_btree::{choose_free_inode, walk_from_agi, Given, InodeChunk, Taken, Which};
 use fs_xfs::superblock::Superblock;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -242,4 +242,107 @@ fn taking_then_giving_back_leaves_no_trace() {
             "{taken:?} should be undone by {expected:?}, not {given:?}"
         );
     }
+}
+
+/// Giving an inode back reproduces what the kernel's own `rm` did.
+///
+/// The mirror of the create case, and with the interesting case the
+/// other way round: giving one back to a chunk that had **none** free
+/// puts that chunk into the free-inode tree.
+///
+/// A driver that updated the counts and left the tree alone would not
+/// corrupt anything, and nothing would report it — the filesystem would
+/// simply lose an inode, free and correctly recorded as free and
+/// invisible to the tree a create looks in.
+#[test]
+fn giving_an_inode_back_reproduces_what_the_kernel_did() {
+    let mut ran = Vec::new();
+
+    for (case, expected) in [
+        ("spare", Given::ChunkAlreadyHadFree),
+        ("wasfull", Given::ChunkWasFull),
+    ] {
+        let before_path = share().join(format!("xfsunlink-{case}-before.img"));
+        let after_path = share().join(format!("xfsunlink-{case}-after.img"));
+        if !before_path.exists() || !after_path.exists() {
+            continue;
+        }
+
+        let before_dev = FileDevice::open(&before_path).expect("open before");
+        let mut sbb = vec![0u8; 4096];
+        before_dev.read_at(0, &mut sbb).expect("read");
+        let sb = Superblock::parse(&sbb).expect("superblock");
+        let after_dev = FileDevice::open(&after_path).expect("open after");
+
+        // Which inode went away: the one whose bit changed.
+        let (agno, before, after) = changed_group(&before_dev, &after_dev, &sb)
+            .unwrap_or_else(|| panic!("{case}: no group changed, so nothing was removed"));
+
+        let mut predicted = before.all.clone();
+        let mut outcome = None;
+        for (i, (b, a)) in before.all.iter().zip(&after.all).enumerate() {
+            let gained = a.free & !b.free;
+            if gained == 0 {
+                continue;
+            }
+            assert_eq!(
+                gained.count_ones(),
+                1,
+                "{case}: more than one inode was freed, which one `rm` does not do"
+            );
+            let slot = gained.trailing_zeros() as u8;
+            outcome = Some(
+                predicted[i]
+                    .give_back(slot)
+                    .unwrap_or_else(|e| panic!("{case}: {e}")),
+            );
+        }
+        let outcome =
+            outcome.unwrap_or_else(|| panic!("{case}: no inode changed from in-use to free"));
+
+        assert_eq!(
+            outcome, expected,
+            "{case} AG {agno}: giving an inode back gave {outcome:?}, and the fixture is \
+             supposed to exercise {expected:?}"
+        );
+        assert_eq!(
+            predicted, after.all,
+            "{case} AG {agno}: the chunks after giving an inode back do not match what \
+             the kernel produced.\n predicted: {predicted:?}\n kernel:    {:?}",
+            after.all
+        );
+
+        let free: u32 = predicted.iter().map(|c| u32::from(c.freecount)).sum();
+        assert_eq!(
+            free, after.freecount,
+            "{case} AG {agno}: predicted {free} free inodes, the kernel wrote {}",
+            after.freecount
+        );
+
+        // The membership change is the point of the `wasfull` case.
+        let expected_members: BTreeSet<u32> = predicted
+            .iter()
+            .filter(|c| c.freecount > 0)
+            .map(|c| c.startino)
+            .collect();
+        let actual_members: BTreeSet<u32> = after.with_free.iter().map(|c| c.startino).collect();
+        assert_eq!(
+            expected_members, actual_members,
+            "{case} AG {agno}: the free-inode tree does not hold the chunks it should \
+             after the removal"
+        );
+
+        ran.push(case);
+    }
+
+    if ran.is_empty() {
+        eprintln!("no unlink fixtures; build them with ./scripts/vm-build-unlink-fixtures.sh");
+        return;
+    }
+    assert_eq!(
+        ran.len(),
+        2,
+        "only {ran:?} of the two cases were present, so an outcome went unchecked"
+    );
+    eprintln!("both unlink cases match what the kernel wrote");
 }
