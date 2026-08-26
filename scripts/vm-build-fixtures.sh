@@ -26,6 +26,12 @@ GEOMETRIES=(
     "reflink:-m reflink=1,rmapbt=1"
     "bigtime:-m bigtime=1"
     "nocrc:-m crc=0"
+    # A v5 filesystem with sparse inodes turned off. The inode B+tree
+    # record packs a hole mask and a chunk count into the four bytes a v4
+    # record spends on a single free count, and without an image that has
+    # v5 metadata and no sparse inodes there is no way to tell whether
+    # that packing follows the format version or the feature.
+    "nosparse:-m crc=1 -i sparse=0"
 )
 
 # The loop is driven from the host so the geometry list stays in one

@@ -582,6 +582,19 @@ impl Superblock {
         (u64::from(ag) * u64::from(self.agblocks) + u64::from(ag_block)) * u64::from(self.blocksize)
     }
 
+    /// Whether inode chunks may be sparse — that is, whether a chunk of
+    /// 64 inodes may have some of its blocks missing.
+    ///
+    /// This decides how an inode B+tree record is read, and it is the
+    /// **feature** that decides rather than the format version. A v5
+    /// filesystem made with `-i sparse=0` writes the same plain 32-bit
+    /// free count a v4 one does; only with this bit set are those four
+    /// bytes a hole mask, a chunk count and an 8-bit free count. See
+    /// [`crate::inode_btree`].
+    pub fn has_sparse_inodes(&self) -> bool {
+        self.features_incompat & incompat::SPINODES != 0
+    }
+
     /// Whether the free inode B+tree is present.
     pub fn has_finobt(&self) -> bool {
         self.features_ro_compat & ro_compat::FINOBT != 0
