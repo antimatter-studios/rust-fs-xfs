@@ -87,14 +87,24 @@ pub struct Op {
 
 /// The transaction header that opens every transaction's items.
 ///
-/// `num_items` counts log items, not operations — an inode item is one
-/// item spanning two operations.
-pub fn trans_header(tid: u32, kind: u32, num_items: u32) -> Vec<u8> {
+/// `item_ops` counts **operations belonging to items**, not items, and
+/// not the START and COMMIT that bracket them. An inode item spans two
+/// operations and contributes two.
+///
+/// This is worth stating because the natural reading of the field's
+/// name is wrong, and nothing catches it: a record with the wrong count
+/// still encodes, still checksums, and is simply discarded on replay.
+/// The arithmetic settles it — a create is 14 operations, START and
+/// COMMIT and the header included, and its count reads 11 while the
+/// transaction carries only 5 items.
+///
+/// For a lone inode-core change — format op plus core — the count is 2.
+pub fn trans_header(tid: u32, kind: u32, item_ops: u32) -> Vec<u8> {
     let mut v = Vec::with_capacity(TRANS_HEADER_SIZE);
     v.extend_from_slice(&XFS_TRANS_HEADER_MAGIC.to_le_bytes());
     v.extend_from_slice(&kind.to_le_bytes());
     v.extend_from_slice(&tid.to_le_bytes());
-    v.extend_from_slice(&num_items.to_le_bytes());
+    v.extend_from_slice(&item_ops.to_le_bytes());
     v
 }
 
