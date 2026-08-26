@@ -62,6 +62,7 @@ fn errno_for(e: &Error) -> c_int {
         | Error::BadSuperblock(_)
         | Error::ChecksumMismatch { .. }
         | Error::BlockIdentityMismatch { .. }
+        | Error::CorruptLog(_)
         | Error::DirtyLog
         | Error::Io(_) => libc_eio(),
     }

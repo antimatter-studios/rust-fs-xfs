@@ -84,17 +84,26 @@ cargo test -- --ignored    # adds tests that shell out to xfsprogs (Linux)
 arm64 under QEMU, hardware-accelerated via HVF, so there is no emulation penalty:
 
 ```sh
-./scripts/vm.sh up               # boot (first run provisions)
-./scripts/vm-build-fixtures.sh   # build the geometry matrix into .vm-share/
+./scripts/install-host-tools.sh      # what the VM needs on this machine
+./scripts/vm.sh up                   # boot (first run provisions)
+./scripts/vm-build-fixtures.sh       # the geometry matrix, for the superblock tests
+./scripts/vm-build-log-fixtures.sh   # populated filesystems, for the log tests
 cargo test --test oracle_vm_fixtures -- --nocapture
 ```
+
+The two fixture scripts build different things. `vm-build-fixtures.sh` formats a
+filesystem per geometry and never mounts it, which is what the superblock and inode
+parsers need. `vm-build-log-fixtures.sh` mounts, writes and unmounts, so the log keeps
+the records that were written along the way — a log with nothing in it cannot disagree
+with us about how an item is written.
 
 The comparison runs on the host, so the VM is only needed when fixtures are
 regenerated — not on every `cargo test`. In CI no VM is involved at all: GitHub's Linux
 runners are already Linux and build the same matrix natively.
 
-Prerequisites: `brew install qemu virtiofsd`, plus
-`vagrant plugin install vagrant-qemu-christhomas vagrant-notify-forwarder-christhomas`.
+Prerequisites are installed by `./scripts/install-host-tools.sh`, which also says what
+each is for. `vm.sh` checks them before every boot, so a missing one is reported with
+the command that fixes it rather than as a failure to start.
 
 Other `vm.sh` verbs: `run <cmd>`, `share`, `put <file>`, `down`, `destroy`.
 

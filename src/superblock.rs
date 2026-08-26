@@ -500,6 +500,48 @@ impl Superblock {
 
     /// Whether the log lives inside the data section. An external log
     /// device is not addressable through the block device we were given.
+    /// Bytes in one inode cluster — the unit inodes are read and
+    /// written in, and the buffer a logged inode addresses.
+    ///
+    /// A logged inode does not name its own address. It names the
+    /// cluster buffer holding it and its offset inside that buffer, so
+    /// a writer that gets this wrong produces a record the kernel
+    /// accepts, starts replaying, and then fails on with an I/O error
+    /// against block zero.
+    ///
+    /// # The rule
+    ///
+    /// The base is 8 KiB. On v5, where inodes carry the v3 core, it is
+    /// scaled by how many 256-byte minimum inodes fit in one of this
+    /// filesystem's — so a 512-byte inode doubles it and a 2 KiB inode
+    /// takes it to 64 KiB. The result is then truncated to a whole
+    /// number of filesystem blocks, since a cluster is read as blocks.
+    ///
+    /// Measured, not assumed: 7,260 inode items the kernel wrote across
+    /// four allocation groups and four geometries, every one of them
+    /// naming a buffer of exactly this size, aligned to it, with the
+    /// inode's offset inside it accounted for to the byte.
+    ///
+    /// Untested at a 64 KiB block size, where the truncation would take
+    /// a smaller cluster to zero blocks and the clamp below applies —
+    /// mounting such a filesystem needs a kernel with matching pages,
+    /// which the oracle does not have.
+    pub fn inode_cluster_bytes(&self) -> u32 {
+        /// `XFS_INODE_BIG_CLUSTER_SIZE`.
+        const BASE: u32 = 8192;
+        /// `XFS_DINODE_MIN_SIZE` — the smallest inode the format allows,
+        /// and so the unit the scaling above is expressed in.
+        const MIN_INODE: u32 = 256;
+
+        let raw = if self.is_v5() {
+            BASE * (u32::from(self.inodesize) / MIN_INODE)
+        } else {
+            BASE
+        };
+        let blocks = (raw / self.blocksize).max(1);
+        blocks * self.blocksize
+    }
+
     pub fn has_internal_log(&self) -> bool {
         self.logstart != 0
     }
@@ -664,6 +706,54 @@ mod tests {
         let crc = crc32c_with_zeroed_crc(&b, SB_CRC_OFFSET);
         b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+
+    /// Rebuild a v5 superblock with a different inode size, so the rule
+    /// that scales the cluster can be exercised at more than one point.
+    fn v5_with_inodesize(inodesize: u16, blocksize: u32) -> Superblock {
+        let mut b = v4_superblock();
+        b[100..102].copy_from_slice(&5u16.to_be_bytes());
+        b[4..8].copy_from_slice(&blocksize.to_be_bytes());
+        b[104..106].copy_from_slice(&inodesize.to_be_bytes());
+        b[106..108].copy_from_slice(&((blocksize / u32::from(inodesize)) as u16).to_be_bytes());
+        b[120] = blocksize.trailing_zeros() as u8;
+        b[122] = inodesize.trailing_zeros() as u8;
+        b[123] = (blocksize / u32::from(inodesize)).trailing_zeros() as u8;
+        let crc = crc32c_with_zeroed_crc(&b, SB_CRC_OFFSET);
+        b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        Superblock::parse(&b).expect("superblock")
+    }
+
+    /// The cluster is 8 KiB scaled by how many minimum-size inodes fit
+    /// in one of this filesystem's, then truncated to whole blocks.
+    ///
+    /// The three v5 cases are the ones the oracle confirms against
+    /// filesystems the kernel wrote; they are repeated here so the rule
+    /// is still covered where there are no fixtures to read.
+    #[test]
+    fn the_inode_cluster_scales_with_the_inode_size() {
+        for (blocksize, inodesize, expect) in [
+            (4096u32, 512u16, 16384u32),
+            (1024, 512, 16384),
+            (4096, 1024, 32768),
+            (4096, 2048, 65536),
+        ] {
+            let sb = v5_with_inodesize(inodesize, blocksize);
+            assert_eq!(
+                sb.inode_cluster_bytes(),
+                expect,
+                "blocksize {blocksize}, inodesize {inodesize}"
+            );
+        }
+    }
+
+    /// v4 does not scale: its inodes carry the older core, and the
+    /// cluster stays at the 8 KiB base.
+    #[test]
+    fn a_v4_inode_cluster_does_not_scale() {
+        let sb = Superblock::parse(&v4_superblock()).unwrap();
+        assert!(!sb.is_v5());
+        assert_eq!(sb.inode_cluster_bytes(), 8192);
     }
 
     #[test]
