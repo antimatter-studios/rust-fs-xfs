@@ -7,6 +7,40 @@ transactions, 1694 ops.
 This exists so a log writer knows what it must emit, and so the next person does not
 have to measure it again.
 
+## What is written now
+
+Three of these shapes are implemented, and each came out matching the measurement
+without being fitted to it — the op counts, the item counts and the block addresses
+below were all predictions this document made before there was any code to check them
+against.
+
+| shape | ops | items | state |
+|---|---|---|---|
+| rename in one directory | 8 | 2 | written, replayed by the kernel |
+| truncate to zero | 11 | 4 | written, replayed by the kernel |
+| write 4 KiB (allocating) | 12 | 4 | written, kernel reads the file back |
+| create empty file | 14 | 5 | not yet — needs the AGI and the inode B+trees |
+| unlink | 14 | 5 | not yet — same, plus the unlinked list |
+| mkdir | 15 | 5 | not yet |
+| shortform to block directory | 23 | 9 | not yet |
+
+The two allocator shapes share their machinery, since freeing an extent and allocating
+one are the same work in opposite directions. What differs is which way the records
+move, and one thing that has no counterpart in truncating: a write has to put the file's
+bytes somewhere and point an extent record at them.
+
+Both were checked the same way — the record is written and nothing on disk is touched,
+so a filesystem that changed is one the kernel replayed. `xfs_repair -n` afterwards is
+what catches free-space trees that are plausible on their own and inconsistent with each
+other.
+
+### What the implementations refuse
+
+Named here so the gap between what is measured and what is written stays visible:
+extents spanning more than one allocation group; a data fork in B+tree format; a
+free-space tree more than one level deep, or a root with no room for another record; a
+file too large for a single extent; real-time files; and v4 filesystems.
+
 ## The framing fact that changes everything
 
 **A log record does not contain a transaction. It contains a CIL checkpoint** — the
