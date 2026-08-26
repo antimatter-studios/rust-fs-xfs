@@ -28,11 +28,12 @@
 use crate::ag::{Agf, Agi};
 use crate::bmbt;
 use crate::dir::{self, DirEntry};
+use crate::endian::{be32, be64, le32, uuid_at};
 use crate::error::{Error, Result};
 use crate::extent::{self, Extent};
 use crate::inode::{Format, Inode};
 use crate::log;
-use crate::superblock::Superblock;
+use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 use fs_core::{BlockDevice, BlockRead};
 use std::sync::Arc;
 
@@ -363,11 +364,147 @@ impl Filesystem {
     }
 
     /// Resolve a symbolic link's target.
+    ///
+    /// # Why this is not just reading the file
+    ///
+    /// A short target lives inline in the inode and is nothing but the
+    /// bytes. A long one is stored in filesystem blocks, and on v5 each
+    /// of those blocks begins with a 56-byte self-describing header. The
+    /// target is the blocks' contents *with those headers removed*.
+    ///
+    /// Reading it as a file instead fails quietly. `di_size` is the
+    /// target's length rather than the blocks' length, so taking
+    /// `di_size` bytes from the start yields something of exactly the
+    /// right length that begins `XSLM` and stops early — a plausible
+    /// path, and the wrong one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotAFile`] if `inode` is not a symlink, and
+    /// [`Error::ChecksumMismatch`] or [`Error::BlockIdentityMismatch`]
+    /// for a v5 block that fails its own header — the same treatment
+    /// every other self-describing structure gets.
     pub fn read_link(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<u8>> {
+        use crate::format::symlink::{self as sym, offsets as at};
+
         if !inode.is_symlink() {
             return Err(Error::NotAFile);
         }
-        self.read_file(inode, raw)
+        let want = inode.size as usize;
+        if want > sym::XFS_SYMLINK_MAXLEN {
+            return Err(Error::BadSuperblock(format!(
+                "inode {} is a symlink claiming a {want}-byte target, past the \
+                 {}-byte maximum",
+                inode.ino,
+                sym::XFS_SYMLINK_MAXLEN
+            )));
+        }
+        // Short targets are inline, with no header and no block to read.
+        if inode.format == Format::Local {
+            return self.read_file(inode, raw);
+        }
+
+        // The unit is the extent, not the block. Each contiguous run of
+        // blocks is one buffer with one header at its front, and that
+        // header describes the whole run — so walking block by block
+        // finds a header where the target's own continuation is.
+        let v5 = self.sb.is_v5();
+        let blocksize = u64::from(self.sb.blocksize);
+        let mut out = Vec::with_capacity(want);
+
+        for e in self.data_extents(inode, raw)? {
+            if out.len() >= want {
+                break;
+            }
+            if e.is_unwritten() {
+                return Err(Error::BadSuperblock(format!(
+                    "inode {}: a symlink's target is in an unwritten extent, which holds \
+                     no target to read",
+                    inode.ino
+                )));
+            }
+            let bytes = (e.blockcount * blocksize) as usize;
+            let disk = self.block_offset(e.startblock);
+            let mut buf = vec![0u8; bytes];
+            self.device.read_at(disk, &mut buf)?;
+
+            let body = if v5 {
+                self.verify_symlink_block(&buf, inode.ino, disk, out.len())?;
+                let holds = be32(&buf, at::BYTES) as usize;
+                let end = sym::XFS_SYMLINK_HDR_SIZE + holds.min(sym::buf_space(bytes, true));
+                &buf[sym::XFS_SYMLINK_HDR_SIZE..end]
+            } else {
+                &buf[..]
+            };
+            let take = body.len().min(want - out.len());
+            out.extend_from_slice(&body[..take]);
+        }
+
+        if out.len() != want {
+            return Err(Error::BadSuperblock(format!(
+                "inode {}: the symlink's extents hold {} bytes of a {want}-byte target",
+                inode.ino,
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Check a v5 symlink block says it is what was asked for.
+    ///
+    /// The checksum catches corrupted bits; the owner, address and
+    /// position catch an intact block that came from somewhere else —
+    /// the same division of labour as every other v5 structure here.
+    fn verify_symlink_block(
+        &self,
+        buf: &[u8],
+        ino: u64,
+        disk_offset: u64,
+        so_far: usize,
+    ) -> Result<()> {
+        use crate::format::symlink::{offsets as at, XFS_SYMLINK_MAGIC};
+
+        const WHAT: &str = "symlink block";
+        let block = disk_offset / u64::from(self.sb.blocksize);
+
+        if be32(buf, at::MAGIC) != XFS_SYMLINK_MAGIC {
+            return Err(Error::BlockIdentityMismatch {
+                what: WHAT,
+                expected: u64::from(XFS_SYMLINK_MAGIC),
+                found: u64::from(be32(buf, at::MAGIC)),
+            });
+        }
+        // Over the whole buffer — every block of the extent, not just
+        // the one the header sits in.
+        if crc32c_with_zeroed_crc(buf, at::CRC) != le32(buf, at::CRC) {
+            return Err(Error::ChecksumMismatch { what: WHAT, block });
+        }
+        if uuid_at(buf, at::UUID) != self.sb.uuid {
+            return Err(Error::BlockIdentityMismatch {
+                what: WHAT,
+                expected: block,
+                found: block,
+            });
+        }
+        if be64(buf, at::OWNER) != ino {
+            return Err(Error::BlockIdentityMismatch {
+                what: WHAT,
+                expected: ino,
+                found: be64(buf, at::OWNER),
+            });
+        }
+        // `sl_offset` is where this block's bytes belong in the target,
+        // so it must be exactly what has been gathered already. A block
+        // out of order would otherwise assemble a target that is the
+        // right length and the wrong path.
+        if be32(buf, at::OFFSET) as usize != so_far {
+            return Err(Error::BlockIdentityMismatch {
+                what: WHAT,
+                expected: so_far as u64,
+                found: u64::from(be32(buf, at::OFFSET)),
+            });
+        }
+        Ok(())
     }
 
     /// List a directory's entries.
