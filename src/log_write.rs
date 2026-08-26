@@ -153,6 +153,25 @@ pub fn inode_log_format(ino: u64, fields: u32, buffer: &InodeBuffer) -> Vec<u8> 
     v
 }
 
+/// `xfs_inode_log_format` for an item that logs a data fork too.
+///
+/// `dsize` is the fork's own length, not its operation's — the operation
+/// is padded to four bytes and this field is not.
+pub fn inode_log_format_with_fork(
+    ino: u64,
+    fields: u32,
+    buffer: &InodeBuffer,
+    dsize: u16,
+) -> Vec<u8> {
+    use crate::format::log_items::inode_log_format::offsets as at;
+
+    let mut v = inode_log_format(ino, fields, buffer);
+    // Three operations: this format, the core, then the fork.
+    v[at::SIZE..at::SIZE + 2].copy_from_slice(&3u16.to_le_bytes());
+    v[at::DSIZE..at::DSIZE + 2].copy_from_slice(&dsize.to_le_bytes());
+    v
+}
+
 /// Assemble a record's payload from its operations.
 ///
 /// Every operation carries the same transaction id; that is what ties
