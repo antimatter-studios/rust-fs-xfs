@@ -47,6 +47,40 @@ pub const BBSIZE: usize = 512;
 /// `XLOG_HEADER_MAGIC_NUM`, at the start of every log record header.
 pub const XLOG_HEADER_MAGIC: u32 = 0xFEED_BABE;
 
+/// `h_fmt` values — the byte order the record's **item payloads** are in.
+///
+/// The record header itself is big-endian like the rest of the
+/// filesystem, so anyone can find the log head. The items inside it are
+/// memory images written in the byte order of whichever machine wrote
+/// them, and this field is how a reader finds out which.
+///
+/// It matters when a disk moves between architectures. A cleanly
+/// unmounted filesystem carries nothing to replay, so it travels
+/// freely; a dirty one holds items that only a machine of matching
+/// endianness can interpret. Replaying them byte-reversed would write
+/// plausible nonsense into metadata, so the correct response to a
+/// mismatch is to refuse.
+pub mod format {
+    /// Not recorded — written by something that did not set the field.
+    pub const UNKNOWN: u32 = 0;
+    /// Little-endian Linux, which is x86-64 and every ARM this driver
+    /// is likely to meet.
+    pub const LINUX_LE: u32 = 1;
+    /// Big-endian Linux, such as s390x.
+    pub const LINUX_BE: u32 = 2;
+    /// Big-endian IRIX, where XFS started.
+    pub const IRIX_BE: u32 = 3;
+
+    /// The value a record written on this machine would carry.
+    pub const fn native() -> u32 {
+        if cfg!(target_endian = "little") {
+            LINUX_LE
+        } else {
+            LINUX_BE
+        }
+    }
+}
+
 /// `XLOG_UNMOUNT_TRANS` — the operation flag that marks the record a
 /// clean unmount writes as its last act.
 const XLOG_UNMOUNT_TRANS: u8 = 0x20;
@@ -74,6 +108,8 @@ mod offsets {
     pub const LEN: usize = 12;
     pub const LSN: usize = 16;
     pub const NUM_LOGOPS: usize = 40;
+    /// `h_fmt` — the byte order this record's item payloads are in.
+    pub const FMT: usize = 300;
     /// `h_crc` — CRC32C over the header struct and the record's data,
     /// stored little-endian like every other XFS checksum.
     pub const CRC: usize = 32;
@@ -153,6 +189,9 @@ struct Record {
     num_logops: u32,
     /// Basic blocks this record's header occupies before its data.
     header_blocks: u64,
+    /// The record's header block, kept so its format field can be
+    /// checked once the newest record is known.
+    header: Vec<u8>,
 }
 
 /// Read the log and report whether anything in it is outstanding.
@@ -191,6 +230,20 @@ pub fn inspect(device: &dyn BlockRead, sb: &Superblock) -> Result<LogState> {
     // that operation carries the unmount flag. Both halves matter: a
     // record with more operations is ordinary work, whatever its first
     // operation happens to be flagged as.
+    // A record we cannot interpret must not be treated as clean. The
+    // header is big-endian so it reads anywhere, but the items inside
+    // are memory images in the byte order of whatever wrote them, and
+    // replaying those reversed would write plausible nonsense into
+    // metadata. A cleanly unmounted volume moves between architectures
+    // freely because it has nothing to replay; a dirty one does not.
+    let fmt = be32(&newest.header, offsets::FMT);
+    if fmt != format::native() {
+        return Err(Error::UnsupportedFeature(format!(
+            "the log was written in format {fmt}, and this machine writes              {}; a log holding unapplied records can only be read by a machine              of matching byte order",
+            format::native()
+        )));
+    }
+
     if newest.num_logops != 1 {
         return Ok(LogState::NeedsReplay);
     }
@@ -250,6 +303,7 @@ fn scan_for_newest_record(
                 lsn,
                 num_logops: be32(block, offsets::NUM_LOGOPS),
                 header_blocks: header_blocks(block),
+                header: block.to_vec(),
             });
         }
         at += want as u64;
@@ -353,6 +407,7 @@ mod tests {
         h[offsets::NUM_LOGOPS..offsets::NUM_LOGOPS + 4].copy_from_slice(&num_logops.to_be_bytes());
         h[offsets::FS_UUID..offsets::FS_UUID + 16].copy_from_slice(&UUID);
         h[offsets::SIZE..offsets::SIZE + 4].copy_from_slice(&XLOG_HEADER_CYCLE_SIZE.to_be_bytes());
+        h[offsets::FMT..offsets::FMT + 4].copy_from_slice(&format::native().to_be_bytes());
     }
 
     /// Set the operation flags of the record whose header is at `bb`.
@@ -367,6 +422,45 @@ mod tests {
         let sb = sb();
         let (dev, _) = device(&sb);
         assert_eq!(inspect(&dev, &sb).unwrap(), LogState::Empty);
+    }
+
+    /// A log written by a machine of the other byte order must be
+    /// refused rather than read reversed. This is what stops a dirty
+    /// disk moved between an Intel and an ARM host from having its
+    /// metadata rewritten with plausible nonsense.
+    #[test]
+    fn a_log_from_the_other_byte_order_is_refused() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        put_op_flags(&dev, log_at, 0, XLOG_UNMOUNT_TRANS);
+        {
+            // Whatever this host is, claim the opposite.
+            let other = if format::native() == format::LINUX_LE {
+                format::LINUX_BE
+            } else {
+                format::LINUX_LE
+            };
+            let mut b = dev.0.lock().unwrap();
+            let at = log_at as usize + offsets::FMT;
+            b[at..at + 4].copy_from_slice(&other.to_be_bytes());
+        }
+        let err = inspect(&dev, &sb).unwrap_err();
+        assert!(
+            format!("{err}").contains("matching byte order"),
+            "got {err}"
+        );
+    }
+
+    /// And a log in this machine's own format is read normally, so the
+    /// check above cannot pass by refusing everything.
+    #[test]
+    fn a_log_in_this_machines_format_is_accepted() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        put_op_flags(&dev, log_at, 0, XLOG_UNMOUNT_TRANS);
+        assert_eq!(inspect(&dev, &sb).unwrap(), LogState::CleanlyUnmounted);
     }
 
     #[test]
