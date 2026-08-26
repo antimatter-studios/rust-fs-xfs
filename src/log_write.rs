@@ -208,6 +208,14 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
 /// A version-2 inode logs a **96-byte** core rather than 176, so the
 /// length is taken from `di_version` rather than assumed.
 ///
+/// **Only the core is converted.** A fork logged alongside it — a
+/// shortform directory, an extent list — stays big-endian inside a
+/// native-endian record, which is not what anyone would guess and is
+/// why this function stops at the core rather than taking the whole
+/// inode. Observed directly: a shortform directory's parent inode read
+/// `00 00 00 80` for 128 in a record whose surrounding core was
+/// little-endian.
+///
 /// Two features move fields, and both are read from `di_flags2` in the
 /// inode itself rather than from the superblock, because it is the
 /// inode's own encoding that matters:
