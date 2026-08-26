@@ -497,6 +497,23 @@ pub mod inode_log_format {
     /// directory's entries.
     pub const XFS_ILOG_DDATA: u32 = 0x02;
 
+    /// `XFS_ILOG_DEXT` in `ilf_fields` — the item logs the data fork's
+    /// **extent list**, which follows as a further operation after the
+    /// core.
+    ///
+    /// This is what a file that has just gained or lost blocks logs, and
+    /// it is the commonest fork flag by some margin: 1,518 of the inode
+    /// items in one stress fixture carried `0x0005`, this bit together
+    /// with [`XFS_ILOG_CORE`].
+    ///
+    /// Isolated the same way [`XFS_ILOG_DDATA`] was — by what the third
+    /// operation turned out to hold. Every one of those items occupied
+    /// three operations and reported a `ilf_dsize` that is a multiple of
+    /// sixteen: 16, 32, 48, 64 and up, which is one, two, three and four
+    /// extent records. An inline fork has no such rule, and a
+    /// short-form directory's 30 bytes is the proof of it.
+    pub const XFS_ILOG_DEXT: u32 = 0x04;
+
     /// # What the sizes mean, and how the fork operation is framed
     ///
     /// Measured on a rename inside a short-form directory — 8 operations,

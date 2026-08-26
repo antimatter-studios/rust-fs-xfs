@@ -40,8 +40,8 @@ use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
 use crate::fs::Filesystem;
 use crate::inode::Format;
 use crate::log_write::{
-    append, inode_log_format, log_dinode_from_disk, trans_header, InodeBuffer, Op,
-    XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
+    InodeBuffer, Op, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// Log operations round up to this; the data they carry does not.
@@ -267,20 +267,6 @@ impl Filesystem {
         }
         Ok(out)
     }
-}
-
-/// `xfs_inode_log_format` for an item that logs a data fork too.
-///
-/// `dsize` is the fork's own length, not its operation's — the operation
-/// is padded to four bytes and this field is not.
-fn inode_log_format_with_fork(ino: u64, fields: u32, buffer: &InodeBuffer, dsize: u16) -> Vec<u8> {
-    use crate::format::log_items::inode_log_format::offsets as at;
-
-    let mut v = inode_log_format(ino, fields, buffer);
-    // Three operations: this format, the core, then the fork.
-    v[at::SIZE..at::SIZE + 2].copy_from_slice(&3u16.to_le_bytes());
-    v[at::DSIZE..at::DSIZE + 2].copy_from_slice(&dsize.to_le_bytes());
-    v
 }
 
 /// Set `di_size` in an on-disk inode's bytes.
