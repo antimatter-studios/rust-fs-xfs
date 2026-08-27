@@ -48,6 +48,7 @@ pub mod log;
 pub mod log_write;
 pub mod superblock;
 pub mod truncate;
+pub mod unlink;
 pub mod write;
 
 pub use error::{Error, Result};

@@ -20,7 +20,7 @@ against.
 | truncate to zero | 11 | 4 | written, replayed by the kernel |
 | write 4 KiB (allocating) | 12 | 4 | written, kernel reads the file back |
 | create empty file | 14 | 5 | written, kernel opens and writes the file |
-| unlink | 14 | 5 | not yet — needs the unlinked list |
+| unlink | 14 | 5 | written, kernel agrees the file is gone |
 | mkdir | 15 | 5 | not yet |
 | shortform to block directory | 23 | 9 | not yet |
 
@@ -41,7 +41,8 @@ extents spanning more than one allocation group; a data fork in B+tree format; a
 free-space or inode tree more than one level deep, or a root with no room for another
 record; a file too large for a single extent; a group with no free inode, which needs a
 whole new chunk and so needs to allocate blocks; a directory that has outgrown its
-inode; real-time files; and v4 filesystems.
+inode; a file that still holds blocks, or has more than one link, or is a directory,
+when removing it; real-time files; and v4 filesystems.
 
 ### One checkpoint per mount
 

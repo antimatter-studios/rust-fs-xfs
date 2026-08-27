@@ -141,10 +141,11 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
     }
 
     let script = r#"
-        cp /share/xfs-rename.img /tmp/r.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/xfs-rename.img "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
-        if mount -o loop /tmp/r.img "$m"; then
+        if mount -o loop,nouuid "$img" "$m"; then
             echo "NAMES $(ls "$m/sf" | sort | tr '\n' ' ')"
             echo "INO $(stat -c %i "$m/sf/cccc" 2>/dev/null || echo none)"
             umount "$m"
@@ -154,9 +155,9 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         fi
         rmdir "$m" 2>/dev/null
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/r.img 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
-        rm -f /tmp/r.img
+        rm -f "$img"
         echo "DONE"
         "#;
     let Some(out) = vm_run(script) else {

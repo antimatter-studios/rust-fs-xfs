@@ -151,10 +151,11 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
 
     let script = format!(
         r#"
-        cp /share/{name} /tmp/w.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/{name} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
-        if mount -o loop /tmp/w.img "$m"; then
+        if mount -o loop,nouuid "$img" "$m"; then
             echo "SIZE $(stat -c %s "$m/victim")"
             echo "SUM $(md5sum < "$m/victim" | cut -d' ' -f1)"
             ok=yes
@@ -171,9 +172,9 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
         fi
         rmdir "$m" 2>/dev/null
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/w.img 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
-        rm -f /tmp/w.img
+        rm -f "$img"
         echo "DONE"
         "#
     );

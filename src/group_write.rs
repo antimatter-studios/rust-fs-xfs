@@ -23,6 +23,7 @@
 use crate::alloc_btree::FreeExtent;
 use crate::buf_write::BufferItem;
 use crate::format::log_items::buf_log_format::BLF_CHUNK;
+use crate::inode_btree::InodeChunk;
 use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 
 /// Byte offsets within the allocation-group header that a free changes.
@@ -138,6 +139,33 @@ pub fn rebuild_leaf(original: &[u8], records: &[FreeExtent]) -> Vec<u8> {
         out[at + 4..at + 8].copy_from_slice(&record.blockcount.to_be_bytes());
     }
     // The checksum is deliberately left stale; see `restamp_crc`.
+    out
+}
+
+/// A record of an inode B+tree, in every version.
+pub const INODE_RECORD_LEN: usize = 16;
+
+/// A tree root rewritten to hold `chunks`.
+///
+/// The record shape follows the sparse-inodes feature, not the format
+/// version — see [`crate::inode_btree`].
+pub fn rebuild_inode_leaf(original: &[u8], chunks: &[InodeChunk], sparse: bool) -> Vec<u8> {
+    let mut out = original.to_vec();
+    out[btree::NUMRECS..btree::NUMRECS + 2].copy_from_slice(&(chunks.len() as u16).to_be_bytes());
+    for (i, c) in chunks.iter().enumerate() {
+        let at = btree::V5_BODY + i * INODE_RECORD_LEN;
+        out[at..at + 4].copy_from_slice(&c.startino.to_be_bytes());
+        if sparse {
+            out[at + 4..at + 6].copy_from_slice(&c.holemask.to_be_bytes());
+            out[at + 6] = c.count;
+            out[at + 7] = c.freecount;
+        } else {
+            out[at + 4..at + 8].copy_from_slice(&u32::from(c.freecount).to_be_bytes());
+        }
+        out[at + 8..at + 16].copy_from_slice(&c.free.to_be_bytes());
+    }
+    // The checksum is deliberately left stale; recovery recomputes it.
+    // See `group_write::restamp_crc`.
     out
 }
 

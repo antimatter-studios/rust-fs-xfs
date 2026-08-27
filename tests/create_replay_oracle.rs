@@ -161,10 +161,11 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
 
     let script = format!(
         r#"
-        cp /share/{name} /tmp/c.img
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/{name} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
-        if mount -o loop /tmp/c.img "$m"; then
+        if mount -o loop,nouuid "$img" "$m"; then
             echo "NAMES $(ls -A "$m" | sort | tr '\n' ' ')"
             {checks}
             # The directory's other entries must still resolve.
@@ -178,9 +179,9 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         fi
         rmdir "$m" 2>/dev/null
         echo "REPAIR_BEGIN"
-        xfs_repair -n /tmp/c.img 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
-        rm -f /tmp/c.img
+        rm -f "$img"
         echo "DONE"
         "#
     );

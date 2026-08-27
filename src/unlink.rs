@@ -1,58 +1,52 @@
-//! Creating a file, through the log.
+//! Removing a file, through the log.
 //!
-//! The first transaction with **five** items in it, and the first that
-//! touches two inodes and three metadata blocks at once. Creating a file
-//! means taking an inode out of an allocation group's accounting, making
-//! that inode into a file, and adding a name for it to a directory — and
-//! none of the three is any use without the other two.
+//! Create in reverse, and the same five items: the group's inode header,
+//! both inode trees, the parent directory and the inode itself. The name
+//! goes out of the directory, the inode goes back into the group's
+//! accounting, and the inode is emptied.
 //!
-//! ```text
-//! op  what
-//!  0   START
-//!  1   transaction header
-//!  2   the group's inode header, and its dirty chunk
-//!  ..  the inode tree's root
-//!  ..  the free-inode tree's root
-//!  ..  the parent directory's format, core and entries
-//!  ..  the new inode's format and core
-//!  ..  COMMIT
-//! ```
+//! # The case that is easy to get wrong
 //!
-//! Fourteen operations for the smallest case, which is what a create was
-//! measured to produce.
+//! Giving an inode back to a chunk that had **none** free puts that
+//! chunk into the free-inode tree, which is a change of membership
+//! rather than of contents — the mirror of a create taking a chunk's
+//! last free inode and pushing it out.
 //!
-//! # A free inode is not an empty one
+//! A driver that updated the counts and left the tree alone would not
+//! corrupt anything, and nothing would report it. The filesystem would
+//! simply lose an inode: free, correctly recorded as free, and invisible
+//! to the tree a create looks in. That is why the fixtures cover it and
+//! why the test says which case each one exercised.
 //!
-//! XFS initialises a whole chunk of inodes when it allocates the chunk,
-//! not when it hands one out. So the inode a create takes already has
-//! its magic, its version, its own inode number and the filesystem UUID
-//! on disk, all correct — and this reads it and changes what a file
-//! needs changed, rather than building a core from nothing.
+//! # What the kernel writes into a freed inode
 //!
-//! That is not a shortcut. `di_ino` and `di_uuid` are the fields a v5
-//! filesystem uses to catch a block that landed in the wrong place, and
-//! a core built from scratch would have to reproduce them exactly to be
-//! accepted. Reading what is already there cannot get them wrong.
+//! Read off a filesystem before and after `rm`: the magic and the
+//! version stay, the mode and the link count go to zero, and the
+//! **generation changes** — it read 0 before and 4,245,130,214 after.
+//!
+//! The generation is what stops a reference to the inode's previous life
+//! from resolving to whatever is put there next, so it has to move. The
+//! kernel randomises it; this increments it, because there is no
+//! entropy here to randomise with and inventing some would be worse than
+//! saying so. Incrementing gives the property that matters — the new
+//! generation is not the old one — and does not give unpredictability.
+//! A driver serving NFS handles to a hostile network would want the
+//! stronger of the two.
 //!
 //! # What it will not do
 //!
 //! Each is refused by name rather than attempted:
 //!
-//! - a group with no free inode, which needs a whole new chunk and so
-//!   needs to allocate blocks as well;
-//! - a parent that is not a short-form directory, or one with no room
-//!   left in its inode for another entry;
-//! - a name that is already in the directory;
-//! - inode trees more than one level deep, or a root with no room;
+//! - a file that still holds blocks, which would have to free extents as
+//!   well and is a bigger transaction than this one;
+//! - a file with more than one link, where the inode survives and only
+//!   the count moves;
+//! - a directory, which has `.` and `..` to account for and a parent
+//!   whose link count changes;
+//! - a parent that has outgrown its inode;
+//! - inode trees more than one level deep, or a root with no room for
+//!   the chunk this may put back;
 //! - a v4 filesystem.
-//!
-//! # What is deliberately left alone
-//!
-//! **The timestamps.** There is no clock here, and the driver would have
-//! to invent one. A created file gets whatever the free inode carried,
-//! which is the epoch. That is visibly wrong rather than subtly wrong,
-//! which is the better failure of the two, and it is what
-//! [`crate::dir_write`] already does for the same reason.
 
 use crate::ag::{offsets::agi as agi_at, Agi};
 use crate::alloc_btree::expected_blkno;
@@ -61,9 +55,9 @@ use crate::error::{Error, Result};
 use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGI, BLFT_BTREE};
 use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
-use crate::group_write::{changed_chunks, rebuild_inode_leaf};
+use crate::group_write::{btree, changed_chunks, rebuild_inode_leaf, INODE_RECORD_LEN};
 use crate::inode::Format;
-use crate::inode_btree::{choose_free_inode, walk_from_agi, InodeChunk, Taken, Which};
+use crate::inode_btree::{walk_from_agi, InodeChunk, Which};
 use crate::log::BBSIZE;
 use crate::log_write::{
     append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
@@ -74,33 +68,28 @@ use crate::log_write::{
 /// is not.
 const OP_ALIGN: usize = 4;
 
-/// Offsets within the on-disk inode core that a create sets.
+/// Offsets within the on-disk inode core that a removal changes.
 mod core_at {
     pub const MODE: usize = 2;
-    pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
     pub const SIZE: usize = 56;
     pub const GEN: usize = 92;
     pub const CHANGECOUNT: usize = 104;
 }
 
-/// The inode core of a newly created regular file.
+/// The inode core of a file that has just been removed.
 ///
-/// Read from the free inode rather than built, so the identity fields
-/// that are already correct stay correct.
-fn created_core(raw: &[u8], mode: u16) -> Vec<u8> {
+/// The identity fields are left exactly as they are: this inode will be
+/// handed out again, and `di_ino` and `di_uuid` are as correct now as
+/// they will be then.
+fn emptied_core(raw: &[u8]) -> Vec<u8> {
     let mut core = raw.to_vec();
-    core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&mode.to_be_bytes());
-    // An empty regular file keeps its extents inline, of which it has
-    // none.
-    core[core_at::FORMAT] = crate::inode::Format::Extents as u8;
-    core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&1u32.to_be_bytes());
+    core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0u16.to_be_bytes());
+    core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&0u32.to_be_bytes());
     core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&0u64.to_be_bytes());
 
-    // The generation is what stops a stale reference to the inode's
-    // previous life from resolving to its new one. Advancing it is the
-    // whole of that protection, so it is advanced even though nothing
-    // here would notice if it were not.
+    // See the note at the top on why this increments where the kernel
+    // randomises.
     let gen = u32::from_be_bytes(
         core[core_at::GEN..core_at::GEN + 4]
             .try_into()
@@ -115,34 +104,28 @@ fn created_core(raw: &[u8], mode: u16) -> Vec<u8> {
 }
 
 impl Filesystem {
-    /// Create an empty regular file called `name` in `parent`.
+    /// Remove `name` from `parent`, freeing the inode it names.
     ///
-    /// Returns the new file's inode number and the sequence number the
-    /// record was given. Nothing on disk is touched: the record is the
-    /// change.
+    /// Returns the removed file's inode number and the sequence number
+    /// the record was given. Nothing on disk is touched: the record is
+    /// the change.
     ///
     /// # Errors
     ///
     /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
-    /// [`Error::AlreadyExists`] if the name is taken,
+    /// [`Error::NotFound`] if the name is not there,
     /// [`Error::NotADirectory`] if `parent` is not one, and
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
-    pub fn create_file(&self, parent: u64, name: &[u8], mode: u16) -> Result<(u64, u64)> {
+    pub fn unlink_file(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
         self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
-                "creating writes v5 metadata; a v4 filesystem is not supported".into(),
+                "removing writes v5 metadata; a v4 filesystem is not supported".into(),
             ));
-        }
-        if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
-            return Err(Error::UnsupportedFeature(format!(
-                "{:?} is not a name a directory entry can hold",
-                String::from_utf8_lossy(name)
-            )));
         }
 
         let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
@@ -151,20 +134,43 @@ impl Filesystem {
         }
         if dir_inode.format != Format::Local {
             return Err(Error::UnsupportedFeature(format!(
-                "inode {parent} has outgrown the inode, so adding an entry rewrites a \
+                "inode {parent} has outgrown the inode, so removing an entry rewrites a \
                  directory block rather than the inode's own fork"
             )));
         }
 
         let (fork_start, fork_end) = dir_inode.data_fork_range(usize::from(self.sb.inodesize));
         let parsed = dir::read_short_form(&dir_inode, &dir_raw[fork_start..fork_end], &self.sb)?;
-        if parsed.entries.iter().any(|e| e.name == name) {
-            return Err(Error::AlreadyExists);
+        let entry = parsed
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or(Error::NotFound)?;
+        let ino = entry.ino;
+
+        let (victim, victim_raw) = self.read_inode_raw(ino)?;
+        if victim.is_dir() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} is a directory, which has `.` and `..` to account for and a \
+                 parent whose link count changes; only a regular file is supported"
+            )));
+        }
+        if victim.nlink != 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} has {} links, so removing this name leaves the inode alive \
+                 and only moves the count",
+                victim.nlink
+            )));
+        }
+        if victim.nblocks != 0 || victim.nextents != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} still holds {} blocks in {} extents, which would have to be \
+                 freed as well; truncate it first",
+                victim.nblocks, victim.nextents
+            )));
         }
 
-        // The new inode comes from the parent's own group, which is what
-        // keeps a directory's files near the directory.
-        let (agno, _, _) = self.sb.split_ino(parent);
+        let (agno, _, _) = self.sb.split_ino(ino);
         let block = u64::from(self.sb.blocksize);
         let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
         let sector = u64::from(self.sb.sectsize);
@@ -192,53 +198,61 @@ impl Filesystem {
         let mut chunks = walk_from_agi(&self.sb, &agi, Which::All, read)?
             .expect("every filesystem has an inode tree");
 
-        let Some((index, slot)) = choose_free_inode(&chunks) else {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno} has no free inode; allocating a whole new chunk \
-                 also allocates blocks, which is not implemented"
-            )));
-        };
-        let agino = chunks[index].startino + u32::from(slot);
-        let outcome = chunks[index].take(slot)?;
+        // Which chunk holds it, and where in that chunk.
+        let (_, ag_block, offset) = self.sb.split_ino(ino);
+        let agino = (ag_block << self.sb.inopblog) | offset;
+        let index = chunks
+            .iter()
+            .position(|c| {
+                agino >= c.startino
+                    && agino - c.startino < u32::from(crate::inode_btree::INODES_PER_CHUNK)
+            })
+            .ok_or_else(|| {
+                Error::CorruptLog(format!(
+                    "inode {ino} is in no chunk of allocation group {agno}'s inode tree"
+                ))
+            })?;
+        let slot = (agino - chunks[index].startino) as u8;
+        chunks[index].give_back(slot)?;
 
-        // The new inode's absolute number, which is what a directory
-        // entry names and what the inode itself records.
-        let ino = self.sb.join_ino(agno, agino);
-
-        let mut inobt_raw = read(agi.root)?;
-        let mut finobt_raw = read(agi.free_root)?;
+        let inobt_raw = read(agi.root)?;
+        let finobt_raw = read(agi.free_root)?;
         let sparse = self.sb.has_sparse_inodes();
 
         let new_inobt = rebuild_inode_leaf(&inobt_raw, &chunks, sparse);
 
-        // The free-inode tree holds only the chunks with something free,
-        // so a chunk that has just been filled leaves it.
+        // A chunk that had nothing free now has something, so the
+        // free-inode tree gains a record — which is the one direction in
+        // which this tree can run out of room.
         let with_free: Vec<InodeChunk> =
             chunks.iter().copied().filter(|c| c.freecount > 0).collect();
+        let capacity = (self.sb.blocksize as usize - btree::V5_BODY) / INODE_RECORD_LEN;
+        if with_free.len() > capacity {
+            return Err(Error::UnsupportedFeature(format!(
+                "allocation group {agno}'s free-inode tree would need {} records and its \
+                 root holds {capacity}; splitting a node is not implemented",
+                with_free.len()
+            )));
+        }
         let new_finobt = rebuild_inode_leaf(&finobt_raw, &with_free, sparse);
-        debug_assert_eq!(
-            outcome == Taken::ChunkNowFull,
-            !with_free
+        // The chunk an inode was just given back to has one free by
+        // definition, so it must be in the tree that holds the chunks
+        // with free inodes. When it was full a moment ago, that is the
+        // membership change this whole case is about.
+        debug_assert!(
+            with_free
                 .iter()
                 .any(|c| c.startino == chunks[index].startino),
-            "a chunk that is now full must have left the free-inode tree"
+            "the chunk an inode was given back to must be in the free-inode tree"
         );
 
         let mut new_agi = agi_raw.clone();
         let freecount: u32 = chunks.iter().map(|c| u32::from(c.freecount)).sum();
         new_agi[agi_at::FREECOUNT..agi_at::FREECOUNT + 4].copy_from_slice(&freecount.to_be_bytes());
-        // The checksum is left stale on purpose — recovery recomputes it,
-        // and writing it here would dirty a chunk nothing else touches and
-        // add an operation to the record. See `group_write::restamp_crc`.
+        // The checksum is left stale on purpose — recovery recomputes it.
+        // See `group_write::restamp_crc`.
 
-        // The parent gains an entry, so its fork and its size change.
-        let fork = self.short_form_with_entry(
-            &parsed,
-            name,
-            ino,
-            dir::ftype_to_raw(Some(crate::inode::FileType::Regular)),
-            fork_end - fork_start,
-        )?;
+        let fork = self.short_form_without_entry(&parsed, name, fork_end - fork_start)?;
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8]
             .copy_from_slice(&(fork.len() as u64).to_be_bytes());
@@ -246,25 +260,16 @@ impl Filesystem {
         let now = u64::from_be_bytes(dir_core[at..at + 8].try_into().expect("8 bytes"));
         dir_core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
 
-        // The new inode, read rather than built — see the note at the
-        // top on why the identity fields make that the safer of the two.
-        // Read straight off the device rather than through
-        // `read_inode_raw`: that validates, and a free inode has mode
-        // zero and no fork, which is not a shape a file's parser should
-        // have to accept.
-        let mut new_raw = vec![0u8; usize::from(self.sb.inodesize)];
-        self.device()
-            .read_at(self.inode_offset(ino)?, &mut new_raw)?;
-        let new_core = created_core(&new_raw, mode);
+        let victim_core = emptied_core(&victim_raw);
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;
-        let new_logged = log_dinode_from_disk(&new_core)
+        let victim_logged = log_dinode_from_disk(&victim_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
 
         let cluster = self.sb.inode_cluster_bytes();
         let dir_buf = InodeBuffer::containing(self.inode_offset(parent)?, cluster);
-        let new_buf = InodeBuffer::containing(self.inode_offset(ino)?, cluster);
+        let victim_buf = InodeBuffer::containing(self.inode_offset(ino)?, cluster);
 
         let dsize = fork.len();
         let mut fork_op = fork;
@@ -289,11 +294,7 @@ impl Filesystem {
             new_finobt,
             BLFT_BTREE,
         );
-        inobt_raw.clear();
-        finobt_raw.clear();
 
-        // Three operations for the parent — format, core and entries —
-        // and two for the new inode, which logs no fork of its own.
         let item_ops = agi_item.op_count() + inobt_item.op_count() + finobt_item.op_count() + 3 + 2;
 
         let lsn = append(device.as_ref(), &self.sb, |tid| {
@@ -329,11 +330,11 @@ impl Filesystem {
             });
             ops.push(Op {
                 flags: 0,
-                data: inode_log_format(ino, XFS_ILOG_CORE, &new_buf),
+                data: inode_log_format(ino, XFS_ILOG_CORE, &victim_buf),
             });
             ops.push(Op {
                 flags: 0,
-                data: new_logged,
+                data: victim_logged,
             });
             ops.push(Op {
                 flags: XLOG_COMMIT_TRANS,
@@ -350,39 +351,39 @@ impl Filesystem {
 mod tests {
     use super::*;
 
-    /// A created file is a regular file with one link and no contents,
-    /// and its generation has moved on from whatever the free inode
-    /// carried.
+    /// A removed file has no mode, no links and no size, and its
+    /// generation has moved on.
     #[test]
-    fn a_created_core_is_an_empty_regular_file() {
+    fn an_emptied_core_is_a_free_inode_again() {
         let mut raw = vec![0u8; 176];
-        raw[core_at::GEN..core_at::GEN + 4].copy_from_slice(&7u32.to_be_bytes());
+        raw[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0o100644u16.to_be_bytes());
+        raw[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&1u32.to_be_bytes());
+        raw[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&4096u64.to_be_bytes());
+        raw[core_at::GEN..core_at::GEN + 4].copy_from_slice(&41u32.to_be_bytes());
 
-        let core = created_core(&raw, 0o100644);
+        let core = emptied_core(&raw);
         assert_eq!(
             u16::from_be_bytes(core[core_at::MODE..core_at::MODE + 2].try_into().unwrap()),
-            0o100644
+            0
         );
         assert_eq!(
             u32::from_be_bytes(core[core_at::NLINK..core_at::NLINK + 4].try_into().unwrap()),
-            1
+            0
         );
         assert_eq!(
             u64::from_be_bytes(core[core_at::SIZE..core_at::SIZE + 8].try_into().unwrap()),
             0
         );
-        assert_eq!(core[core_at::FORMAT], Format::Extents as u8);
         assert_eq!(
             u32::from_be_bytes(core[core_at::GEN..core_at::GEN + 4].try_into().unwrap()),
-            8,
-            "the generation must move on, so a stale reference to the inode's previous \
-             life cannot resolve to its new one"
+            42,
+            "the generation must move on, so a reference to the inode's previous life \
+             cannot resolve to whatever is put there next"
         );
     }
 
-    /// The identity fields a v5 filesystem checks are carried across
-    /// untouched, which is the whole reason the core is read rather than
-    /// built.
+    /// The identity fields survive, because this inode will be handed
+    /// out again and they are as correct now as they will be then.
     #[test]
     fn the_identity_fields_survive() {
         const DI_INO: usize = 152;
@@ -392,9 +393,9 @@ mod tests {
         raw[0..2].copy_from_slice(&0x494eu16.to_be_bytes());
         raw[4] = 3;
         raw[DI_INO..DI_INO + 8].copy_from_slice(&186u64.to_be_bytes());
-        raw[DI_UUID..DI_UUID + 16].copy_from_slice(&[0xab; 16]);
+        raw[DI_UUID..DI_UUID + 16].copy_from_slice(&[0xcd; 16]);
 
-        let core = created_core(&raw, 0o100644);
+        let core = emptied_core(&raw);
         assert_eq!(&core[0..2], &0x494eu16.to_be_bytes(), "di_magic");
         assert_eq!(core[4], 3, "di_version");
         assert_eq!(
@@ -402,6 +403,6 @@ mod tests {
             186,
             "di_ino"
         );
-        assert_eq!(&core[DI_UUID..DI_UUID + 16], &[0xab; 16], "di_uuid");
+        assert_eq!(&core[DI_UUID..DI_UUID + 16], &[0xcd; 16], "di_uuid");
     }
 }
