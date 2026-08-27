@@ -38,15 +38,73 @@ require_host_tools() {
     fi
 }
 
+# Vagrant takes an exclusive lock on a machine for the length of any
+# command, including `status`. The test suites run in parallel and each
+# one calls in here, so contention is normal rather than exceptional —
+# and Vagrant's answer to it is to fail immediately with a message
+# telling you to wait, which is what this does on its behalf.
+#
+# Without this a suite fails with the VM apparently unreachable, skips
+# its verification, and reports success. That is the worst of the three
+# possible outcomes: the tests that matter most quietly stop running.
+LOCK_MESSAGE='locks each machine'
+LOCK_TRIES=60
+LOCK_WAIT=2
+
+vagrant_locked_out() {
+    grep -q "$LOCK_MESSAGE" "$1"
+}
+
 vm_up() {
     # `vagrant status` is authoritative but slow-ish; only boot when the
     # machine is not already running.
     require_host_tools
-    if ! (cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>/dev/null \
-            | grep -q ',state,running'); then
+    local tries=0 err running=1
+    err=$(mktemp)
+    while :; do
+        if (cd "$VAGRANT_DIR" && vagrant status --machine-readable 2>"$err") \
+                | grep -q ',state,running'; then
+            running=0
+            break
+        fi
+        if vagrant_locked_out "$err" && [ "$tries" -lt "$LOCK_TRIES" ]; then
+            tries=$((tries + 1))
+            sleep "$LOCK_WAIT"
+            continue
+        fi
+        break
+    done
+    rm -f "$err"
+
+    if [ "$running" -ne 0 ]; then
         echo "[vm] booting Debian arm64 oracle (first run provisions, ~2 min)..." >&2
         (cd "$VAGRANT_DIR" && vagrant up)
     fi
+}
+
+# Run a script in the guest, waiting out any lock another caller holds.
+#
+# The script is passed rather than piped in from the caller so a retry
+# can send it again: standard input is consumed by the first attempt, and
+# a retry that sent nothing would report success having run nothing.
+vm_run() {
+    local script="$1" tries=0 err
+    err=$(mktemp)
+    while :; do
+        if printf '%s\n' "$script" \
+                | (cd "$VAGRANT_DIR" && vagrant ssh -- -T 'sudo bash -s') 2>"$err"; then
+            rm -f "$err"
+            return 0
+        fi
+        if vagrant_locked_out "$err" && [ "$tries" -lt "$LOCK_TRIES" ]; then
+            tries=$((tries + 1))
+            sleep "$LOCK_WAIT"
+            continue
+        fi
+        cat "$err" >&2
+        rm -f "$err"
+        return 1
+    done
 }
 
 case "${1:-}" in
@@ -58,7 +116,7 @@ case "${1:-}" in
         vm_up
         # `vagrant ssh -c` mangles quoting for complex commands; feed the
         # command on stdin instead so the guest shell sees it verbatim.
-        printf '%s\n' "$*" | (cd "$VAGRANT_DIR" && vagrant ssh -- -T 'sudo bash -s')
+        vm_run "$*"
         ;;
     share)
         echo "$SHARE"

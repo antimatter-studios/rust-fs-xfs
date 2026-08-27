@@ -74,6 +74,67 @@ use crate::log_write::{
 /// is not.
 const OP_ALIGN: usize = 4;
 
+/// What is being created, and everything that differs between the two.
+///
+/// A directory is a file with a fork, a different link count and a
+/// parent whose own link count moves — and nothing else about the
+/// transaction changes, which is why the two share one path rather than
+/// two that would drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// An empty regular file: no fork, one link, no size.
+    File,
+    /// An empty directory: a short-form fork holding only its parent,
+    /// and **two** links — its own `.` and the entry naming it.
+    Directory,
+}
+
+impl Kind {
+    /// The fork format the new inode records.
+    fn format(self) -> Format {
+        match self {
+            // An empty file keeps its extents inline, of which it has
+            // none.
+            Kind::File => Format::Extents,
+            // A directory small enough lives inside its inode, and a
+            // new one always is.
+            Kind::Directory => Format::Local,
+        }
+    }
+
+    /// The new inode's link count.
+    ///
+    /// A directory starts with two: the entry naming it in its parent,
+    /// and its own `.`. Getting this wrong is not caught by reading the
+    /// directory back — only by a consistency check, or by the
+    /// directory refusing to be removed later.
+    fn nlink(self) -> u32 {
+        match self {
+            Kind::File => 1,
+            Kind::Directory => 2,
+        }
+    }
+
+    /// What the parent's link count becomes, given what it was.
+    ///
+    /// A new subdirectory's `..` is a link to the parent, so the parent
+    /// gains one. A file has no `..` and the parent does not move.
+    fn parent_nlink(self, was: u32) -> u32 {
+        match self {
+            Kind::File => was,
+            Kind::Directory => was + 1,
+        }
+    }
+
+    /// The file type recorded in the directory entry.
+    fn ftype(self) -> u8 {
+        dir::ftype_to_raw(Some(match self {
+            Kind::File => crate::inode::FileType::Regular,
+            Kind::Directory => crate::inode::FileType::Directory,
+        }))
+    }
+}
+
 /// Offsets within the on-disk inode core that a create sets.
 mod core_at {
     pub const MODE: usize = 2;
@@ -84,18 +145,16 @@ mod core_at {
     pub const CHANGECOUNT: usize = 104;
 }
 
-/// The inode core of a newly created regular file.
+/// The inode core of a newly created file or directory.
 ///
 /// Read from the free inode rather than built, so the identity fields
 /// that are already correct stay correct.
-fn created_core(raw: &[u8], mode: u16) -> Vec<u8> {
+fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
     let mut core = raw.to_vec();
     core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&mode.to_be_bytes());
-    // An empty regular file keeps its extents inline, of which it has
-    // none.
-    core[core_at::FORMAT] = crate::inode::Format::Extents as u8;
-    core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&1u32.to_be_bytes());
-    core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&0u64.to_be_bytes());
+    core[core_at::FORMAT] = kind.format() as u8;
+    core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&kind.nlink().to_be_bytes());
+    core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&size.to_be_bytes());
 
     // The generation is what stops a stale reference to the inode's
     // previous life from resolving to its new one. Advancing it is the
@@ -129,6 +188,35 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn create_file(&self, parent: u64, name: &[u8], mode: u16) -> Result<(u64, u64)> {
+        self.create(parent, name, mode, Kind::File)
+    }
+
+    /// Create an empty directory called `name` in `parent`.
+    ///
+    /// The new directory holds no entries: `.` and `..` are not entries
+    /// in the short form, which keeps its parent in the header and its
+    /// own identity in the inode. So its fork is the six-byte header
+    /// alone, and its link count is two — the entry naming it, and its
+    /// own `.`.
+    ///
+    /// The parent's link count goes up by one, because the new
+    /// directory's `..` is a link to it. That is the whole difference
+    /// between this and [`Filesystem::create_file`], and it is the part
+    /// nothing catches by reading the directory back: a wrong link count
+    /// shows up only in a consistency check, or later, when the
+    /// directory refuses to be removed.
+    ///
+    /// Returns the new directory's inode number and the sequence number
+    /// the record was given.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::create_file`].
+    pub fn create_directory(&self, parent: u64, name: &[u8], mode: u16) -> Result<(u64, u64)> {
+        self.create(parent, name, mode, Kind::Directory)
+    }
+
+    fn create(&self, parent: u64, name: &[u8], mode: u16, kind: Kind) -> Result<(u64, u64)> {
         self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
@@ -232,16 +320,13 @@ impl Filesystem {
         // add an operation to the record. See `group_write::restamp_crc`.
 
         // The parent gains an entry, so its fork and its size change.
-        let fork = self.short_form_with_entry(
-            &parsed,
-            name,
-            ino,
-            dir::ftype_to_raw(Some(crate::inode::FileType::Regular)),
-            fork_end - fork_start,
-        )?;
+        let fork =
+            self.short_form_with_entry(&parsed, name, ino, kind.ftype(), fork_end - fork_start)?;
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8]
             .copy_from_slice(&(fork.len() as u64).to_be_bytes());
+        dir_core[core_at::NLINK..core_at::NLINK + 4]
+            .copy_from_slice(&kind.parent_nlink(dir_inode.nlink).to_be_bytes());
         let at = core_at::CHANGECOUNT;
         let now = u64::from_be_bytes(dir_core[at..at + 8].try_into().expect("8 bytes"));
         dir_core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
@@ -255,7 +340,16 @@ impl Filesystem {
         let mut new_raw = vec![0u8; usize::from(self.sb.inodesize)];
         self.device()
             .read_at(self.inode_offset(ino)?, &mut new_raw)?;
-        let new_core = created_core(&new_raw, mode);
+        // A new directory's fork is the short-form header alone: no
+        // entries, and the parent it belongs to. `.` and `..` are not
+        // entries in this form — the parent lives in the header and the
+        // directory's own identity in the inode — so an empty directory
+        // really is empty.
+        let new_fork = match kind {
+            Kind::File => Vec::new(),
+            Kind::Directory => empty_short_form_dir(parent),
+        };
+        let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64);
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;
@@ -294,7 +388,18 @@ impl Filesystem {
 
         // Three operations for the parent — format, core and entries —
         // and two for the new inode, which logs no fork of its own.
-        let item_ops = agi_item.op_count() + inobt_item.op_count() + finobt_item.op_count() + 3 + 2;
+        // The new inode's own fork operation, when it has one.
+        let new_dsize = new_fork.len();
+        let mut new_fork_op = new_fork;
+        new_fork_op.resize(new_dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+
+        // Three operations for the parent — format, core and entries —
+        // and two or three for the new inode, depending on whether it
+        // has a fork. That one operation is the whole difference between
+        // a create's fourteen and a mkdir's fifteen.
+        let new_ops = if new_dsize == 0 { 2 } else { 3 };
+        let item_ops =
+            agi_item.op_count() + inobt_item.op_count() + finobt_item.op_count() + 3 + new_ops;
 
         let lsn = append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
@@ -327,14 +432,34 @@ impl Filesystem {
                 flags: 0,
                 data: fork_op,
             });
-            ops.push(Op {
-                flags: 0,
-                data: inode_log_format(ino, XFS_ILOG_CORE, &new_buf),
-            });
-            ops.push(Op {
-                flags: 0,
-                data: new_logged,
-            });
+            if new_dsize == 0 {
+                ops.push(Op {
+                    flags: 0,
+                    data: inode_log_format(ino, XFS_ILOG_CORE, &new_buf),
+                });
+                ops.push(Op {
+                    flags: 0,
+                    data: new_logged,
+                });
+            } else {
+                ops.push(Op {
+                    flags: 0,
+                    data: inode_log_format_with_fork(
+                        ino,
+                        XFS_ILOG_CORE | XFS_ILOG_DDATA,
+                        &new_buf,
+                        new_dsize as u16,
+                    ),
+                });
+                ops.push(Op {
+                    flags: 0,
+                    data: new_logged,
+                });
+                ops.push(Op {
+                    flags: 0,
+                    data: new_fork_op,
+                });
+            }
             ops.push(Op {
                 flags: XLOG_COMMIT_TRANS,
                 data: Vec::new(),
@@ -344,6 +469,26 @@ impl Filesystem {
 
         Ok((ino, lsn))
     }
+}
+
+/// The data fork of a directory that has just been made: no entries,
+/// and the parent it belongs to.
+///
+/// Six bytes when the parent's inode number fits in 32 bits and ten when
+/// it does not, and which of those it is has to be recorded in
+/// `i8count` — a reader takes the width from that field, so a wide
+/// parent written as narrow is read as a different directory entirely.
+fn empty_short_form_dir(parent: u64) -> Vec<u8> {
+    let wide = parent > u64::from(u32::MAX);
+    let mut out = Vec::with_capacity(if wide { 10 } else { 6 });
+    out.push(0); // count: no entries
+    out.push(u8::from(wide)); // i8count: how wide the inode numbers are
+    if wide {
+        out.extend_from_slice(&parent.to_be_bytes());
+    } else {
+        out.extend_from_slice(&(parent as u32).to_be_bytes());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -358,7 +503,7 @@ mod tests {
         let mut raw = vec![0u8; 176];
         raw[core_at::GEN..core_at::GEN + 4].copy_from_slice(&7u32.to_be_bytes());
 
-        let core = created_core(&raw, 0o100644);
+        let core = created_core(&raw, 0o100644, Kind::File, 0);
         assert_eq!(
             u16::from_be_bytes(core[core_at::MODE..core_at::MODE + 2].try_into().unwrap()),
             0o100644
@@ -394,7 +539,7 @@ mod tests {
         raw[DI_INO..DI_INO + 8].copy_from_slice(&186u64.to_be_bytes());
         raw[DI_UUID..DI_UUID + 16].copy_from_slice(&[0xab; 16]);
 
-        let core = created_core(&raw, 0o100644);
+        let core = created_core(&raw, 0o100644, Kind::File, 0);
         assert_eq!(&core[0..2], &0x494eu16.to_be_bytes(), "di_magic");
         assert_eq!(core[4], 3, "di_version");
         assert_eq!(
