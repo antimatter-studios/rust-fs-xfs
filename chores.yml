@@ -115,6 +115,12 @@ tasks:
     desc: Halt the oracle VM, keeping its disk image
     cmds: ['./scripts/vm.sh down']
 
+  vm:status:
+    desc: Say whether the oracle VM is running
+    # "Is anything still up?" had no answer short of reading `ps` for a
+    # qemu command line. Every leak was found that way, after the fact.
+    cmds: ['./scripts/vm.sh status']
+
   vm:destroy:
     desc: Destroy the oracle VM, reclaiming its disk image (~4.7 GB)
     # Halting keeps the image and a re-boot is quick; destroying reclaims
@@ -136,6 +142,16 @@ tasks:
       - defer: ./scripts/vm.sh down
       - |
         set -euo pipefail
+        # One boot for the whole run, one teardown at the end.
+        #
+        # Each wrapper now tears the machine down when it finishes, which
+        # is right when it is run on its own and wrong seven in a row:
+        # build, halt, boot, build, halt, boot. KEEP_VM tells them to
+        # leave it up. The `defer:` above is what brings it down — once,
+        # whether this succeeded or failed, and chore fails the task if
+        # that teardown fails.
+        export KEEP_VM=1
+        ./scripts/vm.sh up
         run() {
           echo "==> $1"
           "./scripts/$1"
@@ -150,6 +166,11 @@ tasks:
           unlink)   run vm-build-unlink-fixtures.sh ;;
           dirconv)  run vm-build-dirconv-fixtures.sh ;;
           all)
+            # `stress` is NOT in this list. Saying so out loud because a
+            # set that is quietly skipped by the catch-all is the same
+            # shape of problem as an oracle that skips: `all` that is not
+            # all should say which.
+            echo "note: the 'stress' set is not part of 'all' — build it with --set stress" >&2
             # Geometry and data first: several suites read those, and the
             # rest are independent of each other.
             run vm-build-fixtures.sh
