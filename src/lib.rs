@@ -34,6 +34,7 @@ pub mod buf_write;
 pub mod capi;
 pub mod create;
 pub mod dir;
+pub mod dir_block;
 pub mod dir_write;
 pub mod endian;
 pub mod error;
