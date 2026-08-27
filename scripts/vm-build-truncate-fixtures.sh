@@ -35,6 +35,9 @@
 #   ./scripts/vm-build-truncate-fixtures.sh
 set -euo pipefail
 
+# Bring the machine down when this finishes, however it finishes.
+source "$(dirname "${BASH_SOURCE[0]}")/vm-session.sh"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # One megabyte per file: enough to be a real extent, small enough that

@@ -12,6 +12,9 @@
 # inode-number split, and the feature flags change the AG layout.
 set -euo pipefail
 
+# Bring the machine down when this finishes, however it finishes.
+source "$(dirname "${BASH_SOURCE[0]}")/vm-session.sh"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$REPO/scripts/vm.sh" up
 
