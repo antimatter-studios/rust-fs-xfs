@@ -148,6 +148,24 @@ jobs:
       - name: Build the XFS fixture matrix
         run: ./scripts/build-fixtures-native.sh
 
+      # The directory-conversion fixtures, which need to mount and so
+      # cannot come from build-fixtures-native.sh. Same script the VM
+      # runner calls — deliberately one copy, because the geometry
+      # fixtures already have two builders and the warning above about
+      # them drifting was written after they did.
+      #
+      # Without this the block-form comparison in tests/dir_block_oracle.rs
+      # finds no fixtures and skips, which reads exactly like passing.
+      - name: Build the directory-conversion fixtures
+        run: ./scripts/build-dirconv-fixtures.sh
+
+      # The strongest check in the suite: build a block-form directory
+      # from the short-form one, and require it to equal the block the
+      # kernel built for the same entries, byte for byte apart from the
+      # checksum and sequence number it stamps after logging.
+      - name: Compare our block-form directory against the kernel's
+        run: cargo test --locked --release --test dir_block_oracle -- --nocapture
+
       # The comparison itself: parse each image with this driver and
       # require every field to equal what xfs_db reported for it. This
       # MUST run before the mount step below — mounting replays the log
