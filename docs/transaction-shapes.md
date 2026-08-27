@@ -21,7 +21,7 @@ against.
 | write 4 KiB (allocating) | 12 | 4 | written, kernel reads the file back |
 | create empty file | 14 | 5 | written, kernel opens and writes the file |
 | unlink | 14 | 5 | written, kernel agrees the file is gone |
-| mkdir | 15 | 5 | not yet |
+| mkdir | 15 | 5 | written, kernel uses the directory |
 | shortform to block directory | 23 | 9 | not yet |
 
 The two allocator shapes share their machinery, since freeing an extent and allocating

@@ -277,3 +277,148 @@ fn a_group_with_no_free_inode_is_refused() {
         "the refusal should say what is missing, not merely fail: {message}"
     );
 }
+
+/// A directory made by this driver, used by the kernel.
+///
+/// Everything a create has to get right, plus the two things only a
+/// directory has: a fork of its own holding the parent it belongs to,
+/// and a **parent whose link count moves** because the new directory's
+/// `..` is a link to it.
+///
+/// The link count is the part nothing catches by reading the directory
+/// back. A parent left at its old count reads perfectly, lists
+/// perfectly, and is wrong — it shows up in a consistency check, or much
+/// later, when the parent refuses to be removed because the kernel
+/// believes something still links to it.
+#[test]
+fn the_kernel_uses_a_directory_this_driver_made() {
+    let source = share().join("xfscreate-spare-before.img");
+    if !source.exists() {
+        eprintln!("no create fixture — skipping");
+        return;
+    }
+    let name = "xfs-mkdir-scratch.img";
+    let scratch = Scratch::from(&source, name);
+    let img = scratch.path();
+
+    let (made, parent_nlink_before) = {
+        let dev = FileDevice::open_rw(img).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        let root = fs.superblock().rootino;
+        let before = fs.read_inode(root).expect("read the root").nlink;
+        let (ino, lsn) = fs
+            .create_directory(root, b"newdir", 0o040755)
+            .expect("the mkdir must be accepted");
+        assert_ne!(lsn, 0, "a record must be given a sequence number");
+        (ino, before)
+    };
+
+    let script = format!(
+        r#"
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/{name} "$img"
+        dmesg -C >/dev/null 2>&1
+        m=$(mktemp -d)
+        if mount -o loop,nouuid "$img" "$m"; then
+            if [ -d "$m/newdir" ]; then echo "IS_DIR"; else echo "NOT_DIR"; fi
+            echo "DIR_INO $(stat -c %i "$m/newdir")"
+            echo "DIR_LINKS $(stat -c %h "$m/newdir")"
+            echo "PARENT_LINKS $(stat -c %h "$m")"
+            echo "DOTDOT $(stat -c %i "$m/newdir/..")"
+            echo "EMPTY $(ls -A "$m/newdir" | wc -l)"
+            # A directory has to be usable, not merely present.
+            if : > "$m/newdir/inside" 2>/dev/null; then
+                echo "USABLE ok"
+                echo "LISTS $(ls "$m/newdir" | tr '\n' ' ')"
+            else
+                echo "USABLE failed"
+            fi
+            umount "$m"
+        else
+            echo "MOUNT_FAILED"
+            dmesg | tail -12
+        fi
+        rmdir "$m" 2>/dev/null
+        echo "REPAIR_BEGIN"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
+        rm -f "$img"
+        echo "DONE"
+        "#
+    );
+
+    let Some(out) = vm_run(&script) else {
+        eprintln!("oracle VM unavailable — skipping verification");
+        return;
+    };
+
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "the kernel refused the filesystem after the mkdir was logged:\n{out}"
+    );
+    assert!(out.contains("IS_DIR"), "newdir is not a directory\n{out}");
+    assert!(
+        out.contains("USABLE ok"),
+        "nothing could be created inside the new directory\n{out}"
+    );
+
+    let field = |key: &str| -> String {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key} ")))
+            .unwrap_or_else(|| panic!("the VM did not report {key}:\n{out}"))
+            .trim()
+            .to_string()
+    };
+
+    assert_eq!(
+        field("DIR_INO"),
+        made.to_string(),
+        "the directory came back as a different inode than was logged\n{out}"
+    );
+    assert_eq!(
+        field("EMPTY"),
+        "0",
+        "a directory that has just been made should hold nothing — `.` and `..` are \
+         not entries in the short form\n{out}"
+    );
+    assert_eq!(
+        field("DOTDOT"),
+        // The parent is the root, whose inode number the fixture's
+        // superblock states.
+        {
+            let fs = Filesystem::mount(Arc::new(FileDevice::open(&source).expect("open")))
+                .expect("mount");
+            fs.superblock().rootino.to_string()
+        },
+        "the new directory's `..` does not point at its parent\n{out}"
+    );
+
+    // Two links: the entry naming it, and its own `.`.
+    assert_eq!(
+        field("DIR_LINKS"),
+        "2",
+        "a new directory has two links — the entry naming it and its own `.`\n{out}"
+    );
+
+    // And the parent gained one, because the new directory's `..` links
+    // to it.
+    assert_eq!(
+        field("PARENT_LINKS"),
+        (parent_nlink_before + 1).to_string(),
+        "the parent's link count should have gone up by one for the new directory's \
+         `..`, from {parent_nlink_before}\n{out}"
+    );
+
+    let repair: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
+        .take_while(|l| !l.starts_with("REPAIR_END"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        repair.contains("REPAIR_RC=0"),
+        "xfs_repair found something wrong after the replay:\n{repair}"
+    );
+
+    eprintln!("the kernel used a directory this driver made (inode {made})");
+}
