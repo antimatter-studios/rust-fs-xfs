@@ -61,6 +61,20 @@ jobs:
       # xfsprogs installed; the validate-kernel-xfs job below opts them in.
       - run: cargo test --locked --release
 
+      # The VM-teardown guards, which decide whether a machine is left
+      # running. They stub pgrep and vagrant, so they need neither.
+      #
+      # These existed and ran nowhere: the same hole the fixture oracles
+      # had, in the tests written to close it.
+      - name: VM teardown and reaper semantics
+        run: |
+          set -euo pipefail
+          for t in tests/scripts/*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
   # ---------------------------------------------------------------------
   # Real-kernel cross-validation gate. This job BLOCKS — it is not
   # advisory, and it is not continue-on-error.
