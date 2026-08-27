@@ -57,9 +57,10 @@
 use crate::ag::{offsets::agi as agi_at, Agi};
 use crate::alloc_btree::expected_blkno;
 use crate::dir;
+use crate::dir_block;
 use crate::error::{Error, Result};
 use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGI, BLFT_BTREE};
-use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
+use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
 use crate::group_write::{changed_chunks, rebuild_inode_leaf};
 use crate::inode::Format;
@@ -140,6 +141,7 @@ mod core_at {
     pub const MODE: usize = 2;
     pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
+    pub const NBLOCKS: usize = 64;
     pub const SIZE: usize = 56;
     pub const GEN: usize = 92;
     pub const CHANGECOUNT: usize = 104;
@@ -173,7 +175,115 @@ fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
     core
 }
 
+/// What converting a directory to block form produced.
+struct Converted {
+    /// The parent's new data fork: a single extent record naming the
+    /// block the directory now lives in.
+    fork: Vec<u8>,
+    /// Its new size, which is one directory block.
+    size: u64,
+    /// The three items recording the allocation, then the directory
+    /// block itself.
+    items: Vec<crate::buf_write::BufferItem>,
+}
+
+/// Set `di_nextents`, wherever the inode's own feature bits put it.
+fn set_nextents(core: &mut [u8], count: u64) {
+    const NEXTENTS: usize = 76;
+    const NEXTENTS64: usize = 24;
+    const FLAGS2: usize = 120;
+
+    let nrext64 = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"))
+        & crate::format::log_items::log_dinode::flags2::DI_FLAGS2_NREXT64
+        != 0;
+    if nrext64 {
+        core[NEXTENTS64..NEXTENTS64 + 8].copy_from_slice(&count.to_be_bytes());
+    } else {
+        core[NEXTENTS..NEXTENTS + 4].copy_from_slice(&(count as u32).to_be_bytes());
+    }
+}
+
 impl Filesystem {
+    /// Move a short-form directory into a block of its own, with `new`
+    /// added.
+    ///
+    /// This is what happens when one more entry will not fit inside the
+    /// inode. A block is allocated, the whole directory is written into
+    /// it — `.`, `..`, every existing name and the new one, plus a hash
+    /// index — and the inode's fork becomes a single extent naming it.
+    ///
+    /// # The block is not written to disk
+    ///
+    /// It goes into the record as a buffer item, like every other
+    /// metadata change here, and recovery writes it. That is what keeps
+    /// the operation checkable: a directory that came out converted is
+    /// one something replayed.
+    ///
+    /// That differs from an allocating file write, which does put the
+    /// file's bytes on disk before logging — because file data is not
+    /// journalled and directory blocks are.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::group_write::Allocated`], and
+    /// [`Error::UnsupportedFeature`] if the entries do not fit in one
+    /// block — that is the leaf form.
+    fn convert_to_block_form(
+        &self,
+        parent: u64,
+        parsed: &dir::ShortFormDir,
+        new: dir_block::Entry,
+    ) -> Result<Converted> {
+        use crate::extent::Extent;
+        use crate::format::log_items::buf_log_format::buf_type::BLFT_DIR_BLOCK;
+        use crate::group_write::changed_chunks;
+
+        let dirblocksize = (u64::from(self.sb.blocksize) << self.sb.dirblklog) as usize;
+        if dirblocksize != self.sb.blocksize as usize {
+            return Err(Error::UnsupportedFeature(format!(
+                "a directory block of {dirblocksize} bytes spans more than one filesystem                  block, so converting would allocate several; only a directory block the                  size of a filesystem block is supported"
+            )));
+        }
+
+        // The block comes from the directory's own group, which keeps it
+        // near the inode that names it.
+        let (agno, _, _) = self.sb.split_ino(parent);
+        let allocated = self.allocate_in_group(agno, 1)?;
+        let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(allocated.agblock);
+
+        let entries = {
+            let mut e = dir_block::entries_from_short_form(parsed, parent, None);
+            e.push(new);
+            e
+        };
+        let block = dir_block::build(&self.sb, fsblock, parent, &entries)?;
+
+        // The block did not exist a moment ago, so every byte of it is a
+        // change — but only the bytes that are not zero are worth
+        // logging, and diffing against a block of zeros is what says
+        // which those are. It comes to the header and entries at the
+        // front and the index and tail at the back, with the free middle
+        // left out, which is what the kernel logs too.
+        let fresh = vec![0u8; dirblocksize];
+        let blkno = fsblock * u64::from(self.sb.blocksize) / crate::log::BBSIZE as u64;
+        let block_item = changed_chunks(blkno, &fresh, block, BLFT_DIR_BLOCK);
+
+        let extent = Extent {
+            startoff: 0,
+            startblock: fsblock,
+            blockcount: 1,
+            unwritten: false,
+        };
+
+        let mut items = allocated.items;
+        items.push(block_item);
+        Ok(Converted {
+            fork: extent.to_bytes()?.to_vec(),
+            size: dirblocksize as u64,
+            items,
+        })
+    }
+
     /// Create an empty regular file called `name` in `parent`.
     ///
     /// Returns the new file's inode number and the sequence number the
@@ -319,12 +429,48 @@ impl Filesystem {
         // and writing it here would dirty a chunk nothing else touches and
         // add an operation to the record. See `group_write::restamp_crc`.
 
-        // The parent gains an entry, so its fork and its size change.
-        let fork =
-            self.short_form_with_entry(&parsed, name, ino, kind.ftype(), fork_end - fork_start)?;
+        // The parent gains an entry, so its fork and its size change —
+        // unless the entry will not fit, in which case the directory
+        // leaves its inode entirely and this becomes a conversion.
+        let fork_space = fork_end - fork_start;
+        let short_form =
+            self.short_form_with_entry(&parsed, name, ino, kind.ftype(), fork_space)?;
+
+        let converted = match &short_form {
+            Some(_) => None,
+            None => Some(self.convert_to_block_form(
+                parent,
+                &parsed,
+                dir_block::Entry {
+                    name: name.to_vec(),
+                    ino,
+                    ftype: kind.ftype(),
+                },
+            )?),
+        };
+
+        // Whichever it is, the parent's fork is these bytes and its size
+        // is their length — a short-form directory's size is its fork,
+        // and a converted one's is the block it now occupies.
+        let (fork, dir_fields, dir_size, dir_blocks, dir_nextents, dir_format) =
+            match (&short_form, &converted) {
+                (Some(fork), _) => (
+                    fork.clone(),
+                    XFS_ILOG_DDATA,
+                    fork.len() as u64,
+                    dir_inode.nblocks,
+                    dir_inode.nextents,
+                    Format::Local,
+                ),
+                (None, Some(c)) => (c.fork.clone(), XFS_ILOG_DEXT, c.size, 1, 1, Format::Extents),
+                (None, None) => unreachable!("one of the two is always taken"),
+            };
+
         let mut dir_core = dir_raw.clone();
-        dir_core[core_at::SIZE..core_at::SIZE + 8]
-            .copy_from_slice(&(fork.len() as u64).to_be_bytes());
+        dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
+        dir_core[core_at::FORMAT] = dir_format as u8;
+        dir_core[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&dir_blocks.to_be_bytes());
+        set_nextents(&mut dir_core, dir_nextents);
         dir_core[core_at::NLINK..core_at::NLINK + 4]
             .copy_from_slice(&kind.parent_nlink(dir_inode.nlink).to_be_bytes());
         let at = core_at::CHANGECOUNT;
@@ -398,8 +544,19 @@ impl Filesystem {
         // has a fork. That one operation is the whole difference between
         // a create's fourteen and a mkdir's fifteen.
         let new_ops = if new_dsize == 0 { 2 } else { 3 };
-        let item_ops =
-            agi_item.op_count() + inobt_item.op_count() + finobt_item.op_count() + 3 + new_ops;
+
+        // The conversion's own items, when there was one: the group
+        // header, the two free-space trees and the directory block.
+        // Empty otherwise, which is why the ordinary create's shape is
+        // unchanged by any of this.
+        let extra: Vec<crate::buf_write::BufferItem> = converted.map_or_else(Vec::new, |c| c.items);
+
+        let item_ops = agi_item.op_count()
+            + inobt_item.op_count()
+            + finobt_item.op_count()
+            + extra.iter().map(|i| i.op_count()).sum::<usize>()
+            + 3
+            + new_ops;
 
         let lsn = append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
@@ -415,11 +572,16 @@ impl Filesystem {
             ops.extend(agi_item.ops());
             ops.extend(inobt_item.ops());
             ops.extend(finobt_item.ops());
+            for item in &extra {
+                ops.extend(item.ops());
+            }
             ops.push(Op {
                 flags: 0,
                 data: inode_log_format_with_fork(
                     parent,
-                    XFS_ILOG_CORE | XFS_ILOG_DDATA,
+                    // DDATA while the directory is still inline, DEXT
+                    // once it has been moved into a block of its own.
+                    XFS_ILOG_CORE | dir_fields,
                     &dir_buf,
                     dsize as u16,
                 ),

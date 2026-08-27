@@ -31,7 +31,7 @@ corrupt.
 | Symlinks | inline and remote (`XSLM`), across multiple extents |
 | Extended attributes | on-disk shapes documented; reading not yet |
 | Log replay | not yet — a dirty volume is refused, not silently misread |
-| Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir |
+| Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir, directory conversion |
 | Write path | overwrite in place, plus the journalled operations above |
 
 ### What the write path can do
@@ -48,6 +48,7 @@ record the Linux kernel replays:
 | create an empty file | 14 | 5 |
 | remove an empty file | 14 | 5 |
 | make an empty directory | 15 | 5 |
+| convert a directory to block form | 23 | 9 |
 
 Those op and item counts are not this driver's choice. They were measured from
 filesystems the kernel wrote, recorded in `docs/transaction-shapes.md`, and the encoder
@@ -64,9 +65,9 @@ creates in a row would hand out the same inode. The second attempt is refused ra
 than answered wrongly; supporting more needs a dirty-block overlay this does not have.
 
 Each operation also refuses by name what it cannot do rather than attempting it. See
-`docs/transaction-shapes.md` for the list and for the shape not yet written — the
-short-form-to-block directory conversion, which is what every one of these refuses when
-a directory grows past its inode.
+`docs/transaction-shapes.md` for the list. Every shape that document measured is now
+written; what remains is the next size up — a directory that has outgrown a single
+block, which is the leaf form.
 
 Features recognised in the superblock and gated rather than guessed: `finobt`,
 `rmapbt`, `reflink`, `inobtcnt`, `ftype`, `sparse inodes`, `metadata UUID`, `bigtime`,

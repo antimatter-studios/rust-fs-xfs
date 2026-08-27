@@ -229,13 +229,27 @@ impl Filesystem {
         encode_short_form(parsed, has_ftype, &entries, fork_space)
     }
 
-    /// The directory's fork with `name` added at the end.
+    /// The directory's fork with `name` added at the end, or `None` if
+    /// it will not fit.
     ///
     /// The new entry goes last with a fresh cookie, the same as a
     /// rename's replacement does, because a cookie is a reader's place
     /// in the directory and handing out one that has been used before
     /// would send a reader that is part-way through back to an entry it
     /// has already seen.
+    ///
+    /// # Why not fitting is an answer rather than an error
+    ///
+    /// It is what triggers the conversion to block form, which is a
+    /// thing the caller does rather than a failure. The alternative —
+    /// returning an error and having the caller decide which errors mean
+    /// "convert" — puts that decision behind a string comparison, and
+    /// the same error type is also how a genuine refusal arrives.
+    ///
+    /// The size comes from encoding it rather than from arithmetic
+    /// repeated here: the fork is built against no limit and its length
+    /// is then compared, so there is one description of the layout and
+    /// not two that can disagree.
     pub(crate) fn short_form_with_entry(
         &self,
         parsed: &dir::ShortFormDir,
@@ -243,7 +257,7 @@ impl Filesystem {
         ino: u64,
         ftype: u8,
         fork_space: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         let has_ftype = self.sb.has_ftype();
         let next = next_cookie(parsed, has_ftype);
 
@@ -264,7 +278,11 @@ impl Filesystem {
             cookie: next,
         });
 
-        encode_short_form(parsed, has_ftype, &entries, fork_space)
+        // Encoded against no limit, then measured. A cookie past what
+        // the two-byte field holds is still an error from in there — it
+        // is a genuine refusal and converting would not help.
+        let fork = encode_short_form(parsed, has_ftype, &entries, usize::MAX)?;
+        Ok((fork.len() <= fork_space).then_some(fork))
     }
 
     /// The directory's fork with `name` taken out.
@@ -342,7 +360,11 @@ fn encode_short_form(
         XFS_DIR2_SF_HDR_SIZE_4
     };
 
-    let mut out = Vec::with_capacity(fork_space);
+    // Sized from the entries rather than from `fork_space`: callers
+    // measuring a fork against no limit pass `usize::MAX`, and a
+    // capacity hint of that is a panic rather than a large allocation.
+    let mut out =
+        Vec::with_capacity(header + entries.iter().map(|e| 12 + e.name.len()).sum::<usize>());
     out.push(u8::try_from(entries.len()).map_err(|_| {
         Error::UnsupportedFeature(format!(
             "a short-form directory cannot hold {} entries",

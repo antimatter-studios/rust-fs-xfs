@@ -22,6 +22,7 @@
 
 use crate::alloc_btree::FreeExtent;
 use crate::buf_write::BufferItem;
+use crate::error::{Error, Result};
 use crate::format::log_items::buf_log_format::BLF_CHUNK;
 use crate::inode_btree::InodeChunk;
 use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
@@ -210,6 +211,149 @@ pub fn split_fsblock(sb: &Superblock, fsblock: u64) -> (u32, u32) {
         (fsblock >> sb.agblklog) as u32,
         (fsblock & ((1u64 << sb.agblklog) - 1)) as u32,
     )
+}
+
+// ---------------------------------------------------------------------
+// Taking blocks out of a group
+// ---------------------------------------------------------------------
+
+/// Blocks taken out of an allocation group, and the items that say so.
+pub struct Allocated {
+    /// Where the run starts, relative to the group.
+    pub agblock: u32,
+    /// The group header, the by-block tree and the by-length tree, in
+    /// that order.
+    pub items: Vec<BufferItem>,
+}
+
+impl crate::fs::Filesystem {
+    /// Take `want` contiguous blocks out of allocation group `agno`.
+    ///
+    /// Returns where they start and the three buffer items recording the
+    /// change. Nothing is written: the items are the change, and the
+    /// caller puts them in a record.
+    ///
+    /// # Which blocks
+    ///
+    /// The first free run long enough, in block order. That policy is
+    /// this driver's rather than XFS's — XFS weighs locality,
+    /// contiguity and several other things, none of which is visible in
+    /// a record. Any run that is genuinely free produces a filesystem
+    /// the kernel accepts, so the choice affects layout rather than
+    /// correctness.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when the group's free-space trees
+    /// are more than one level deep, when no single run is long enough,
+    /// or when the result would need more records than a tree root
+    /// holds.
+    pub(crate) fn allocate_in_group(&self, agno: u32, want: u32) -> Result<Allocated> {
+        use crate::ag::agf_btree::{BNO, CNT};
+        use crate::ag::Agf;
+        use crate::alloc_btree::{alloc_extent, expected_blkno, longest, total_free, FreeExtent};
+        use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
+        use crate::log::BBSIZE;
+
+        let blocksize = u64::from(self.sb.blocksize);
+        let sector = u64::from(self.sb.sectsize);
+        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * blocksize;
+
+        let mut agf_raw = vec![0u8; self.sb.sectsize as usize];
+        self.device().read_at(ag_start + sector, &mut agf_raw)?;
+        let agf = Agf::parse(&agf_raw, &self.sb, agno)?;
+
+        for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
+            if agf.levels[which] != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno}'s {name} free-space tree is {} levels deep, \
+                     where taking a record out can collapse a node; only a single-level \
+                     tree is supported",
+                    agf.levels[which]
+                )));
+            }
+        }
+
+        let mut bno_raw = vec![0u8; self.sb.blocksize as usize];
+        self.device().read_at(
+            ag_start + u64::from(agf.roots[BNO]) * blocksize,
+            &mut bno_raw,
+        )?;
+        let mut cnt_raw = vec![0u8; self.sb.blocksize as usize];
+        self.device().read_at(
+            ag_start + u64::from(agf.roots[CNT]) * blocksize,
+            &mut cnt_raw,
+        )?;
+
+        let numrecs = u16::from_be_bytes(
+            bno_raw[btree::NUMRECS..btree::NUMRECS + 2]
+                .try_into()
+                .expect("2 bytes"),
+        );
+        let mut by_block = leaf_records(&bno_raw, numrecs);
+
+        let chosen = by_block
+            .iter()
+            .find(|run| run.blockcount >= want)
+            .copied()
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "allocation group {agno} has no single free run of {want} blocks — its \
+                     longest is {}, and splitting across extents is not implemented",
+                    longest(&by_block)
+                ))
+            })?;
+        let taking = FreeExtent {
+            startblock: chosen.startblock,
+            blockcount: want,
+        };
+        alloc_extent(&mut by_block, taking)?;
+
+        let capacity = leaf_capacity(self.sb.blocksize);
+        if by_block.len() > capacity {
+            return Err(Error::UnsupportedFeature(format!(
+                "allocation group {agno} would need {} free-space records and its tree root \
+                 holds {capacity}; splitting a node is not implemented",
+                by_block.len()
+            )));
+        }
+
+        let mut by_count = by_block.clone();
+        by_count.sort_by_key(|e| (e.blockcount, e.startblock));
+
+        let new_bno = rebuild_leaf(&bno_raw, &by_block);
+        let new_cnt = rebuild_leaf(&cnt_raw, &by_count);
+
+        let mut new_agf = agf_raw.clone();
+        let freeblks = u32::try_from(total_free(&by_block)).map_err(|_| {
+            Error::CorruptLog(format!(
+                "allocation group {agno} has more free blocks than fit"
+            ))
+        })?;
+        new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
+        new_agf[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&longest(&by_block).to_be_bytes());
+        // The checksum is left stale on purpose — recovery recomputes it.
+
+        let ag_bb = ag_start / BBSIZE as u64;
+        Ok(Allocated {
+            agblock: taking.startblock,
+            items: vec![
+                changed_chunks(ag_bb + sector / BBSIZE as u64, &agf_raw, new_agf, BLFT_AGF),
+                changed_chunks(
+                    expected_blkno(&self.sb, agno, agf.roots[BNO]),
+                    &bno_raw,
+                    new_bno,
+                    BLFT_BTREE,
+                ),
+                changed_chunks(
+                    expected_blkno(&self.sb, agno, agf.roots[CNT]),
+                    &cnt_raw,
+                    new_cnt,
+                    BLFT_BTREE,
+                ),
+            ],
+        })
+    }
 }
 
 #[cfg(test)]
