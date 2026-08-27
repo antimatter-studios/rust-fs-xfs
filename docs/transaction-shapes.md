@@ -9,7 +9,7 @@ have to measure it again.
 
 ## What is written now
 
-Three of these shapes are implemented, and each came out matching the measurement
+**Every measured shape is implemented**, and each came out matching the measurement
 without being fitted to it — the op counts, the item counts and the block addresses
 below were all predictions this document made before there was any code to check them
 against.
@@ -22,7 +22,7 @@ against.
 | create empty file | 14 | 5 | written, kernel opens and writes the file |
 | unlink | 14 | 5 | written, kernel agrees the file is gone |
 | mkdir | 15 | 5 | written, kernel uses the directory |
-| shortform to block directory | 23 | 9 | not yet |
+| shortform to block directory | 23 | 9 | written, kernel uses the converted directory |
 
 The two allocator shapes share their machinery, since freeing an extent and allocating
 one are the same work in opposite directions. What differs is which way the records
@@ -40,9 +40,11 @@ Named here so the gap between what is measured and what is written stays visible
 extents spanning more than one allocation group; a data fork in B+tree format; a
 free-space or inode tree more than one level deep, or a root with no room for another
 record; a file too large for a single extent; a group with no free inode, which needs a
-whole new chunk and so needs to allocate blocks; a directory that has outgrown its
-inode; a file that still holds blocks, or has more than one link, or is a directory,
-when removing it; real-time files; and v4 filesystems.
+whole new chunk and so needs to allocate blocks; a directory that was
+*already* past its inode before the operation began — converting one is implemented,
+adding to one that is already converted is not; a file that still holds blocks, or has
+more than one link, or is a directory, when removing it; real-time files; and v4
+filesystems.
 
 ### One checkpoint per mount
 

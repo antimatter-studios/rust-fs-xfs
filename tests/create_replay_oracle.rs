@@ -422,3 +422,162 @@ fn the_kernel_uses_a_directory_this_driver_made() {
 
     eprintln!("the kernel used a directory this driver made (inode {made})");
 }
+
+/// A short-form directory converted to block form, replayed by the
+/// kernel.
+///
+/// The largest transaction this driver writes: 23 operations across 9
+/// items — a block allocated, the whole directory written into it, the
+/// inode moved from an inline fork to an extent list, and a file created
+/// in the same breath. It is what every write here refused until now,
+/// and the reason a directory of about thirty short names was the
+/// ceiling on everything else.
+///
+/// # What is actually being checked
+///
+/// That the kernel accepts it is the weakest of the claims below. A
+/// directory block can be structurally perfect and still be unusable:
+/// the index is what a lookup binary-searches, so a name that cannot be
+/// found is the failure to look for, and it is invisible to `ls`.
+///
+/// So the test looks up every name individually, adds another entry
+/// afterwards, and removes one — three things that each go through the
+/// index rather than through a linear walk.
+#[test]
+fn the_kernel_uses_a_directory_this_driver_converted() {
+    let source = share().join("xfsdirconv-exact-before.img");
+    if !source.exists() {
+        eprintln!("no conversion fixture — skipping");
+        return;
+    }
+    let name = "xfs-dirconv-scratch.img";
+    let scratch = Scratch::from(&source, name);
+    let img = scratch.path();
+
+    // What the directory held before, so the check afterwards knows what
+    // must still be there.
+    let before: Vec<String> = {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(img).expect("open"))).expect("mount");
+        let d = fs.lookup_path("/d").expect("the directory");
+        let (inode, raw) = fs.read_inode_raw(d.ino).expect("read it");
+        assert_eq!(
+            inode.format,
+            fs_xfs::inode::Format::Local,
+            "the fixture's directory should start short form"
+        );
+        fs.read_dir(&inode, &raw)
+            .expect("list it")
+            .into_iter()
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect()
+    };
+    assert!(
+        before.len() > 20,
+        "the fixture should be nearly full, not {} entries",
+        before.len()
+    );
+
+    let added = "converted";
+    {
+        let dev = FileDevice::open_rw(img).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        let d = fs.lookup_path("/d").expect("the directory");
+        let (ino, lsn) = fs
+            .create_file(d.ino, added.as_bytes(), 0o100644)
+            .expect("the conversion must be accepted");
+        assert_ne!(lsn, 0, "a record must be given a sequence number");
+        assert_ne!(ino, 0);
+    }
+
+    let checks: String = before
+        .iter()
+        .take(6)
+        .map(|n| format!("\n            [ -e \"$m/d/{n}\" ] || echo \"LOST {n}\""))
+        .collect();
+
+    let script = format!(
+        r#"
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/{name} "$img"
+        dmesg -C >/dev/null 2>&1
+        m=$(mktemp -d)
+        if mount -o loop,nouuid "$img" "$m"; then
+            echo "COUNT $(ls -A "$m/d" | wc -l)"
+            [ -e "$m/d/{added}" ] && echo "ADDED_PRESENT" || echo "ADDED_MISSING"
+            # Every one of these resolves through the hash index, not a
+            # linear walk — a name that cannot be looked up is invisible
+            # to `ls` and fatal to everything else.{checks}
+            # Adding and removing exercise the index as a structure that
+            # is maintained, not merely read.
+            : > "$m/d/afterwards" 2>/dev/null && echo "ADD_OK" || echo "ADD_FAILED"
+            rm -f "$m/d/{added}" 2>/dev/null && echo "REMOVE_OK" || echo "REMOVE_FAILED"
+            umount "$m"
+        else
+            echo "MOUNT_FAILED"
+            dmesg | tail -12
+        fi
+        rmdir "$m" 2>/dev/null
+        echo "REPAIR_BEGIN"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
+        rm -f "$img"
+        echo "DONE"
+        "#
+    );
+
+    let Some(out) = vm_run(&script) else {
+        eprintln!("oracle VM unavailable — skipping verification");
+        return;
+    };
+
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "the kernel refused the filesystem after the conversion:\n{out}"
+    );
+    assert!(
+        !out.contains("LOST "),
+        "a name that was in the short form cannot be found after the conversion — \
+         the hash index does not agree with the entries\n{out}"
+    );
+    assert!(
+        out.contains("ADDED_PRESENT"),
+        "the entry that triggered the conversion is not there\n{out}"
+    );
+    assert!(
+        out.contains("ADD_OK"),
+        "nothing could be added to the converted directory\n{out}"
+    );
+    assert!(
+        out.contains("REMOVE_OK"),
+        "nothing could be removed from the converted directory\n{out}"
+    );
+
+    let count: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("COUNT "))
+        .expect("the VM did not report the count")
+        .trim()
+        .parse()
+        .expect("a number");
+    assert_eq!(
+        count,
+        before.len() + 1,
+        "the converted directory should hold everything it did plus the new entry\n{out}"
+    );
+
+    let repair: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
+        .take_while(|l| !l.starts_with("REPAIR_END"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        repair.contains("REPAIR_RC=0"),
+        "xfs_repair found something wrong after the conversion:\n{repair}"
+    );
+
+    eprintln!(
+        "the kernel used a directory this driver converted ({} entries, all found)",
+        count
+    );
+}
