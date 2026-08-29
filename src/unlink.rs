@@ -118,7 +118,6 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn unlink_file(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
-        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
@@ -297,6 +296,11 @@ impl Filesystem {
 
         let item_ops = agi_item.op_count() + inobt_item.op_count() + finobt_item.op_count() + 3 + 2;
 
+        // Every refusal this operation has is behind us and the next
+        // statement writes, so the mount's one checkpoint is claimed
+        // here rather than on the way in: a refusal must not spend it.
+        // See `Filesystem::begin_checkpoint`.
+        self.begin_checkpoint()?;
         let lsn = append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
                 Op {

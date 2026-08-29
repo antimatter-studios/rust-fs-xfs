@@ -137,7 +137,6 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn write_into_empty_file(&self, ino: u64, data: &[u8]) -> Result<u64> {
-        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
@@ -272,6 +271,14 @@ impl Filesystem {
         // The checksum is left stale on purpose — recovery recomputes it,
         // and writing it here would dirty a chunk nothing else touches and
         // add an operation to the record. See `group_write::restamp_crc`.
+
+        // Every refusal this operation has is behind us and the next
+        // statement writes, so the mount's one checkpoint is claimed
+        // here rather than on the way in: a refusal must not spend it.
+        // See `Filesystem::begin_checkpoint`. This is the one entry
+        // point where the claim comes before the file's own bytes rather
+        // than before the record, because the bytes go out first.
+        self.begin_checkpoint()?;
 
         // The file's own bytes, straight to their blocks, before the
         // record that claims them. A machine that dies between the two

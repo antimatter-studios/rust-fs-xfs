@@ -76,7 +76,6 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
-        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
@@ -231,6 +230,11 @@ impl Filesystem {
         // went.
         let item_ops = agf_item.op_count() + bno_item.op_count() + cnt_item.op_count() + 2;
 
+        // Every refusal this operation has is behind us and the next
+        // statement writes, so the mount's one checkpoint is claimed
+        // here rather than on the way in: a refusal must not spend it.
+        // See `Filesystem::begin_checkpoint`.
+        self.begin_checkpoint()?;
         append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
                 Op {
