@@ -45,7 +45,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.1
+          toolchain: 1.95.0
           components: rustfmt, clippy
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -127,7 +127,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.1
+          toolchain: 1.95.0
       # xfsprogs provides mkfs.xfs (builds the fixtures) and xfs_db (the
       # oracle we grade ourselves against). Print the version: which
       # geometries and feature flags are accepted depends on it, and the
