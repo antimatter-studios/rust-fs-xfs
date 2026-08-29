@@ -572,7 +572,6 @@ impl Filesystem {
     /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
     /// and as [`append`] otherwise.
     pub fn log_inode_core(&self, ino: u64, disk_core: &[u8]) -> Result<u64> {
-        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
@@ -582,6 +581,11 @@ impl Filesystem {
         let buffer =
             InodeBuffer::containing(self.inode_offset(ino)?, self.sb.inode_cluster_bytes());
 
+        // Every refusal this operation has is behind us and the next
+        // statement writes, so the mount's one checkpoint is claimed
+        // here rather than on the way in: a refusal must not spend it.
+        // See `Filesystem::begin_checkpoint`.
+        self.begin_checkpoint()?;
         append(device.as_ref(), &self.sb, |tid| {
             vec![
                 Op {

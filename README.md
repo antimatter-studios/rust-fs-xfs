@@ -64,6 +64,10 @@ disk, so a second would be built from a disk that does not yet reflect the first
 creates in a row would hand out the same inode. The second attempt is refused rather
 than answered wrongly; supporting more needs a dirty-block overlay this does not have.
 
+That budget is spent by writing, not by asking. An operation this driver refuses — a
+name that already exists, an inode of a shape it cannot rewrite — leaves the disk as it
+found it and leaves the checkpoint for whatever the caller does next.
+
 Each operation also refuses by name what it cannot do rather than attempting it. See
 `docs/transaction-shapes.md` for the list. Every shape that document measured is now
 written; what remains is the next size up — a directory that has outgrown a single

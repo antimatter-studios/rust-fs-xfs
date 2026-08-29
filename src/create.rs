@@ -327,7 +327,6 @@ impl Filesystem {
     }
 
     fn create(&self, parent: u64, name: &[u8], mode: u16, kind: Kind) -> Result<(u64, u64)> {
-        self.begin_checkpoint()?;
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
@@ -558,6 +557,11 @@ impl Filesystem {
             + 3
             + new_ops;
 
+        // Every refusal this operation has is behind us and the next
+        // statement writes, so the mount's one checkpoint is claimed
+        // here rather than on the way in: a refusal must not spend it.
+        // See `Filesystem::begin_checkpoint`.
+        self.begin_checkpoint()?;
         let lsn = append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
                 Op {

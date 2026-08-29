@@ -91,6 +91,33 @@ impl Filesystem {
     /// attempt is refused, because a wrong answer here is one nothing
     /// downstream would catch.
     ///
+    /// # Where to call this
+    ///
+    /// At the last point before the operation writes its first byte,
+    /// **not** as the first statement of the entry point. The token is a
+    /// budget for checkpoints that were written. An operation refused
+    /// for a name that already exists, an inode of a shape this cannot
+    /// rewrite, or a tree too deep to change has left the disk exactly
+    /// as it found it, so there is nothing for the next operation to be
+    /// built on top of and so nothing to spend.
+    ///
+    /// Spending it on a refusal costs the caller the whole mount. The
+    /// next write — a legitimate one, on a handle that has written
+    /// nothing — comes back saying a checkpoint has already been
+    /// written, which is both untrue and unactionable: the error tells
+    /// the caller to mount again after a replay, and there is nothing to
+    /// replay. Nothing resets the flag, so the handle is finished.
+    ///
+    /// Claiming it late is safe because everything an entry point does
+    /// beforehand is reads and arithmetic. The cost is that a second
+    /// caller does that work before being refused, which is work it was
+    /// going to waste anyway.
+    ///
+    /// It is deliberately not given back when the write itself fails.
+    /// Once the first byte is out, a failure may have left part of a
+    /// record on disk, and carrying on from there is precisely what the
+    /// limit exists to prevent.
+    ///
     /// # Errors
     ///
     /// [`Error::UnsupportedFeature`] if a checkpoint has already been

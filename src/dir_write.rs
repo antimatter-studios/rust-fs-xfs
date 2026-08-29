@@ -76,7 +76,6 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] naming which restriction was met
     /// for a directory this cannot yet rewrite.
     pub fn rename_in_directory(&self, dir_ino: u64, from: &[u8], to: &[u8]) -> Result<u64> {
-        self.begin_checkpoint()?;
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
@@ -140,6 +139,11 @@ impl Filesystem {
         let mut fork_op = fork;
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
+        // Every refusal this operation has is behind us and the next
+        // statement writes, so the mount's one checkpoint is claimed
+        // here rather than on the way in: a refusal must not spend it.
+        // See `Filesystem::begin_checkpoint`.
+        self.begin_checkpoint()?;
         let device = self.writable.as_ref().expect("checked above");
         append(device.as_ref(), &self.sb, |tid| {
             vec![
