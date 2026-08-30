@@ -59,11 +59,45 @@ clause are gated to the tests that still use them.
 which of the two is right means re-deriving the transaction reservation, which
 is the same work M6 asks for.
 
-### H3, H4, H5 — the inode-core offset table in seven places, the log record header in three, btree node parsing triplicated — **fixable, not yet done**
+### H5 — one of three btree parsers omitted the block-address check — **fixed**
 
-H5 is the one to do first and the reason is in the finding: **one of the three
-copies silently omits an identity check**. Three parsers of the same structure
-where one validates less than the others is a bug with a delay on it.
+`alloc_btree::parse_block` and `inode_btree::parse_block` both verify a v5
+block's self-recorded address. `bmbt::parse_block` did not: `grep -in 'blkno'
+src/bmbt.rs` returned nothing at all, and the offsets module had no `BLKNO`
+constant to return.
+
+That left the block-map tree weakest against exactly the failure the check
+exists for. A pointer corrupted into **another valid block of the same file**
+passes the CRC — it is a real block — passes the owner check — same inode — and
+passes the level check whenever the two sit at the same depth. Its recorded
+address is the only field that separates them.
+
+`AGENTS.md` states the rule the omission sat against: on v5, verify the CRC *and*
+the self-describing identity fields.
+
+`bb_blkno` is at 24 in the long form, by the same +8 shift that puts `UUID` at 40
+instead of 32 — the long form carries 64-bit sibling pointers. It holds a
+**basic-block address**, 512-byte units, not a filesystem block number, so the
+conversion is now `alloc_btree::blkno_of_fsblock` and `expected_blkno` calls it:
+two callers, one conversion, neither able to be right while the other is wrong.
+
+Two tests. The first hands the walk a leaf that is correct in every other respect
+— right inode, right level, valid checksum — read at the wrong block, then reads
+the same block where it belongs to show it is not failing for some other reason.
+The second pins the unit: a 4 KiB block is eight basic blocks, and stamping the
+fsblock as-is is refused. That mistake would hide on 512-byte blocks and fire on
+every real geometry.
+
+**Every existing fixture had to start stamping its address**, which is its own
+evidence: none of them recorded one, so none of them was a block the reader
+should have accepted. Mutation-checked — removing the check fails both tests.
+
+### H3, H4 — the inode-core offset table in seven places, the log record header in three
+
+Both remain: the same `struct Node` and near-verbatim `parse_block`/`walk` in
+three files, and the inode-core offsets spread across seven. H5 was the part of
+that duplication with teeth — three parsers where one validated less — and the
+rest is readability.
 
 ### H6, H7 — `write_into_empty_file` open-coding `allocate_in_group`; `emptied_core` naming two different live functions — **needs your decision**
 
