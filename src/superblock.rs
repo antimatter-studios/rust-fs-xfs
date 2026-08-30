@@ -56,16 +56,26 @@ pub mod offsets {
     pub const DBLOCKS: usize = 8;
     /// `sb_rblocks` — total real-time section blocks.
     pub const RBLOCKS: usize = 16;
+    /// `sb_rextents` — real-time extents in the realtime section.
+    pub const REXTENTS: usize = 24;
     /// `sb_uuid` — filesystem UUID.
     pub const UUID: usize = 32;
     /// `sb_logstart` — first block of the internal log, 0 if external.
     pub const LOGSTART: usize = 48;
     /// `sb_rootino` — root directory inode number.
     pub const ROOTINO: usize = 56;
+    /// `sb_rbmino` — inode holding the realtime bitmap.
+    pub const RBMINO: usize = 64;
+    /// `sb_rsumino` — inode holding the realtime summary.
+    pub const RSUMINO: usize = 72;
+    /// `sb_rextsize` — realtime extent size in filesystem blocks.
+    pub const REXTSIZE: usize = 80;
     /// `sb_agblocks` — blocks per allocation group.
     pub const AGBLOCKS: usize = 84;
     /// `sb_agcount` — number of allocation groups.
     pub const AGCOUNT: usize = 88;
+    /// `sb_rbmblocks` — blocks the realtime bitmap occupies.
+    pub const RBMBLOCKS: usize = 92;
     /// `sb_logblocks` — log length in filesystem blocks.
     pub const LOGBLOCKS: usize = 96;
     /// `sb_versionnum` — version plus the v4-era feature bits.
@@ -90,22 +100,49 @@ pub mod offsets {
     pub const INOPBLOG: usize = 123;
     /// `sb_agblklog` — log2 of blocks per AG, rounded up.
     pub const AGBLKLOG: usize = 124;
+    /// `sb_rextslog` — log2 of the realtime extent count.
+    pub const REXTSLOG: usize = 125;
     /// `sb_inprogress` — non-zero while mkfs is still writing.
     pub const INPROGRESS: usize = 126;
+    /// `sb_imax_pct` — percentage of the filesystem inodes may occupy.
+    pub const IMAX_PCT: usize = 127;
     /// `sb_icount` — allocated inodes.
     pub const ICOUNT: usize = 128;
     /// `sb_ifree` — free inodes.
     pub const IFREE: usize = 136;
     /// `sb_fdblocks` — free data blocks.
     pub const FDBLOCKS: usize = 144;
+    /// `sb_frextents` — free realtime extents.
+    pub const FREXTENTS: usize = 152;
+    /// `sb_uquotino` — user quota inode, 0 when unset.
+    pub const UQUOTINO: usize = 160;
+    /// `sb_gquotino` — group quota inode, 0 when unset.
+    pub const GQUOTINO: usize = 168;
+    /// `sb_qflags` — quota accounting and enforcement flags.
+    pub const QFLAGS: usize = 176;
+    /// `sb_flags` — miscellaneous filesystem flags.
+    pub const FLAGS: usize = 178;
+    /// `sb_shared_vn` — shared version number; 0 on every modern volume.
+    pub const SHARED_VN: usize = 179;
     /// `sb_inoalignmt` — inode alignment in blocks.
     pub const INOALIGNMT: usize = 180;
+    /// `sb_unit` — RAID stripe unit in filesystem blocks.
+    pub const UNIT: usize = 184;
+    /// `sb_width` — RAID stripe width in filesystem blocks.
+    pub const WIDTH: usize = 188;
     /// `sb_dirblklog` — log2 of directory block size over block size.
     pub const DIRBLKLOG: usize = 192;
+    /// `sb_logsectlog` — log2 of the log's sector size.
+    pub const LOGSECTLOG: usize = 193;
+    /// `sb_logsectsize` — the log's sector size in bytes.
+    pub const LOGSECTSIZE: usize = 194;
     /// `sb_logsunit` — log stripe unit in bytes.
     pub const LOGSUNIT: usize = 196;
     /// `sb_features2`.
     pub const FEATURES2: usize = 200;
+    /// `sb_bad_features2` — the mirror of `sb_features2` written by
+    /// kernels with the alignment bug. Carried, never trusted.
+    pub const BAD_FEATURES2: usize = 204;
     /// `sb_features_compat` — v5 only.
     pub const FEATURES_COMPAT: usize = 208;
     /// `sb_features_ro_compat` — v5 only.
@@ -118,6 +155,11 @@ pub mod offsets {
     pub const CRC: usize = 224;
     /// `sb_spino_align` — sparse inode chunk alignment. v5 only.
     pub const SPINO_ALIGN: usize = 228;
+    /// `sb_pquotino` — project quota inode. v5 only.
+    pub const PQUOTINO: usize = 232;
+    /// `sb_lsn` — log sequence number of the last superblock write.
+    /// v5 only.
+    pub const LSN: usize = 240;
     /// `sb_meta_uuid` — UUID stamped into metadata blocks. v5 only.
     pub const META_UUID: usize = 248;
 }
@@ -264,6 +306,66 @@ pub struct Superblock {
     pub meta_uuid: [u8; 16],
     /// Volume label, trailing NULs trimmed.
     pub fname: String,
+
+    // ---------------------------------------------------------------
+    // Fields below this line are modelled so a superblock can be
+    // WRITTEN, not because reading needs them. A formatter has to emit
+    // every field; a reader of a data-section-only filesystem needs
+    // almost none of them. They are parsed and round-tripped exactly,
+    // and nothing in this crate reads them to make a decision.
+    //
+    // Splitting them out into their own struct was the alternative.
+    // Kept flat so the field order still matches the on-disk order,
+    // which is the property that makes an offset typo visible by eye.
+    // ---------------------------------------------------------------
+    /// `sb_rextents` — realtime extents in the realtime section.
+    pub rextents: u64,
+    /// `sb_rbmino` — inode holding the realtime bitmap.
+    pub rbmino: u64,
+    /// `sb_rsumino` — inode holding the realtime summary.
+    pub rsumino: u64,
+    /// `sb_rextsize` — realtime extent size in filesystem blocks.
+    pub rextsize: u32,
+    /// `sb_rbmblocks` — blocks the realtime bitmap occupies.
+    pub rbmblocks: u32,
+    /// `sb_rextslog` — log2 of the realtime extent count.
+    pub rextslog: u8,
+    /// `sb_imax_pct` — percentage of the filesystem inodes may occupy.
+    pub imax_pct: u8,
+    /// `sb_frextents` — free realtime extents.
+    pub frextents: u64,
+    /// `sb_uquotino` — user quota inode, 0 when unset.
+    pub uquotino: u64,
+    /// `sb_gquotino` — group quota inode, 0 when unset.
+    pub gquotino: u64,
+    /// `sb_qflags` — quota accounting and enforcement flags.
+    pub qflags: u16,
+    /// `sb_flags` — miscellaneous filesystem flags.
+    pub flags: u8,
+    /// `sb_shared_vn` — shared version number; 0 on every modern volume.
+    pub shared_vn: u8,
+    /// `sb_unit` — RAID stripe unit in filesystem blocks.
+    pub unit: u32,
+    /// `sb_width` — RAID stripe width in filesystem blocks.
+    pub width: u32,
+    /// `sb_logsectlog` — log2 of the log's sector size.
+    pub logsectlog: u8,
+    /// `sb_logsectsize` — the log's sector size in bytes.
+    pub logsectsize: u16,
+    /// `sb_bad_features2` — the mirror of [`Self::features2`] that
+    /// kernels with the alignment bug wrote.
+    ///
+    /// It is carried so a superblock can be reproduced, and is never
+    /// consulted: a filesystem where the two disagree is one the kernel
+    /// itself repairs on mount, and guessing which side is right here
+    /// would be a decision made with less information than the kernel
+    /// has.
+    pub bad_features2: u32,
+    /// `sb_pquotino` — project quota inode. v5 only; 0 on v4.
+    pub pquotino: u64,
+    /// `sb_lsn` — log sequence number of the last superblock write.
+    /// v5 only; 0 on v4.
+    pub lsn: i64,
 }
 
 /// Read a **little-endian** `u32` at `off`.
@@ -390,6 +492,39 @@ impl Superblock {
             },
             meta_uuid,
             fname,
+
+            rextents: be64(buf, offsets::REXTENTS),
+            rbmino: be64(buf, offsets::RBMINO),
+            rsumino: be64(buf, offsets::RSUMINO),
+            rextsize: be32(buf, offsets::REXTSIZE),
+            rbmblocks: be32(buf, offsets::RBMBLOCKS),
+            rextslog: buf[offsets::REXTSLOG],
+            imax_pct: buf[offsets::IMAX_PCT],
+            frextents: be64(buf, offsets::FREXTENTS),
+            uquotino: be64(buf, offsets::UQUOTINO),
+            gquotino: be64(buf, offsets::GQUOTINO),
+            qflags: be16(buf, offsets::QFLAGS),
+            flags: buf[offsets::FLAGS],
+            shared_vn: buf[offsets::SHARED_VN],
+            unit: be32(buf, offsets::UNIT),
+            width: be32(buf, offsets::WIDTH),
+            logsectlog: buf[offsets::LOGSECTLOG],
+            logsectsize: be16(buf, offsets::LOGSECTSIZE),
+            bad_features2: be32(buf, offsets::BAD_FEATURES2),
+            // Both live past the 208-byte v4 structure. On a v4
+            // filesystem those bytes are not `sb_pquotino` and
+            // `sb_lsn`; they are whatever follows the superblock, so
+            // reading them would report a field that does not exist.
+            pquotino: if is_v5 {
+                be64(buf, offsets::PQUOTINO)
+            } else {
+                0
+            },
+            lsn: if is_v5 {
+                be64(buf, offsets::LSN) as i64
+            } else {
+                0
+            },
         };
 
         sb.validate()?;
