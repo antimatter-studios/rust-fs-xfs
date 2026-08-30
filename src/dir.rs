@@ -39,7 +39,7 @@
 use crate::endian::{be16, be32, be64, le32, uuid_at};
 use crate::error::{Error, Result};
 use crate::inode::{FileType, Format, Inode};
-use crate::superblock::{crc32c_with_zeroed_crc, version_flags, Superblock};
+use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 
 /// The directory and B-tree-node layout constants this module parses
 /// with. They are defined once, in [`crate::format::dir`], alongside the
@@ -78,6 +78,7 @@ pub const MAX_SUPPORTED_NODE_LEVEL: u16 = 2;
 
 /// `XFS_SB_VERSION2_FTYPE` — on a v4 filesystem the file-type feature is
 /// advertised here rather than in the v5 incompatible feature mask.
+#[cfg(test)]
 const SB_VERSION2_FTYPE: u32 = 0x0000_0200;
 
 /// Byte offsets within the on-disk directory structures.
@@ -217,22 +218,21 @@ fn align_up(n: usize) -> usize {
 
 /// Whether directory entries on this filesystem carry a file-type byte.
 ///
-/// This is deliberately not [`Superblock::has_ftype`]. That method tests
-/// only the v5 incompatible feature bit, which is where v5 filesystems
-/// advertise the feature — but a **v4** filesystem advertises it in
-/// `sb_features2` instead, and mkfs has enabled it by default there for
-/// years. The `xfs-nocrc` oracle fixture is exactly that case: v4,
-/// `features_incompat = 0`, `features2 = 0x28a`. Reading its directories
-/// without the file-type byte shifts every inode number by one byte.
+/// Delegates to [`Superblock::has_ftype`], which tests both places the
+/// flag can live: the v5 incompatible feature mask, and `sb_features2`
+/// where a **v4** filesystem advertises it — mkfs has enabled it by
+/// default there for years. The `xfs-nocrc` oracle fixture is exactly
+/// that case (v4, `features_incompat = 0`, `features2 = 0x28a`), and
+/// reading its directories without the file-type byte shifts every
+/// inode number by one.
 ///
-/// The two conditions together are what the kernel's
-/// `xfs_sb_version_hasftype()` tests. Fixing [`Superblock::has_ftype`]
-/// to match belongs in that module, not this one.
+/// This function used to repeat the `sb_features2` half itself, with a
+/// doc saying `has_ftype` tested only the v5 bit and that fixing it
+/// "belongs in that module, not this one". It was fixed in that module;
+/// the note outlived the reason for it, and the duplicated clause had
+/// become unreachable.
 fn dir_has_ftype(sb: &Superblock) -> bool {
-    if sb.has_ftype() {
-        return true;
-    }
-    sb.versionnum & version_flags::MOREBITSBIT != 0 && sb.features2 & SB_VERSION2_FTYPE != 0
+    sb.has_ftype()
 }
 
 /// The file-type byte stored beside a directory entry name.
@@ -1280,7 +1280,7 @@ mod tests {
         b[56..64].copy_from_slice(&128u64.to_be_bytes()); // rootino
         b[84..88].copy_from_slice(&agblocks.to_be_bytes()); // agblocks
         b[88..92].copy_from_slice(&agcount.to_be_bytes()); // agcount
-        let versionnum = version | version_flags::MOREBITSBIT;
+        let versionnum = version | crate::superblock::version_flags::MOREBITSBIT;
         b[100..102].copy_from_slice(&versionnum.to_be_bytes());
         b[102..104].copy_from_slice(&512u16.to_be_bytes()); // sectsize
         b[104..106].copy_from_slice(&512u16.to_be_bytes()); // inodesize

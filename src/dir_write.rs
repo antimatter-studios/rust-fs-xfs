@@ -79,6 +79,17 @@ impl Filesystem {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);
         }
+        // The v5 gate every other journalled entry point has, and this
+        // one did not. Renaming journals the same metadata that
+        // creating, removing, truncating and writing do — v5
+        // self-describing headers with CRCs and owner fields that a v4
+        // filesystem has nowhere to put — so without this it was the
+        // one write path that would stamp them onto a v4 image.
+        if !self.sb.is_v5() {
+            return Err(Error::UnsupportedFeature(
+                "renaming writes v5 metadata; a v4 filesystem is not supported".into(),
+            ));
+        }
         if to.is_empty() || to.len() > u8::MAX as usize {
             return Err(Error::UnsupportedFeature(format!(
                 "a name of {} bytes cannot be stored; the length is one byte",

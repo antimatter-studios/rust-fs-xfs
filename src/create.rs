@@ -40,10 +40,14 @@
 //!
 //! - a group with no free inode, which needs a whole new chunk and so
 //!   needs to allocate blocks as well;
-//! - a parent that is not a short-form directory, or one with no room
-//!   left in its inode for another entry;
+//! - a parent that is not a short-form directory. A short-form parent
+//!   with no room left is NOT refused: it is converted to block form
+//!   (see `convert_to_block_form`), which is a feature of this module
+//!   rather than a limit of it;
 //! - a name that is already in the directory;
-//! - inode trees more than one level deep, or a root with no room;
+//! - inode trees more than one level deep. A root with no room is not
+//!   checked here — the capacity refusal lives in `unlink`, and this
+//!   list previously promised a guard `create` does not have;
 //! - a v4 filesystem.
 //!
 //! # What is deliberately left alone
