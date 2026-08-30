@@ -934,3 +934,56 @@ fn v4_fixture_advertises_ftype_outside_the_incompat_mask() {
         "sb_features2 is only meaningful when the MOREBITS flag is set"
     );
 }
+
+/// Renaming refuses a v4 filesystem, as every other journalled write
+/// does.
+///
+/// `rename_in_directory` was the one journalled entry point with no v5
+/// gate. Creating, removing, truncating and writing all refuse a v4
+/// image by name; renaming would have gone ahead and stamped v5
+/// self-describing headers — CRCs and owner fields — onto a filesystem
+/// with nowhere to put them.
+///
+/// `xfs-nocrc` is the only v4 fixture in the matrix, so it is the only
+/// thing that can catch this. The test pins its version too, so that if
+/// the fixture ever stops being v4 the assertion says so rather than
+/// passing for the wrong reason.
+#[test]
+fn renaming_refuses_a_v4_filesystem() {
+    use fs_core::BlockDevice;
+    use std::sync::Arc;
+
+    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
+    let img = share.join("xfs-nocrc.img");
+    if !img.exists() {
+        eprintln!("no xfs-nocrc.img — skipping");
+        return;
+    }
+
+    // Work on a copy: mount_rw takes a writable device and this must not
+    // disturb the shared fixture.
+    let tmp = std::env::temp_dir().join("xfs-nocrc-rename-gate.img");
+    std::fs::copy(&img, &tmp).expect("copy fixture");
+
+    let bytes = std::fs::read(&tmp).expect("read image");
+    let sb = Superblock::parse(&bytes).expect("parse superblock");
+    assert_eq!(
+        sb.version(),
+        4,
+        "this test needs a v4 fixture to mean anything"
+    );
+
+    let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open_rw(&tmp).expect("open rw"));
+    let fs = fs_xfs::fs::Filesystem::mount_rw(dev).expect("mount the v4 image");
+
+    let err = fs
+        .rename_in_directory(sb.rootino, b"anything", b"anything-else")
+        .expect_err("renaming must refuse a v4 filesystem");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("v5 metadata"),
+        "the refusal should say why, like the other write paths do: {msg}"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
