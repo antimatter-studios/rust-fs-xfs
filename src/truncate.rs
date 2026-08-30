@@ -75,6 +75,26 @@ impl Filesystem {
     /// [`Error::NotAFile`] for anything but a regular file, and
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
+    ///
+    /// # This is not a special case of [`Filesystem::truncate`]
+    ///
+    /// The names suggest it is. It is the **more** complete of the two:
+    ///
+    /// | | `truncate_to_zero` | `truncate` |
+    /// |---|---|---|
+    /// | journalled | **yes** — writes a log record and nothing else | **no** — writes straight to the device |
+    /// | the blocks | **freed** into the group's free-space trees | **kept**, past end of file |
+    /// | takes | an inode number | an `&Inode` you already read |
+    /// | new size | zero | any size not larger |
+    ///
+    /// Freeing the blocks is the allocation work `truncate` avoids
+    /// precisely so it can skip the log. That is the whole difference,
+    /// and it is the one a caller most needs to know: after `truncate`,
+    /// `du` still reports the old size while `ls` does not.
+    ///
+    /// Neither name says any of that, and renaming a published function
+    /// is a decision rather than a correction — so until one is made,
+    /// each says it here.
     pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);

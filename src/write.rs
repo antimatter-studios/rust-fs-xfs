@@ -339,6 +339,27 @@ impl Filesystem {
     /// [`Error::NotAFile`] for anything but a regular file, and
     /// [`Error::UnsupportedFeature`] for a grow, an inline file, a
     /// reflinked inode or a real-time inode.
+    ///
+    /// # This is not the smaller sibling of [`Filesystem::truncate_to_zero`]
+    ///
+    /// The names suggest one is a special case of the other. They are
+    /// two different operations, and the differences are the ones that
+    /// matter most:
+    ///
+    /// | | `truncate` | `truncate_to_zero` |
+    /// |---|---|---|
+    /// | journalled | **no** — writes straight to the device | **yes** — writes a log record and nothing else |
+    /// | the blocks | **kept**, past end of file | **freed** into the group's free-space trees |
+    /// | takes | an `&Inode` you already read | an inode number |
+    /// | new size | any size not larger | zero |
+    ///
+    /// So `truncate_to_zero` is the *more* complete operation, not the
+    /// narrower one: it does the allocation work this deliberately
+    /// avoids, which is exactly why it needs the log and this does not.
+    ///
+    /// Neither name says any of that, and renaming a published function
+    /// is a decision rather than a correction — so until one is made,
+    /// each says it here.
     pub fn truncate(&self, inode: &Inode, new_size: u64, when: Option<Timestamp>) -> Result<()> {
         if self.writable.is_none() {
             return Err(Error::ReadOnly);

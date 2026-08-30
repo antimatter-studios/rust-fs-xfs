@@ -135,6 +135,26 @@ mapping; a private `mod inode` shadowing `crate::inode`.
 
 **M7 is worth doing on its own** — it is user-visible and takes minutes.
 
+### M18 — two truncates with opposite durability and near-identical names — **documented; the rename is yours**
+
+`Filesystem::truncate` is **not** journalled, writes straight to the device, and
+**keeps** the blocks past end of file. `Filesystem::truncate_to_zero` **is**
+journalled, touches nothing on disk, and **frees** the blocks back to the
+allocation group.
+
+So `truncate_to_zero` is the *more* complete operation, not the narrower one —
+freeing the blocks is the allocation work `truncate` avoids precisely so it can
+skip the log. The names say the opposite, and a caller who guesses wrong gets a
+file whose `du` disagrees with its `ls`.
+
+A wrong call is at least a compile error rather than a silent one: `truncate`
+takes an `&Inode`, `truncate_to_zero` an inode number. That is what stops this
+being a live defect.
+
+Renaming a published function is a decision, not a correction, so both docs now
+carry the same four-row comparison and point at each other. Whether one of them
+should be renamed — and to what — stays with you.
+
 ---
 
 ## Verification
