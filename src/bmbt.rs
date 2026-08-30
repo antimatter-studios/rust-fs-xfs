@@ -74,6 +74,12 @@ mod offsets {
     pub const LEVEL: usize = 4;
     pub const NUMRECS: usize = 6;
     /// v5 only, from here down.
+    ///
+    /// `bb_blkno` — the block's own address, in 512-byte basic blocks.
+    /// It sits at 24 rather than the short-form tree's 16 by the same
+    /// +8 shift that puts `UUID` at 40 instead of 32: the long form
+    /// carries 64-bit sibling pointers.
+    pub const BLKNO: usize = 24;
     pub const UUID: usize = 40;
     pub const OWNER: usize = 56;
     pub const CRC: usize = 64;
@@ -150,10 +156,11 @@ fn parse_root(fork: &[u8], ino: u64) -> Result<Node> {
 /// Read and check an on-disk node's header.
 ///
 /// `expect_level` is the level the parent said this child sits at, and
-/// `owner` the inode the tree belongs to. Checking both is what makes
-/// the descent self-verifying: a block that is not part of this tree, or
-/// not at the depth the parent believed, is rejected before its contents
-/// are read as extents.
+/// `ino` the inode the tree belongs to. On v5 the block's own recorded
+/// address is checked too. Together they make the descent
+/// self-verifying: a block that is not part of this tree, not at the
+/// depth the parent believed, or not the one that was asked for, is
+/// rejected before its contents are read as extents.
 fn parse_block(
     buf: &[u8],
     sb: &Superblock,
@@ -210,6 +217,25 @@ fn parse_block(
                 what: "bmbt block owner",
                 expected: ino,
                 found: owner,
+            });
+        }
+        // The block records its own address, so one read from the wrong
+        // place says so rather than being believed.
+        //
+        // Both short-form trees check this and this one did not, which
+        // made it the weakest of the three parsers against exactly the
+        // failure the check exists for: a pointer that has been
+        // corrupted into another valid block of the SAME inode passes
+        // the CRC (it is a real block) and passes the owner check (same
+        // file), and the level check only catches it when the depths
+        // differ. Its address is what tells the two apart.
+        let stated = be64(buf, offsets::BLKNO);
+        let expected = crate::alloc_btree::blkno_of_fsblock(sb, fsblock);
+        if stated != expected {
+            return Err(Error::BlockIdentityMismatch {
+                what: "bmbt block address",
+                expected,
+                found: stated,
             });
         }
     }
@@ -395,7 +421,12 @@ mod tests {
     }
 
     /// A leaf block holding `recs`, checksummed if `sb` is v5.
-    fn leaf(sb: &Superblock, ino: u64, recs: &[Extent]) -> Vec<u8> {
+    ///
+    /// `at` is the filesystem block the test will hand this back for.
+    /// A v5 block records its own address, so a fixture that does not
+    /// set one is not a block the reader should accept — which is
+    /// exactly what these fixtures were before the check existed.
+    fn leaf(sb: &Superblock, ino: u64, at: u64, recs: &[Extent]) -> Vec<u8> {
         let header = if sb.is_v5() {
             V5_HEADER_LEN
         } else {
@@ -417,14 +448,17 @@ mod tests {
         if sb.is_v5() {
             b[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
             b[offsets::OWNER..offsets::OWNER + 8].copy_from_slice(&ino.to_be_bytes());
+            let blkno = crate::alloc_btree::blkno_of_fsblock(sb, at);
+            b[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
             let crc = crc32c_with_zeroed_crc(&b, offsets::CRC);
             b[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
         }
         b
     }
 
-    /// An internal block at `level` pointing at `children`.
-    fn node(sb: &Superblock, ino: u64, level: u16, children: &[(u64, u64)]) -> Vec<u8> {
+    /// An internal block at `level` pointing at `children`, to be read
+    /// at filesystem block `at`.
+    fn node(sb: &Superblock, ino: u64, at: u64, level: u16, children: &[(u64, u64)]) -> Vec<u8> {
         let header = if sb.is_v5() {
             V5_HEADER_LEN
         } else {
@@ -449,6 +483,8 @@ mod tests {
         if sb.is_v5() {
             b[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
             b[offsets::OWNER..offsets::OWNER + 8].copy_from_slice(&ino.to_be_bytes());
+            let blkno = crate::alloc_btree::blkno_of_fsblock(sb, at);
+            b[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
             let crc = crc32c_with_zeroed_crc(&b, offsets::CRC);
             b[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
         }
@@ -484,7 +520,7 @@ mod tests {
         let sb = v5_superblock();
         let ino = 1234;
         let recs = [ext(0, 100, 1), ext(1, 200, 2), ext(3, 300, 1)];
-        let block = leaf(&sb, ino, &recs);
+        let block = leaf(&sb, ino, 42, &recs);
         let fork = root(1, 96, &[(0, 42)]);
 
         let got = walk(&fork, 3, &sb, ino, |b| {
@@ -504,8 +540,8 @@ mod tests {
         let ino = 7;
         let left = [ext(0, 10, 1)];
         let right = [ext(1, 20, 1)];
-        let lb = leaf(&sb, ino, &left);
-        let rb = leaf(&sb, ino, &right);
+        let lb = leaf(&sb, ino, 11, &left);
+        let rb = leaf(&sb, ino, 22, &right);
         let fork = root(1, 200, &[(0, 11), (1, 22)]);
 
         let got = walk(&fork, 2, &sb, ino, |b| match b {
@@ -524,11 +560,11 @@ mod tests {
         let a = [ext(0, 10, 1)];
         let b = [ext(1, 20, 1)];
         let c = [ext(2, 30, 1)];
-        let la = leaf(&sb, ino, &a);
-        let lb = leaf(&sb, ino, &b);
-        let lc = leaf(&sb, ino, &c);
-        let n1 = node(&sb, ino, 1, &[(0, 101), (1, 102)]);
-        let n2 = node(&sb, ino, 1, &[(2, 103)]);
+        let la = leaf(&sb, ino, 101, &a);
+        let lb = leaf(&sb, ino, 102, &b);
+        let lc = leaf(&sb, ino, 103, &c);
+        let n1 = node(&sb, ino, 201, 1, &[(0, 101), (1, 102)]);
+        let n2 = node(&sb, ino, 202, 1, &[(2, 103)]);
         let fork = root(2, 96, &[(0, 201), (2, 202)]);
 
         let got = walk(&fork, 3, &sb, ino, |blk| match blk {
@@ -546,7 +582,7 @@ mod tests {
     #[test]
     fn a_block_owned_by_another_inode_is_refused() {
         let sb = v5_superblock();
-        let block = leaf(&sb, 4321, &[ext(0, 10, 1)]);
+        let block = leaf(&sb, 4321, 42, &[ext(0, 10, 1)]);
         let fork = root(1, 96, &[(0, 42)]);
         let err = walk(&fork, 1, &sb, 1234, |_| Ok(block.clone())).unwrap_err();
         assert!(
@@ -555,11 +591,78 @@ mod tests {
         );
     }
 
+    /// A block read from somewhere other than where it says it lives is
+    /// refused.
+    ///
+    /// This was the one identity check the block-map tree did not make,
+    /// while both short-form trees did — which left it weakest against
+    /// exactly what the check is for. A pointer corrupted into another
+    /// valid block **of the same file** passes the CRC (it is a real
+    /// block), passes the owner check (same inode), and passes the level
+    /// check whenever the two sit at the same depth. Its recorded
+    /// address is the only field that separates them.
+    ///
+    /// So the fixture here is not damaged in any way: it is a
+    /// well-formed leaf of the right inode at the right level, read at
+    /// the wrong block.
+    #[test]
+    fn a_block_read_at_an_address_it_was_not_written_for_is_refused() {
+        let sb = v5_superblock();
+        let ino = 5;
+        let block = leaf(&sb, ino, 77, &[ext(0, 10, 1)]);
+        let fork = root(1, 96, &[(0, 42)]);
+
+        let err = walk(&fork, 1, &sb, ino, |_| Ok(block.clone())).unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("bmbt block address"),
+            "the refusal should name the address: {err}"
+        );
+
+        // And it is not passing for some other reason: the same block
+        // read where it belongs is accepted.
+        let fork_ok = root(1, 96, &[(0, 77)]);
+        walk(&fork_ok, 1, &sb, ino, |b| {
+            assert_eq!(b, 77);
+            Ok(block.clone())
+        })
+        .expect("the block is fine where it lives");
+    }
+
+    /// `bb_blkno` counts 512-byte basic blocks, not filesystem blocks.
+    ///
+    /// Comparing it against a filesystem block number directly is right
+    /// only when the block size is 512, so the bug would hide on the one
+    /// geometry nobody uses and fire on every real one.
+    #[test]
+    fn the_recorded_address_is_in_basic_blocks_not_filesystem_blocks() {
+        let sb = v5_superblock(); // 4 KiB blocks
+        assert_eq!(sb.blocksize, 4096);
+        assert_eq!(
+            crate::alloc_btree::blkno_of_fsblock(&sb, 1),
+            8,
+            "one 4 KiB block is eight 512-byte basic blocks"
+        );
+        assert_eq!(crate::alloc_btree::blkno_of_fsblock(&sb, 0), 0);
+
+        // Written the wrong way round — the fsblock stamped as-is — the
+        // block would be refused at its own address.
+        let ino = 5;
+        let mut block = leaf(&sb, ino, 42, &[ext(0, 10, 1)]);
+        block[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&42u64.to_be_bytes());
+        let crc = crc32c_with_zeroed_crc(&block, offsets::CRC);
+        block[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let fork = root(1, 96, &[(0, 42)]);
+        let err = walk(&fork, 1, &sb, ino, |_| Ok(block.clone())).unwrap_err();
+        assert!(format!("{err}").contains("bmbt block address"), "got {err}");
+    }
+
     #[test]
     fn a_corrupted_block_fails_its_checksum() {
         let sb = v5_superblock();
         let ino = 5;
-        let mut block = leaf(&sb, ino, &[ext(0, 10, 1)]);
+        let mut block = leaf(&sb, ino, 42, &[ext(0, 10, 1)]);
         block[V5_HEADER_LEN + 4] ^= 0xFF;
         let fork = root(1, 96, &[(0, 42)]);
         let err = walk(&fork, 1, &sb, ino, |_| Ok(block.clone())).unwrap_err();
@@ -572,7 +675,7 @@ mod tests {
         let ino = 5;
         // The root says level 2, so its children must be level 1; hand it
         // a leaf instead.
-        let block = leaf(&sb, ino, &[ext(0, 10, 1)]);
+        let block = leaf(&sb, ino, 42, &[ext(0, 10, 1)]);
         let fork = root(2, 96, &[(0, 42)]);
         let err = walk(&fork, 1, &sb, ino, |_| Ok(block.clone())).unwrap_err();
         assert!(format!("{err}").contains("level"), "got {err}");
@@ -592,8 +695,8 @@ mod tests {
         let ino = 5;
         let mx = maxrecs(BLOCK_SIZE - V5_HEADER_LEN);
         let fanout: Vec<(u64, u64)> = (0..mx as u64).map(|i| (i, 300)).collect();
-        let wide = node(&sb, ino, 1, &fanout);
-        let leaf_block = leaf(&sb, ino, &[ext(0, 10, 1)]);
+        let wide = node(&sb, ino, 200, 1, &fanout);
+        let leaf_block = leaf(&sb, ino, 300, &[ext(0, 10, 1)]);
         let fork = root(2, 96, &[(0, 200)]);
 
         let err = walk(&fork, 1, &sb, ino, |b| match b {
@@ -617,7 +720,7 @@ mod tests {
     fn an_extent_count_that_disagrees_with_the_tree_is_refused() {
         let sb = v5_superblock();
         let ino = 5;
-        let block = leaf(&sb, ino, &[ext(0, 10, 1)]);
+        let block = leaf(&sb, ino, 42, &[ext(0, 10, 1)]);
         let fork = root(1, 96, &[(0, 42)]);
         let err = walk(&fork, 9, &sb, ino, |_| Ok(block.clone())).unwrap_err();
         assert!(format!("{err}").contains("records 9"), "got {err}");

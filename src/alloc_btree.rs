@@ -276,6 +276,20 @@ fn parse_block(
 /// than recomputed at each use.
 pub fn expected_blkno(sb: &Superblock, agno: u32, agblock: u32) -> u64 {
     let fsblock = u64::from(agno) * u64::from(sb.agblocks) + u64::from(agblock);
+    blkno_of_fsblock(sb, fsblock)
+}
+
+/// What `bb_blkno` holds for the block at `fsblock`.
+///
+/// `bb_blkno` is a **basic-block address**, not a filesystem block
+/// number: XFS records block identity in 512-byte units throughout, so
+/// the value scales by `blocksize / BBSIZE`. Comparing an fsblock
+/// against it directly succeeds only when the block size is 512.
+///
+/// Shared with the block-map tree, which addresses its blocks by
+/// filesystem block rather than by group and offset — two callers, one
+/// conversion, so neither can be right while the other is wrong.
+pub fn blkno_of_fsblock(sb: &Superblock, fsblock: u64) -> u64 {
     fsblock * u64::from(sb.blocksize) / crate::log::BBSIZE as u64
 }
 
