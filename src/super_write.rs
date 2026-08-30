@@ -5,27 +5,33 @@
 //! it, and every AG header is checked against the geometry the
 //! superblock states.
 //!
-//! # It writes into a buffer rather than producing one
+//! # It writes into a buffer, and the buffer may be empty
 //!
-//! [`Superblock`] models 33 fields. The on-disk structure has more —
-//! the realtime subvolume's inodes and extent counts, the quota inodes,
-//! the stripe unit and width, `imax_pct`, `frextents`, the log sector
-//! geometry, `lsn`. This crate has never needed them to read a
-//! filesystem, so it never parsed them.
+//! [`apply`] overwrites a buffer rather than returning one, because the
+//! caller owns the sector: a superblock is written into an AG header
+//! that already exists, and the backup copies are written into sectors
+//! the formatter has already laid out.
 //!
-//! An encoder built from the parsed fields alone would therefore be
-//! lossy in a way that is invisible: it would produce a superblock that
-//! looks right in every field anyone here has named, and has zeroes
-//! where the rest belong. So [`apply`] takes the existing bytes and
-//! overwrites what it models, which is exactly as much as this crate
-//! can honestly claim to know.
+//! What changed is what the buffer has to contain beforehand: nothing.
+//! [`Superblock`] used to model 33 of the structure's fields, so `apply`
+//! could only be honest by carrying the rest across from whatever was
+//! underneath — which made it useless to a formatter, since a formatter
+//! has no superblock to carry anything from.
 //!
-//! Building one from nothing is what a formatter needs, and it needs
-//! the unmodelled fields first. This is the half that can be checked
-//! today: round-tripping a real `mkfs.xfs` superblock through
-//! [`Superblock::parse`] and back must reproduce the original byte for
-//! byte, which is a claim about the offset table and the encodings that
-//! holds whether or not the struct is complete.
+//! Every on-disk field is now modelled, including the ones no reader
+//! consults: the realtime inodes and extent counts, the quota inodes,
+//! the stripe geometry, `imax_pct`, `qflags`, the log sector geometry,
+//! `bad_features2`, `lsn`. So `apply` over a **zeroed** buffer produces
+//! a complete superblock, and that is the claim
+//! `applying_into_an_empty_buffer_reproduces_the_original` makes: for
+//! every real `mkfs.xfs` fixture, parse it, apply it into zeroes, and
+//! require the sector to come back byte for byte.
+//!
+//! That test is what proves the model complete. A field left unmodelled
+//! reads as zero, writes as nothing, and shows up as a differing byte at
+//! its own offset — which the failure message names. The older
+//! apply-over-itself test cannot see such a field at all, because the
+//! original's value is already sitting there.
 //!
 //! # The checksum
 //!
@@ -34,12 +40,20 @@
 //! A v4 superblock has no CRC and the field is left alone.
 
 use crate::error::{Error, Result};
-use crate::superblock::{crc32c_with_zeroed_crc, incompat, offsets, Superblock};
+use crate::superblock::{crc32c_with_zeroed_crc, incompat, offsets, Superblock, XFS_SB_MAGIC};
 
-/// Overwrite the fields [`Superblock`] models, and re-checksum.
+/// Write `sb` into `buf` as an on-disk superblock, and checksum it.
 ///
-/// `buf` must be at least one sector and must already hold a superblock:
-/// the fields this crate does not parse are carried across untouched.
+/// `buf` must be at least one sector. It does **not** need to hold a
+/// superblock already: every field of the structure is written, so a
+/// zeroed sector is a valid destination and is how a formatter uses
+/// this. Passing the sector the superblock was read from is equally
+/// valid and reproduces it exactly.
+///
+/// Bytes past the end of the 264-byte structure are left as they are.
+/// They are part of the sector the v5 checksum covers, so a caller
+/// writing into scratch memory must zero it first — which is what
+/// `mkfs.xfs` leaves there.
 ///
 /// # Errors
 ///
@@ -54,14 +68,23 @@ pub fn apply(buf: &mut [u8], sb: &Superblock) -> Result<()> {
         )));
     }
 
+    // The magic is written too, so `apply` over a zeroed buffer builds
+    // a whole superblock rather than one that happens to be right
+    // because a real one was underneath it.
+    put32(buf, offsets::MAGIC, XFS_SB_MAGIC);
     put32(buf, offsets::BLOCKSIZE, sb.blocksize);
     put64(buf, offsets::DBLOCKS, sb.dblocks);
     put64(buf, offsets::RBLOCKS, sb.rblocks);
+    put64(buf, offsets::REXTENTS, sb.rextents);
     buf[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.uuid);
     put64(buf, offsets::LOGSTART, sb.logstart);
     put64(buf, offsets::ROOTINO, sb.rootino);
+    put64(buf, offsets::RBMINO, sb.rbmino);
+    put64(buf, offsets::RSUMINO, sb.rsumino);
+    put32(buf, offsets::REXTSIZE, sb.rextsize);
     put32(buf, offsets::AGBLOCKS, sb.agblocks);
     put32(buf, offsets::AGCOUNT, sb.agcount);
+    put32(buf, offsets::RBMBLOCKS, sb.rbmblocks);
     put32(buf, offsets::LOGBLOCKS, sb.logblocks);
     put16(buf, offsets::VERSIONNUM, sb.versionnum);
     put16(buf, offsets::SECTSIZE, sb.sectsize);
@@ -81,14 +104,27 @@ pub fn apply(buf: &mut [u8], sb: &Superblock) -> Result<()> {
     buf[offsets::INODELOG] = sb.inodelog;
     buf[offsets::INOPBLOG] = sb.inopblog;
     buf[offsets::AGBLKLOG] = sb.agblklog;
+    buf[offsets::REXTSLOG] = sb.rextslog;
     buf[offsets::INPROGRESS] = sb.inprogress;
+    buf[offsets::IMAX_PCT] = sb.imax_pct;
     put64(buf, offsets::ICOUNT, sb.icount);
     put64(buf, offsets::IFREE, sb.ifree);
     put64(buf, offsets::FDBLOCKS, sb.fdblocks);
+    put64(buf, offsets::FREXTENTS, sb.frextents);
+    put64(buf, offsets::UQUOTINO, sb.uquotino);
+    put64(buf, offsets::GQUOTINO, sb.gquotino);
+    put16(buf, offsets::QFLAGS, sb.qflags);
+    buf[offsets::FLAGS] = sb.flags;
+    buf[offsets::SHARED_VN] = sb.shared_vn;
     put32(buf, offsets::INOALIGNMT, sb.inoalignmt);
+    put32(buf, offsets::UNIT, sb.unit);
+    put32(buf, offsets::WIDTH, sb.width);
     buf[offsets::DIRBLKLOG] = sb.dirblklog;
+    buf[offsets::LOGSECTLOG] = sb.logsectlog;
+    put16(buf, offsets::LOGSECTSIZE, sb.logsectsize);
     put32(buf, offsets::LOGSUNIT, sb.logsunit);
     put32(buf, offsets::FEATURES2, sb.features2);
+    put32(buf, offsets::BAD_FEATURES2, sb.bad_features2);
 
     // The v5 fields exist only in a v5 superblock. Writing them into a
     // v4 one would put feature masks over `sb_pquotino` and the log
@@ -103,6 +139,8 @@ pub fn apply(buf: &mut [u8], sb: &Superblock) -> Result<()> {
             sb.features_log_incompat,
         );
         put32(buf, offsets::SPINO_ALIGN, sb.spino_align);
+        put64(buf, offsets::PQUOTINO, sb.pquotino);
+        put64(buf, offsets::LSN, sb.lsn as u64);
 
         // ONLY when the feature is on. `Superblock::parse` reports
         // `meta_uuid` as the ordinary UUID when the incompat bit is
