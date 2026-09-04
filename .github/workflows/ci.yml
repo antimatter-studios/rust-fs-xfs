@@ -173,6 +173,32 @@ jobs:
       - name: Build the directory-conversion fixtures
         run: ./scripts/build-dirconv-fixtures.sh
 
+      # The write-path fixtures: the same filesystem before and after the
+      # kernel truncated a file, and before and after it removed one.
+      #
+      # These existed only as VM scripts, so nothing here could build them
+      # and tests/truncate_oracle.rs plus tests/unlink_replay_oracle.rs
+      # skipped in CI on every run -- which reads exactly like passing.
+      # It showed up as coverage: truncate.rs sat at 5% and unlink.rs at
+      # 26% while their oracles reported ok. The logic moved into these
+      # native scripts and the vm-build-* ones now just ship them into the
+      # VM, so there is one copy rather than two that can drift.
+      - name: Build the truncate and unlink fixtures
+        run: |
+          ./scripts/build-truncate-fixtures.sh
+          ./scripts/build-unlink-fixtures.sh
+
+      # Freeing an extent and freeing an inode are the two write
+      # operations whose result cannot be checked by looking at it: a
+      # zero-length file looks the same however its blocks were returned.
+      # The before/after pair is the only oracle, so these run where the
+      # pair can actually be built.
+      - name: Replay the kernel's truncate and unlink against ours
+        run: |
+          cargo test --locked --release --test truncate_oracle -- --nocapture
+          cargo test --locked --release --test truncate_replay_oracle -- --nocapture
+          cargo test --locked --release --test unlink_replay_oracle -- --nocapture
+
       # The strongest check in the suite: build a block-form directory
       # from the short-form one, and require it to equal the block the
       # kernel built for the same entries, byte for byte apart from the
@@ -255,6 +281,38 @@ jobs:
             exit 1
           fi
           echo "images accepted by the in-kernel XFS driver: $mounted"
+
+      # A SKIP IS NOT A PASS. Every fixture-gated test prints a skip
+      # line and returns ok when it cannot find its fixture -- right for
+      # a fresh checkout, wrong in a job that just built the fixtures.
+      # Without this, a green run can mean nothing ran, which is how
+      # truncate_oracle came to skip in CI for its whole existence.
+      #
+      # SCOPED DELIBERATELY, to the suites whose fixtures the steps above
+      # build. The rest are not covered here and are listed so the gap is
+      # visible rather than implied:
+      #
+      #   create_replay, log_replay, file_write_replay, stress
+      #     -- these drive the oracle VM live at test time rather than
+      #        reading a pre-built pair, so there is nothing for CI to
+      #        build and they skip here. Making their fixtures buildable
+      #        the way truncate's and unlink's now are is the next step.
+      - name: Fail if a fixture-backed test skipped
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked --release \
+                  --test oracle_vm_fixtures \
+                  --test dir_block_oracle \
+                  --test truncate_oracle \
+                  --test truncate_replay_oracle \
+                  --test unlink_replay_oracle \
+                  -- --nocapture 2>&1)
+          if echo "$out" | grep -qiE "skipp|no fixture|unavailable"; then
+            echo "$out" | grep -iE "skipp|no fixture|unavailable"
+            echo "::error::a fixture-backed test skipped in the job that builds its fixture"
+            exit 1
+          fi
+          echo "every fixture-backed suite ran"
 
       # A mount that succeeds can still have made the kernel unhappy:
       # corrupt-but-tolerated metadata, geometry it dislikes, log recovery
