@@ -6,6 +6,44 @@ never does.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-04
+
+Minor rather than patch: `File` and the three constructors that return
+it are new public API, and for a `0.x` crate the minor is the
+compatibility boundary. Nothing existing changed — every low-level
+`(&Inode, &[u8])` call keeps its signature.
+
+### Added
+
+- **`File`, and `Filesystem::open` / `open_ino` / `root`.** XFS threads
+  the raw inode fork through every read, because an inode keeps its
+  extents — and when small enough its data or directory entries —
+  inside that fork. So the low-level calls take `(&Inode, &[u8])`, and a
+  caller had to carry both values and remember they belong together.
+  `File` carries them.
+
+  It also removes a read. `lookup_path` walks the tree holding
+  `(inode, raw)` at every component and returns **only the inode**, so
+  anyone who then read the file fetched the last inode a second time.
+  `read_path` and `list_path` did exactly that, in this crate. They
+  delegate to `open` now.
+
+  Measured, not asserted — `tests/file_handle_oracle.rs` wraps the
+  device in a counter and compares the routes on a real `mkfs.xfs`
+  image:
+
+      /small.txt: handle 4 reads / 1548 bytes, low-level 5 reads / 2060 bytes
+
+  `File` is a **snapshot**: nothing invalidates it, so one held across a
+  write to the same inode is stale. Safe for open-read-drop within an
+  operation; re-open otherwise, which is one inode read.
+
+### Changed
+
+- `lookup_path` is retained and now delegates to `open`, with docs
+  saying why `open` is the one to reach for.
+
+
 ## [0.5.2] — 2026-09-04
 
 ### Added
@@ -91,7 +129,8 @@ never does.
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.4.0...v0.5.0
