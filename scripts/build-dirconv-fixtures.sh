@@ -79,7 +79,7 @@ for entry in "${CASES[@]}"; do
     rm -f "$before" "$final"
 
     truncate -s "$SIZE" "$before"
-    mkfs.xfs -m crc=1 -f -q "$before" >/dev/null
+    mkfs.xfs -m crc=1,rmapbt=0 -f -q "$before" >/dev/null
 
     m="$(mktemp -d)"
     $SUDO mount -o loop "$before" "$m"

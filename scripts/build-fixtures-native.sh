@@ -30,8 +30,16 @@ SIZE="${XFS_FIXTURE_SIZE:-400M}"
 MIN_FIXTURES="${XFS_MIN_FIXTURES:-6}"
 
 # "<name>:<mkfs.xfs args>"
+#
+# `default` is pinned to rmapbt=0 rather than left to mkfs. It is the
+# image log_replay_oracle WRITES to, and this driver refuses a read-write
+# mount of a filesystem with the reverse-mapping tree because it does not
+# maintain one. mkfs.xfs 6.6 turns rmapbt on by default and older ones do
+# not, so leaving it unpinned makes the write oracle's fixture depend on
+# which xfsprogs the host happens to have. The `reflink` case below keeps
+# an rmapbt=1 image, which is what the refusal itself is tested against.
 GEOMETRIES=(
-    "default:"
+    "default:-m rmapbt=0"
     "1k:-b size=1024"
     "2k:-b size=2048"
     "i512:-i size=512"

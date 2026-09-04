@@ -449,3 +449,51 @@ fn a_refused_write_leaves_the_checkpoint_for_a_real_one() {
         "the second write should be refused as a second checkpoint, not as {err}"
     );
 }
+
+/// A read-write mount of a filesystem with the reverse-mapping tree is
+/// refused, and a read-only mount of the same image is not.
+///
+/// `rmapbt` is a `ro_compat` feature: reading one is fine, writing one
+/// without maintaining the tree is not. This driver does not maintain
+/// it, and the cost of ignoring that is not a failure — it is a
+/// filesystem that mounts and passes normal use while `xfs_repair`
+/// reports `Missing reverse-mapping record`.
+///
+/// Found by CI, not by reasoning: `mkfs.xfs` 6.6 enables rmapbt by
+/// default and the oracle VM's older one does not, so every write test
+/// had run against filesystems without it.
+#[test]
+fn a_reverse_mapping_filesystem_is_read_only() {
+    let img = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".vm-share")
+        .join("xfs-reflink.img");
+    if !img.exists() {
+        eprintln!("no rmapbt fixture (xfs-reflink.img) — skipping");
+        return;
+    }
+
+    // Reading it is fine, and must stay fine: refusing to read would be
+    // a regression, not extra safety.
+    let ro = fs_core::FileDevice::open(&img).expect("open read-only");
+    let fs = fs_xfs::Filesystem::mount(
+        std::sync::Arc::new(ro) as std::sync::Arc<dyn fs_core::BlockRead>
+    )
+    .expect("a reverse-mapping filesystem must still be readable");
+    assert!(
+        fs.superblock().has_rmapbt(),
+        "the fixture is supposed to have rmapbt set; without it this test proves nothing"
+    );
+    fs.root().expect("its root should list");
+
+    let rw = fs_core::FileDevice::open_rw(&img).expect("open read-write");
+    let err = fs_xfs::Filesystem::mount_rw(std::sync::Arc::new(rw))
+        .err()
+        .expect("a read-write mount must be refused");
+    match err {
+        fs_xfs::Error::UnsupportedFeature(m) => assert!(
+            m.contains("rmapbt"),
+            "the refusal should name the feature, got: {m}"
+        ),
+        other => panic!("expected UnsupportedFeature naming rmapbt, got {other}"),
+    }
+}

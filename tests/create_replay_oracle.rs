@@ -32,37 +32,10 @@
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
-}
-
-fn vm_run(script: &str) -> Option<String> {
-    let out = Command::new(repo().join("scripts/vm.sh"))
-        .arg("run")
-        .arg(script)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() {
-        eprintln!(
-            "vm.sh run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return None;
-    }
-    assert!(
-        stdout.contains("DONE"),
-        "the VM script did not run to completion:\n{stdout}"
-    );
-    Some(stdout)
-}
+mod common;
+use common::{kernel_run, share};
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope. Every other suite treats each `.img` there as a fixture, so
@@ -186,7 +159,7 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         "#
     );
 
-    let out = vm_run(&script)?;
+    let out = kernel_run(&script)?;
 
     assert!(
         !out.contains("MOUNT_FAILED"),
@@ -347,7 +320,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         "#
     );
 
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
@@ -471,11 +444,36 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             .map(|e| String::from_utf8_lossy(&e.name).into_owned())
             .collect()
     };
-    assert!(
-        before.len() > 20,
-        "the fixture should be nearly full, not {} entries",
-        before.len()
-    );
+    // THE PRECONDITION, CHECKED RATHER THAN GUESSED. This test needs a
+    // directory that is one entry short of leaving its inode. It used to
+    // assert "more than 20 entries" as a stand-in, and that failed on a
+    // runner where the same fixture held 17 — with nothing wrong.
+    //
+    // The count is not a property of the fixture. build-dirconv-fixtures
+    // fills until the kernel converts and steps back one, so it depends
+    // on how much of the inode the data fork gets. On a runner and in a
+    // container the directory is created with a security xattr, so it
+    // has an ATTRIBUTE FORK: forkoff=24 leaves the data fork 192 bytes
+    // and the kernel converts at 18 entries. In the VM there is no
+    // xattr, forkoff=0, and it converts at 31. Same inode size, same
+    // block size, nearly twice the entries.
+    //
+    // So ask the fixture pair instead: the `-after` image is the same
+    // directory with one more entry, and if that one is in block form
+    // then the pair brackets the conversion, whatever the count.
+    {
+        let after_img = share().join("xfsdirconv-exact-after.img");
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&after_img).expect("open")))
+            .expect("mount");
+        let d = fs.lookup_path("/d").expect("the directory");
+        let (inode, _) = fs.read_inode_raw(d.ino).expect("read it");
+        assert_eq!(
+            inode.format,
+            fs_xfs::inode::Format::Extents,
+            "the -after fixture should show the directory converted; the pair does not \
+             bracket the conversion, so this test has nothing to convert"
+        );
+    }
 
     let added = "converted";
     {
@@ -525,7 +523,7 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
         "#
     );
 
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };

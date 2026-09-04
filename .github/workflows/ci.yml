@@ -173,12 +173,40 @@ jobs:
       - name: Build the directory-conversion fixtures
         run: ./scripts/build-dirconv-fixtures.sh
 
+      # The write-path fixtures: the same filesystem before and after the
+      # kernel truncated a file, and before and after it removed one.
+      #
+      # These existed only as VM scripts, so nothing here could build them
+      # and tests/truncate_oracle.rs plus tests/unlink_replay_oracle.rs
+      # skipped in CI on every run -- which reads exactly like passing.
+      # It showed up as coverage: truncate.rs sat at 5% and unlink.rs at
+      # 26% while their oracles reported ok. The logic moved into these
+      # native scripts and the vm-build-* ones now just ship them into the
+      # VM, so there is one copy rather than two that can drift.
+      - name: Build the truncate, unlink and create fixtures
+        run: |
+          ./scripts/build-truncate-fixtures.sh
+          ./scripts/build-unlink-fixtures.sh
+          ./scripts/build-create-fixtures.sh
+
+      # Freeing an extent and freeing an inode are the two write
+      # operations whose result cannot be checked by looking at it: a
+      # zero-length file looks the same however its blocks were returned.
+      # The before/after pair is the only oracle, so these run where the
+      # pair can actually be built.
+      - name: Replay against the kernel every oracle that can reach one
+        run: |
+          for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
+                       create_replay_oracle log_replay_oracle file_write_replay_oracle; do
+            ./scripts/ci-test.sh --test "$suite"
+          done
+
       # The strongest check in the suite: build a block-form directory
       # from the short-form one, and require it to equal the block the
       # kernel built for the same entries, byte for byte apart from the
       # checksum and sequence number it stamps after logging.
       - name: Compare our block-form directory against the kernel's
-        run: cargo test --locked --release --test dir_block_oracle -- --nocapture
+        run: ./scripts/ci-test.sh --test dir_block_oracle
 
       # The comparison itself: parse each image with this driver and
       # require every field to equal what xfs_db reported for it. This
@@ -187,7 +215,7 @@ jobs:
       # which would leave the images disagreeing with the dumps that were
       # taken straight out of mkfs.
       - name: Cross-validate every superblock field against xfs_db
-        run: cargo test --locked --release --test oracle_vm_fixtures -- --nocapture
+        run: ./scripts/ci-test.sh --test oracle_vm_fixtures
 
       # The #[ignore]-gated oracle suite in tests/oracle_mkfs.rs does the
       # same field-by-field comparison, but builds its own images inline
