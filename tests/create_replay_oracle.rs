@@ -32,37 +32,10 @@
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
-}
-
-fn vm_run(script: &str) -> Option<String> {
-    let out = Command::new(repo().join("scripts/vm.sh"))
-        .arg("run")
-        .arg(script)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() {
-        eprintln!(
-            "vm.sh run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return None;
-    }
-    assert!(
-        stdout.contains("DONE"),
-        "the VM script did not run to completion:\n{stdout}"
-    );
-    Some(stdout)
-}
+mod common;
+use common::{kernel_run, share};
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope. Every other suite treats each `.img` there as a fixture, so
@@ -186,7 +159,7 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         "#
     );
 
-    let out = vm_run(&script)?;
+    let out = kernel_run(&script)?;
 
     assert!(
         !out.contains("MOUNT_FAILED"),
@@ -347,7 +320,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         "#
     );
 
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
@@ -525,7 +498,7 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
         "#
     );
 
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
