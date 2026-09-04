@@ -668,12 +668,20 @@ impl Filesystem {
     /// Symbolic links are **not** followed. A caller that wants them
     /// followed should do so explicitly, so that link loops are its
     /// policy rather than a surprise from this function.
-    pub fn lookup_path(&self, path: &str) -> Result<Inode> {
+    /// Resolve a path to a [`File`], keeping the raw inode fork.
+    ///
+    /// This is the entry point to prefer. XFS threads the raw inode
+    /// bytes through every read — an inode keeps its extents and inline
+    /// data in that fork — and this walk already reads them at each
+    /// component. Returning them means a caller does not read the same
+    /// bytes a second time, which is what [`Self::lookup_path`] forces
+    /// by handing back only the parsed inode.
+    pub fn open(&self, path: &str) -> Result<File<'_>> {
         let (mut inode, mut raw) = self.read_inode_raw(self.sb.rootino)?;
         for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
             if component == ".." {
                 return Err(Error::UnsupportedFeature(
-                    "`..` in a path is not resolved by lookup_path".into(),
+                    "`..` in a path is not resolved by open".into(),
                 ));
             }
             if !inode.is_dir() {
@@ -684,22 +692,152 @@ impl Filesystem {
             inode = i;
             raw = r;
         }
-        Ok(inode)
+        Ok(File {
+            fs: self,
+            inode,
+            raw,
+        })
+    }
+
+    /// Open by inode number, for a caller that already has one — a
+    /// directory entry, or a handle being re-resolved.
+    pub fn open_ino(&self, ino: u64) -> Result<File<'_>> {
+        let (inode, raw) = self.read_inode_raw(ino)?;
+        Ok(File {
+            fs: self,
+            inode,
+            raw,
+        })
+    }
+
+    /// The root directory as a [`File`].
+    pub fn root(&self) -> Result<File<'_>> {
+        self.open_ino(self.sb.rootino)
+    }
+
+    /// Resolve a path to its inode, discarding the raw fork.
+    ///
+    /// Prefer [`Self::open`]: this walk reads the raw bytes at every
+    /// component and then throws the last one away, so any caller that
+    /// goes on to read the file pays for the same inode twice.
+    /// Retained because it is public API and callers that only want to
+    /// test existence or read metadata do not need the fork.
+    pub fn lookup_path(&self, path: &str) -> Result<Inode> {
+        self.open(path).map(|f| f.inode)
     }
 
     /// Read a whole file by path.
+    ///
+    /// Went through `lookup_path` and then re-read the same inode; it
+    /// now goes through [`Self::open`], which already holds the fork.
     pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
-        let (inode, raw) = {
-            let inode = self.lookup_path(path)?;
-            self.read_inode_raw(inode.ino)?
-        };
-        self.read_file(&inode, &raw)
+        self.open(path)?.read_all()
     }
 
     /// List a directory by path.
     pub fn list_path(&self, path: &str) -> Result<Vec<DirEntry>> {
-        let inode = self.lookup_path(path)?;
-        let (inode, raw) = self.read_inode_raw(inode.ino)?;
-        self.read_dir(&inode, &raw)
+        self.open(path)?.entries()
+    }
+}
+
+/// A resolved file or directory, holding the raw inode fork alongside
+/// the parsed inode.
+///
+/// # Why this exists
+///
+/// Every XFS read needs both. An inode keeps its extents — or, when
+/// small enough, its data or directory entries — inside the raw fork,
+/// so the parsed [`Inode`] alone is not enough to read anything. The
+/// low-level calls therefore take `(&Inode, &[u8])`, and a caller using
+/// them has to carry both values around and remember they belong
+/// together.
+///
+/// `File` carries them for you, and removes a read while doing it:
+/// [`Filesystem::open`] already fetches the fork during its path walk,
+/// where [`Filesystem::lookup_path`] discarded it and left the caller
+/// to fetch it again.
+///
+/// # Validity
+///
+/// A `File` is a SNAPSHOT taken at open. Nothing invalidates it, so a
+/// write to the same inode through another path leaves it stale. That
+/// is safe for the pattern it is built for — open, read, drop, within
+/// one operation — and wrong for a handle held across writes. Re-open
+/// if in doubt; it is one inode read.
+///
+/// The low-level `(&Inode, &[u8])` calls remain public and unchanged
+/// for callers that want to manage that themselves.
+pub struct File<'a> {
+    fs: &'a Filesystem,
+    inode: Inode,
+    raw: Vec<u8>,
+}
+
+impl File<'_> {
+    /// The parsed inode.
+    pub fn inode(&self) -> &Inode {
+        &self.inode
+    }
+
+    /// The raw inode fork, for a caller dropping to the low-level API.
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// File size in bytes. Meaningful for regular files; a directory's
+    /// value is the size of its own on-disk representation.
+    pub fn len(&self) -> u64 {
+        self.inode.size
+    }
+
+    /// Whether the file has no bytes. Present because clippy asks for
+    /// it wherever `len` exists, and it is occasionally what a caller
+    /// means.
+    pub fn is_empty(&self) -> bool {
+        self.inode.size == 0
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.inode.is_dir()
+    }
+
+    pub fn is_regular_file(&self) -> bool {
+        self.inode.is_regular_file()
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.inode.is_symlink()
+    }
+
+    /// Read `buf.len()` bytes from `offset`, returning how many were
+    /// filled. Short only at end of file; holes and unwritten extents
+    /// read as zeros rather than stale disk contents.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.fs.read_at(&self.inode, &self.raw, offset, buf)
+    }
+
+    /// Read the whole file.
+    pub fn read_all(&self) -> Result<Vec<u8>> {
+        self.fs.read_file(&self.inode, &self.raw)
+    }
+
+    /// List this directory.
+    pub fn entries(&self) -> Result<Vec<DirEntry>> {
+        self.fs.read_dir(&self.inode, &self.raw)
+    }
+
+    /// This symlink's target, as stored — which may be relative.
+    pub fn link_target(&self) -> Result<Vec<u8>> {
+        self.fs.read_link(&self.inode, &self.raw)
+    }
+
+    /// Open a named entry within this directory, without re-walking
+    /// from the root.
+    pub fn open_child(&self, name: &[u8]) -> Result<File<'_>> {
+        if !self.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        let entry = self.fs.lookup(&self.inode, &self.raw, name)?;
+        self.fs.open_ino(entry.ino)
     }
 }
