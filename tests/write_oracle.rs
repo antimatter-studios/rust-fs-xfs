@@ -27,38 +27,15 @@
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
+
+mod common;
+use common::{kernel_run, share};
 
 /// The file the write lands in: 8 MiB of random bytes, so it is
 /// extent-backed, fully written, not sparse and not shared — every
 /// condition the in-place path requires.
 const TARGET: &str = "/large.bin";
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
-}
-
-/// Run a shell snippet inside the oracle VM, returning its stdout.
-fn vm_run(script: &str) -> Option<String> {
-    let out = Command::new(repo().join("scripts/vm.sh"))
-        .arg("run")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "vm.sh run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope — including on a panic.
@@ -162,7 +139,7 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         "#
     );
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
@@ -299,7 +276,7 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         "#
     );
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
@@ -408,7 +385,7 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         "#
     );
-    let Some(out) = vm_run(&script) else {
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };

@@ -28,47 +28,14 @@
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
+
+mod common;
+use common::{kernel_run, share};
 
 /// A directory small enough to live inside its inode, built by the
 /// fixture script with two equal-length names.
 const DIR: &str = "/sf";
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
-}
-
-/// Run a script in the oracle VM.
-///
-/// `None` means the VM could not be reached. It deliberately does not
-/// cover a script that ran and reported a problem — the scripts below
-/// never exit non-zero, so a kernel refusing the filesystem arrives as
-/// output to assert on rather than as an unreachable VM.
-fn vm_run(script: &str) -> Option<String> {
-    let out = Command::new(repo().join("scripts/vm.sh"))
-        .arg("run")
-        .arg(script)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() {
-        eprintln!(
-            "vm.sh run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return None;
-    }
-    assert!(
-        stdout.contains("DONE"),
-        "the VM script did not run to completion:\n{stdout}"
-    );
-    Some(stdout)
-}
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope. Every other suite treats each `.img` there as a fixture, so
@@ -160,7 +127,7 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         rm -f "$img"
         echo "DONE"
         "#;
-    let Some(out) = vm_run(script) else {
+    let Some(out) = kernel_run(script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };

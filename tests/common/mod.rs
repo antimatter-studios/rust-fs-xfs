@@ -98,10 +98,17 @@ fn is_root() -> bool {
 
 /// Run `script` against a kernel and return its stdout.
 ///
-/// `None` means no kernel was reachable, or the script failed — the
-/// caller skips and says which. A script that runs but does not print
-/// `DONE` is a bug in the script rather than a missing host, so that is
-/// an assertion, not a skip.
+/// `None` means no kernel was reachable — a reason to skip. It
+/// deliberately does **not** cover a script that ran and reported a
+/// problem: the scripts never exit non-zero, so a kernel refusing the
+/// filesystem arrives as output to assert on rather than as a missing
+/// host. Conflating the two is how a real failure got reported as a
+/// skip the first time these suites ran. (Carried here from the four
+/// copies of this function that it replaces, because it is the same
+/// mistake this whole module exists to stop.)
+///
+/// A script that runs but does not print `DONE` is a bug in the script
+/// rather than a missing host, so that is an assertion, not a skip.
 pub fn kernel_run(script: &str) -> Option<String> {
     let out = match transport() {
         Transport::Native => {
