@@ -42,24 +42,36 @@ mkdir -p "$OUT"
 # to say which, rather than this script encoding a rule that changes
 # between versions.
 GEOMETRIES=(
-    "1024 512"
-    "4096 512"
-    "4096 1024"
-    "4096 2048"
+    "1024 512 "
+    "4096 512 "
+    "4096 1024 "
+    "4096 2048 "
+    # Legacy timestamps: a v3 inode WITHOUT bigtime, where di_atime and
+    # friends are a pair of 32-bit halves rather than one 64-bit count.
+    #
+    # log_write.rs has a branch for that shape and nothing reached it.
+    # Mutating it changed no test result, because modern mkfs.xfs turns
+    # bigtime on by default and the one v4 image here takes the separate
+    # v2 path instead -- so a whole arm of field_layout was untested
+    # while looking covered.
+    "4096 512 -m bigtime=0"
 )
 
 for geom in "${GEOMETRIES[@]}"; do
-    read -r bsize isize <<<"$geom"
-    img="$OUT/xfslog-b${bsize}-i${isize}.img"
+    read -r bsize isize extra <<<"$geom"
+    suffix=""
+    case "$extra" in *bigtime=0*) suffix="-nobigtime" ;; esac
+    img="$OUT/xfslog-b${bsize}-i${isize}${suffix}.img"
 
     rm -f "$img"
     truncate -s "$SIZE" "$img"
     # rmapbt=0: these are the images the write oracles mount read-write,
     # and this driver refuses a reverse-mapping filesystem because it
     # does not maintain the tree. Modern mkfs.xfs turns it on by default.
-    if ! mkfs.xfs -f -q -b "size=$bsize" -i "size=$isize" -m crc=1,rmapbt=0 "$img" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if ! mkfs.xfs -f -q -b "size=$bsize" -i "size=$isize" -m crc=1,rmapbt=0 $extra "$img" >/dev/null 2>&1; then
         rm -f "$img"
-        echo "SKIP  b=$bsize i=$isize (mkfs.xfs rejected this geometry)"
+        echo "SKIP  b=$bsize i=$isize $extra (mkfs.xfs rejected this geometry)"
         continue
     fi
 
@@ -78,7 +90,7 @@ for geom in "${GEOMETRIES[@]}"; do
     echo two | $SUDO tee "$m/sf/bbbb" > /dev/null
     sync
     $SUDO umount "$m"; rmdir "$m"
-    echo "BUILT b=$bsize i=$isize"
+    echo "BUILT b=$bsize i=$isize $extra"
 done
 
 echo
