@@ -193,11 +193,14 @@ jobs:
       # zero-length file looks the same however its blocks were returned.
       # The before/after pair is the only oracle, so these run where the
       # pair can actually be built.
-      - name: Replay the kernel's truncate and unlink against ours
+      - name: Replay against the kernel every oracle that can reach one
         run: |
           cargo test --locked --release --test truncate_oracle -- --nocapture
           cargo test --locked --release --test truncate_replay_oracle -- --nocapture
           cargo test --locked --release --test unlink_replay_oracle -- --nocapture
+          cargo test --locked --release --test create_replay_oracle -- --nocapture
+          cargo test --locked --release --test log_replay_oracle -- --nocapture
+          cargo test --locked --release --test file_write_replay_oracle -- --nocapture
 
       # The strongest check in the suite: build a block-form directory
       # from the short-form one, and require it to equal the block the
@@ -288,15 +291,15 @@ jobs:
       # Without this, a green run can mean nothing ran, which is how
       # truncate_oracle came to skip in CI for its whole existence.
       #
-      # SCOPED DELIBERATELY, to the suites whose fixtures the steps above
-      # build. The rest are not covered here and are listed so the gap is
-      # visible rather than implied:
+      # The replay oracles are in scope now because they no longer need
+      # the VM: they need A kernel, and tests/common/mod.rs hands them
+      # this runner's. They build their own scratch images from fixtures
+      # the steps above produce -- log_replay from xfs-default.img,
+      # file_write_replay from the xfstrunc pair.
       #
-      #   create_replay, log_replay, file_write_replay, stress
-      #     -- these drive the oracle VM live at test time rather than
-      #        reading a pre-built pair, so there is nothing for CI to
-      #        build and they skip here. Making their fixtures buildable
-      #        the way truncate's and unlink's now are is the next step.
+      # NOT COVERED HERE: stress_oracle, whose corpus is built by a
+      # 281-line VM-only script and is the one fixture set a runner still
+      # cannot produce. Named rather than implied.
       - name: Fail if a fixture-backed test skipped
         run: |
           set -euo pipefail
@@ -306,6 +309,9 @@ jobs:
                   --test truncate_oracle \
                   --test truncate_replay_oracle \
                   --test unlink_replay_oracle \
+                  --test create_replay_oracle \
+                  --test log_replay_oracle \
+                  --test file_write_replay_oracle \
                   -- --nocapture 2>&1)
           if echo "$out" | grep -qiE "skipp|no fixture|unavailable"; then
             echo "$out" | grep -iE "skipp|no fixture|unavailable"
