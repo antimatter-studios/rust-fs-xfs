@@ -190,8 +190,58 @@ impl Filesystem {
             sb,
             checkpointed: std::sync::atomic::AtomicBool::new(false),
         };
+        fs.refuse_unmaintained_features()?;
         fs.check_log_is_clean()?;
         Ok(fs)
+    }
+
+    /// Refuse a read-write mount of a filesystem carrying a feature this
+    /// driver reads but does not maintain.
+    ///
+    /// `sb_features_ro_compat` means exactly this: an implementation may
+    /// READ a filesystem with a bit it does not know, and must not WRITE
+    /// one. The bits are there because the structures they describe sit
+    /// apart from the ones a write already touches, so a write that
+    /// ignores them leaves the filesystem internally inconsistent
+    /// without ever failing.
+    ///
+    /// # Measured, not inferred
+    ///
+    /// A directory conversion allocates a block. On a filesystem with
+    /// the reverse-mapping tree that block needs an rmap record, and
+    /// this driver does not write one. `xfs_repair` says so:
+    ///
+    /// ```text
+    /// Missing reverse-mapping record for (0/13) len 1 owner 131 off 0
+    /// ```
+    ///
+    /// It went unnoticed because it depends on who formatted the volume.
+    /// `mkfs.xfs` 6.6 turns `rmapbt` on by default and the oracle VM's
+    /// older one does not, so every write test ran for its whole
+    /// existence against filesystems without the feature. The first CI
+    /// run on a modern runner found it.
+    ///
+    /// Refusing is the honest answer while the tree is unmaintained: a
+    /// named error at mount is recoverable, and a filesystem quietly
+    /// missing rmap records is not.
+    ///
+    /// REFLINK IS DELIBERATELY NOT HERE, and that is a gap rather than a
+    /// judgement. It is the same kind of bit -- freeing an extent that
+    /// another file shares would take blocks still in use -- but every
+    /// fixture in this repository has it set, so gating it turns the
+    /// whole write suite off. Whether this driver should write to a
+    /// reflink filesystem at all needs deciding on its own.
+    fn refuse_unmaintained_features(&self) -> Result<()> {
+        if self.sb.has_rmapbt() {
+            return Err(Error::UnsupportedFeature(
+                "this filesystem has the reverse-mapping tree (rmapbt), which every \
+                 allocation and free must update; this driver does not maintain it, so \
+                 writing would leave the tree inconsistent. Mount read-only, or format \
+                 with -m rmapbt=0"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// The parsed superblock.

@@ -67,7 +67,7 @@ for CASE in lone after before between; do
     base="$OUT/xfstrunc-$CASE"
     rm -f "$base-before.img" "$base-after.img"
     truncate -s "$SIZE" "$base-before.img"
-    mkfs.xfs -f -q -m crc=1 "$base-before.img" >/dev/null
+    mkfs.xfs -f -q -m crc=1,rmapbt=0 "$base-before.img" >/dev/null
 
     m="$(mktemp -d)"
     $SUDO mount -o loop "$base-before.img" "$m"

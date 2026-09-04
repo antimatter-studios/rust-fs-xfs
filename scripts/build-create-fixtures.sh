@@ -73,7 +73,7 @@ for entry in "${CASES[@]}"; do
 
     rm -f "$base-before.img" "$base-after.img"
     truncate -s "$SIZE" "$base-before.img"
-    mkfs.xfs -m crc=1 -f -q "$base-before.img" >/dev/null
+    mkfs.xfs -m crc=1,rmapbt=0 -f -q "$base-before.img" >/dev/null
 
     m="$(mktemp -d)"
     $SUDO mount -o loop "$base-before.img" "$m"
