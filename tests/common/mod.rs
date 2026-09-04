@@ -126,11 +126,22 @@ pub fn kernel_run(script: &str) -> Option<String> {
             };
             cmd.arg(localised).output().ok()?
         }
-        Transport::Vm => Command::new(repo().join("scripts/vm.sh"))
-            .arg("run")
-            .arg(script)
-            .output()
-            .ok()?,
+        Transport::Vm => {
+            // One caller at a time. Vagrant holds a lock per machine and
+            // FAILS rather than waits when it is taken, so two test
+            // binaries reaching for the VM at once turn into
+            // "Translation missing: en.vagrant.errors.machine_action_locked"
+            // and a skip -- which reads as a pass. Cargo runs each test
+            // binary's tests in parallel, so this is ordinary, and it is
+            // intermittent, which is worse: the suite loses a little
+            // coverage at random and says so only in a line nobody reads.
+            let _guard = VmLock::acquire();
+            Command::new(repo().join("scripts/vm.sh"))
+                .arg("run")
+                .arg(script)
+                .output()
+                .ok()?
+        }
         Transport::None => return None,
     };
 
@@ -149,4 +160,52 @@ pub fn kernel_run(script: &str) -> Option<String> {
         transport()
     );
     Some(stdout)
+}
+
+/// A lock held across one `vm.sh` invocation.
+///
+/// A file rather than a mutex: the contention is between separate test
+/// BINARIES, which are separate processes, so nothing in this one's
+/// memory can serialise them.
+///
+/// Advisory and deliberately simple -- create the file exclusively, or
+/// wait and try again. A holder that dies without cleaning up would
+/// wedge every later caller, so the file is treated as stale after
+/// `STALE_AFTER` and taken; the longest legitimate hold is a VM boot
+/// plus a script, and the timeout is well past that.
+struct VmLock(PathBuf);
+
+impl VmLock {
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn acquire() -> Self {
+        let path = share().join(".kernel-run.lock");
+        let _ = std::fs::create_dir_all(share());
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self(path),
+                Err(_) => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().unwrap_or_default() > Self::STALE_AFTER)
+                        .unwrap_or(true);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for VmLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }

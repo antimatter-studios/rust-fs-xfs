@@ -74,11 +74,13 @@ jobs:
         run: ./scripts/ci-test.sh --test stress_oracle
 
       # The corpus reaches parts of the reader the hand-built fixtures do
-      # not, so the suites that walk every image are worth running
-      # against it too. This is where the bmbt addressing bug showed up:
-      # a real file lands in a later allocation group and a hand-written
-      # one does not.
-      - name: Run the whole-image oracles against it
-        run: |
-          ./scripts/ci-test.sh --test log_dinode_oracle
-          ./scripts/ci-test.sh --test endtoend_oracle
+      # not, so a suite that walks every image is worth running against
+      # it too. This is where the bmbt addressing bug showed up: a real
+      # file lands in a later allocation group and a hand-written one
+      # does not.
+      #
+      # log_dinode_oracle only, and not endtoend_oracle, which wants the
+      # xfsdata-* fixtures this workflow has no reason to build. Adding
+      # it was my own over-reach and the skip check caught it.
+      - name: Reproduce every logged inode core from the corpus
+        run: ./scripts/ci-test.sh --test log_dinode_oracle

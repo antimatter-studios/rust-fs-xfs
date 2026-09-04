@@ -183,11 +183,18 @@ jobs:
       # 26% while their oracles reported ok. The logic moved into these
       # native scripts and the vm-build-* ones now just ship them into the
       # VM, so there is one copy rather than two that can drift.
-      - name: Build the truncate, unlink and create fixtures
+      # The populated filesystems and the crashed one. These were the
+      # last fixture set only the VM could build, which is why
+      # write_oracle, endtoend_oracle, dir_oracle and log_oracle all
+      # skipped here.
+      - name: Build the write-path and data fixtures
         run: |
+          sudo apt-get install -y -qq attr
           ./scripts/build-truncate-fixtures.sh
           ./scripts/build-unlink-fixtures.sh
           ./scripts/build-create-fixtures.sh
+          ./scripts/build-log-fixtures.sh
+          ./scripts/build-data-fixtures.sh
 
       # Freeing an extent and freeing an inode are the two write
       # operations whose result cannot be checked by looking at it: a
@@ -197,7 +204,8 @@ jobs:
       - name: Replay against the kernel every oracle that can reach one
         run: |
           for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
-                       create_replay_oracle log_replay_oracle file_write_replay_oracle; do
+                       create_replay_oracle log_replay_oracle file_write_replay_oracle \
+                       rename_oracle write_oracle endtoend_oracle log_oracle; do
             ./scripts/ci-test.sh --test "$suite"
           done
 

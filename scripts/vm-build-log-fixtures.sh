@@ -1,23 +1,10 @@
 #!/usr/bin/env bash
 #
-# vm-build-log-fixtures.sh — build filesystems whose logs hold work.
+# vm-build-log-fixtures.sh — run build-log-fixtures.sh inside the oracle
+# VM, for a host that has no xfsprogs and cannot loop-mount.
 #
-# The geometry fixtures from vm-build-fixtures.sh are formatted and never
-# mounted, so their logs contain one unmount record and nothing else.
-# That is the right shape for checking the superblock parser and the
-# wrong one for checking anything about the log: a log with no items in
-# it cannot disagree with us about how an item is written.
-#
-# These are mounted, written to, and unmounted. The records stay in the
-# ring afterwards — a clean unmount adds a record, it does not erase the
-# ones before it — so each image carries a few thousand real log items
-# for tests to read.
-#
-# The inode size is the point. A logged inode addresses the *cluster*
-# holding it, and the cluster's size scales with the inode size by a rule
-# that is not in the record and not obvious. One inode size proves the
-# arithmetic and nothing about the rule, so this varies it as far as
-# mkfs.xfs will allow.
+# The rationale for the fixtures themselves is in that script. This is
+# only the transport: one copy of the logic, shipped where it can run.
 #
 #   ./scripts/vm-build-log-fixtures.sh
 set -euo pipefail
@@ -26,51 +13,6 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/vm-session.sh"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-"$REPO/scripts/vm.sh" up
-
-# Block size × inode size. Not every pair is legal — a filesystem's
-# inodes must fit its blocks with room to spare — and mkfs.xfs is left
-# to say which, rather than this script encoding a rule that changes
-# between versions.
-GEOMETRIES=(
-    "1024 512"
-    "4096 512"
-    "4096 1024"
-    "4096 2048"
-)
-
-for geom in "${GEOMETRIES[@]}"; do
-    read -r bsize isize <<<"$geom"
-    "$REPO/scripts/vm.sh" run "
-        set -e
-        cd /share
-        img=xfslog-b${bsize}-i${isize}.img
-        rm -f \"\$img\"
-        truncate -s 400M \"\$img\"
-        if ! mkfs.xfs -f -q -b size=$bsize -i size=$isize -m crc=1 \"\$img\" >/dev/null 2>&1; then
-            rm -f \"\$img\"
-            echo 'SKIP  b=$bsize i=$isize (mkfs.xfs rejected this geometry)'
-            exit 0
-        fi
-        m=\$(mktemp -d)
-        mount -o loop \"\$img\" \"\$m\"
-        # Enough inodes to span more than one cluster, so the fixture
-        # exercises the cluster boundary rather than only its start.
-        mkdir -p \"\$m/logged\"
-        for n in \$(seq 1 200); do echo \"entry \$n\" > \"\$m/logged/f\$n\"; done
-        # A directory small enough to stay inside its inode, for the
-        # tests that rewrite a short-form directory. Two entries of
-        # equal name length, so a rename between them changes nothing
-        # but the name and cannot be passed by accident.
-        mkdir -p \"\$m/sf\"
-        echo one > \"\$m/sf/aaaa\"
-        echo two > \"\$m/sf/bbbb\"
-        sync
-        umount \"\$m\"; rmdir \"\$m\"
-        echo 'BUILT b=$bsize i=$isize'
-    "
-done
-
-echo
-echo "Log fixtures in $REPO/.vm-share:"
-ls -1 "$REPO/.vm-share"/xfslog-*.img 2>/dev/null | sed 's|.*/|  |'
+guest_path="$("$REPO/scripts/vm.sh" put "$REPO/scripts/build-log-fixtures.sh")"
+"$REPO/scripts/vm.sh" run "XFS_FIXTURE_DIR=/share bash '$guest_path'"
+rm -f "$REPO/.vm-share/build-log-fixtures.sh"
