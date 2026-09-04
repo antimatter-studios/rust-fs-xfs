@@ -269,7 +269,13 @@ impl Filesystem {
         // front and the index and tail at the back, with the free middle
         // left out, which is what the kernel logs too.
         let fresh = vec![0u8; dirblocksize];
-        let blkno = fsblock * u64::from(self.sb.blocksize) / crate::log::BBSIZE as u64;
+        // Unpacked, not multiplied: `fsblock` above is built as
+        // (agno << agblklog) | agblock, and the buffer log item is
+        // addressed in basic blocks from the start of the device. The
+        // two only coincide in group 0, or when agblocks happens to be a
+        // power of two. Getting this wrong tells recovery to write the
+        // block somewhere it does not belong.
+        let blkno = crate::alloc_btree::blkno_of_fsbno(&self.sb, fsblock);
         let block_item = changed_chunks(blkno, &fresh, block, BLFT_DIR_BLOCK);
 
         let extent = Extent {
