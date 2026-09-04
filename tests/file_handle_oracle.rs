@@ -55,7 +55,49 @@ fn fixture_with_content() -> Option<PathBuf> {
         let Ok(entries) = root.entries() else {
             return false;
         };
+        // A NON-EMPTY REGULAR FILE, not merely "some entry".
+        //
+        // "Has entries" was the test here, and it picked xfscreate-*,
+        // whose 55 filler files are all zero length -- so the loop
+        // skipped every one of them and the run ended on "no regular
+        // file was read". That assertion did its job; this is the other
+        // half of it. A fixture with nothing to read is not a fixture
+        // this test can use, and choosing one is not something to
+        // discover at the end.
+        //
+        // Recursive, because the file may be a level down: xfslog-*
+        // keeps its files in logged/ and sf/, and the root holds only
+        // directories.
+        fn has_a_readable_file(fs: &Filesystem, path: &str, depth: u32) -> bool {
+            if depth == 0 {
+                return false;
+            }
+            let Ok(dir) = fs.open(path) else {
+                return false;
+            };
+            let Ok(entries) = dir.entries() else {
+                return false;
+            };
+            entries.iter().any(|e| {
+                if e.name == b"." || e.name == b".." {
+                    return false;
+                }
+                let name = String::from_utf8_lossy(&e.name);
+                let child = if path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{path}/{name}")
+                };
+                match fs.open(&child) {
+                    Ok(f) if f.is_regular_file() && !f.is_empty() => true,
+                    Ok(f) if f.is_dir() => has_a_readable_file(fs, &child, depth - 1),
+                    _ => false,
+                }
+            })
+        }
+
         entries.iter().any(|e| e.name != b"." && e.name != b"..")
+            && has_a_readable_file(&fs, "/", 4)
     })
 }
 
