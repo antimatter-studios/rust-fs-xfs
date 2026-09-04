@@ -126,6 +126,7 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         echo "REPAIR_END"
         rm -f "$img"
         echo "DONE"
+        echo DONE
         "#;
     let Some(out) = kernel_run(script) else {
         eprintln!("oracle VM unavailable — skipping verification");

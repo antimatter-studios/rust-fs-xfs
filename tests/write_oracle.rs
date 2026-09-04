@@ -137,6 +137,7 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         mount -o ro,loop "$img" "$mnt"
         echo "SHA $(sha256sum "$mnt{TARGET}" | cut -d' ' -f1)"
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
+        echo DONE
         "#
     );
     let Some(out) = kernel_run(&script) else {
@@ -274,6 +275,7 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
         echo "MTIME_NS $(stat -c%y "$mnt{TARGET}")"
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
+        echo DONE
         "#
     );
     let Some(out) = kernel_run(&script) else {
@@ -383,6 +385,7 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         echo "BLOCKS $(stat -c%b "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
+        echo DONE
         "#
     );
     let Some(out) = kernel_run(&script) else {
