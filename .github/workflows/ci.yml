@@ -196,19 +196,17 @@ jobs:
       # pair can actually be built.
       - name: Replay against the kernel every oracle that can reach one
         run: |
-          cargo test --locked --release --test truncate_oracle -- --nocapture
-          cargo test --locked --release --test truncate_replay_oracle -- --nocapture
-          cargo test --locked --release --test unlink_replay_oracle -- --nocapture
-          cargo test --locked --release --test create_replay_oracle -- --nocapture
-          cargo test --locked --release --test log_replay_oracle -- --nocapture
-          cargo test --locked --release --test file_write_replay_oracle -- --nocapture
+          for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
+                       create_replay_oracle log_replay_oracle file_write_replay_oracle; do
+            ./scripts/ci-test.sh --test "$suite"
+          done
 
       # The strongest check in the suite: build a block-form directory
       # from the short-form one, and require it to equal the block the
       # kernel built for the same entries, byte for byte apart from the
       # checksum and sequence number it stamps after logging.
       - name: Compare our block-form directory against the kernel's
-        run: cargo test --locked --release --test dir_block_oracle -- --nocapture
+        run: ./scripts/ci-test.sh --test dir_block_oracle
 
       # The comparison itself: parse each image with this driver and
       # require every field to equal what xfs_db reported for it. This
@@ -217,7 +215,7 @@ jobs:
       # which would leave the images disagreeing with the dumps that were
       # taken straight out of mkfs.
       - name: Cross-validate every superblock field against xfs_db
-        run: cargo test --locked --release --test oracle_vm_fixtures -- --nocapture
+        run: ./scripts/ci-test.sh --test oracle_vm_fixtures
 
       # The #[ignore]-gated oracle suite in tests/oracle_mkfs.rs does the
       # same field-by-field comparison, but builds its own images inline
@@ -285,41 +283,6 @@ jobs:
             exit 1
           fi
           echo "images accepted by the in-kernel XFS driver: $mounted"
-
-      # A SKIP IS NOT A PASS. Every fixture-gated test prints a skip
-      # line and returns ok when it cannot find its fixture -- right for
-      # a fresh checkout, wrong in a job that just built the fixtures.
-      # Without this, a green run can mean nothing ran, which is how
-      # truncate_oracle came to skip in CI for its whole existence.
-      #
-      # The replay oracles are in scope now because they no longer need
-      # the VM: they need A kernel, and tests/common/mod.rs hands them
-      # this runner's. They build their own scratch images from fixtures
-      # the steps above produce -- log_replay from xfs-default.img,
-      # file_write_replay from the xfstrunc pair.
-      #
-      # NOT COVERED HERE: stress_oracle, whose corpus is built by a
-      # 281-line VM-only script and is the one fixture set a runner still
-      # cannot produce. Named rather than implied.
-      - name: Fail if a fixture-backed test skipped
-        run: |
-          set -euo pipefail
-          out=$(cargo test --locked --release \
-                  --test oracle_vm_fixtures \
-                  --test dir_block_oracle \
-                  --test truncate_oracle \
-                  --test truncate_replay_oracle \
-                  --test unlink_replay_oracle \
-                  --test create_replay_oracle \
-                  --test log_replay_oracle \
-                  --test file_write_replay_oracle \
-                  -- --nocapture 2>&1)
-          if echo "$out" | grep -qiE "skipp|no fixture|unavailable"; then
-            echo "$out" | grep -iE "skipp|no fixture|unavailable"
-            echo "::error::a fixture-backed test skipped in the job that builds its fixture"
-            exit 1
-          fi
-          echo "every fixture-backed suite ran"
 
       # A mount that succeeds can still have made the kernel unhappy:
       # corrupt-but-tolerated metadata, geometry it dislikes, log recovery
