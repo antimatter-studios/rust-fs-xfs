@@ -444,11 +444,17 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             .map(|e| String::from_utf8_lossy(&e.name).into_owned())
             .collect()
     };
-    assert!(
-        before.len() > 20,
-        "the fixture should be nearly full, not {} entries",
-        before.len()
-    );
+    // No assertion on how MANY entries there are. There was one -- "the
+    // fixture should be nearly full", meaning more than 20 -- and it
+    // failed on a CI runner that built the same fixture with 17. The
+    // count is not a property of the fixture: build-dirconv-fixtures.sh
+    // fills the directory until it converts and then steps back one, so
+    // the number depends on the inode size and name length that this
+    // mkfs.xfs chose. The script says as much ("found by asking rather
+    // than assumed"); the test then assumed it anyway.
+    //
+    // What matters is that the directory is one entry short of
+    // converting, and that is checked below by converting it.
 
     let added = "converted";
     {
@@ -460,6 +466,20 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             .expect("the conversion must be accepted");
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         assert_ne!(ino, 0);
+
+        // The subject of the test: that one entry took the directory out
+        // of the inode and into a block. If the fixture was not actually
+        // full, this still reads Local and there was no conversion to
+        // check -- which is what the entry count was a proxy for, stated
+        // directly and without depending on the count.
+        let after = fs.lookup_path("/d").expect("the directory");
+        let (converted, _) = fs.read_inode_raw(after.ino).expect("read it back");
+        assert_eq!(
+            converted.format,
+            fs_xfs::inode::Format::Extents,
+            "adding an entry should have converted the directory to block form, \
+             but it is still short form -- the fixture was not full"
+        );
     }
 
     let checks: String = before
