@@ -276,21 +276,30 @@ fn parse_block(
 /// than recomputed at each use.
 pub fn expected_blkno(sb: &Superblock, agno: u32, agblock: u32) -> u64 {
     let fsblock = u64::from(agno) * u64::from(sb.agblocks) + u64::from(agblock);
-    blkno_of_fsblock(sb, fsblock)
+    blkno_of_linear_block(sb, fsblock)
 }
 
-/// What `bb_blkno` holds for the block at `fsblock`.
+/// What `bb_blkno` holds for the block at `linear`, a block counted
+/// straight through the device from zero.
 ///
-/// `bb_blkno` is a **basic-block address**, not a filesystem block
-/// number: XFS records block identity in 512-byte units throughout, so
-/// the value scales by `blocksize / BBSIZE`. Comparing an fsblock
-/// against it directly succeeds only when the block size is 512.
+/// NOT an fsbno. XFS's block pointers are packed -- `agno` in the high
+/// bits, `agbno` in the low `sb_agblklog` -- and `agblklog` is rounded
+/// UP to a power of two while `agblocks` is not, so the two forms differ
+/// by `agno * (2^agblklog - agblocks)` for every group above the first.
+/// Use [`blkno_of_fsbno`] when the number came out of a B+tree pointer.
+pub fn blkno_of_linear_block(sb: &Superblock, linear: u64) -> u64 {
+    linear * u64::from(sb.blocksize) / crate::log::BBSIZE as u64
+}
+
+/// What `bb_blkno` holds for the block at packed `fsbno`.
 ///
-/// Shared with the block-map tree, which addresses its blocks by
-/// filesystem block rather than by group and offset — two callers, one
-/// conversion, so neither can be right while the other is wrong.
-pub fn blkno_of_fsblock(sb: &Superblock, fsblock: u64) -> u64 {
-    fsblock * u64::from(sb.blocksize) / crate::log::BBSIZE as u64
+/// This is the form every on-disk pointer uses, so it is the one a
+/// parser wants. Unpacking first is the whole difference: on a 500 MB
+/// filesystem with four groups, `agblocks` is 32000 and `2^agblklog` is
+/// 32768, so a block in group 2 is 1536 blocks -- 12288 basic blocks --
+/// further along in the packed form than it is on the device.
+pub fn blkno_of_fsbno(sb: &Superblock, fsbno: u64) -> u64 {
+    sb.fsblock_offset(fsbno) / crate::log::BBSIZE as u64
 }
 
 /// Collect every free extent in one of a group's two trees, in the

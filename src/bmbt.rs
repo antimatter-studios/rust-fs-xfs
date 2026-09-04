@@ -230,7 +230,7 @@ fn parse_block(
         // file), and the level check only catches it when the depths
         // differ. Its address is what tells the two apart.
         let stated = be64(buf, offsets::BLKNO);
-        let expected = crate::alloc_btree::blkno_of_fsblock(sb, fsblock);
+        let expected = crate::alloc_btree::blkno_of_fsbno(sb, fsblock);
         if stated != expected {
             return Err(Error::BlockIdentityMismatch {
                 what: "bmbt block address",
@@ -392,7 +392,23 @@ mod tests {
     /// Same shape as `dir.rs`'s test builder, kept local so the two can
     /// diverge without one silently changing the other's fixtures.
     fn v5_superblock() -> Superblock {
-        let (agcount, agblocks, agblklog) = (4u32, 1024u32, 10u8);
+        // agblocks is a power of two here, so a packed fsbno and a
+        // linear block number are the same value. Convenient, and it is
+        // why no test in this module could tell the two apart until
+        // `v5_superblock_ragged` existed.
+        v5_superblock_with(4, 1024, 10)
+    }
+
+    /// A geometry where `agblocks` is NOT a power of two, which is the
+    /// ordinary case on a real filesystem: `mkfs.xfs` sizes groups to
+    /// the device and rounds `agblklog` up. Packed and linear block
+    /// numbers then differ by `agno * (2^agblklog - agblocks)`, and any
+    /// code that confuses them is wrong from group 1 onward.
+    fn v5_superblock_ragged() -> Superblock {
+        v5_superblock_with(4, 1000, 10)
+    }
+
+    fn v5_superblock_with(agcount: u32, agblocks: u32, agblklog: u8) -> Superblock {
         let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&4096u32.to_be_bytes()); // blocksize
@@ -448,7 +464,7 @@ mod tests {
         if sb.is_v5() {
             b[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
             b[offsets::OWNER..offsets::OWNER + 8].copy_from_slice(&ino.to_be_bytes());
-            let blkno = crate::alloc_btree::blkno_of_fsblock(sb, at);
+            let blkno = crate::alloc_btree::blkno_of_fsbno(sb, at);
             b[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
             let crc = crc32c_with_zeroed_crc(&b, offsets::CRC);
             b[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
@@ -483,7 +499,7 @@ mod tests {
         if sb.is_v5() {
             b[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
             b[offsets::OWNER..offsets::OWNER + 8].copy_from_slice(&ino.to_be_bytes());
-            let blkno = crate::alloc_btree::blkno_of_fsblock(sb, at);
+            let blkno = crate::alloc_btree::blkno_of_fsbno(sb, at);
             b[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
             let crc = crc32c_with_zeroed_crc(&b, offsets::CRC);
             b[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
@@ -604,6 +620,52 @@ mod tests {
     ///
     /// So the fixture here is not damaged in any way: it is a
     /// well-formed leaf of the right inode at the right level, read at
+    /// A block in a group above the first, on a filesystem whose groups
+    /// are not a power of two blocks long.
+    ///
+    /// The address check compares `bb_blkno` against where the block was
+    /// expected, and both sides have to speak the same units. A pointer
+    /// out of a B+tree is a PACKED fsbno -- `agno` above `sb_agblklog`
+    /// bits of `agbno` -- while `bb_blkno` counts 512-byte units from
+    /// the start of the device. Multiplying the packed value straight
+    /// through conflates them.
+    ///
+    /// It went unnoticed because it cannot show up in group 0, and
+    /// because `v5_superblock` gives every group exactly 1024 blocks
+    /// with `agblklog` 10 -- so packed and linear are equal everywhere
+    /// on it, and the fixture builders stamped `bb_blkno` with the same
+    /// function the parser checked it against. Two things agreeing on
+    /// the same misunderstanding.
+    ///
+    /// Found on a real filesystem, by the stress corpus: a 500 MB image
+    /// with four groups has `agblocks` 32000 against `2^agblklog` 32768,
+    /// and a bmbt block in group 2 read 12288 basic blocks off.
+    #[test]
+    fn a_block_in_a_later_group_is_addressed_by_its_packed_number() {
+        let sb = v5_superblock_ragged();
+        let ino = 5;
+
+        // Group 2, block 7. Packed as the on-disk pointer holds it.
+        let fsbno = (2u64 << sb.agblklog) | 7;
+        let linear = 2 * u64::from(sb.agblocks) + 7;
+        assert_ne!(
+            fsbno, linear,
+            "this geometry is supposed to make the two forms differ"
+        );
+        assert_eq!(
+            crate::alloc_btree::blkno_of_fsbno(&sb, fsbno),
+            crate::alloc_btree::blkno_of_linear_block(&sb, linear),
+            "a packed fsbno and the linear block it names must land on the same address"
+        );
+
+        // And the walk accepts a block stamped for that address.
+        let block = leaf(&sb, ino, fsbno, &[ext(0, 10, 1)]);
+        let fork = root(1, 96, &[(0, fsbno)]);
+        let extents = walk(&fork, 1, &sb, ino, |_| Ok(block.clone()))
+            .expect("a correctly addressed block in group 2 must be accepted");
+        assert_eq!(extents.len(), 1);
+    }
+
     /// the wrong block.
     #[test]
     fn a_block_read_at_an_address_it_was_not_written_for_is_refused() {
@@ -639,11 +701,11 @@ mod tests {
         let sb = v5_superblock(); // 4 KiB blocks
         assert_eq!(sb.blocksize, 4096);
         assert_eq!(
-            crate::alloc_btree::blkno_of_fsblock(&sb, 1),
+            crate::alloc_btree::blkno_of_fsbno(&sb, 1),
             8,
             "one 4 KiB block is eight 512-byte basic blocks"
         );
-        assert_eq!(crate::alloc_btree::blkno_of_fsblock(&sb, 0), 0);
+        assert_eq!(crate::alloc_btree::blkno_of_fsbno(&sb, 0), 0);
 
         // Written the wrong way round — the fsblock stamped as-is — the
         // block would be refused at its own address.
