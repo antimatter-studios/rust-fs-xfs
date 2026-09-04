@@ -65,7 +65,7 @@ jobs:
       # equivalent, but the manifest still has to resolve locally first.
       - name: clone am-fs-core sibling
         shell: bash
-        run: git clone --depth 1 --branch v0.2.3 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch v0.2.4 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
       # A version already on crates.io cannot be published again, and a
       # re-tag — or a first release published by hand before trusted
