@@ -63,7 +63,6 @@ use crate::format::dir::{
     offsets, XFS_DIR2_BLOCK_TAIL_SIZE, XFS_DIR2_DATA_ALIGN, XFS_DIR2_DATA_FREE_TAG,
     XFS_DIR2_LEAF_ENTRY_SIZE, XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_HDR_SIZE,
 };
-use crate::log::BBSIZE;
 use crate::superblock::Superblock;
 
 /// One entry to place in the block.
@@ -134,7 +133,12 @@ pub fn build(sb: &Superblock, fsblock: u64, owner: u64, entries: &[Entry]) -> Re
     block[h::MAGIC..h::MAGIC + 4].copy_from_slice(&XFS_DIR3_BLOCK_MAGIC.to_be_bytes());
     // The block records its own address in 512-byte basic blocks, which
     // is what catches a block that was written to the wrong place.
-    let blkno = fsblock * u64::from(sb.blocksize) / BBSIZE as u64;
+    //
+    // `fsblock` is PACKED -- agno above sb_agblklog bits of agbno -- so
+    // it has to be unpacked before it means an address. Multiplying it
+    // straight through is right only while agblocks is a power of two,
+    // and mkfs.xfs sizes groups to the device.
+    let blkno = crate::alloc_btree::blkno_of_fsbno(sb, fsblock);
     block[h::BLKNO..h::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
     block[h::UUID..h::UUID + 16].copy_from_slice(&sb.meta_uuid);
     block[h::OWNER..h::OWNER + 8].copy_from_slice(&owner.to_be_bytes());
@@ -291,13 +295,29 @@ mod tests {
     /// A 4 KiB v5 filesystem, enough for the geometry this module reads
     /// out of a superblock: the block size and the directory-block log.
     fn superblock() -> Superblock {
+        superblock_with(1024)
+    }
+
+    /// A geometry whose groups are NOT a power of two blocks long, which
+    /// is the ordinary case: `mkfs.xfs` sizes groups to the device and
+    /// rounds `agblklog` up. A packed fsbno and a linear block number
+    /// then differ from group 1 onward, and `superblock()` above cannot
+    /// tell them apart because 1024 blocks with agblklog 10 makes them
+    /// equal everywhere.
+    fn ragged_superblock() -> Superblock {
+        superblock_with(1000)
+    }
+
+    fn superblock_with(agblocks: u32) -> Superblock {
         let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&4096u32.to_be_bytes()); // blocksize
-        b[8..16].copy_from_slice(&4096u64.to_be_bytes()); // dblocks
+                                                         // Derived, so a geometry with ragged groups still adds up: the
+                                                         // superblock parser refuses agcount * agblocks below dblocks.
+        b[8..16].copy_from_slice(&(4u64 * u64::from(agblocks)).to_be_bytes()); // dblocks
         b[48..56].copy_from_slice(&4u64.to_be_bytes()); // logstart
         b[56..64].copy_from_slice(&128u64.to_be_bytes()); // rootino
-        b[84..88].copy_from_slice(&1024u32.to_be_bytes()); // agblocks
+        b[84..88].copy_from_slice(&agblocks.to_be_bytes()); // agblocks
         b[88..92].copy_from_slice(&4u32.to_be_bytes()); // agcount
         b[96..100].copy_from_slice(&16u32.to_be_bytes()); // logblocks
         let versionnum = 5u16 | crate::superblock::version_flags::MOREBITSBIT;
@@ -334,6 +354,46 @@ mod tests {
         assert!(
             err.to_string().contains("leaf form"),
             "the refusal should name what the answer would be: {err}"
+        );
+    }
+    /// A directory block built for a group above the first records the
+    /// address it will actually be written to.
+    ///
+    /// `bb_blkno` is what catches a block read from the wrong place, so
+    /// a wrong one is worse than useless: on the write side the buffer
+    /// log item carries the same number, and recovery writes the block
+    /// where it says. The value has to come from unpacking the fsbno,
+    /// not from multiplying it.
+    ///
+    /// This could not be caught before because `superblock()` gives
+    /// every group 1024 blocks with `agblklog` 10, so packed and linear
+    /// agree on it, and because the only fixtures that reached this code
+    /// allocated in group 0.
+    #[test]
+    fn a_block_built_for_a_later_group_records_its_real_address() {
+        let sb = ragged_superblock();
+        let fsbno = (2u64 << sb.agblklog) | 7;
+        let linear = 2 * u64::from(sb.agblocks) + 7;
+        assert_ne!(fsbno, linear, "the geometry must make the two differ");
+
+        let entries = [Entry {
+            name: b"a".to_vec(),
+            ino: 200,
+            ftype: 1, // regular file, as ftype_to_raw encodes it
+        }];
+        let block = build(&sb, fsbno, 128, &entries).expect("build");
+
+        use offsets::dir3_blk as h;
+        let stated = u64::from_be_bytes(block[h::BLKNO..h::BLKNO + 8].try_into().unwrap());
+        assert_eq!(
+            stated,
+            crate::alloc_btree::blkno_of_fsbno(&sb, fsbno),
+            "the block should record where it will be written"
+        );
+        assert_ne!(
+            stated,
+            fsbno * u64::from(sb.blocksize) / crate::log::BBSIZE as u64,
+            "and not what multiplying the packed number gives"
         );
     }
 }
