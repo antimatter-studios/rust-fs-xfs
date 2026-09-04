@@ -145,6 +145,7 @@ fn logged_cores_match_the_inodes_on_disk() {
         // Counted rather than ignored: if it were ever most of them,
         // this test would be asserting almost nothing.
         let mut stale = 0usize;
+        let mut drifted = 0usize;
         for (ino, (_, logged)) in &newest {
             // Read the inode as it now sits on disk.
             let mut raw = vec![0u8; usize::from(sb.inodesize)];
@@ -215,6 +216,36 @@ fn logged_cores_match_the_inodes_on_disk() {
                     stale += 1;
                     continue;
                 }
+
+                // EQUAL COUNTERS DO NOT MEAN EQUAL TIMESTAMPS.
+                // di_changecount is the NFS change attribute, and XFS
+                // does not bump it for an update that only moves a
+                // timestamp. So the disk can carry a later mtime than
+                // the record at the same count, and that is the disk
+                // being ahead rather than a conversion fault -- the same
+                // thing the check above is for, in the one case it
+                // cannot see.
+                //
+                // MEASURED, on xfsstress-ops1k.img inode 262235: every
+                // byte identical except di_mtime and di_ctime,
+                // changecount 12 on both sides, di_flags2 = 8 so these
+                // are bigtime timestamps and each is one 64-bit
+                // nanosecond count. The disk's is 191,976,019 ns ahead
+                // of the record's -- 192 milliseconds, which is a later
+                // update and not a byte this driver got wrong.
+                //
+                // ATIME IS NOT FORGIVEN, and that is what keeps this
+                // honest. Every plausible fault in the conversion is a
+                // wrong field width or offset, and one of those moves
+                // ALL the timestamps, atime included -- so it cannot
+                // hide in here. An earlier version of this allowed the
+                // whole 32..56 range and did hide one.
+                const DRIFTABLE: std::ops::Range<usize> = 40..56;
+                let differing: Vec<usize> = (0..a.len()).filter(|&k| a[k] != b[k]).collect();
+                if !differing.is_empty() && differing.iter().all(|k| DRIFTABLE.contains(k)) {
+                    drifted += 1;
+                    continue;
+                }
             }
             assert_eq!(
                 a,
@@ -226,7 +257,10 @@ fn logged_cores_match_the_inodes_on_disk() {
             here += 1;
         }
         if here > 0 || stale > 0 {
-            eprintln!("{name}: {here} inodes matched, {stale} records older than disk");
+            eprintln!(
+                "{name}: {here} inodes matched, {stale} records older than disk, \
+                 {drifted} with a timestamp the disk moved on from"
+            );
             compared += here;
             skipped_stale += stale;
         }
