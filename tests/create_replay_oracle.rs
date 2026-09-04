@@ -444,17 +444,36 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             .map(|e| String::from_utf8_lossy(&e.name).into_owned())
             .collect()
     };
-    // No assertion on how MANY entries there are. There was one -- "the
-    // fixture should be nearly full", meaning more than 20 -- and it
-    // failed on a CI runner that built the same fixture with 17. The
-    // count is not a property of the fixture: build-dirconv-fixtures.sh
-    // fills the directory until it converts and then steps back one, so
-    // the number depends on the inode size and name length that this
-    // mkfs.xfs chose. The script says as much ("found by asking rather
-    // than assumed"); the test then assumed it anyway.
+    // THE PRECONDITION, CHECKED RATHER THAN GUESSED. This test needs a
+    // directory that is one entry short of leaving its inode. It used to
+    // assert "more than 20 entries" as a stand-in, and that failed on a
+    // runner where the same fixture held 17 — with nothing wrong.
     //
-    // What matters is that the directory is one entry short of
-    // converting, and that is checked below by converting it.
+    // The count is not a property of the fixture. build-dirconv-fixtures
+    // fills until the kernel converts and steps back one, so it depends
+    // on how much of the inode the data fork gets. On a runner and in a
+    // container the directory is created with a security xattr, so it
+    // has an ATTRIBUTE FORK: forkoff=24 leaves the data fork 192 bytes
+    // and the kernel converts at 18 entries. In the VM there is no
+    // xattr, forkoff=0, and it converts at 31. Same inode size, same
+    // block size, nearly twice the entries.
+    //
+    // So ask the fixture pair instead: the `-after` image is the same
+    // directory with one more entry, and if that one is in block form
+    // then the pair brackets the conversion, whatever the count.
+    {
+        let after_img = share().join("xfsdirconv-exact-after.img");
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&after_img).expect("open")))
+            .expect("mount");
+        let d = fs.lookup_path("/d").expect("the directory");
+        let (inode, _) = fs.read_inode_raw(d.ino).expect("read it");
+        assert_eq!(
+            inode.format,
+            fs_xfs::inode::Format::Extents,
+            "the -after fixture should show the directory converted; the pair does not \
+             bracket the conversion, so this test has nothing to convert"
+        );
+    }
 
     let added = "converted";
     {
@@ -466,20 +485,6 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             .expect("the conversion must be accepted");
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         assert_ne!(ino, 0);
-
-        // The subject of the test: that one entry took the directory out
-        // of the inode and into a block. If the fixture was not actually
-        // full, this still reads Local and there was no conversion to
-        // check -- which is what the entry count was a proxy for, stated
-        // directly and without depending on the count.
-        let after = fs.lookup_path("/d").expect("the directory");
-        let (converted, _) = fs.read_inode_raw(after.ino).expect("read it back");
-        assert_eq!(
-            converted.format,
-            fs_xfs::inode::Format::Extents,
-            "adding an entry should have converted the directory to block form, \
-             but it is still short form -- the fixture was not full"
-        );
     }
 
     let checks: String = before
