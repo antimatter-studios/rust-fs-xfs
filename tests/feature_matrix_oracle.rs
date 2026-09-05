@@ -96,6 +96,7 @@ const COMBOS: &[&str] = &[
     "b2k",
     "i1k",
     "dirblock8k",
+    "ci",
 ];
 
 /// What happened to one combination.
@@ -322,6 +323,19 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                         eprintln!("{combo:22} {op:22} wrote, no kernel to judge it");
                         continue;
                     }
+                    // A KERNEL THAT REFUSED THE IMAGE IS A FAILURE, and
+                    // it has to be tested for FIRST. A refused mount
+                    // leaves the log unreplayed, so the check below
+                    // matches too — and when it came first it turned the
+                    // worst possible result into "not judged". That is
+                    // how a filesystem the kernel shut down on sight was
+                    // nearly recorded as untested rather than broken.
+                    if repair.contains("MOUNT_FAILED") {
+                        eprintln!("{combo:22} {op:22} THE KERNEL REFUSED IT\n{repair}");
+                        broken.push(format!("{combo} / {op}: the kernel refused to mount it"));
+                        continue;
+                    }
+
                     // The checker disqualifies its own answer when the
                     // log was not replayed, and says so. Counting that
                     // as a verdict on this driver would be reading a

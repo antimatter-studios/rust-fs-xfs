@@ -184,6 +184,9 @@ pub mod version_flags {
     /// Sector size may differ from 512 bytes.
     pub const SECTORBIT: u16 = 0x0800;
     /// `sb_features2` is valid.
+    /// `XFS_SB_VERSION_BORGBIT` — directory names are matched and hashed
+    /// case-insensitively, for ASCII letters only.
+    pub const BORGBIT: u16 = 0x4000;
     pub const MOREBITSBIT: u16 = 0x8000;
 }
 
@@ -768,6 +771,19 @@ impl Superblock {
     /// Checking only the v5 bit reads every entry on a v4 filesystem one
     /// byte short, which shifts the inode number that follows the name
     /// and corrupts the whole listing.
+    /// Whether directory names are hashed case-insensitively.
+    ///
+    /// `mkfs.xfs -n version=ci`. Only ASCII letters are folded, which is
+    /// why the kernel calls it ASCII-CI and why the hash is the ordinary
+    /// one applied to a lowercased name.
+    ///
+    /// Measured: "Mixed" hashes to 0xdd3e32e0 on an ordinary filesystem
+    /// and 0xdd3e32e2 on this kind, and `hashname` of the lowercased
+    /// name gives exactly the second.
+    pub fn has_case_insensitive_dirs(&self) -> bool {
+        self.versionnum & version_flags::BORGBIT != 0
+    }
+
     pub fn has_ftype(&self) -> bool {
         if self.features_incompat & incompat::FTYPE != 0 {
             return true;
