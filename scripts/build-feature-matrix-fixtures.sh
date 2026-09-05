@@ -188,6 +188,18 @@ for combo in "${COMBOS[@]}"; do
     $SUDO rm -f "$m/full/e$n"
     $SUDO sync
 
+    # DIRECTORIES IN GROUPS ABOVE THE FIRST.
+    #
+    # XFS puts a new directory in a different allocation group from its
+    # parent, on purpose, so a tree spreads across the device. Every
+    # other file here lands in group 0, and group 0 is exactly where the
+    # two arithmetic bugs found this week could not show: a packed fsbno
+    # and a linear block number are equal there, and differ everywhere
+    # else. A fixture that never leaves the first group cannot tell the
+    # two apart.
+    $SUDO mkdir -p "$m/spread"
+    for n in $(seq 1 64); do $SUDO mkdir -p "$m/spread/d$n"; done
+
     # Enough inodes that the group's chunk is neither fresh nor full, so
     # creating and unlinking move real records rather than the first and
     # only ones.

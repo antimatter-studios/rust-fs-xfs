@@ -35,7 +35,9 @@
 
 use crate::dir;
 use crate::error::{Error, Result};
-use crate::format::dir::{XFS_DIR2_DATA_ALIGN, XFS_DIR2_SF_HDR_SIZE_4, XFS_DIR2_SF_HDR_SIZE_8};
+use crate::format::dir::{
+    XFS_DIR2_DATA_ALIGN, XFS_DIR2_SF_HDR_SIZE_4, XFS_DIR2_SF_HDR_SIZE_8, XFS_DIR3_DATA_HDR_SIZE,
+};
 use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
 use crate::fs::Filesystem;
 use crate::inode::Format;
@@ -345,13 +347,45 @@ struct SfEntry<'a> {
 ///
 /// One past the highest any existing entry reaches, so it can never
 /// collide with one already handed out.
+/// Where the first entry of an empty directory sits.
+///
+/// A short-form directory stores neither `.` nor `..` — the parent is in
+/// the header and the directory's own number is its inode — but both
+/// still occupy the offset space, because that space describes the BLOCK
+/// the directory would become. So the first real entry does not start at
+/// zero; it starts past the block's header and past the two entries that
+/// are not written down.
+///
+/// Measured rather than derived, then checked against the derivation. A
+/// directory the kernel added one file to:
+///
+/// ```text
+/// list[0].namelen = 5   offset = 0x60   name = "first"
+/// list[1].namelen = 6   offset = 0x78   name = "second"
+/// ```
+///
+/// 0x60 is 96: a 64-byte v5 data header, then `.` and `..` at 16 bytes
+/// each. And 0x78 − 0x60 is 24, which is `cookie_span(5, true)` — so the
+/// span arithmetic was right all along and only the starting point was
+/// wrong.
+///
+/// Getting it wrong is not a crash. The entries are all there and the
+/// directory lists correctly; the offsets are simply not the ones the
+/// kernel would have written, and `xfs_repair` says so:
+/// `would have corrected entry offsets in directory 786496`.
+fn first_cookie(has_ftype: bool) -> u32 {
+    XFS_DIR3_DATA_HDR_SIZE as u32 + cookie_span(1, has_ftype) + cookie_span(2, has_ftype)
+}
+
 fn next_cookie(parsed: &dir::ShortFormDir, has_ftype: bool) -> u32 {
     parsed
         .entries
         .iter()
         .map(|e| e.offset + cookie_span(e.name.len(), has_ftype))
         .max()
-        .unwrap_or(0)
+        // An empty directory: the next entry is the FIRST one, and a
+        // first entry does not begin at zero.
+        .unwrap_or_else(|| first_cookie(has_ftype))
 }
 
 /// Encode a short-form directory from its header and a final list of
@@ -454,4 +488,114 @@ fn bump_changecount(raw: &mut [u8], v5: bool) {
     let at = DI_CHANGECOUNT;
     let now = u64::from_be_bytes(raw[at..at + 8].try_into().expect("8 bytes"));
     raw[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_dir() -> dir::ShortFormDir {
+        dir::ShortFormDir {
+            parent_ino: 128,
+            i8count: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    /// The call site, not just the constant.
+    ///
+    /// `next_cookie` returned zero for a directory with no entries, and
+    /// a unit test on `first_cookie` alone does not notice — reverting
+    /// the call site left that test passing. This is the one that fails.
+    #[test]
+    fn the_first_entry_of_an_empty_directory_does_not_start_at_zero() {
+        assert_eq!(
+            next_cookie(&empty_dir(), true),
+            0x60,
+            "an empty directory's next entry is its first, and the kernel puts that at 0x60"
+        );
+        assert_ne!(
+            next_cookie(&empty_dir(), true),
+            0,
+            "zero is where this used to put it, and xfs_repair rewrote every one"
+        );
+    }
+
+    /// And a directory that already has entries carries on from them,
+    /// which is what it always did correctly.
+    #[test]
+    fn a_later_entry_follows_the_ones_before_it() {
+        let mut d = empty_dir();
+        d.entries.push(dir::DirEntry {
+            name: b"first".to_vec(),
+            ino: 132,
+            ftype: None,
+            offset: 0x60,
+        });
+        assert_eq!(
+            next_cookie(&d, true),
+            0x78,
+            "0x60 plus the five-letter name's span, exactly as the kernel wrote it"
+        );
+    }
+
+    /// The offset the kernel gives a first entry, pinned.
+    ///
+    /// Read off a directory the kernel added two files to:
+    ///
+    /// ```text
+    /// list[0].namelen = 5   offset = 0x60   name = "first"
+    /// list[1].namelen = 6   offset = 0x78   name = "second"
+    /// ```
+    ///
+    /// This started at zero, and every directory this driver added a
+    /// first entry to came out with offsets the kernel would not have
+    /// written. Nothing failed and the directory listed correctly --
+    /// `xfs_repair` was the only thing that knew.
+    #[test]
+    fn a_first_entry_starts_past_the_header_and_the_two_unwritten_entries() {
+        // 64-byte v5 data header, then `.` and `..` at 16 bytes each.
+        assert_eq!(
+            first_cookie(true),
+            0x60,
+            "measured on a v5 filesystem with ftype"
+        );
+        assert_eq!(
+            first_cookie(true),
+            XFS_DIR3_DATA_HDR_SIZE as u32 + 16 + 16,
+            "and it is the header plus the two entries short form does not store"
+        );
+
+        // The step from the first entry to the second is the first
+        // entry's own span, which is what says the span arithmetic was
+        // never the problem.
+        assert_eq!(
+            first_cookie(true) + cookie_span(5, true),
+            0x78,
+            "the kernel put a six-letter name after a five-letter one at 0x78"
+        );
+
+        // Without the file-type byte the two unwritten entries are one
+        // byte shorter each -- and it makes no difference, because
+        // eight-byte alignment absorbs it at these name lengths. Worth
+        // asserting rather than assuming: I assumed the opposite and
+        // this caught it.
+        assert_eq!(
+            first_cookie(false),
+            first_cookie(true),
+            "one byte per entry disappears into the alignment"
+        );
+
+        // The ftype byte does change the span once a name is long
+        // enough to push the entry over an alignment boundary.
+        assert_eq!(cookie_span(4, false), 16);
+        assert_eq!(cookie_span(4, true), 16, "13 and 14 bytes both round to 16");
+        assert_eq!(cookie_span(6, false), 24, "17 rounds to 24");
+        assert_eq!(cookie_span(5, false), 16, "16 is already aligned");
+        assert_eq!(
+            cookie_span(5, true),
+            24,
+            "and the ftype byte pushes it over"
+        );
+    }
 }
