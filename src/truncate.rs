@@ -95,64 +95,23 @@ impl Filesystem {
     /// Neither name says any of that, and renaming a published function
     /// is a decision rather than a correction — so until one is made,
     /// each says it here.
-    pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
-        let Some(device) = self.writable.as_ref() else {
-            return Err(Error::ReadOnly);
-        };
-        if !self.sb.is_v5() {
-            return Err(Error::UnsupportedFeature(
-                "truncating writes v5 metadata; a v4 filesystem is not supported".into(),
-            ));
-        }
-
-        let (file, raw) = self.read_inode_raw(ino)?;
-        if !file.is_regular_file() {
-            return Err(Error::NotAFile);
-        }
-        if file.is_realtime() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} keeps its data on the real-time device, which has no \
-                 allocation groups to free into"
-            )));
-        }
-        if file.format == crate::inode::Format::Btree {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} keeps its extents in a B+tree, whose own blocks would have \
-                 to be freed alongside the file's; only an inline extent list is supported"
-            )));
-        }
-
-        let extents = self.data_extents(&file, &raw)?;
-        if extents.is_empty() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} has no extents to free"
-            )));
-        }
-
-        // One group only. Freeing into several means one buffer item per
-        // tree per group, and a checkpoint that no longer resembles the
-        // shape this was measured against.
-        let (agno, _) = split_fsblock(&self.sb, extents[0].startblock);
-        let mut freeing = Vec::with_capacity(extents.len());
-        for extent in &extents {
-            let (owner, agblock) = split_fsblock(&self.sb, extent.startblock);
-            if owner != agno {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino} has extents in allocation groups {agno} and {owner}; \
-                     freeing across groups is not implemented"
-                )));
-            }
-            freeing.push(FreeExtent {
-                startblock: agblock,
-                blockcount: u32::try_from(extent.blockcount).map_err(|_| {
-                    Error::UnsupportedFeature(format!(
-                        "inode {ino} has an extent of {} blocks, more than a group can hold",
-                        extent.blockcount
-                    ))
-                })?,
-            });
-        }
-
+    /// Give one allocation group's worth of blocks back, and say what
+    /// changed.
+    ///
+    /// Everything a free touches is per-group — the header, the two
+    /// free-space trees, the reverse map and the reference-count tree —
+    /// so a file whose extents are in several groups is this, several
+    /// times, and nothing about it is singular.
+    ///
+    /// Returns the buffer items. Nothing is written: the items are the
+    /// change, and the caller puts them in a record.
+    fn free_in_group(
+        &self,
+        ino: u64,
+        agno: u32,
+        freeing_here: &[FreeExtent],
+        extents_here: &[crate::extent::Extent],
+    ) -> Result<Vec<crate::buf_write::BufferItem>> {
         let block = u64::from(self.sb.blocksize);
         let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
         let sector = u64::from(self.sb.sectsize);
@@ -213,7 +172,7 @@ impl Filesystem {
             // file's map entire, so a record that does not line up means
             // the tree and the inode disagree and the free must not go
             // ahead. `crate::rmap::remove` says which.
-            for extent in &extents {
+            for extent in extents_here {
                 let (_, agblock) = split_fsblock(&self.sb, extent.startblock);
                 crate::rmap::remove(
                     &mut rmap_records,
@@ -272,7 +231,7 @@ impl Filesystem {
         }
 
         let mut refcount_changed = false;
-        for extent in &freeing {
+        for extent in freeing_here {
             let release = if reflink && refcount_level > 0 {
                 let before = refcount_records.len();
                 let r = crate::refcount::release(
@@ -358,6 +317,86 @@ impl Filesystem {
             )
         });
 
+        let mut items = vec![agf_item, bno_item, cnt_item];
+        if let Some(item) = rmap_item {
+            items.push(item);
+        }
+        if let Some(item) = refcount_item {
+            items.push(item);
+        }
+        Ok(items)
+    }
+
+    pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
+        let Some(device) = self.writable.as_ref() else {
+            return Err(Error::ReadOnly);
+        };
+        if !self.sb.is_v5() {
+            return Err(Error::UnsupportedFeature(
+                "truncating writes v5 metadata; a v4 filesystem is not supported".into(),
+            ));
+        }
+
+        let (file, raw) = self.read_inode_raw(ino)?;
+        if !file.is_regular_file() {
+            return Err(Error::NotAFile);
+        }
+        if file.is_realtime() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} keeps its data on the real-time device, which has no \
+                 allocation groups to free into"
+            )));
+        }
+        if file.format == crate::inode::Format::Btree {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} keeps its extents in a B+tree, whose own blocks would have \
+                 to be freed alongside the file's; only an inline extent list is supported"
+            )));
+        }
+
+        let extents = self.data_extents(&file, &raw)?;
+        if extents.is_empty() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} has no extents to free"
+            )));
+        }
+
+        // ONE GROUP AT A TIME, however many there are.
+        //
+        // A file bigger than an allocation group has to be split across
+        // several, and then everything a free touches — the header, both
+        // free-space trees, the reverse map, the reference-count tree —
+        // exists once per group. This refused that case, which meant a
+        // file larger than a group could never be truncated, and a group
+        // is 75 MB on the fixture that found it.
+        //
+        // The groups are visited in order so the record's items come out
+        // in a fixed sequence rather than in whatever order the file's
+        // extents happen to be in.
+        let mut by_group: std::collections::BTreeMap<
+            u32,
+            (Vec<FreeExtent>, Vec<crate::extent::Extent>),
+        > = std::collections::BTreeMap::new();
+        for extent in &extents {
+            let (owner, agblock) = split_fsblock(&self.sb, extent.startblock);
+            let entry = by_group.entry(owner).or_default();
+            entry.0.push(FreeExtent {
+                startblock: agblock,
+                blockcount: u32::try_from(extent.blockcount).map_err(|_| {
+                    Error::UnsupportedFeature(format!(
+                        "inode {ino} has an extent of {} blocks, more than a group can hold",
+                        extent.blockcount
+                    ))
+                })?,
+            });
+            entry.1.push(*extent);
+        }
+
+        let mut group_items = Vec::new();
+        for (agno, (freeing_here, extents_here)) in &by_group {
+            group_items.extend(self.free_in_group(ino, *agno, freeing_here, extents_here)?);
+        }
+
         let core = emptied_core(&raw, true);
         let logged = log_dinode_from_disk(&core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
@@ -368,12 +407,7 @@ impl Filesystem {
         // items' own counts summed rather than a constant — how many
         // chunks of a tree block changed depends on where the record
         // went.
-        let item_ops = agf_item.op_count()
-            + bno_item.op_count()
-            + cnt_item.op_count()
-            + rmap_item.as_ref().map_or(0, |i| i.op_count())
-            + refcount_item.as_ref().map_or(0, |i| i.op_count())
-            + 2;
+        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 2;
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -391,13 +425,7 @@ impl Filesystem {
                     data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
             ];
-            ops.extend(agf_item.ops());
-            ops.extend(bno_item.ops());
-            ops.extend(cnt_item.ops());
-            if let Some(item) = &rmap_item {
-                ops.extend(item.ops());
-            }
-            if let Some(item) = &refcount_item {
+            for item in &group_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
