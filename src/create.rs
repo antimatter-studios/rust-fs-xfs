@@ -283,7 +283,9 @@ impl Filesystem {
         // The block comes from the directory's own group, which keeps it
         // near the inode that names it.
         let (agno, _, _) = self.sb.split_ino(parent);
-        let allocated = self.allocate_in_group(agno, 1)?;
+        // The directory's own inode owns the block, at file offset 0:
+        // this is the first block of a directory that had none.
+        let allocated = self.allocate_in_group(agno, 1, parent as i64, 0)?;
         let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(allocated.agblock);
 
         let entries = {

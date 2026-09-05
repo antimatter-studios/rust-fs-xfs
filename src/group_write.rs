@@ -221,17 +221,27 @@ pub fn split_fsblock(sb: &Superblock, fsblock: u64) -> (u32, u32) {
 pub struct Allocated {
     /// Where the run starts, relative to the group.
     pub agblock: u32,
-    /// The group header, the by-block tree and the by-length tree, in
-    /// that order.
+    /// The group header, the by-block tree, the by-length tree and —
+    /// where the filesystem has one — the reverse-mapping tree, in that
+    /// order.
     pub items: Vec<BufferItem>,
 }
 
 impl crate::fs::Filesystem {
-    /// Take `want` contiguous blocks out of allocation group `agno`.
+    /// Take `want` contiguous blocks out of allocation group `agno`, for
+    /// `owner` at file offset `offset`.
     ///
-    /// Returns where they start and the three buffer items recording the
+    /// Returns where they start and the buffer items recording the
     /// change. Nothing is written: the items are the change, and the
     /// caller puts them in a record.
+    ///
+    /// # Why the owner is an argument
+    ///
+    /// Where the filesystem has a reverse-mapping tree, an allocation is
+    /// not complete until the tree says who the blocks belong to. That
+    /// is not something an allocator can work out — only the caller
+    /// knows what it is allocating for — so it comes in with the
+    /// request rather than being inferred here.
     ///
     /// # Which blocks
     ///
@@ -248,8 +258,14 @@ impl crate::fs::Filesystem {
     /// are more than one level deep, when no single run is long enough,
     /// or when the result would need more records than a tree root
     /// holds.
-    pub(crate) fn allocate_in_group(&self, agno: u32, want: u32) -> Result<Allocated> {
-        use crate::ag::agf_btree::{BNO, CNT};
+    pub(crate) fn allocate_in_group(
+        &self,
+        agno: u32,
+        want: u32,
+        owner: i64,
+        offset: u64,
+    ) -> Result<Allocated> {
+        use crate::ag::agf_btree::{BNO, CNT, RMAP};
         use crate::ag::Agf;
         use crate::alloc_btree::{alloc_extent, expected_blkno, longest, total_free, FreeExtent};
         use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
@@ -335,23 +351,75 @@ impl crate::fs::Filesystem {
         // The checksum is left stale on purpose — recovery recomputes it.
 
         let ag_bb = ag_start / BBSIZE as u64;
+        // The reverse map, where the filesystem has one. Blocks that
+        // have just left free space belong to `owner` from here on, and
+        // a tree that does not say so describes a filesystem where they
+        // belong to nobody.
+        let mut items = vec![
+            changed_chunks(ag_bb + sector / BBSIZE as u64, &agf_raw, new_agf, BLFT_AGF),
+            changed_chunks(
+                expected_blkno(&self.sb, agno, agf.roots[BNO]),
+                &bno_raw,
+                new_bno,
+                BLFT_BTREE,
+            ),
+            changed_chunks(
+                expected_blkno(&self.sb, agno, agf.roots[CNT]),
+                &cnt_raw,
+                new_cnt,
+                BLFT_BTREE,
+            ),
+        ];
+
+        if self.sb.has_rmapbt() {
+            if agf.levels[RMAP] != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
+                     where inserting a record can split a node; only a single-level tree \
+                     is supported",
+                    agf.levels[RMAP]
+                )));
+            }
+            let mut rmap_raw = vec![0u8; self.sb.blocksize as usize];
+            self.device().read_at(
+                ag_start + u64::from(agf.roots[RMAP]) * blocksize,
+                &mut rmap_raw,
+            )?;
+            let n = u16::from_be_bytes(
+                rmap_raw[btree::NUMRECS..btree::NUMRECS + 2]
+                    .try_into()
+                    .expect("2 bytes"),
+            );
+            let mut records = crate::rmap::leaf_records(&rmap_raw, n);
+            crate::rmap::insert(
+                &mut records,
+                crate::rmap::Rmap {
+                    startblock: taking.startblock,
+                    blockcount: taking.blockcount,
+                    owner,
+                    offset,
+                },
+            )?;
+            let rmap_capacity = crate::rmap::capacity(self.sb.blocksize);
+            if records.len() > rmap_capacity {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno} would need {} reverse-mapping records and its \
+                     tree root holds {rmap_capacity}; splitting a node is not implemented",
+                    records.len()
+                )));
+            }
+            let new_rmap = crate::rmap::rebuild_leaf(&rmap_raw, &records);
+            items.push(changed_chunks(
+                expected_blkno(&self.sb, agno, agf.roots[RMAP]),
+                &rmap_raw,
+                new_rmap,
+                BLFT_BTREE,
+            ));
+        }
+
         Ok(Allocated {
             agblock: taking.startblock,
-            items: vec![
-                changed_chunks(ag_bb + sector / BBSIZE as u64, &agf_raw, new_agf, BLFT_AGF),
-                changed_chunks(
-                    expected_blkno(&self.sb, agno, agf.roots[BNO]),
-                    &bno_raw,
-                    new_bno,
-                    BLFT_BTREE,
-                ),
-                changed_chunks(
-                    expected_blkno(&self.sb, agno, agf.roots[CNT]),
-                    &cnt_raw,
-                    new_cnt,
-                    BLFT_BTREE,
-                ),
-            ],
+            items,
         })
     }
 }

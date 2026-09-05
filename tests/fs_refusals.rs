@@ -450,20 +450,23 @@ fn a_refused_write_leaves_the_checkpoint_for_a_real_one() {
     );
 }
 
-/// A read-write mount of a filesystem with the reverse-mapping tree is
-/// refused, and a read-only mount of the same image is not.
+/// A filesystem with the reverse-mapping tree is readable AND writable,
+/// and a write keeps the tree in step.
 ///
-/// `rmapbt` is a `ro_compat` feature: reading one is fine, writing one
-/// without maintaining the tree is not. This driver does not maintain
-/// it, and the cost of ignoring that is not a failure — it is a
-/// filesystem that mounts and passes normal use while `xfs_repair`
-/// reports `Missing reverse-mapping record`.
+/// This asserted the opposite until the tree was maintained: a
+/// read-write mount was refused, because allocating without adding a
+/// record and freeing without removing one leaves a filesystem that
+/// mounts and behaves while `xfs_repair` reports
+/// `Missing reverse-mapping record`. Refusing was the honest answer then
+/// and the wrong one to keep, since `mkfs.xfs` turns the feature on by
+/// default — it meant refusing an ordinary volume.
 ///
-/// Found by CI, not by reasoning: `mkfs.xfs` 6.6 enables rmapbt by
-/// default and the oracle VM's older one does not, so every write test
-/// had run against filesystems without it.
+/// The claim is now the one that matters: the mount is allowed, and the
+/// tree describes what the filesystem holds. The kernel-replay half of
+/// that is in `tests/feature_matrix_oracle.rs`, which runs every write
+/// operation against this feature and has `xfs_repair` judge the result.
 #[test]
-fn a_reverse_mapping_filesystem_is_read_only() {
+fn a_reverse_mapping_filesystem_is_writable_and_stays_consistent() {
     let img = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(".vm-share")
         .join("xfs-reflink.img");
@@ -472,28 +475,45 @@ fn a_reverse_mapping_filesystem_is_read_only() {
         return;
     }
 
-    // Reading it is fine, and must stay fine: refusing to read would be
-    // a regression, not extra safety.
     let ro = fs_core::FileDevice::open(&img).expect("open read-only");
     let fs = fs_xfs::Filesystem::mount(
         std::sync::Arc::new(ro) as std::sync::Arc<dyn fs_core::BlockRead>
     )
-    .expect("a reverse-mapping filesystem must still be readable");
+    .expect("a reverse-mapping filesystem must be readable");
     assert!(
         fs.superblock().has_rmapbt(),
         "the fixture is supposed to have rmapbt set; without it this test proves nothing"
     );
     fs.root().expect("its root should list");
+    drop(fs);
 
+    // The mount that used to be refused.
     let rw = fs_core::FileDevice::open_rw(&img).expect("open read-write");
-    let err = fs_xfs::Filesystem::mount_rw(std::sync::Arc::new(rw))
-        .err()
-        .expect("a read-write mount must be refused");
-    match err {
-        fs_xfs::Error::UnsupportedFeature(m) => assert!(
-            m.contains("rmapbt"),
-            "the refusal should name the feature, got: {m}"
-        ),
-        other => panic!("expected UnsupportedFeature naming rmapbt, got {other}"),
+    let fs = fs_xfs::Filesystem::mount_rw(std::sync::Arc::new(rw))
+        .expect("a reverse-mapping filesystem is writable now that the tree is maintained");
+
+    // And the tree it will have to keep in step is one this driver can
+    // read: every record the group holds, with the reserved owners
+    // coming back negative rather than as enormous positive numbers.
+    let agf = fs.agf(0).expect("the first group's header");
+    assert!(
+        agf.has_rmap(),
+        "the group should carry a reverse-mapping tree"
+    );
+    let records = fs.rmap_records(0).expect("read the reverse-mapping tree");
+    assert!(
+        !records.is_empty(),
+        "a formatted group always has records: its own headers, if nothing else"
+    );
+    assert!(
+        records.iter().any(|r| r.owner < 0),
+        "the reserved owners are negative, and reading them as unsigned would hide that"
+    );
+    for pair in records.windows(2) {
+        assert!(
+            pair[0].startblock < pair[1].startblock,
+            "records are ordered by start block, which is what makes an insert position \
+             well defined"
+        );
     }
 }
