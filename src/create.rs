@@ -149,7 +149,21 @@ mod core_at {
     pub const SIZE: usize = 56;
     pub const GEN: usize = 92;
     pub const CHANGECOUNT: usize = 104;
+    /// `di_anextents`, `di_forkoff` and `di_aformat` — the attribute
+    /// fork. A new file has none, and saying so is not the same as
+    /// leaving the bytes alone: see `created_core`.
+    pub const ANEXTENTS: usize = 80;
+    pub const FORKOFF: usize = 82;
+    pub const AFORMAT: usize = 83;
 }
+
+/// `XFS_DINODE_FMT_EXTENTS`, which is what an empty attribute fork is.
+///
+/// Not zero. Zero is `XFS_DINODE_FMT_DEV`, which belongs to device
+/// inodes and is not a legal attribute format for anything —
+/// `xfs_repair` reports `bad attribute format 0 in inode N, would reset
+/// value`.
+const AFORMAT_EXTENTS: u8 = 2;
 
 /// The inode core of a newly created file or directory.
 ///
@@ -176,6 +190,23 @@ fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
     let at = core_at::CHANGECOUNT;
     let now = u64::from_be_bytes(core[at..at + 8].try_into().expect("8 bytes"));
     core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+
+    // THE ATTRIBUTE FORK, STATED RATHER THAN INHERITED.
+    //
+    // This core starts as a copy of the free inode's slot, which is the
+    // right default for the identity fields and the wrong one for
+    // anything describing contents. A free slot carries zero here, and
+    // zero is XFS_DINODE_FMT_DEV -- a device inode's format, and not a
+    // legal attribute format for a file or a directory. The new inode
+    // mounted and behaved; only the checker knew:
+    //
+    //     bad attribute format 0 in inode 138, would reset value
+    //
+    // A new file has an empty attribute fork, and the way to say that is
+    // EXTENTS with no extents and no fork offset.
+    core[core_at::AFORMAT] = AFORMAT_EXTENTS;
+    core[core_at::FORKOFF] = 0;
+    core[core_at::ANEXTENTS..core_at::ANEXTENTS + 2].copy_from_slice(&0u16.to_be_bytes());
     core
 }
 

@@ -109,6 +109,32 @@ impl Filesystem {
         if !file.is_regular_file() {
             return Err(Error::NotAFile);
         }
+        // AN EXTENT ANOTHER FILE ALSO POINTS AT MUST NOT BE FREED.
+        //
+        // Freeing returns the blocks to the group's free space. If the
+        // extent is shared, the refcount tree is what decides whether
+        // that is allowed, and this driver does not maintain it -- so
+        // the blocks go back while the other file still points at them,
+        // and the allocator hands them out again. xfs_repair, after
+        // exactly this on a reflink filesystem:
+        //
+        //     data fork in ino 134 claims free block 24
+        //
+        // The flag is conservative in the right direction: the kernel
+        // sets it on any inode that may have shared extents and leaves
+        // it set afterwards, so a false positive costs a refusal and
+        // there is no false negative to lose data to.
+        //
+        // `Filesystem::truncate` has made this check since it was
+        // written. This path did not, which is the whole difference
+        // between the two on a reflink filesystem.
+        if file.has_shared_extents() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} may have extents shared with another file, and freeing one \
+                 has to decrement the reference count rather than return the blocks; \
+                 this driver does not maintain the refcount tree"
+            )));
+        }
         if file.is_realtime() {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} keeps its data on the real-time device, which has no \
