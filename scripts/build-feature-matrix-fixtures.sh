@@ -112,6 +112,11 @@ COMBOS=(
     # directory index, so a driver that writes one with the ordinary hash
     # builds an index the kernel cannot look names up in.
     "ci:-m crc=1 -n version=ci"
+    # Every inode in the group already used, with a reverse map to keep
+    # in step. Creating here has to allocate a whole chunk, and the
+    # blocks it gets are next to the chunk before them with the same
+    # owner -- which is a reverse-mapping record the kernel merges.
+    "fullinodes:-m crc=1,rmapbt=1,finobt=1"
 )
 
 built=0
@@ -217,6 +222,18 @@ for combo in "${COMBOS[@]}"; do
     # only ones.
     $SUDO mkdir -p "$m/fill"
     for n in $(seq 1 40); do $SUDO touch "$m/fill/f$n"; done
+
+    # The `fullinodes` row uses up every inode the group's one chunk
+    # holds, so that creating anything has to make a new chunk. 64 to a
+    # chunk, minus what the tree above already took.
+    if [ "$name" = fullinodes ]; then
+        $SUDO mkdir -p "$m/eat"
+        n=0
+        while [ "$n" -lt 200 ]; do
+            $SUDO touch "$m/eat/i$n"
+            n=$((n + 1))
+        done
+    fi
 
     sync
     # Unmounted rather than only synced: a mounted filesystem's headers

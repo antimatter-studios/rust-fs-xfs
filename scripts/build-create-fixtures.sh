@@ -60,20 +60,33 @@ command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" 
 mkdir -p "$OUT"
 
 # case:files-before
+# name:files-before[:extra mkfs arguments]
 CASES=(
     "spare:55"
     "last:59"
     "newchunk:60"
+    # The same full group, with a reverse map to keep in step. Allocating
+    # a chunk here takes blocks next to the chunk before them, owned by
+    # the same -7 -- which is a reverse-mapping record the kernel merges
+    # rather than adding a second one beside it.
+    "newchunk-rmap:60:-m crc=1,rmapbt=1"
 )
 
 for entry in "${CASES[@]}"; do
     name="${entry%%:*}"
-    fill="${entry#*:}"
+    rest="${entry#*:}"
+    fill="${rest%%:*}"
+    if [ "$rest" = "$fill" ]; then
+        args="-m crc=1,rmapbt=0"
+    else
+        args="${rest#*:}"
+    fi
     base="$OUT/xfscreate-$name"
 
     rm -f "$base-before.img" "$base-after.img"
     truncate -s "$SIZE" "$base-before.img"
-    mkfs.xfs -m crc=1,rmapbt=0 -f -q "$base-before.img" >/dev/null
+    # shellcheck disable=SC2086
+    mkfs.xfs $args -f -q "$base-before.img" >/dev/null
 
     m="$(mktemp -d)"
     $SUDO mount -o loop "$base-before.img" "$m"
@@ -93,7 +106,7 @@ for entry in "${CASES[@]}"; do
     $SUDO umount "$m"
     rmdir "$m"
 
-    echo "BUILT $name (after $fill files)"
+    echo "BUILT $name (after $fill files, $args)"
 done
 
 echo

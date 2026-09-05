@@ -151,8 +151,23 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
             dmesg | tail -12
         fi
         rmdir "$m" 2>/dev/null
+        # RETRY IF THE LOG DID NOT GO IN. Mounting replays it; when that
+        # does not happen, xfs_repair describes an unreplayed log instead
+        # and warns that what follows is spurious --
+        # "sb_ifree 30, counted 29" is the warning coming true. Reading
+        # that as a verdict fails the test for a reason that has nothing
+        # to do with what it checks.
+        for attempt in 1 2 3; do
+            out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+            case "$out" in
+                *"valuable metadata changes in a log"*) ;;
+                *) break ;;
+            esac
+            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+        done
         echo "REPAIR_BEGIN"
-        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "$out"
+        echo "REPAIR_RC=$rc"
         echo "REPAIR_END"
         rm -f "$img"
         echo "DONE"
@@ -239,12 +254,41 @@ fn the_kernel_uses_a_file_this_driver_created() {
 /// kernel replays it into a filesystem `xfs_repair` is content with.
 #[test]
 fn a_group_with_no_free_inode_gets_a_new_chunk() {
-    let source = share().join("xfscreate-newchunk-before.img");
-    if !source.exists() {
-        eprintln!("no newchunk fixture — skipping");
+    let mut ran = Vec::new();
+    // Both with and without a reverse map. The map is the interesting
+    // one: the blocks a chunk gets sit next to the chunk before them and
+    // are owned by the same -7, so the record has to MERGE with its
+    // neighbour rather than be added beside it.
+    for case in ["newchunk", "newchunk-rmap"] {
+        if chunk_case(case) {
+            ran.push(case);
+        }
+    }
+    // NO FIXTURE IS A FRESH CHECKOUT, not a failure — the same contract
+    // every suite here keeps, and the job that builds the fixtures runs
+    // through scripts/ci-test.sh, which fails on a skip. Asserting here
+    // instead broke the no-fixture job, which has none on purpose.
+    //
+    // Second time I have written that assertion and had CI correct it.
+    if ran.is_empty() {
+        eprintln!(
+            "no newchunk fixtures — skipping. Build them with \
+             `sudo ./scripts/build-create-fixtures.sh` (needs xfsprogs, so Linux)."
+        );
         return;
     }
-    let name = "xfs-create-newchunk-scratch.img";
+    eprintln!("a chunk was allocated and replayed for: {ran:?}");
+}
+
+/// Returns false when the fixture is missing, so the caller can say so.
+fn chunk_case(case: &str) -> bool {
+    let source = share().join(format!("xfscreate-{case}-before.img"));
+    if !source.exists() {
+        eprintln!("no {case} fixture — skipping");
+        return false;
+    }
+    let name = format!("xfs-create-{case}-scratch.img");
+    let name = name.as_str();
     let scratch = Scratch::from(&source, name);
 
     let (before_free, root) = {
@@ -294,8 +338,23 @@ fn a_group_with_no_free_inode_gets_a_new_chunk() {
         # filesystem's geometry and gets ENOTDIR from the share.
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
         cp /share/{name} "$img"
+        # RETRY IF THE LOG DID NOT GO IN. Mounting replays it; when that
+        # does not happen, xfs_repair describes an unreplayed log instead
+        # and warns that what follows is spurious --
+        # "sb_ifree 30, counted 29" is the warning coming true. Reading
+        # that as a verdict fails the test for a reason that has nothing
+        # to do with what it checks.
+        for attempt in 1 2 3; do
+            out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+            case "$out" in
+                *"valuable metadata changes in a log"*) ;;
+                *) break ;;
+            esac
+            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+        done
         echo "REPAIR_BEGIN"
-        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "$out"
+        echo "REPAIR_RC=$rc"
         echo "REPAIR_END"
         rm -f "$img"
         echo DONE
@@ -304,12 +363,12 @@ fn a_group_with_no_free_inode_gets_a_new_chunk() {
 
     let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
-        return;
+        return false;
     };
 
     assert!(
         !out.contains("MOUNT_FAILED"),
-        "the kernel refused a filesystem whose inode chunk this driver allocated:\n{out}"
+        "{case}: the kernel refused a filesystem whose inode chunk this driver allocated:\n{out}"
     );
     assert!(
         out.contains("PRESENT"),
@@ -360,7 +419,8 @@ fn a_group_with_no_free_inode_gets_a_new_chunk() {
         "a chunk of 64 inodes at {inopblock} to a block should cost {expected} blocks, not {}",
         before - after
     );
-    eprintln!("the chunk cost {expected} blocks, and inode {ino} came out of it");
+    eprintln!("{case}: the chunk cost {expected} blocks, and inode {ino} came out of it");
+    true
 }
 
 /// A directory made by this driver, used by the kernel.
@@ -424,8 +484,23 @@ fn the_kernel_uses_a_directory_this_driver_made() {
             dmesg | tail -12
         fi
         rmdir "$m" 2>/dev/null
+        # RETRY IF THE LOG DID NOT GO IN. Mounting replays it; when that
+        # does not happen, xfs_repair describes an unreplayed log instead
+        # and warns that what follows is spurious --
+        # "sb_ifree 30, counted 29" is the warning coming true. Reading
+        # that as a verdict fails the test for a reason that has nothing
+        # to do with what it checks.
+        for attempt in 1 2 3; do
+            out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+            case "$out" in
+                *"valuable metadata changes in a log"*) ;;
+                *) break ;;
+            esac
+            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+        done
         echo "REPAIR_BEGIN"
-        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "$out"
+        echo "REPAIR_RC=$rc"
         echo "REPAIR_END"
         rm -f "$img"
         echo "DONE"
@@ -627,8 +702,23 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             dmesg | tail -12
         fi
         rmdir "$m" 2>/dev/null
+        # RETRY IF THE LOG DID NOT GO IN. Mounting replays it; when that
+        # does not happen, xfs_repair describes an unreplayed log instead
+        # and warns that what follows is spurious --
+        # "sb_ifree 30, counted 29" is the warning coming true. Reading
+        # that as a verdict fails the test for a reason that has nothing
+        # to do with what it checks.
+        for attempt in 1 2 3; do
+            out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+            case "$out" in
+                *"valuable metadata changes in a log"*) ;;
+                *) break ;;
+            esac
+            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+        done
         echo "REPAIR_BEGIN"
-        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "$out"
+        echo "REPAIR_RC=$rc"
         echo "REPAIR_END"
         rm -f "$img"
         echo "DONE"

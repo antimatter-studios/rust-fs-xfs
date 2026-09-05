@@ -91,14 +91,37 @@ impl Rmap {
         self.offset & !OFF_MASK
     }
 
+    /// Whether this record is one of the reserved owners rather than an
+    /// inode.
+    ///
+    /// It decides what "continues" means. A file's extents carry the
+    /// offset within the file, so two records only join when the second
+    /// starts where the first left off. The reserved owners have no such
+    /// thing — the filesystem's headers are not at an offset within
+    /// anything — and their offset is always zero, so adjacency on disk
+    /// is the whole test.
+    ///
+    /// Getting that wrong is how a merge went undetected: two inode
+    /// chunks at blocks 16 and 24, both owned by -7, both at offset
+    /// zero. `0 + 8 == 0` is false, so they looked unrelated, and
+    /// xfs_repair said otherwise -- `record 8 in block (0/5) of rmap
+    /// tree should be merged with previous record`.
+    fn is_reserved_owner(&self) -> bool {
+        self.owner < 0
+    }
+
     /// Whether `other` continues this record exactly: the same owner and
-    /// flags, starting at the block after this one ends, at the file
-    /// offset after this one ends.
+    /// flags, starting at the block after this one ends, and — for a
+    /// file — at the file offset after this one ends.
     fn continues_into(&self, other: &Rmap) -> bool {
-        self.owner == other.owner
-            && self.flags() == other.flags()
-            && self.startblock.checked_add(self.blockcount) == Some(other.startblock)
-            && self.file_offset() + u64::from(self.blockcount) == other.file_offset()
+        if self.owner != other.owner || self.flags() != other.flags() {
+            return false;
+        }
+        if self.startblock.checked_add(self.blockcount) != Some(other.startblock) {
+            return false;
+        }
+        self.is_reserved_owner()
+            || self.file_offset() + u64::from(self.blockcount) == other.file_offset()
     }
 }
 
@@ -149,20 +172,25 @@ pub fn capacity(blocksize: u32) -> usize {
 /// Records are ordered by start block, and the tree holds no two records
 /// for the same one, so the position is decided by the extent itself.
 ///
-/// # What this refuses
+/// # Merging
 ///
-/// A record that would MERGE with a neighbour. The kernel keeps one
-/// record per contiguous run and will merge an allocation into an
-/// adjacent record of the same owner — measured, growing a file from one
-/// block to four turned `[12,1,131,0]` into `[12,4,131,0]` rather than
-/// adding a second record.
+/// The kernel keeps ONE record per contiguous run, so an extent that
+/// continues its neighbour extends that record rather than adding
+/// another beside it. Measured: growing a file from one block to four
+/// turned `[12,1,131,0]` into `[12,4,131,0]`.
 ///
-/// No operation in this driver can produce that case: blocks are only
-/// allocated for a file that had none, or for a directory leaving its
-/// inode, and neither has an existing extent to abut. So rather than
-/// implement a merge against no evidence, this refuses one — if the case
-/// ever arises it will say so instead of writing a shape that was never
-/// measured.
+/// This refused that case until an inode chunk produced it. A chunk's
+/// blocks land next to the chunk before them and carry the same reserved
+/// owner, so allocating one on a filesystem with a reverse map is a
+/// merge every time — and `xfs_repair` says so:
+///
+/// ```text
+/// record 8 in block (0/5) of rmap tree should be merged with previous record
+/// ```
+///
+/// Both neighbours are considered, and both can join at once: an extent
+/// that exactly fills a gap between two records of the same owner
+/// collapses all three into one.
 pub fn insert(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
     let at = records
         .iter()
@@ -178,25 +206,60 @@ pub fn insert(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
                 rec.startblock, before.startblock, end, before.owner
             )));
         }
-        if before.continues_into(&rec) {
-            return Err(Error::UnsupportedFeature(format!(
-                "the extent at group block {} continues the reverse-mapping record before \
-                 it, which the kernel would merge into one; merging is not implemented",
-                rec.startblock
-            )));
-        }
-    }
-    if let Some(after) = records.get(at) {
-        if rec.continues_into(after) {
-            return Err(Error::UnsupportedFeature(format!(
-                "the extent at group block {} runs into the reverse-mapping record after \
-                 it, which the kernel would merge into one; merging is not implemented",
-                rec.startblock
-            )));
-        }
     }
 
-    records.insert(at, rec);
+    let joins_before = at
+        .checked_sub(1)
+        .and_then(|i| records.get(i))
+        .is_some_and(|before| before.continues_into(&rec));
+    let joins_after = records
+        .get(at)
+        .is_some_and(|after| rec.continues_into(after));
+
+    match (joins_before, joins_after) {
+        // Fills the gap exactly: three records become one.
+        (true, true) => {
+            let after = records.remove(at);
+            let before = &mut records[at - 1];
+            before.blockcount = before
+                .blockcount
+                .checked_add(rec.blockcount)
+                .and_then(|n| n.checked_add(after.blockcount))
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(
+                        "merging three reverse-mapping records would overflow the block count"
+                            .into(),
+                    )
+                })?;
+        }
+        // Extends the record before it.
+        (true, false) => {
+            let before = &mut records[at - 1];
+            before.blockcount = before
+                .blockcount
+                .checked_add(rec.blockcount)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(
+                        "merging reverse-mapping records would overflow the block count".into(),
+                    )
+                })?;
+        }
+        // Extends the record after it, which now starts earlier.
+        (false, true) => {
+            let after = &mut records[at];
+            after.blockcount = after
+                .blockcount
+                .checked_add(rec.blockcount)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(
+                        "merging reverse-mapping records would overflow the block count".into(),
+                    )
+                })?;
+            after.startblock = rec.startblock;
+            after.offset = rec.offset;
+        }
+        (false, false) => records.insert(at, rec),
+    }
     Ok(())
 }
 
@@ -378,19 +441,6 @@ mod tests {
             "got: {err}"
         );
 
-        // An allocation the kernel would merge into its neighbour.
-        let err = insert(
-            &mut records,
-            Rmap {
-                startblock: 13,
-                blockcount: 1,
-                owner: 131,
-                offset: 1,
-            },
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("merge"), "got: {err}");
-
         // An allocation on top of an extent that is already owned.
         let err = insert(
             &mut records,
@@ -403,6 +453,94 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("overlaps"), "got: {err}");
+    }
+
+    /// An allocation that continues its neighbour extends that record
+    /// rather than adding another.
+    ///
+    /// Measured: the kernel grew a one-block file to four and the record
+    /// went from `[12,1,131,0]` to `[12,4,131,0]`.
+    #[test]
+    fn an_extent_that_continues_its_neighbour_extends_it() {
+        let mut records = kernel_leaf();
+        insert(
+            &mut records,
+            Rmap {
+                startblock: 13,
+                blockcount: 3,
+                owner: 131,
+                offset: 1,
+            },
+        )
+        .expect("a continuation merges");
+
+        assert_eq!(records.len(), 6, "no record was added");
+        let file = records.iter().find(|r| r.owner == 131).expect("the file");
+        assert_eq!(
+            (file.startblock, file.blockcount),
+            (12, 4),
+            "one record covering the whole run, as the kernel wrote it"
+        );
+    }
+
+    /// A reserved owner has no file offset, so being next door is the
+    /// whole test.
+    ///
+    /// This is what an inode chunk does: its blocks land beside the
+    /// chunk before them, both owned by -7 and both at offset zero.
+    /// Requiring the offsets to continue made `0 + 8 == 0` the question,
+    /// which is false, so the merge went unnoticed until xfs_repair said
+    /// `record 8 ... should be merged with previous record`.
+    #[test]
+    fn a_reserved_owner_merges_on_adjacency_alone() {
+        let mut records = kernel_leaf();
+        // The inode chunks run 16..24; a new chunk starts exactly there.
+        insert(
+            &mut records,
+            Rmap {
+                startblock: 24,
+                blockcount: 8,
+                owner: -7,
+                offset: 0,
+            },
+        )
+        .expect("a chunk beside a chunk merges");
+
+        let chunks: Vec<_> = records.iter().filter(|r| r.owner == -7).collect();
+        assert_eq!(chunks.len(), 1, "one record for the inode chunks, not two");
+        assert_eq!((chunks[0].startblock, chunks[0].blockcount), (16, 16));
+    }
+
+    /// An extent that exactly fills the gap between two records of the
+    /// same owner collapses all three.
+    #[test]
+    fn filling_a_gap_between_two_records_collapses_all_three() {
+        let mut records = vec![
+            Rmap {
+                startblock: 0,
+                blockcount: 4,
+                owner: 200,
+                offset: 0,
+            },
+            Rmap {
+                startblock: 10,
+                blockcount: 4,
+                owner: 200,
+                offset: 10,
+            },
+        ];
+        insert(
+            &mut records,
+            Rmap {
+                startblock: 4,
+                blockcount: 6,
+                owner: 200,
+                offset: 4,
+            },
+        )
+        .expect("the gap is filled");
+        assert_eq!(records.len(), 1, "three runs became one");
+        assert_eq!((records[0].startblock, records[0].blockcount), (0, 14));
     }
 
     #[test]
