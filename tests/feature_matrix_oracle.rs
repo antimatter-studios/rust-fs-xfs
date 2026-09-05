@@ -128,6 +128,8 @@ const OPS: &[&str] = &[
     "truncate_shared",
     // The only operation here that allocates for a directory.
     "convert_directory",
+    // An operation in an allocation group above the first.
+    "create_in_later_group",
 ];
 
 /// Perform one operation on one image.
@@ -164,6 +166,29 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
             .write_into_empty_file(ino("/sf/empty.bin")?, b"written by this driver")
             .map(|_| ())
             .map_err(|e| e.to_string()),
+        // Creating in a directory that lives in a group above the
+        // first. Every arithmetic mistake this driver has made about
+        // block numbers was invisible in group 0 -- a packed fsbno and
+        // a linear block number are the same value there -- so an
+        // operation that never leaves it cannot catch the next one.
+        "create_in_later_group" => {
+            let sb = fs.superblock();
+            let spread = fs.lookup_path("/spread").map_err(|e| e.to_string())?;
+            let (inode, raw) = fs.read_inode_raw(spread.ino).map_err(|e| e.to_string())?;
+            let later = fs
+                .read_dir(&inode, &raw)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|e| e.name != b"." && e.name != b"..")
+                .map(|e| e.ino)
+                .find(|ino| sb.split_ino(*ino).0 > 0)
+                .ok_or_else(|| {
+                    "not applicable: no directory landed in a group above the first".to_string()
+                })?;
+            fs.create_file(later, b"faraway", 0o100644)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
         // Adding an entry to a directory that has no room left, which
         // moves it out of the inode and into a block of its own. That
         // block has to be allocated, so this is the one operation here
@@ -235,12 +260,21 @@ fn exercise(img: &Path, op: &str) -> Outcome {
         img=$(mktemp -u /tmp/feat-XXXXXX.img)
         cp /share/scratch/{name} "$img"
         m=$(mktemp -d)
-        if mount -o loop,nouuid "$img" "$m"; then
-            umount "$m"
-        else
-            echo "MOUNT_FAILED"
-            dmesg | tail -8
-        fi
+        # Mounted TWICE. The first mount replays the log; the second is
+        # insurance, because a replay that does not happen turns the
+        # checker's answer into one about an unreplayed log rather than
+        # about this driver -- and xfs_repair says as much: "valuable
+        # metadata changes in a log which is being ignored ... Expect
+        # spurious inconsistencies". A second mount is cheap and a
+        # replayed log is idempotent.
+        mounted=0
+        for _ in 1 2; do
+            if mount -o loop,nouuid "$img" "$m"; then
+                umount "$m"
+                mounted=$((mounted + 1))
+            fi
+        done
+        [ "$mounted" -gt 0 ] || {{ echo "MOUNT_FAILED"; dmesg | tail -8; }}
         rmdir "$m" 2>/dev/null
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
@@ -286,6 +320,18 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                     if repair.is_empty() {
                         unjudged += 1;
                         eprintln!("{combo:22} {op:22} wrote, no kernel to judge it");
+                        continue;
+                    }
+                    // The checker disqualifies its own answer when the
+                    // log was not replayed, and says so. Counting that
+                    // as a verdict on this driver would be reading a
+                    // measurement the instrument called spurious.
+                    if repair.contains("valuable metadata changes in a log") {
+                        unjudged += 1;
+                        eprintln!(
+                            "{combo:22} {op:22} NOT JUDGED: the log was not replayed, so \
+                             xfs_repair is describing that rather than this driver"
+                        );
                         continue;
                     }
                     let ok = repair.contains("REPAIR_RC=0")
@@ -339,6 +385,13 @@ fn every_feature_combination_is_written_correctly_or_refused() {
     eprintln!(
         "\n{checked} combination/operation pairs: {sound} written and sound, \
          {refused} refused by name, {unjudged} unjudged"
+    );
+
+    // Unjudged is not the same as sound, and a run where several pairs
+    // went unjudged has proved less than it looks like it has.
+    assert!(
+        unjudged * 4 < checked,
+        "{unjudged} of {checked} pairs went unjudged — too many to call this run a check"
     );
 
     assert!(
