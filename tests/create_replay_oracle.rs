@@ -264,10 +264,19 @@ fn a_group_with_no_free_inode_gets_a_new_chunk() {
             ran.push(case);
         }
     }
-    assert!(
-        !ran.is_empty(),
-        "no newchunk fixture — build them with scripts/build-create-fixtures.sh"
-    );
+    // NO FIXTURE IS A FRESH CHECKOUT, not a failure — the same contract
+    // every suite here keeps, and the job that builds the fixtures runs
+    // through scripts/ci-test.sh, which fails on a skip. Asserting here
+    // instead broke the no-fixture job, which has none on purpose.
+    //
+    // Second time I have written that assertion and had CI correct it.
+    if ran.is_empty() {
+        eprintln!(
+            "no newchunk fixtures — skipping. Build them with \
+             `sudo ./scripts/build-create-fixtures.sh` (needs xfsprogs, so Linux)."
+        );
+        return;
+    }
     eprintln!("a chunk was allocated and replayed for: {ran:?}");
 }
 
