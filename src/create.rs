@@ -217,6 +217,15 @@ struct Converted {
     fork: Vec<u8>,
     /// Its new size, which is one directory block.
     size: u64,
+    /// How many filesystem blocks the directory block took.
+    ///
+    /// Not always one: `sb_dirblklog` says how many a directory block
+    /// spans, and mkfs.xfs defaults the directory block to 4 KiB
+    /// whatever the filesystem block is. The inode's `di_nblocks` has to
+    /// say the same number, and saying 1 regardless is what xfs_repair
+    /// caught: `bad nblocks 1 for inode 262208, would reset to 4`.
+    blocks: u64,
+
     /// The three items recording the allocation, then the directory
     /// block itself.
     items: Vec<crate::buf_write::BufferItem>,
@@ -274,18 +283,28 @@ impl Filesystem {
         use crate::group_write::changed_chunks;
 
         let dirblocksize = (u64::from(self.sb.blocksize) << self.sb.dirblklog) as usize;
-        if dirblocksize != self.sb.blocksize as usize {
-            return Err(Error::UnsupportedFeature(format!(
-                "a directory block of {dirblocksize} bytes spans more than one filesystem                  block, so converting would allocate several; only a directory block the                  size of a filesystem block is supported"
-            )));
-        }
+
+        // A DIRECTORY BLOCK IS NOT ALWAYS A FILESYSTEM BLOCK.
+        //
+        // `sb_dirblklog` says how many filesystem blocks one directory
+        // block spans, and mkfs.xfs defaults the directory block to 4 KiB
+        // whatever the filesystem block is — so `-b size=1024`, an
+        // ordinary choice, makes it four. This refused anything but one,
+        // which meant a directory on such a filesystem could never leave
+        // its inode.
+        //
+        // The run is contiguous, so it is one allocation and one buffer:
+        // a buffer log item is addressed by its first basic block and
+        // sized by its length, and nothing about it assumes a single
+        // filesystem block.
+        let blocks = 1u32 << self.sb.dirblklog;
 
         // The block comes from the directory's own group, which keeps it
         // near the inode that names it.
         let (agno, _, _) = self.sb.split_ino(parent);
         // The directory's own inode owns the block, at file offset 0:
         // this is the first block of a directory that had none.
-        let allocated = self.allocate_in_group(agno, 1, parent as i64, 0)?;
+        let allocated = self.allocate_in_group(agno, blocks, parent as i64, 0)?;
         let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(allocated.agblock);
 
         let entries = {
@@ -314,7 +333,7 @@ impl Filesystem {
         let extent = Extent {
             startoff: 0,
             startblock: fsblock,
-            blockcount: 1,
+            blockcount: u64::from(blocks),
             unwritten: false,
         };
 
@@ -323,6 +342,7 @@ impl Filesystem {
         Ok(Converted {
             fork: extent.to_bytes()?.to_vec(),
             size: dirblocksize as u64,
+            blocks: u64::from(blocks),
             items,
         })
     }
@@ -525,7 +545,15 @@ impl Filesystem {
                     dir_inode.nextents,
                     Format::Local,
                 ),
-                (None, Some(c)) => (c.fork.clone(), XFS_ILOG_DEXT, c.size, 1, 1, Format::Extents),
+                (None, Some(c)) => (
+                    c.fork.clone(),
+                    XFS_ILOG_DEXT,
+                    c.size,
+                    // One extent, however many blocks long.
+                    c.blocks,
+                    1,
+                    Format::Extents,
+                ),
                 (None, None) => unreachable!("one of the two is always taken"),
             };
 
