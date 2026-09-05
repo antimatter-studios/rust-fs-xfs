@@ -86,6 +86,16 @@ const COMBOS: &[&str] = &[
     "rmapbt",
     "rmapbt-reflink",
     "everything",
+    // How things are encoded, with the features held still.
+    "bigtime0",
+    "nrext64",
+    "nrext64-bigtime0",
+    "sparse",
+    "nosparse",
+    "b1k",
+    "b2k",
+    "i1k",
+    "dirblock8k",
 ];
 
 /// What happened to one combination.
@@ -116,6 +126,8 @@ const OPS: &[&str] = &[
     // Only meaningful where an extent is actually shared, and skipped
     // as "not applicable" elsewhere -- see `perform`.
     "truncate_shared",
+    // The only operation here that allocates for a directory.
+    "convert_directory",
 ];
 
 /// Perform one operation on one image.
@@ -152,6 +164,18 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
             .write_into_empty_file(ino("/sf/empty.bin")?, b"written by this driver")
             .map(|_| ())
             .map_err(|e| e.to_string()),
+        // Adding an entry to a directory that has no room left, which
+        // moves it out of the inode and into a block of its own. That
+        // block has to be allocated, so this is the one operation here
+        // that takes space for a directory -- and the one that a
+        // filesystem whose directory block is larger than its
+        // filesystem block cannot do.
+        "convert_directory" => {
+            let full = fs.lookup_path("/full").map_err(|e| e.to_string())?.ino;
+            fs.create_file(full, b"overflow", 0o100644)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
         // Freeing an extent that another file also points at. The
         // refcount tree has to be decremented rather than the blocks
         // returned; getting it wrong hands out blocks that are still in
