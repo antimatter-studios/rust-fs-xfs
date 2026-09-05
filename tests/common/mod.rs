@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// How long one call into the VM may take before it is given up on.
+const VM_CALL_TIMEOUT_SECONDS: u32 = 600;
+
 /// The shared fixture directory. Inside the VM it is mounted at
 /// `/share`; natively it is this path, and scripts written against
 /// `/share` are rewritten to match.
@@ -109,7 +112,53 @@ fn is_root() -> bool {
 ///
 /// A script that runs but does not print `DONE` is a bug in the script
 /// rather than a missing host, so that is an assertion, not a skip.
+/// Stop dead if the process that started this test has gone.
+///
+/// # The mess this prevents
+///
+/// Killing `cargo test` does not kill the test BINARY it spawned. The
+/// binary keeps running, keeps calling `vm.sh`, and `vm.sh` boots the VM
+/// on demand — so every `vagrant halt` was followed by a fresh QEMU a
+/// few seconds later, and the machine sat at a load of 8 with nothing
+/// visibly running. `pkill -f "cargo test"` does not match
+/// `target/release/deps/feature_matrix_oracle-<hash>`, so the obvious
+/// way to stop a run does not stop it.
+///
+/// An orphaned test has nobody to report to and no reason to keep
+/// booting a virtual machine. It exits.
+///
+/// The parent is recorded on first use rather than compared against
+/// pid 1: a process reparented to `launchd` is the same situation, and
+/// on macOS it does not always land on 1.
+fn abort_if_orphaned() {
+    static PARENT: OnceLock<Option<u32>> = OnceLock::new();
+
+    let parent = *PARENT.get_or_init(|| {
+        Command::new("ps")
+            .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+    });
+    let Some(parent) = parent else { return };
+
+    let alive = Command::new("kill")
+        .args(["-0", &parent.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true);
+    if !alive {
+        eprintln!(
+            "the process that started this test ({parent}) is gone, so this one is \
+             orphaned and would go on booting the oracle VM with nobody watching. Stopping."
+        );
+        std::process::exit(1);
+    }
+}
+
 pub fn kernel_run(script: &str) -> Option<String> {
+    abort_if_orphaned();
+
     let out = match transport() {
         Transport::Native => {
             // The scripts are written for the VM, where the fixtures are
@@ -136,7 +185,14 @@ pub fn kernel_run(script: &str) -> Option<String> {
             // intermittent, which is worse: the suite loses a little
             // coverage at random and says so only in a line nobody reads.
             let _guard = VmLock::acquire();
-            Command::new(repo().join("scripts/vm.sh"))
+            // BOUNDED. A call that never returns is how a test run
+            // becomes a process nobody knows about: no output, no
+            // failure, and a virtual machine held open behind it. Ten
+            // minutes is far beyond the slowest legitimate call here — a
+            // cold boot plus a replay is about two.
+            Command::new("timeout")
+                .arg(VM_CALL_TIMEOUT_SECONDS.to_string())
+                .arg(repo().join("scripts/vm.sh"))
                 .arg("run")
                 .arg(script)
                 .output()
