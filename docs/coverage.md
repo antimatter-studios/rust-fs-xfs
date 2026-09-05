@@ -3,7 +3,19 @@
 Measured 2026-09-05 with `cargo llvm-cov --all-features --summary-only`,
 every fixture present.
 
-**87.80% of lines, 90.27% of functions.**
+**88.49% of lines, 91.06% of functions.**
+
+The write path has moved a long way since the first figure below: the
+reverse-mapping and reference-count trees are maintained rather than
+refused, and `tests/feature_matrix_oracle.rs` now runs every write
+operation against every legal combination of the features and encodings
+that change what a write has to do. See `docs/write-support.md`.
+
+    create.rs     94.53%      rmap.rs       97.03%
+    dir_block.rs  97.71%      refcount.rs   97.95%
+    dir_write.rs  91.08%      unlink.rs     86.43%
+    fs.rs         82.92%      file_write.rs 78.55%
+                              truncate.rs   77.27%
 
 ## How it moved, and why that is the interesting part
 
