@@ -97,6 +97,7 @@ const COMBOS: &[&str] = &[
     "i1k",
     "dirblock8k",
     "ci",
+    "fullinodes",
 ];
 
 /// What happened to one combination.
