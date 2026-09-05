@@ -205,43 +205,77 @@ impl Filesystem {
     /// ignores them leaves the filesystem internally inconsistent
     /// without ever failing.
     ///
-    /// # Measured, not inferred
+    /// # What is not here any more
     ///
-    /// A directory conversion allocates a block. On a filesystem with
-    /// the reverse-mapping tree that block needs an rmap record, and
-    /// this driver does not write one. `xfs_repair` says so:
+    /// `rmapbt` was, and it is maintained now: every allocation adds a
+    /// reverse-mapping record and every free removes one. Refusing it
+    /// meant refusing any volume `mkfs.xfs` formatted with its defaults,
+    /// which is most of them.
     ///
-    /// ```text
-    /// Missing reverse-mapping record for (0/13) len 1 owner 131 off 0
-    /// ```
+    /// `reflink` was never here, and is handled where it actually
+    /// matters instead: an inode that may share extents cannot have them
+    /// freed, so `truncate_to_zero` refuses that inode rather than the
+    /// whole filesystem. Everything else on a reflink filesystem is
+    /// sound, which the feature matrix shows rather than assumes.
     ///
-    /// It went unnoticed because it depends on who formatted the volume.
-    /// `mkfs.xfs` 6.6 turns `rmapbt` on by default and the oracle VM's
-    /// older one does not, so every write test ran for its whole
-    /// existence against filesystems without the feature. The first CI
-    /// run on a modern runner found it.
-    ///
-    /// Refusing is the honest answer while the tree is unmaintained: a
-    /// named error at mount is recoverable, and a filesystem quietly
-    /// missing rmap records is not.
-    ///
-    /// REFLINK IS DELIBERATELY NOT HERE, and that is a gap rather than a
-    /// judgement. It is the same kind of bit -- freeing an extent that
-    /// another file shares would take blocks still in use -- but every
-    /// fixture in this repository has it set, so gating it turns the
-    /// whole write suite off. Whether this driver should write to a
-    /// reflink filesystem at all needs deciding on its own.
+    /// Nothing is refused at mount today. The check stays because the
+    /// next `ro_compat` bit will need it, and because leaving the shape
+    /// here records what the rule is: a feature that changes what a
+    /// write must maintain is either maintained or refused.
     fn refuse_unmaintained_features(&self) -> Result<()> {
-        if self.sb.has_rmapbt() {
-            return Err(Error::UnsupportedFeature(
-                "this filesystem has the reverse-mapping tree (rmapbt), which every \
-                 allocation and free must update; this driver does not maintain it, so \
-                 writing would leave the tree inconsistent. Mount read-only, or format \
-                 with -m rmapbt=0"
-                    .to_string(),
-            ));
-        }
         Ok(())
+    }
+
+    /// An allocation group's header.
+    pub fn agf(&self, agno: u32) -> Result<crate::ag::Agf> {
+        if agno >= self.sb.agcount {
+            return Err(Error::BadSuperblock(format!(
+                "allocation group {agno} does not exist; there are {}",
+                self.sb.agcount
+            )));
+        }
+        let block = u64::from(self.sb.blocksize);
+        let sector = u64::from(self.sb.sectsize);
+        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
+        let mut raw = vec![0u8; self.sb.sectsize as usize];
+        self.device.read_at(ag_start + sector, &mut raw)?;
+        crate::ag::Agf::parse(&raw, &self.sb, agno)
+    }
+
+    /// Every reverse-mapping record in an allocation group: which extent
+    /// belongs to whom.
+    ///
+    /// Empty when the filesystem has no such tree, which is a filesystem
+    /// where nothing owns anything in this sense rather than a failure.
+    ///
+    /// Reads the root alone, so it answers only for a single-level tree
+    /// — the same shape the write paths require, and it says so rather
+    /// than returning half a tree.
+    pub fn rmap_records(&self, agno: u32) -> Result<Vec<crate::rmap::Rmap>> {
+        if !self.sb.has_rmapbt() {
+            return Ok(Vec::new());
+        }
+        let agf = self.agf(agno)?;
+        let level = agf.levels[crate::ag::agf_btree::RMAP];
+        if level != 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "allocation group {agno}'s reverse-mapping tree is {level} levels deep, \
+                 and this reads the root alone"
+            )));
+        }
+        let block = u64::from(self.sb.blocksize);
+        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
+        let mut raw = vec![0u8; self.sb.blocksize as usize];
+        self.device.read_at(
+            ag_start + u64::from(agf.roots[crate::ag::agf_btree::RMAP]) * block,
+            &mut raw,
+        )?;
+        let numrecs = u16::from_be_bytes(
+            raw[crate::group_write::btree::NUMRECS..crate::group_write::btree::NUMRECS + 2]
+                .try_into()
+                .expect("2 bytes"),
+        );
+        Ok(crate::rmap::leaf_records(&raw, numrecs))
     }
 
     /// The parsed superblock.

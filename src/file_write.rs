@@ -195,7 +195,7 @@ impl Filesystem {
         self.device().read_at(ag_start + sector, &mut agf_raw)?;
         let agf = Agf::parse(&agf_raw, &self.sb, agno)?;
 
-        use crate::ag::agf_btree::{BNO, CNT};
+        use crate::ag::agf_btree::{BNO, CNT, RMAP};
         for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
             if agf.levels[which] != 1 {
                 return Err(Error::UnsupportedFeature(format!(
@@ -252,6 +252,59 @@ impl Filesystem {
                  holds {capacity}; splitting a node is not implemented",
                 by_block.len()
             )));
+        }
+
+        // THE REVERSE MAP, WHERE THE FILESYSTEM HAS ONE.
+        //
+        // Blocks taken out of free space are owned by this inode from
+        // here on, and the tree is where that is written down.
+        // Allocating without saying so leaves blocks belonging to
+        // nobody, and xfs_repair is what notices:
+        //
+        //     Missing reverse-mapping record for (0/13) len 1 owner 131
+        //
+        // The file was empty, so this is its first extent: offset zero,
+        // no flags, and no record of its own to merge with.
+        let rmap = self.sb.has_rmapbt();
+        let mut rmap_raw = Vec::new();
+        let mut rmap_records = Vec::new();
+        if rmap {
+            if agf.levels[RMAP] != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
+                     where inserting a record can split a node; only a single-level tree \
+                     is supported",
+                    agf.levels[RMAP]
+                )));
+            }
+            rmap_raw = vec![0u8; self.sb.blocksize as usize];
+            self.device().read_at(
+                ag_start + u64::from(agf.roots[RMAP]) * blocksize,
+                &mut rmap_raw,
+            )?;
+            let n = u16::from_be_bytes(
+                rmap_raw[btree::NUMRECS..btree::NUMRECS + 2]
+                    .try_into()
+                    .expect("2 bytes"),
+            );
+            rmap_records = crate::rmap::leaf_records(&rmap_raw, n);
+            crate::rmap::insert(
+                &mut rmap_records,
+                crate::rmap::Rmap {
+                    startblock: taking.startblock,
+                    blockcount: taking.blockcount,
+                    owner: ino as i64,
+                    offset: 0,
+                },
+            )?;
+            let rmap_capacity = crate::rmap::capacity(self.sb.blocksize);
+            if rmap_records.len() > rmap_capacity {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno} would need {} reverse-mapping records and its \
+                     tree root holds {rmap_capacity}; splitting a node is not implemented",
+                    rmap_records.len()
+                )));
+            }
         }
 
         let mut by_count = by_block.clone();
@@ -318,6 +371,14 @@ impl Filesystem {
             new_cnt,
             BLFT_BTREE,
         );
+        let rmap_item = rmap.then(|| {
+            changed_chunks(
+                expected_blkno(&self.sb, agno, agf.roots[RMAP]),
+                &rmap_raw,
+                crate::rmap::rebuild_leaf(&rmap_raw, &rmap_records),
+                BLFT_BTREE,
+            )
+        });
 
         let core = filled_core(&raw, data.len() as u64, blocks);
         let logged = log_dinode_from_disk(&core)
@@ -327,7 +388,11 @@ impl Filesystem {
 
         // Three operations for the inode this time — format, core and
         // extent list — where a truncate logs two.
-        let item_ops = agf_item.op_count() + bno_item.op_count() + cnt_item.op_count() + 3;
+        let item_ops = agf_item.op_count()
+            + bno_item.op_count()
+            + cnt_item.op_count()
+            + rmap_item.as_ref().map_or(0, |i| i.op_count())
+            + 3;
 
         append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
@@ -343,6 +408,9 @@ impl Filesystem {
             ops.extend(agf_item.ops());
             ops.extend(bno_item.ops());
             ops.extend(cnt_item.ops());
+            if let Some(item) = &rmap_item {
+                ops.extend(item.ops());
+            }
             ops.push(Op {
                 flags: 0,
                 data: inode_log_format_with_fork(

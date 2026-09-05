@@ -187,7 +187,7 @@ impl Filesystem {
         self.device().read_at(ag_start + sector, &mut agf_raw)?;
         let agf = Agf::parse(&agf_raw, &self.sb, agno)?;
 
-        use crate::ag::agf_btree::{BNO, CNT};
+        use crate::ag::agf_btree::{BNO, CNT, RMAP};
         for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
             if agf.levels[which] != 1 {
                 return Err(Error::UnsupportedFeature(format!(
@@ -205,6 +205,53 @@ impl Filesystem {
         let mut cnt_raw = vec![0u8; self.sb.blocksize as usize];
         self.device()
             .read_at(ag_start + u64::from(agf.roots[CNT]) * block, &mut cnt_raw)?;
+
+        // THE REVERSE MAP, WHERE THE FILESYSTEM HAS ONE.
+        //
+        // Returning blocks to free space without taking their ownership
+        // record out leaves the tree saying a file still holds them.
+        // Nothing fails at the time; xfs_repair is what notices. This
+        // driver used to refuse the mount rather than get it wrong,
+        // which meant refusing any volume mkfs.xfs formatted by default.
+        let rmap = self.sb.has_rmapbt();
+        let mut rmap_raw = Vec::new();
+        let mut rmap_records = Vec::new();
+        if rmap {
+            if agf.levels[RMAP] != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
+                     where removing a record can merge a node; only a single-level tree \
+                     is supported",
+                    agf.levels[RMAP]
+                )));
+            }
+            rmap_raw = vec![0u8; self.sb.blocksize as usize];
+            self.device()
+                .read_at(ag_start + u64::from(agf.roots[RMAP]) * block, &mut rmap_raw)?;
+            let n = u16::from_be_bytes(
+                rmap_raw[btree::NUMRECS..btree::NUMRECS + 2]
+                    .try_into()
+                    .expect("2 bytes"),
+            );
+            rmap_records = crate::rmap::leaf_records(&rmap_raw, n);
+
+            // One record per extent, matched exactly: this frees a
+            // file's map entire, so a record that does not line up means
+            // the tree and the inode disagree and the free must not go
+            // ahead. `crate::rmap::remove` says which.
+            for extent in &extents {
+                let (_, agblock) = split_fsblock(&self.sb, extent.startblock);
+                crate::rmap::remove(
+                    &mut rmap_records,
+                    crate::rmap::Rmap {
+                        startblock: agblock,
+                        blockcount: extent.blockcount as u32,
+                        owner: ino as i64,
+                        offset: extent.startoff,
+                    },
+                )?;
+            }
+        }
 
         let numrecs = u16::from_be_bytes(
             bno_raw[btree::NUMRECS..btree::NUMRECS + 2]
@@ -263,6 +310,14 @@ impl Filesystem {
             new_cnt,
             BLFT_BTREE,
         );
+        let rmap_item = rmap.then(|| {
+            changed_chunks(
+                expected_blkno(&self.sb, agno, agf.roots[RMAP]),
+                &rmap_raw,
+                crate::rmap::rebuild_leaf(&rmap_raw, &rmap_records),
+                BLFT_BTREE,
+            )
+        });
 
         let core = emptied_core(&raw, true);
         let logged = log_dinode_from_disk(&core)
@@ -274,7 +329,11 @@ impl Filesystem {
         // items' own counts summed rather than a constant — how many
         // chunks of a tree block changed depends on where the record
         // went.
-        let item_ops = agf_item.op_count() + bno_item.op_count() + cnt_item.op_count() + 2;
+        let item_ops = agf_item.op_count()
+            + bno_item.op_count()
+            + cnt_item.op_count()
+            + rmap_item.as_ref().map_or(0, |i| i.op_count())
+            + 2;
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -295,6 +354,9 @@ impl Filesystem {
             ops.extend(agf_item.ops());
             ops.extend(bno_item.ops());
             ops.extend(cnt_item.ops());
+            if let Some(item) = &rmap_item {
+                ops.extend(item.ops());
+            }
             ops.push(Op {
                 flags: 0,
                 data: inode_log_format(ino, XFS_ILOG_CORE, &buffer),
