@@ -295,6 +295,7 @@ fn every_feature_combination_is_written_correctly_or_refused() {
     let mut checked = 0;
     let mut sound = 0;
     let mut refused = 0;
+    let mut not_applicable = 0;
     let mut broken: Vec<String> = Vec::new();
     let mut unjudged = 0;
 
@@ -314,8 +315,19 @@ fn every_feature_combination_is_written_correctly_or_refused() {
 
             match exercise(scratch.path(), op) {
                 Outcome::Refused(why) => {
-                    refused += 1;
-                    eprintln!("{combo:22} {op:22} refused: {}", first_line(&why));
+                    // "Not applicable" is the test saying this row has
+                    // nothing to exercise -- a filesystem that cannot
+                    // share extents has no shared extent to free. That
+                    // is not the driver declining to do something, and
+                    // counting the two together overstates how much is
+                    // refused.
+                    if why.starts_with("not applicable") {
+                        not_applicable += 1;
+                        eprintln!("{combo:22} {op:22} n/a: {}", first_line(&why));
+                    } else {
+                        refused += 1;
+                        eprintln!("{combo:22} {op:22} refused: {}", first_line(&why));
+                    }
                 }
                 Outcome::Wrote { repair } => {
                     if repair.is_empty() {
@@ -398,7 +410,7 @@ fn every_feature_combination_is_written_correctly_or_refused() {
     }
     eprintln!(
         "\n{checked} combination/operation pairs: {sound} written and sound, \
-         {refused} refused by name, {unjudged} unjudged"
+         {refused} refused by name, {not_applicable} not applicable, {unjudged} unjudged"
     );
 
     // Unjudged is not the same as sound, and a run where several pairs
