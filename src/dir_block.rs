@@ -65,6 +65,35 @@ use crate::format::dir::{
 };
 use crate::superblock::Superblock;
 
+/// The hash a name gets in this filesystem's directory index.
+///
+/// A case-insensitive filesystem folds ASCII letters before hashing, so
+/// `Mixed` and `mixed` land in the same place and a lookup finds either.
+/// The fold is the whole difference — the hash itself is the same
+/// function.
+///
+/// WRITING THE WRONG ONE IS NOT A SUBTLE FAULT. The kernel refused the
+/// filesystem outright after a directory conversion that used the
+/// ordinary hash:
+///
+/// ```text
+/// XFS (loop0): Corruption of in-memory data (0x8) detected at
+///              xfs_buf_submit ... Shutting down filesystem
+/// XFS (loop0): log mount/recovery failed: error -117
+/// ```
+///
+/// Measured both ways. On an ordinary filesystem the kernel hashes
+/// `Mixed` to 0xdd3e32e0; on a case-insensitive one, 0xdd3e32e2 — and
+/// `hashname` of the lowercased name is exactly that.
+fn hash_for(sb: &Superblock, name: &[u8]) -> u32 {
+    if sb.has_case_insensitive_dirs() {
+        let folded: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+        hashname(&folded)
+    } else {
+        hashname(name)
+    }
+}
+
 /// One entry to place in the block.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -173,7 +202,7 @@ pub fn build(sb: &Superblock, fsblock: u64, owner: u64, entries: &[Entry]) -> Re
 
         // An address is the byte offset over eight.
         index.push((
-            hashname(&entry.name),
+            hash_for(sb, &entry.name),
             u32::try_from(at / XFS_DIR2_DATA_ALIGN).expect("fits"),
         ));
         at += len;
@@ -356,6 +385,77 @@ mod tests {
             "the refusal should name what the answer would be: {err}"
         );
     }
+    /// A case-insensitive filesystem, so `hash_for` has to fold.
+    fn ci_superblock() -> Superblock {
+        let mut b = vec![0u8; 512];
+        b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
+        b[4..8].copy_from_slice(&4096u32.to_be_bytes());
+        b[8..16].copy_from_slice(&4096u64.to_be_bytes());
+        b[48..56].copy_from_slice(&4u64.to_be_bytes());
+        b[56..64].copy_from_slice(&128u64.to_be_bytes());
+        b[84..88].copy_from_slice(&1024u32.to_be_bytes());
+        b[88..92].copy_from_slice(&4u32.to_be_bytes());
+        b[96..100].copy_from_slice(&16u32.to_be_bytes());
+        let versionnum = 5u16
+            | crate::superblock::version_flags::MOREBITSBIT
+            | crate::superblock::version_flags::BORGBIT;
+        b[100..102].copy_from_slice(&versionnum.to_be_bytes());
+        b[102..104].copy_from_slice(&512u16.to_be_bytes());
+        b[104..106].copy_from_slice(&512u16.to_be_bytes());
+        b[106..108].copy_from_slice(&8u16.to_be_bytes());
+        b[120] = 12;
+        b[121] = 9;
+        b[122] = 9;
+        b[123] = 3;
+        b[124] = 10;
+        let crc = crate::superblock::crc32c_with_zeroed_crc(&b, 224);
+        b[224..228].copy_from_slice(&crc.to_le_bytes());
+        Superblock::parse(&b).expect("superblock")
+    }
+
+    /// The index hash folds ASCII case when the filesystem says to, and
+    /// does not otherwise.
+    ///
+    /// Both values were read off filesystems the kernel built: `Mixed`
+    /// hashes to 0xdd3e32e0 on an ordinary one and 0xdd3e32e2 on a
+    /// case-insensitive one.
+    ///
+    /// Writing the ordinary hash to a case-insensitive filesystem is not
+    /// a subtle fault. After a directory conversion that did:
+    ///
+    /// ```text
+    /// XFS: Corruption of in-memory data (0x8) detected at xfs_buf_submit
+    ///      ... Shutting down filesystem
+    /// XFS: log mount/recovery failed: error -117
+    /// ```
+    #[test]
+    fn a_case_insensitive_filesystem_folds_before_hashing() {
+        let plain = superblock();
+        let ci = ci_superblock();
+        assert!(!plain.has_case_insensitive_dirs());
+        assert!(ci.has_case_insensitive_dirs());
+
+        assert_eq!(
+            hash_for(&plain, b"Mixed"),
+            0xdd3e_32e0,
+            "the ordinary hash, as the kernel wrote it"
+        );
+        assert_eq!(
+            hash_for(&ci, b"Mixed"),
+            0xdd3e_32e2,
+            "and the folded one, as the kernel wrote it on a ci filesystem"
+        );
+
+        // Folding is the whole difference: the same function, applied to
+        // a lowered name.
+        assert_eq!(hash_for(&ci, b"Mixed"), hash_for(&plain, b"mixed"));
+
+        // A name with no letters to fold hashes identically either way,
+        // which is why an all-lowercase fixture could not tell the two
+        // apart and the ci row passed while proving nothing.
+        assert_eq!(hash_for(&ci, b"alpha"), hash_for(&plain, b"alpha"));
+    }
+
     /// A directory block built for a group above the first records the
     /// address it will actually be written to.
     ///

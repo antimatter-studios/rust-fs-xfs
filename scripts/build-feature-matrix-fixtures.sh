@@ -108,6 +108,10 @@ COMBOS=(
     # A directory block larger than a filesystem block, so a directory
     # that leaves its inode needs several blocks rather than one.
     "dirblock8k:-m crc=1 -b size=4096 -n size=8192"
+    # Case-insensitive directories. Names are hashed differently for the
+    # directory index, so a driver that writes one with the ordinary hash
+    # builds an index the kernel cannot look names up in.
+    "ci:-m crc=1 -n version=ci"
 )
 
 built=0
@@ -174,6 +178,14 @@ for combo in "${COMBOS[@]}"; do
     # makes, for the same reason: assuming a number here produced a test
     # that failed on a runner where it was 17 rather than 30.
     $SUDO mkdir -p "$m/full"
+    # MIXED CASE, on purpose.
+    #
+    # A case-insensitive filesystem hashes names for the directory index
+    # after lowering them, so for an all-lowercase name the two hashes
+    # are the same value and a fixture made only of those cannot tell a
+    # driver using the wrong one apart. Every name here was lowercase,
+    # and the `ci` row passed without proving anything.
+    for name in Mixed UPPER CamelCase mIxEd; do $SUDO touch "$m/full/$name"; done
     n=0
     while [ "$n" -lt 400 ]; do
         $SUDO touch "$m/full/e$n"
