@@ -260,12 +260,21 @@ fn exercise(img: &Path, op: &str) -> Outcome {
         img=$(mktemp -u /tmp/feat-XXXXXX.img)
         cp /share/scratch/{name} "$img"
         m=$(mktemp -d)
-        if mount -o loop,nouuid "$img" "$m"; then
-            umount "$m"
-        else
-            echo "MOUNT_FAILED"
-            dmesg | tail -8
-        fi
+        # Mounted TWICE. The first mount replays the log; the second is
+        # insurance, because a replay that does not happen turns the
+        # checker's answer into one about an unreplayed log rather than
+        # about this driver -- and xfs_repair says as much: "valuable
+        # metadata changes in a log which is being ignored ... Expect
+        # spurious inconsistencies". A second mount is cheap and a
+        # replayed log is idempotent.
+        mounted=0
+        for _ in 1 2; do
+            if mount -o loop,nouuid "$img" "$m"; then
+                umount "$m"
+                mounted=$((mounted + 1))
+            fi
+        done
+        [ "$mounted" -gt 0 ] || {{ echo "MOUNT_FAILED"; dmesg | tail -8; }}
         rmdir "$m" 2>/dev/null
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
@@ -311,6 +320,18 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                     if repair.is_empty() {
                         unjudged += 1;
                         eprintln!("{combo:22} {op:22} wrote, no kernel to judge it");
+                        continue;
+                    }
+                    // The checker disqualifies its own answer when the
+                    // log was not replayed, and says so. Counting that
+                    // as a verdict on this driver would be reading a
+                    // measurement the instrument called spurious.
+                    if repair.contains("valuable metadata changes in a log") {
+                        unjudged += 1;
+                        eprintln!(
+                            "{combo:22} {op:22} NOT JUDGED: the log was not replayed, so \
+                             xfs_repair is describing that rather than this driver"
+                        );
                         continue;
                     }
                     let ok = repair.contains("REPAIR_RC=0")
@@ -364,6 +385,13 @@ fn every_feature_combination_is_written_correctly_or_refused() {
     eprintln!(
         "\n{checked} combination/operation pairs: {sound} written and sound, \
          {refused} refused by name, {unjudged} unjudged"
+    );
+
+    // Unjudged is not the same as sound, and a run where several pairs
+    // went unjudged has proved less than it looks like it has.
+    assert!(
+        unjudged * 4 < checked,
+        "{unjudged} of {checked} pairs went unjudged — too many to call this run a check"
     );
 
     assert!(
