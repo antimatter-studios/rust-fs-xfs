@@ -261,24 +261,36 @@ fn exercise(img: &Path, op: &str) -> Outcome {
         img=$(mktemp -u /tmp/feat-XXXXXX.img)
         cp /share/scratch/{name} "$img"
         m=$(mktemp -d)
-        # Mounted TWICE. The first mount replays the log; the second is
-        # insurance, because a replay that does not happen turns the
-        # checker's answer into one about an unreplayed log rather than
-        # about this driver -- and xfs_repair says as much: "valuable
-        # metadata changes in a log which is being ignored ... Expect
-        # spurious inconsistencies". A second mount is cheap and a
-        # replayed log is idempotent.
+
+        # MOUNT, CHECK, AND RETRY IF THE LOG DID NOT GO IN.
+        #
+        # Mounting replays the log. When it does not -- and it
+        # occasionally does not -- xfs_repair describes an unreplayed log
+        # rather than anything this driver wrote, and says so itself:
+        # "valuable metadata changes in a log which is being ignored ...
+        # Expect spurious inconsistencies".
+        #
+        # Mounting twice up front made that rarer and not rare enough: a
+        # CI run still came back with one pair unjudged. An unjudged pair
+        # is a measurement nobody took, so this keeps taking it until the
+        # log is in, rather than shrugging.
         mounted=0
-        for _ in 1 2; do
+        for attempt in 1 2 3; do
             if mount -o loop,nouuid "$img" "$m"; then
                 umount "$m"
                 mounted=$((mounted + 1))
             fi
+            out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+            case "$out" in
+                *"valuable metadata changes in a log"*) continue ;;
+                *) break ;;
+            esac
         done
-        [ "$mounted" -gt 0 ] || {{ echo "MOUNT_FAILED"; dmesg | tail -8; }}
         rmdir "$m" 2>/dev/null
+        [ "$mounted" -gt 0 ] || {{ echo "MOUNT_FAILED"; dmesg | tail -8; }}
         echo "REPAIR_BEGIN"
-        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "$out"
+        echo "REPAIR_RC=$rc"
         echo "REPAIR_END"
         rm -f "$img"
         echo DONE
