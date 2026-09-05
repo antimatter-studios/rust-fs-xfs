@@ -195,6 +195,7 @@ jobs:
           ./scripts/build-create-fixtures.sh
           ./scripts/build-log-fixtures.sh
           ./scripts/build-data-fixtures.sh
+          ./scripts/build-feature-matrix-fixtures.sh
 
       # Freeing an extent and freeing an inode are the two write
       # operations whose result cannot be checked by looking at it: a
@@ -205,7 +206,8 @@ jobs:
         run: |
           for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
                        create_replay_oracle log_replay_oracle file_write_replay_oracle \
-                       rename_oracle write_oracle endtoend_oracle log_oracle; do
+                       rename_oracle write_oracle endtoend_oracle log_oracle \
+                       feature_matrix_oracle; do
             ./scripts/ci-test.sh --test "$suite"
           done
 

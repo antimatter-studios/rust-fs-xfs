@@ -25,7 +25,7 @@ set -euo pipefail
 # a summary line from a suite that had just passed. A gate that fails on
 # success is worse than no gate, so the patterns are anchored to how a
 # skip is actually phrased and `--self-test` holds them to it.
-SKIP_PATTERN='(^|[[:space:]])SKIPPED|no ([a-z]+ )?fixtures?|(VM|fixture) unavailable|skipped$|skipping( verification)?$'
+SKIP_PATTERN='(^|[[:space:]])SKIPPED|no ([a-z0-9-]+ )?fixtures?|(VM|fixture) unavailable|skipped$|skipping( verification)?$'
 
 if [ "${1:-}" = "--self-test" ]; then
     fail=0
@@ -35,6 +35,11 @@ if [ "${1:-}" = "--self-test" ]; then
         "xfsstress-fsx: no fixture — skipping"
         "oracle VM unavailable — skipping verification"
         "no create fixtures or no VM; build them with ./scripts/vm-build-create-fixtures.sh"
+        # Hyphenated and numbered names: the pattern had [a-z]+ and
+        # missed both, which would have let a real skip through.
+        "no feature-matrix fixtures — skipping. Build them with sudo ./scripts/build-feature-matrix-fixtures.sh"
+        "no xfsfeat-reflink-finobt fixture — skipping"
+        "no xfslog-b4096-i512 fixture — skipping"
     )
     must_not_match=(
         "977 inode cores reproduced from disk, 0 skipped as stale"
