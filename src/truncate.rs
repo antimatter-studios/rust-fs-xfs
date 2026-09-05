@@ -109,32 +109,6 @@ impl Filesystem {
         if !file.is_regular_file() {
             return Err(Error::NotAFile);
         }
-        // AN EXTENT ANOTHER FILE ALSO POINTS AT MUST NOT BE FREED.
-        //
-        // Freeing returns the blocks to the group's free space. If the
-        // extent is shared, the refcount tree is what decides whether
-        // that is allowed, and this driver does not maintain it -- so
-        // the blocks go back while the other file still points at them,
-        // and the allocator hands them out again. xfs_repair, after
-        // exactly this on a reflink filesystem:
-        //
-        //     data fork in ino 134 claims free block 24
-        //
-        // The flag is conservative in the right direction: the kernel
-        // sets it on any inode that may have shared extents and leaves
-        // it set afterwards, so a false positive costs a refusal and
-        // there is no false negative to lose data to.
-        //
-        // `Filesystem::truncate` has made this check since it was
-        // written. This path did not, which is the whole difference
-        // between the two on a reflink filesystem.
-        if file.has_shared_extents() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} may have extents shared with another file, and freeing one \
-                 has to decrement the reference count rather than return the blocks; \
-                 this driver does not maintain the refcount tree"
-            )));
-        }
         if file.is_realtime() {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} keeps its data on the real-time device, which has no \
@@ -260,8 +234,65 @@ impl Filesystem {
         );
         let mut by_block = leaf_records(&bno_raw, numrecs);
 
+        // WHAT MAY ACTUALLY GO BACK TO FREE SPACE.
+        //
+        // On a reflink filesystem an extent can have more than one
+        // owner, and returning its blocks while another file still
+        // points at them is the worst thing available here: the
+        // allocator hands them out again and the two files overwrite
+        // each other. The reference-count tree is what decides, so it is
+        // asked per extent rather than assumed.
+        //
+        // An extent with no record has one owner -- that is what the
+        // absence means -- so the ordinary case reaches `free_extent`
+        // exactly as before.
+        let reflink = self.sb.has_reflink();
+        let mut refcount_raw = Vec::new();
+        let mut refcount_records = Vec::new();
+        let refcount_level = agf.refcount_level;
+        if reflink && refcount_level > 0 {
+            if refcount_level != 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {agno}'s reference-count tree is {refcount_level} \
+                     levels deep, where changing a record can reshape a node; only a \
+                     single-level tree is supported"
+                )));
+            }
+            refcount_raw = vec![0u8; self.sb.blocksize as usize];
+            self.device().read_at(
+                ag_start + u64::from(agf.refcount_root) * block,
+                &mut refcount_raw,
+            )?;
+            let n = u16::from_be_bytes(
+                refcount_raw[btree::NUMRECS..btree::NUMRECS + 2]
+                    .try_into()
+                    .expect("2 bytes"),
+            );
+            refcount_records = crate::refcount::leaf_records(&refcount_raw, n);
+        }
+
+        let mut refcount_changed = false;
         for extent in &freeing {
-            free_extent(&mut by_block, *extent)?;
+            let release = if reflink && refcount_level > 0 {
+                let before = refcount_records.len();
+                let r = crate::refcount::release(
+                    &mut refcount_records,
+                    extent.startblock,
+                    extent.blockcount,
+                )?;
+                refcount_changed |=
+                    r == crate::refcount::Release::StillShared || refcount_records.len() != before;
+                r
+            } else {
+                crate::refcount::Release::Free
+            };
+
+            // Only the last owner returns the blocks. The rmap record
+            // comes out either way: this inode has stopped holding them
+            // whether or not anyone else still does.
+            if release == crate::refcount::Release::Free {
+                free_extent(&mut by_block, *extent)?;
+            }
         }
 
         let capacity = leaf_capacity(self.sb.blocksize);
@@ -310,6 +341,14 @@ impl Filesystem {
             new_cnt,
             BLFT_BTREE,
         );
+        let refcount_item = refcount_changed.then(|| {
+            changed_chunks(
+                expected_blkno(&self.sb, agno, agf.refcount_root),
+                &refcount_raw,
+                crate::refcount::rebuild_leaf(&refcount_raw, &refcount_records),
+                BLFT_BTREE,
+            )
+        });
         let rmap_item = rmap.then(|| {
             changed_chunks(
                 expected_blkno(&self.sb, agno, agf.roots[RMAP]),
@@ -333,6 +372,7 @@ impl Filesystem {
             + bno_item.op_count()
             + cnt_item.op_count()
             + rmap_item.as_ref().map_or(0, |i| i.op_count())
+            + refcount_item.as_ref().map_or(0, |i| i.op_count())
             + 2;
 
         // Every refusal this operation has is behind us and the next
@@ -355,6 +395,9 @@ impl Filesystem {
             ops.extend(bno_item.ops());
             ops.extend(cnt_item.ops());
             if let Some(item) = &rmap_item {
+                ops.extend(item.ops());
+            }
+            if let Some(item) = &refcount_item {
                 ops.extend(item.ops());
             }
             ops.push(Op {
