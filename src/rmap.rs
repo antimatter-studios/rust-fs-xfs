@@ -43,6 +43,20 @@ use crate::group_write::btree;
 /// `sizeof(struct xfs_rmap_rec)`.
 pub const RECORD: usize = 24;
 
+/// The reserved owners, which are negative so they cannot be mistaken
+/// for an inode number.
+///
+/// Read off a filesystem the kernel populated: `-3` beside the group's
+/// own headers, `-5` beside the free-space trees, `-6` beside the inode
+/// tree, `-7` beside the inode chunks.
+pub const OWN_FS: i64 = -3;
+/// `XFS_RMAP_OWN_AG` — the free-space trees and the free list.
+pub const OWN_AG: i64 = -5;
+/// `XFS_RMAP_OWN_INOBT` — the inode B+trees.
+pub const OWN_INOBT: i64 = -6;
+/// `XFS_RMAP_OWN_INODES` — the blocks that hold inode chunks.
+pub const OWN_INODES: i64 = -7;
+
 /// `XFS_RMAP_OFF_ATTR_FORK` — the extent belongs to the attribute fork.
 pub const OFF_ATTR_FORK: u64 = 1 << 63;
 /// `XFS_RMAP_OFF_BMBT_BLOCK` — a block of the inode's own map, not data.

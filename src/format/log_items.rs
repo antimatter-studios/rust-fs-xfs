@@ -402,6 +402,17 @@ pub mod item_types {
     /// Its format structure is [`super::buf_log_format`]. Allocation,
     /// create, unlink and rename all rest on this one.
     pub const XFS_LI_BUF: u16 = 0x123c;
+
+    /// `XFS_LI_ICREATE` — a range of blocks to be initialised as inodes.
+    /// Its format structure is [`super::icreate_log_format`].
+    ///
+    /// The one item here that does not carry the bytes it describes. A
+    /// new inode chunk is 64 inodes — 32 KiB at the usual sizes — and
+    /// logging all of it would dwarf the transaction that allocates it.
+    /// This says "make 64 inodes of this size at this block" and lets
+    /// recovery write them, which is what the kernel does on any v5
+    /// filesystem.
+    pub const XFS_LI_ICREATE: u16 = 0x123f;
 }
 
 // ---------------------------------------------------------------------
@@ -1040,5 +1051,77 @@ pub mod buf_log_format {
             (BLFT_ATTR_LEAF, "(attr leaf)"),
             (BLFT_SB, "XFSB"),
         ];
+    }
+}
+
+// ---------------------------------------------------------------------
+// xfs_icreate_log
+// ---------------------------------------------------------------------
+
+/// `struct xfs_icreate_log` — initialise a run of blocks as inodes.
+///
+/// # Why this exists at all
+///
+/// Allocating an inode chunk creates 64 inodes. Logging their contents
+/// would put 32 KiB in a transaction whose real content is three tree
+/// records and a header, so instead the record says what to make and
+/// recovery makes it. The inodes are identical apart from their
+/// position, so there is nothing to describe beyond the count, the size
+/// and the generation number.
+///
+/// # Measured
+///
+/// `xfs_logprint` on a transaction the kernel wrote to allocate a chunk:
+///
+/// ```text
+/// ICR: cnt:1 total:1 len:28
+///     ICR:  #ag: 0  agbno: 0x18  len: 8
+/// ```
+///
+/// One region of 28 bytes, naming allocation group 0, block 24, and a
+/// run of 8 blocks — which is exactly the 8 blocks that left the free
+/// space tree in the same transaction.
+///
+/// It is used on every v5 filesystem, and is NOT gated by a log-incompat
+/// feature bit: the fixture this was read from has
+/// `sb_features_log_incompat = 0` and the kernel wrote one anyway.
+///
+/// # Layout
+///
+/// ```text
+///   0  u16  icl_type = XFS_LI_ICREATE
+///   2  u16  icl_size = 1          (regions in this item)
+///   4  u32  icl_ag                 allocation group
+///   8  u32  icl_agbno              first block of the run
+///  12  u32  icl_count              inodes to initialise
+///  16  u32  icl_isize              bytes per inode
+///  20  u32  icl_length             blocks in the run
+///  24  u32  icl_gen                generation number to stamp
+/// ```
+///
+/// Every field past the two `u16`s is big-endian, like the on-disk
+/// structures — unlike the inode and buffer formats, whose fields are
+/// native. That is not a choice this driver gets to make; it is what
+/// recovery reads.
+pub mod icreate_log_format {
+    /// `sizeof(struct xfs_icreate_log)`.
+    pub const SIZE: usize = 28;
+
+    /// The one region an icreate item has.
+    pub const REGIONS: u16 = 1;
+
+    /// Build the item's payload.
+    pub fn build(agno: u32, agbno: u32, count: u32, isize: u32, length: u32, gen: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(SIZE);
+        out.extend_from_slice(&super::item_types::XFS_LI_ICREATE.to_ne_bytes());
+        out.extend_from_slice(&REGIONS.to_ne_bytes());
+        out.extend_from_slice(&agno.to_be_bytes());
+        out.extend_from_slice(&agbno.to_be_bytes());
+        out.extend_from_slice(&count.to_be_bytes());
+        out.extend_from_slice(&isize.to_be_bytes());
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&gen.to_be_bytes());
+        debug_assert_eq!(out.len(), SIZE);
+        out
     }
 }

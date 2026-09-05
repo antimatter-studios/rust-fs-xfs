@@ -227,28 +227,140 @@ fn the_kernel_uses_a_file_this_driver_created() {
     eprintln!("the kernel used files this driver created for: {ran:?}");
 }
 
-/// A group with nothing free is refused rather than answered wrongly.
+/// A group with nothing free gets sixty-four more inodes.
+///
+/// This asserted a refusal until the chunk could be allocated. Every
+/// chunk in the group being full is ordinary on a filesystem in use, so
+/// refusing meant a create that stopped working once a directory tree
+/// grew — and the fixture is exactly that state.
+///
+/// The claim now is the one that matters: the driver takes the blocks,
+/// says in the record that they are to be made into inodes, and the
+/// kernel replays it into a filesystem `xfs_repair` is content with.
 #[test]
-fn a_group_with_no_free_inode_is_refused() {
+fn a_group_with_no_free_inode_gets_a_new_chunk() {
     let source = share().join("xfscreate-newchunk-before.img");
     if !source.exists() {
         eprintln!("no newchunk fixture — skipping");
         return;
     }
-    let scratch = Scratch::from(&source, "xfs-create-refuse-scratch.img");
+    let name = "xfs-create-newchunk-scratch.img";
+    let scratch = Scratch::from(&source, name);
 
-    let dev = FileDevice::open_rw(scratch.path()).expect("open read-write");
-    let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
-    let root = fs.superblock().rootino;
+    let (before_free, root) = {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(scratch.path()).expect("open")))
+            .expect("mount");
+        let agi_free: u32 = fs.superblock().agcount.min(1);
+        let _ = agi_free;
+        (
+            fs.free_extents(0).expect("free space"),
+            fs.superblock().rootino,
+        )
+    };
 
-    let err = fs
-        .create_file(root, b"nowhere", 0o100644)
-        .expect_err("a group with no free inode must refuse rather than invent one");
-    let message = err.to_string();
-    assert!(
-        message.contains("no free inode"),
-        "the refusal should say what is missing, not merely fail: {message}"
+    let ino = {
+        let dev = FileDevice::open_rw(scratch.path()).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        let (ino, lsn) = fs
+            .create_file(root, b"needsachunk", 0o100644)
+            .expect("a group with no free inode should get more, not refuse");
+        assert_ne!(lsn, 0, "a record must be given a sequence number");
+        ino
+    };
+
+    let script = format!(
+        r#"
+        m=$(mktemp -d)
+        # Mounted IN PLACE, so the log is replayed into the image this
+        # test then reads back. The other scripts here work on a copy to
+        # keep a fixture pristine; this one is already a scratch, and the
+        # replay is the point.
+        if mount -o loop,nouuid /share/{name} "$m"; then
+            [ -e "$m/needsachunk" ] && echo "PRESENT" || echo "MISSING"
+            # The inode has to be usable, not merely listed. `touch`
+            # rather than a write: writing would ALLOCATE, and this test
+            # measures what the chunk cost. That is not hypothetical --
+            # it read nine blocks instead of eight until the write came
+            # out, and the ninth was the test's own.
+            touch "$m/needsachunk" && echo "WRITABLE" || echo "NOT_WRITABLE"
+            echo "STAT $(stat -c%i "$m/needsachunk")"
+            umount "$m"
+        else
+            echo "MOUNT_FAILED"
+            dmesg | tail -12
+        fi
+        rmdir "$m" 2>/dev/null
+        # The checker runs on a copy on local storage: it wants the host
+        # filesystem's geometry and gets ENOTDIR from the share.
+        img=$(mktemp -u /tmp/oracle-XXXXXX.img)
+        cp /share/{name} "$img"
+        echo "REPAIR_BEGIN"
+        xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
+        rm -f "$img"
+        echo DONE
+        "#
     );
+
+    let Some(out) = kernel_run(&script) else {
+        eprintln!("oracle VM unavailable — skipping verification");
+        return;
+    };
+
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "the kernel refused a filesystem whose inode chunk this driver allocated:\n{out}"
+    );
+    assert!(
+        out.contains("PRESENT"),
+        "the file is not there after the chunk was made for it\n{out}"
+    );
+    assert!(
+        out.contains("WRITABLE"),
+        "the inode was made but cannot be used\n{out}"
+    );
+    assert!(
+        out.contains(&format!("STAT {ino}")),
+        "the kernel resolved the name to a different inode than this driver made ({ino})\n{out}"
+    );
+    assert!(
+        out.contains("REPAIR_RC=0"),
+        "xfs_repair objected to the group after a chunk was added:\n{out}"
+    );
+
+    // And the blocks the chunk needs really did come out of free space.
+    //
+    // Read after the replay, because before it the log is dirty and this
+    // driver refuses to mount a filesystem whose log holds work it has
+    // not applied — which is the correct thing for it to do and the
+    // reason this check cannot come earlier.
+    let after_free = {
+        let fs = Filesystem::mount(Arc::new(
+            FileDevice::open(scratch.path()).expect("open after the replay"),
+        ))
+        .expect("mount after the replay");
+        fs.free_extents(0).expect("free space")
+    };
+    let before: u32 = before_free.iter().map(|e| e.blockcount).sum();
+    let after: u32 = after_free.iter().map(|e| e.blockcount).sum();
+
+    // EXACTLY what a chunk needs, not merely "something". Sixty-four
+    // inodes divided by the inodes a block holds — eight blocks at the
+    // usual sizes — and the kernel's own version of this operation took
+    // the same eight.
+    let inopblock = {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(scratch.path()).expect("open")))
+            .expect("mount");
+        fs.superblock().inopblock
+    };
+    let expected = 64 / u32::from(inopblock);
+    assert_eq!(
+        before - after,
+        expected,
+        "a chunk of 64 inodes at {inopblock} to a block should cost {expected} blocks, not {}",
+        before - after
+    );
+    eprintln!("the chunk cost {expected} blocks, and inode {ino} came out of it");
 }
 
 /// A directory made by this driver, used by the kernel.

@@ -247,7 +247,41 @@ fn set_nextents(core: &mut [u8], count: u64) {
     }
 }
 
+/// The generation number stamped on a freshly made chunk.
+///
+/// The kernel uses a random one. It matters only for NFS file handles —
+/// a stale handle must not resolve to whatever now occupies the inode —
+/// and a deterministic value makes a record reproducible, which is worth
+/// more here than unpredictability this driver does not depend on.
+const NEW_CHUNK_GENERATION: u32 = 1;
+
 impl Filesystem {
+    /// An inode as recovery will have written it, before anything is
+    /// put in it.
+    ///
+    /// When a chunk is allocated in the same record, the icreate item
+    /// tells recovery to make 64 of these and the inode item that
+    /// follows changes one of them. So the change has to be built on
+    /// top of what recovery makes, not on top of whatever the blocks
+    /// happened to hold before they were free space.
+    ///
+    /// Everything is zero but the four fields that say which inode this
+    /// is: the magic, the format version, its own number and the
+    /// filesystem's uuid, plus the generation the icreate item names.
+    /// That is what `xfs_ialloc_inode_init` writes.
+    fn freshly_initialised_inode(&self, ino: u64) -> Vec<u8> {
+        use crate::inode::offsets as at;
+
+        let mut raw = vec![0u8; usize::from(self.sb.inodesize)];
+        raw[at::MAGIC..at::MAGIC + 2]
+            .copy_from_slice(&crate::inode::XFS_DINODE_MAGIC.to_be_bytes());
+        raw[at::VERSION] = 3;
+        raw[at::GEN..at::GEN + 4].copy_from_slice(&NEW_CHUNK_GENERATION.to_be_bytes());
+        raw[at::INO..at::INO + 8].copy_from_slice(&ino.to_be_bytes());
+        raw[at::UUID..at::UUID + 16].copy_from_slice(&self.sb.meta_uuid);
+        raw
+    }
+
     /// Move a short-form directory into a block of its own, with `new`
     /// added.
     ///
@@ -463,11 +497,80 @@ impl Filesystem {
         let mut chunks = walk_from_agi(&self.sb, &agi, Which::All, read)?
             .expect("every filesystem has an inode tree");
 
-        let Some((index, slot)) = choose_free_inode(&chunks) else {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno} has no free inode; allocating a whole new chunk \
-                 also allocates blocks, which is not implemented"
-            )));
+        // NO FREE INODE: MAKE SIXTY-FOUR MORE.
+        //
+        // Every chunk in the group is full, which on a filesystem in use
+        // is ordinary rather than exceptional. A chunk is 64 inodes, so
+        // this takes the blocks that hold them out of free space, says
+        // in the record that they are to be made into inodes, and adds
+        // the chunk to both inode trees.
+        //
+        // Measured against the kernel doing the same thing. Before: one
+        // record [128,0,64,0,0], AGI count 64 freecount 0 newino 128.
+        // After: a second record [192,0,64,63,0xfffffffffffffffe], count
+        // 128, freecount 63, newino 192 -- and eight blocks gone from
+        // the free space tree at block 24.
+        //
+        // 192 is not a coincidence: a chunk's first inode is its first
+        // block times the inodes a block holds, 24 x 8, which is what
+        // ties the two together and why nothing has to be searched for.
+        let mut allocation_items = Vec::new();
+        let mut icreate: Option<Vec<u8>> = None;
+        let mut added_inodes = 0u32;
+
+        let (index, slot) = match choose_free_inode(&chunks) {
+            Some(found) => found,
+            None => {
+                let per_chunk = u32::from(crate::inode_btree::INODES_PER_CHUNK);
+                let inopblock = u32::from(self.sb.inopblock);
+                if inopblock == 0 || per_chunk % inopblock != 0 {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "a chunk of {per_chunk} inodes does not divide into blocks of \
+                         {inopblock}; a sparse chunk is not implemented"
+                    )));
+                }
+                let blocks = per_chunk / inopblock;
+
+                // The inodes own the blocks, which is what the reverse
+                // map records: XFS_RMAP_OWN_INODES, the -7 that appears
+                // beside the group's own headers and trees.
+                let allocated = self.allocate_in_group(agno, blocks, crate::rmap::OWN_INODES, 0)?;
+                let startino = allocated.agblock * inopblock;
+
+                if chunks.iter().any(|c| c.startino == startino) {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "allocation group {agno} already has an inode chunk at {startino}; \
+                         the free space and the inode tree disagree"
+                    )));
+                }
+
+                icreate = Some(crate::format::log_items::icreate_log_format::build(
+                    agno,
+                    allocated.agblock,
+                    per_chunk,
+                    u32::from(self.sb.inodesize),
+                    blocks,
+                    NEW_CHUNK_GENERATION,
+                ));
+                allocation_items = allocated.items;
+                added_inodes = per_chunk;
+
+                let at = chunks
+                    .iter()
+                    .position(|c| c.startino > startino)
+                    .unwrap_or(chunks.len());
+                chunks.insert(
+                    at,
+                    InodeChunk {
+                        startino,
+                        holemask: 0,
+                        count: crate::inode_btree::INODES_PER_CHUNK,
+                        freecount: crate::inode_btree::INODES_PER_CHUNK,
+                        free: u64::MAX,
+                    },
+                );
+                (at, 0)
+            }
         };
         let agino = chunks[index].startino + u32::from(slot);
         let outcome = chunks[index].take(slot)?;
@@ -508,6 +611,15 @@ impl Filesystem {
         let mut new_agi = agi_raw.clone();
         let freecount: u32 = chunks.iter().map(|c| u32::from(c.freecount)).sum();
         new_agi[agi_at::FREECOUNT..agi_at::FREECOUNT + 4].copy_from_slice(&freecount.to_be_bytes());
+        if added_inodes > 0 {
+            // The group holds more inodes than it did, and `agi_newino`
+            // names the chunk a search should start from -- the kernel
+            // set it to the new chunk's first inode.
+            let count = agi.count + added_inodes;
+            new_agi[agi_at::COUNT..agi_at::COUNT + 4].copy_from_slice(&count.to_be_bytes());
+            new_agi[agi_at::NEWINO..agi_at::NEWINO + 4]
+                .copy_from_slice(&chunks[index].startino.to_be_bytes());
+        }
         // The checksum is left stale on purpose — recovery recomputes it,
         // and writing it here would dirty a chunk nothing else touches and
         // add an operation to the record. See `group_write::restamp_crc`.
@@ -574,9 +686,21 @@ impl Filesystem {
         // `read_inode_raw`: that validates, and a free inode has mode
         // zero and no fork, which is not a shape a file's parser should
         // have to accept.
+        // A NEW CHUNK'S INODES ARE NOT ON DISK YET.
+        //
+        // The ordinary path reads the free inode's slot and changes what
+        // it means to change, which keeps the identity fields that are
+        // already right. There is nothing to read when the chunk was
+        // allocated a moment ago: recovery writes those inodes when it
+        // applies the icreate item, so this builds the same thing
+        // recovery will and changes that instead.
         let mut new_raw = vec![0u8; usize::from(self.sb.inodesize)];
-        self.device()
-            .read_at(self.inode_offset(ino)?, &mut new_raw)?;
+        if icreate.is_some() {
+            new_raw = self.freshly_initialised_inode(ino);
+        } else {
+            self.device()
+                .read_at(self.inode_offset(ino)?, &mut new_raw)?;
+        }
         // A new directory's fork is the short-form header alone: no
         // entries, and the parent it belongs to. `.` and `..` are not
         // entries in this form — the parent lives in the header and the
@@ -644,7 +768,9 @@ impl Filesystem {
         // unchanged by any of this.
         let extra: Vec<crate::buf_write::BufferItem> = converted.map_or_else(Vec::new, |c| c.items);
 
-        let item_ops = agi_item.op_count()
+        let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + usize::from(icreate.is_some())
+            + agi_item.op_count()
             + inobt_item.op_count()
             + finobt_item.as_ref().map_or(0, |i| i.op_count())
             + extra.iter().map(|i| i.op_count()).sum::<usize>()
@@ -667,6 +793,18 @@ impl Filesystem {
                     data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
             ];
+            // The order the kernel wrote them in: what the allocation
+            // touched, then the icreate that says what to do with it,
+            // then the inode trees, then the inodes themselves.
+            for item in &allocation_items {
+                ops.extend(item.ops());
+            }
+            if let Some(data) = &icreate {
+                ops.push(Op {
+                    flags: 0,
+                    data: data.clone(),
+                });
+            }
             ops.extend(agi_item.ops());
             ops.extend(inobt_item.ops());
             if let Some(item) = &finobt_item {
