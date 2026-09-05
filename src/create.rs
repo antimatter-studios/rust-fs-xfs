@@ -411,7 +411,18 @@ impl Filesystem {
         self.device().read_at(ag_start + 2 * sector, &mut agi_raw)?;
         let agi = Agi::parse(&agi_raw, &self.sb, agno)?;
 
-        for (level, what) in [(agi.level, "inode"), (agi.free_level, "free-inode")] {
+        // The free-inode tree is optional. `mkfs.xfs -m finobt=0` makes a
+        // filesystem without one, which is legal and ordinary, and its
+        // AGI then reports level 0 because there is no tree rather than
+        // because the tree is unusable. Demanding a single level of it
+        // refused a filesystem this driver can write to perfectly well.
+        let finobt = self.sb.has_finobt();
+        let levels: &[(u32, &str)] = if finobt {
+            &[(agi.level, "inode"), (agi.free_level, "free-inode")]
+        } else {
+            &[(agi.level, "inode")]
+        };
+        for &(level, what) in levels {
             if level != 1 {
                 return Err(Error::UnsupportedFeature(format!(
                     "allocation group {agno}'s {what} tree is {level} levels deep, where \
@@ -444,7 +455,12 @@ impl Filesystem {
         let ino = self.sb.join_ino(agno, agino);
 
         let mut inobt_raw = read(agi.root)?;
-        let mut finobt_raw = read(agi.free_root)?;
+        // Only read when there is a tree to read.
+        let mut finobt_raw = if finobt {
+            read(agi.free_root)?
+        } else {
+            Vec::new()
+        };
         let sparse = self.sb.has_sparse_inodes();
 
         let new_inobt = rebuild_inode_leaf(&inobt_raw, &chunks, sparse);
@@ -453,7 +469,11 @@ impl Filesystem {
         // so a chunk that has just been filled leaves it.
         let with_free: Vec<InodeChunk> =
             chunks.iter().copied().filter(|c| c.freecount > 0).collect();
-        let new_finobt = rebuild_inode_leaf(&finobt_raw, &with_free, sparse);
+        let new_finobt = if finobt {
+            rebuild_inode_leaf(&finobt_raw, &with_free, sparse)
+        } else {
+            Vec::new()
+        };
         debug_assert_eq!(
             outcome == Taken::ChunkNowFull,
             !with_free
@@ -461,6 +481,7 @@ impl Filesystem {
                 .any(|c| c.startino == chunks[index].startino),
             "a chunk that is now full must have left the free-inode tree"
         );
+        let _ = finobt; // read below; named here so the guard reads plainly
 
         let mut new_agi = agi_raw.clone();
         let freecount: u32 = chunks.iter().map(|c| u32::from(c.freecount)).sum();
@@ -563,12 +584,14 @@ impl Filesystem {
             new_inobt,
             BLFT_BTREE,
         );
-        let finobt_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agi.free_root),
-            &finobt_raw,
-            new_finobt,
-            BLFT_BTREE,
-        );
+        let finobt_item = finobt.then(|| {
+            changed_chunks(
+                expected_blkno(&self.sb, agno, agi.free_root),
+                &finobt_raw,
+                new_finobt,
+                BLFT_BTREE,
+            )
+        });
         inobt_raw.clear();
         finobt_raw.clear();
 
@@ -593,7 +616,7 @@ impl Filesystem {
 
         let item_ops = agi_item.op_count()
             + inobt_item.op_count()
-            + finobt_item.op_count()
+            + finobt_item.as_ref().map_or(0, |i| i.op_count())
             + extra.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + new_ops;
@@ -616,7 +639,9 @@ impl Filesystem {
             ];
             ops.extend(agi_item.ops());
             ops.extend(inobt_item.ops());
-            ops.extend(finobt_item.ops());
+            if let Some(item) = &finobt_item {
+                ops.extend(item.ops());
+            }
             for item in &extra {
                 ops.extend(item.ops());
             }

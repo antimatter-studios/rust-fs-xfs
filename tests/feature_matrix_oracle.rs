@@ -38,14 +38,29 @@ use fs_xfs::{Error, Filesystem};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A copy of a fixture, removed when it goes out of scope. Every other
-/// suite treats each `.img` in the share as a fixture, so one left
-/// behind fails unrelated tests.
+/// A copy of a fixture, removed when it goes out of scope.
+///
+/// IN A SUBDIRECTORY, not beside the fixtures. Several suites treat
+/// every `.img` in the share as a fixture to walk, and this test makes
+/// one per combination per operation -- seventy-odd images appearing and
+/// vanishing while other suites enumerate the directory. That is a race
+/// those suites lose, and it made the whole run flaky while each suite
+/// passed on its own.
+///
+/// `read_dir` does not recurse, so a subdirectory is invisible to them.
+/// The VM sees it as `/share/scratch` for the same reason it sees the
+/// rest: the share is mounted whole.
 struct Scratch(PathBuf);
 
 impl Scratch {
+    fn dir() -> PathBuf {
+        let d = share().join("scratch");
+        std::fs::create_dir_all(&d).expect("make the scratch directory");
+        d
+    }
+
     fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
+        let path = Self::dir().join(name);
         std::fs::copy(source, &path).expect("copy the fixture");
         Self(path)
     }
@@ -194,7 +209,7 @@ fn exercise(img: &Path, op: &str) -> Outcome {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/feat-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp /share/scratch/{name} "$img"
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
             umount "$m"
