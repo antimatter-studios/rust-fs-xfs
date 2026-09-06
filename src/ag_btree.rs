@@ -219,9 +219,32 @@ pub fn walk<T, F, D>(
     agno: u32,
     root: u32,
     levels: u32,
-    mut read_agblock: F,
+    read_agblock: F,
     decode: D,
 ) -> Result<Vec<T>>
+where
+    F: FnMut(u32) -> Result<Vec<u8>>,
+    D: Fn(&[u8], usize) -> T,
+{
+    Ok(walk_blocks(sb, shape, agno, root, levels, read_agblock, decode)?.0)
+}
+
+/// The records, and every block the tree occupies.
+///
+/// The blocks matter to a writer rather than a reader: laying the tree
+/// out again writes over the blocks it already has and gives back or
+/// takes the difference, and it cannot do either without knowing which
+/// they were. Leaves first and in the order the walk met them, which is
+/// the order [`build`] wants them in.
+pub fn walk_blocks<T, F, D>(
+    sb: &Superblock,
+    shape: Shape,
+    agno: u32,
+    root: u32,
+    levels: u32,
+    mut read_agblock: F,
+    decode: D,
+) -> Result<(Vec<T>, Vec<u32>)>
 where
     F: FnMut(u32) -> Result<Vec<u8>>,
     D: Fn(&[u8], usize) -> T,
@@ -234,6 +257,9 @@ where
     }
 
     let mut out = Vec::new();
+    // Every block met, kept by the level it sits at, so they can be
+    // handed back leaves-first however the walk found them.
+    let mut seen: Vec<Vec<u32>> = vec![Vec::new(); levels as usize];
     // Depth-first, left to right, so records arrive in the tree's own
     // order and a caller can check that ordering rather than impose it.
     let mut stack = vec![(root, (levels - 1) as u16)];
@@ -262,6 +288,7 @@ where
         })?;
         let buf = read_agblock(agblock)?;
         let node = parse_block(&buf, sb, shape, agno, agblock, expect_level)?;
+        seen[usize::from(node.level)].push(agblock);
 
         if node.level == 0 {
             let end = node.body + usize::from(node.numrecs) * shape.record_len;
@@ -298,7 +325,7 @@ where
         }
     }
 
-    Ok(out)
+    Ok((out, seen.concat()))
 }
 
 /// How a tree of `records` records is laid out: how many blocks each
