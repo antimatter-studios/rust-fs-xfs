@@ -64,15 +64,10 @@
 //! - no single free run long enough, which needs more than one extent;
 //! - a real-time file and a v4 filesystem.
 
-use crate::ag::Agf;
-use crate::alloc_btree::{alloc_extent, expected_blkno, longest, total_free, FreeExtent};
 use crate::error::{Error, Result};
 use crate::extent::Extent;
-use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
 use crate::fs::Filesystem;
-use crate::group_write::{agf, btree, changed_chunks, leaf_capacity, leaf_records, rebuild_leaf};
 use crate::inode::Format;
-use crate::log::BBSIZE;
 use crate::log_write::{
     append, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer, Op,
     XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
@@ -189,133 +184,14 @@ impl Filesystem {
             )));
         }
         let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * blocksize;
-        let sector = u64::from(self.sb.sectsize);
 
-        let mut agf_raw = vec![0u8; self.sb.sectsize as usize];
-        self.device().read_at(ag_start + sector, &mut agf_raw)?;
-        let agf = Agf::parse(&agf_raw, &self.sb, agno)?;
-
-        use crate::ag::agf_btree::{BNO, CNT, RMAP};
-        for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
-            if agf.levels[which] != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s {name} free-space tree is {} levels deep, \
-                     where taking a record out can collapse a node; only a single-level \
-                     tree is supported",
-                    agf.levels[which]
-                )));
-            }
-        }
-
-        let mut bno_raw = vec![0u8; self.sb.blocksize as usize];
-        self.device().read_at(
-            ag_start + u64::from(agf.roots[BNO]) * blocksize,
-            &mut bno_raw,
-        )?;
-        let mut cnt_raw = vec![0u8; self.sb.blocksize as usize];
-        self.device().read_at(
-            ag_start + u64::from(agf.roots[CNT]) * blocksize,
-            &mut cnt_raw,
-        )?;
-
-        let numrecs = crate::group_write::leaf_numrecs(&bno_raw, btree::RECORD)?;
-        let mut by_block = leaf_records(&bno_raw, numrecs);
-
-        // First fit, in block order. See the note on policy at the top:
-        // the choice is this driver's and affects layout, not
-        // correctness.
-        let chosen = by_block
-            .iter()
-            .find(|run| run.blockcount >= want)
-            .copied()
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "allocation group {agno} has no single free run of {want} blocks — its \
-                     longest is {}, and splitting a file across extents is not implemented",
-                    longest(&by_block)
-                ))
-            })?;
-        let taking = FreeExtent {
-            startblock: chosen.startblock,
-            blockcount: want,
-        };
-        alloc_extent(&mut by_block, taking)?;
-
-        let capacity = leaf_capacity(self.sb.blocksize);
-        if by_block.len() > capacity {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno} would need {} free-space records and its tree root \
-                 holds {capacity}; splitting a node is not implemented",
-                by_block.len()
-            )));
-        }
-
-        // THE REVERSE MAP, WHERE THE FILESYSTEM HAS ONE.
-        //
-        // Blocks taken out of free space are owned by this inode from
-        // here on, and the tree is where that is written down.
-        // Allocating without saying so leaves blocks belonging to
-        // nobody, and xfs_repair is what notices:
-        //
-        //     Missing reverse-mapping record for (0/13) len 1 owner 131
-        //
-        // The file was empty, so this is its first extent: offset zero,
-        // no flags, and no record of its own to merge with.
-        let rmap = self.sb.has_rmapbt();
-        let mut rmap_raw = Vec::new();
-        let mut rmap_records = Vec::new();
-        if rmap {
-            if agf.levels[RMAP] != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
-                     where inserting a record can split a node; only a single-level tree \
-                     is supported",
-                    agf.levels[RMAP]
-                )));
-            }
-            rmap_raw = vec![0u8; self.sb.blocksize as usize];
-            self.device().read_at(
-                ag_start + u64::from(agf.roots[RMAP]) * blocksize,
-                &mut rmap_raw,
-            )?;
-            let n = crate::group_write::leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
-            rmap_records = crate::rmap::leaf_records(&rmap_raw, n);
-            crate::rmap::insert(
-                &mut rmap_records,
-                crate::rmap::Rmap {
-                    startblock: taking.startblock,
-                    blockcount: taking.blockcount,
-                    owner: ino as i64,
-                    offset: 0,
-                },
-            )?;
-            let rmap_capacity = crate::rmap::capacity(self.sb.blocksize);
-            if rmap_records.len() > rmap_capacity {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno} would need {} reverse-mapping records and its \
-                     tree root holds {rmap_capacity}; splitting a node is not implemented",
-                    rmap_records.len()
-                )));
-            }
-        }
-
-        let mut by_count = by_block.clone();
-        by_count.sort_by_key(|e| (e.blockcount, e.startblock));
-
-        let new_bno = rebuild_leaf(&bno_raw, &by_block);
-        let new_cnt = rebuild_leaf(&cnt_raw, &by_count);
-
-        let mut new_agf = agf_raw.clone();
-        let freeblks = u32::try_from(total_free(&by_block)).map_err(|_| {
-            Error::CorruptLog(format!(
-                "allocation group {agno} has more free blocks than fit"
-            ))
-        })?;
-        new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
-        new_agf[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&longest(&by_block).to_be_bytes());
-        // The checksum is left stale on purpose — recovery recomputes it,
-        // and writing it here would dirty a chunk nothing else touches and
-        // add an operation to the record. See `group_write::restamp_crc`.
+        // ONE EDITOR FOR THE GROUP, at whatever depth its trees are.
+        // This read the group's header and trees itself and refused any
+        // of them deeper than one block; `GroupAlloc` reads them with
+        // the walker and lays them out again.
+        let mut group = crate::group_write::GroupAlloc::open(&self.sb, self.device(), agno)?;
+        let agblock = group.take(want, ino as i64, 0)?;
+        let group_items = group.into_items()?;
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -329,7 +205,7 @@ impl Filesystem {
         // record that claims them. A machine that dies between the two
         // leaves blocks written but unclaimed — lost space, not a file
         // pointing at someone else's data.
-        let at = ag_start + u64::from(taking.startblock) * blocksize;
+        let at = ag_start + u64::from(agblock) * blocksize;
         let mut padded = data.to_vec();
         padded.resize((blocks * blocksize) as usize, 0);
         device.write_at(at, &padded)?;
@@ -337,7 +213,7 @@ impl Filesystem {
 
         // The extent record names a filesystem block, which packs the
         // group and the block within it.
-        let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(taking.startblock);
+        let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(agblock);
         let extent = Extent {
             startoff: 0,
             startblock: fsblock,
@@ -349,29 +225,6 @@ impl Filesystem {
         let mut fork_op = fork;
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
-        let ag_bb = ag_start / BBSIZE as u64;
-        let agf_item = changed_chunks(ag_bb + sector / BBSIZE as u64, &agf_raw, new_agf, BLFT_AGF);
-        let bno_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agf.roots[BNO]),
-            &bno_raw,
-            new_bno,
-            BLFT_BTREE,
-        );
-        let cnt_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agf.roots[CNT]),
-            &cnt_raw,
-            new_cnt,
-            BLFT_BTREE,
-        );
-        let rmap_item = rmap.then(|| {
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agf.roots[RMAP]),
-                &rmap_raw,
-                crate::rmap::rebuild_leaf(&rmap_raw, &rmap_records),
-                BLFT_BTREE,
-            )
-        });
-
         let core = filled_core(&raw, data.len() as u64, blocks);
         let logged = log_dinode_from_disk(&core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
@@ -380,11 +233,7 @@ impl Filesystem {
 
         // Three operations for the inode this time — format, core and
         // extent list — where a truncate logs two.
-        let item_ops = agf_item.op_count()
-            + bno_item.op_count()
-            + cnt_item.op_count()
-            + rmap_item.as_ref().map_or(0, |i| i.op_count())
-            + 3;
+        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 3;
 
         append(device.as_ref(), &self.sb, |tid| {
             let mut ops = vec![
@@ -397,10 +246,7 @@ impl Filesystem {
                     data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
             ];
-            ops.extend(agf_item.ops());
-            ops.extend(bno_item.ops());
-            ops.extend(cnt_item.ops());
-            if let Some(item) = &rmap_item {
+            for item in &group_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {

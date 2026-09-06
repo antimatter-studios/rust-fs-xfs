@@ -45,20 +45,15 @@
 //! - a real-time file, whose blocks are not in an allocation group at
 //!   all.
 
-use crate::ag::Agf;
-use crate::alloc_btree::{expected_blkno, free_extent, longest, total_free, FreeExtent};
+use crate::alloc_btree::FreeExtent;
 use crate::error::{Error, Result};
-use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
 use crate::fs::Filesystem;
-use crate::group_write::{
-    agf, btree, changed_chunks, emptied_core, leaf_capacity, leaf_records, rebuild_leaf,
-    split_fsblock,
-};
-use crate::log::BBSIZE;
+use crate::group_write::{emptied_core, split_fsblock};
 use crate::log_write::{
     append, inode_log_format, log_dinode_from_disk, trans_header, InodeBuffer, Op, XFS_ILOG_CORE,
     XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
+
 impl Filesystem {
     /// Truncate `ino` to nothing, writing the change to the log.
     ///
@@ -112,78 +107,29 @@ impl Filesystem {
         freeing_here: &[FreeExtent],
         extents_here: &[crate::extent::Extent],
     ) -> Result<Vec<crate::buf_write::BufferItem>> {
-        let block = u64::from(self.sb.blocksize);
-        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
-        let sector = u64::from(self.sb.sectsize);
-
-        let mut agf_raw = vec![0u8; self.sb.sectsize as usize];
-        self.device().read_at(ag_start + sector, &mut agf_raw)?;
-        let agf = Agf::parse(&agf_raw, &self.sb, agno)?;
-
-        use crate::ag::agf_btree::{BNO, CNT, RMAP};
-        for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
-            if agf.levels[which] != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s {name} free-space tree is {} levels deep, \
-                     where inserting a record can split a node; only a single-level tree \
-                     is supported",
-                    agf.levels[which]
-                )));
-            }
-        }
-
-        let mut bno_raw = vec![0u8; self.sb.blocksize as usize];
-        self.device()
-            .read_at(ag_start + u64::from(agf.roots[BNO]) * block, &mut bno_raw)?;
-        let mut cnt_raw = vec![0u8; self.sb.blocksize as usize];
-        self.device()
-            .read_at(ag_start + u64::from(agf.roots[CNT]) * block, &mut cnt_raw)?;
-
-        // THE REVERSE MAP, WHERE THE FILESYSTEM HAS ONE.
+        // ONE EDITOR FOR THE GROUP, at whatever depth its trees are.
         //
-        // Returning blocks to free space without taking their ownership
-        // record out leaves the tree saying a file still holds them.
-        // Nothing fails at the time; xfs_repair is what notices. This
-        // driver used to refuse the mount rather than get it wrong,
-        // which meant refusing any volume mkfs.xfs formatted by default.
-        let rmap = self.sb.has_rmapbt();
-        let mut rmap_raw = Vec::new();
-        let mut rmap_records = Vec::new();
-        if rmap {
-            if agf.levels[RMAP] != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
-                     where removing a record can merge a node; only a single-level tree \
-                     is supported",
-                    agf.levels[RMAP]
-                )));
-            }
-            rmap_raw = vec![0u8; self.sb.blocksize as usize];
-            self.device()
-                .read_at(ag_start + u64::from(agf.roots[RMAP]) * block, &mut rmap_raw)?;
-            let n = crate::group_write::leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
-            rmap_records = crate::rmap::leaf_records(&rmap_raw, n);
+        // This read the four trees itself, refused any of them deeper
+        // than one block, and wrote each one back by rewriting its root
+        // -- which is the shape a fresh filesystem has and no filesystem
+        // in use keeps. `GroupAlloc` reads them with the walker and lays
+        // them out again, so a group whose free space is fragmented is
+        // one this can free into.
+        let mut group = crate::group_write::GroupAlloc::open(&self.sb, self.device(), agno)?;
 
-            // One record per extent, matched exactly: this frees a
-            // file's map entire, so a record that does not line up means
-            // the tree and the inode disagree and the free must not go
-            // ahead. `crate::rmap::remove` says which.
-            for extent in extents_here {
-                let (_, agblock) = split_fsblock(&self.sb, extent.startblock);
-                crate::rmap::remove(
-                    &mut rmap_records,
-                    crate::rmap::Rmap {
-                        startblock: agblock,
-                        blockcount: extent.blockcount as u32,
-                        owner: ino as i64,
-                        offset: extent.startoff,
-                    },
-                )?;
-            }
+        // THE REVERSE MAP FIRST, and matched exactly. This frees a
+        // file's map entire, so a record that does not line up means the
+        // tree and the inode disagree, and the free must not go ahead on
+        // top of that.
+        for extent in extents_here {
+            let (_, agblock) = crate::group_write::split_fsblock(&self.sb, extent.startblock);
+            group.forget_rmap(crate::rmap::Rmap {
+                startblock: agblock,
+                blockcount: extent.blockcount as u32,
+                owner: ino as i64,
+                offset: extent.startoff,
+            })?;
         }
-
-        let numrecs = crate::group_write::leaf_numrecs(&bno_raw, btree::RECORD)?;
-        let mut by_block = leaf_records(&bno_raw, numrecs);
 
         // WHAT MAY ACTUALLY GO BACK TO FREE SPACE.
         //
@@ -191,135 +137,16 @@ impl Filesystem {
         // owner, and returning its blocks while another file still
         // points at them is the worst thing available here: the
         // allocator hands them out again and the two files overwrite
-        // each other. The reference-count tree is what decides, so it is
-        // asked per extent rather than assumed.
-        //
-        // An extent with no record has one owner -- that is what the
-        // absence means -- so the ordinary case reaches `free_extent`
-        // exactly as before.
-        let reflink = self.sb.has_reflink();
-        let mut refcount_raw = Vec::new();
-        let mut refcount_records = Vec::new();
-        let refcount_level = agf.refcount_level;
-        if reflink && refcount_level > 0 {
-            if refcount_level != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s reference-count tree is {refcount_level} \
-                     levels deep, where changing a record can reshape a node; only a \
-                     single-level tree is supported"
-                )));
-            }
-            refcount_raw = vec![0u8; self.sb.blocksize as usize];
-            self.device().read_at(
-                ag_start + u64::from(agf.refcount_root) * block,
-                &mut refcount_raw,
-            )?;
-            let n = crate::group_write::leaf_numrecs(&refcount_raw, crate::refcount::RECORD)?;
-            refcount_records = crate::refcount::leaf_records(&refcount_raw, n);
-        }
-
-        let mut refcount_changed = false;
+        // each other. The reference-count tree decides, per range,
+        // because one extent can be part shared and part not -- and
+        // blocks another file still holds are never returned.
         for extent in freeing_here {
-            // ONE EXTENT CAN BE PART SHARED AND PART NOT.
-            //
-            // The reference-count tree holds a record per shared run, and
-            // a file's extent may cover several of them with unshared
-            // gaps between -- that is what an overwrite in the middle of
-            // a reflinked file leaves behind. So the question is not
-            // whether this extent may be freed but WHICH OF ITS BLOCKS
-            // may, and the tree answers per range.
-            //
-            // Blocks another file still holds are never returned here.
-            // Dropping from two owners to one leaves them with whoever
-            // remains; only blocks nobody else holds go back.
-            let freeable = if reflink && refcount_level > 0 {
-                let before = refcount_records.clone();
-                let ranges = crate::refcount::release(
-                    &mut refcount_records,
-                    extent.startblock,
-                    extent.blockcount,
-                )?;
-                refcount_changed |= refcount_records != before;
-                ranges
-            } else {
-                vec![*extent]
-            };
-
-            for range in &freeable {
-                free_extent(&mut by_block, *range)?;
+            for range in group.release_shared(extent.startblock, extent.blockcount)? {
+                group.give_back(range)?;
             }
         }
 
-        let capacity = leaf_capacity(self.sb.blocksize);
-        if by_block.len() > capacity {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno} would need {} free-space records and its tree root \
-                 holds {capacity}; splitting a node is not implemented",
-                by_block.len()
-            )));
-        }
-
-        // The second tree holds the same extents ordered by length, and
-        // equal lengths are ordered by start block so the ordering is
-        // total.
-        let mut by_count = by_block.clone();
-        by_count.sort_by_key(|e| (e.blockcount, e.startblock));
-
-        let new_bno = rebuild_leaf(&bno_raw, &by_block);
-        let new_cnt = rebuild_leaf(&cnt_raw, &by_count);
-
-        let mut new_agf = agf_raw.clone();
-        let freeblks = u32::try_from(total_free(&by_block)).map_err(|_| {
-            Error::CorruptLog(format!(
-                "allocation group {agno} has more free blocks than fit"
-            ))
-        })?;
-        new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
-        new_agf[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&longest(&by_block).to_be_bytes());
-        // The checksum is left stale on purpose — recovery recomputes it,
-        // and writing it here would dirty a chunk nothing else touches and
-        // add an operation to the record. See `group_write::restamp_crc`.
-
-        // Addresses are in 512-byte basic blocks, absolute on the
-        // device. The group header is its second sector.
-        let ag_bb = ag_start / BBSIZE as u64;
-        let agf_item = changed_chunks(ag_bb + sector / BBSIZE as u64, &agf_raw, new_agf, BLFT_AGF);
-        let bno_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agf.roots[BNO]),
-            &bno_raw,
-            new_bno,
-            BLFT_BTREE,
-        );
-        let cnt_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agf.roots[CNT]),
-            &cnt_raw,
-            new_cnt,
-            BLFT_BTREE,
-        );
-        let refcount_item = refcount_changed.then(|| {
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agf.refcount_root),
-                &refcount_raw,
-                crate::refcount::rebuild_leaf(&refcount_raw, &refcount_records),
-                BLFT_BTREE,
-            )
-        });
-        let rmap_item = rmap.then(|| {
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agf.roots[RMAP]),
-                &rmap_raw,
-                crate::rmap::rebuild_leaf(&rmap_raw, &rmap_records),
-                BLFT_BTREE,
-            )
-        });
-
-        let mut items = vec![agf_item, bno_item, cnt_item];
-        if let Some(item) = rmap_item {
-            items.push(item);
-        }
-        if let Some(item) = refcount_item {
-            items.push(item);
-        }
+        let items = group.into_items()?;
         Ok(items)
     }
 

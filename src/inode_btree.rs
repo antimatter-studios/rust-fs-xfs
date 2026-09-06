@@ -232,6 +232,49 @@ fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> {
     })
 }
 
+/// What tells one inode tree from the other, for the shared descent and
+/// the shared layout in [`crate::ag_btree`].
+///
+/// A key is the chunk's first inode alone: four bytes, where a record is
+/// sixteen.
+pub fn shape(which: Which, is_v5: bool) -> crate::ag_btree::Shape {
+    let _ = is_v5;
+    let (name, magic_v4, magic_v5) = match which {
+        Which::All => ("inobt", XFS_IBT_MAGIC, XFS_IBT_CRC_MAGIC),
+        Which::WithFreeInodes => ("finobt", XFS_FIBT_MAGIC, XFS_FIBT_CRC_MAGIC),
+    };
+    crate::ag_btree::Shape {
+        name,
+        magic_v4: Some(magic_v4),
+        magic_v5,
+        record_len: RECORD_LEN,
+        key_len: KEY_LEN,
+        overlapping: false,
+    }
+}
+
+/// One chunk record written at `at` bytes into `buf`.
+///
+/// `sparse` selects between the two shapes of the middle four bytes, the
+/// same way [`record`] does when reading them: it is the feature that
+/// decides, not the format version.
+pub fn encode(buf: &mut [u8], at: usize, chunk: &InodeChunk, sparse: bool) {
+    buf[at..at + 4].copy_from_slice(&chunk.startino.to_be_bytes());
+    if sparse {
+        buf[at + 4..at + 6].copy_from_slice(&chunk.holemask.to_be_bytes());
+        buf[at + 6] = chunk.count;
+        buf[at + 7] = chunk.freecount;
+    } else {
+        buf[at + 4..at + 8].copy_from_slice(&u32::from(chunk.freecount).to_be_bytes());
+    }
+    buf[at + 8..at + 16].copy_from_slice(&chunk.free.to_be_bytes());
+}
+
+/// The key that stands for a chunk in a node: its first inode.
+pub fn encode_key(buf: &mut [u8], at: usize, chunk: &InodeChunk) {
+    buf[at..at + 4].copy_from_slice(&chunk.startino.to_be_bytes());
+}
+
 /// A header that has been read and checked.
 struct Node {
     level: u16,
@@ -438,6 +481,318 @@ where
         }
     };
     walk(sb, which, agi.seqno, root, levels, read_agblock).map(Some)
+}
+
+// ---------------------------------------------------------------------
+// Editing a group's inode trees
+// ---------------------------------------------------------------------
+
+/// One group's inode trees, read once and written back once.
+///
+/// The same shape as [`crate::group_write::GroupAlloc`], for the other
+/// pair of trees: the inode tree, which holds every chunk, and the
+/// free-inode tree, which holds the chunks with a free inode in them.
+/// Both hang off the AGI rather than the AGF.
+///
+/// WHY ONE TYPE RATHER THAN EACH CALLER'S OWN. `create` and `unlink`
+/// each read these trees, checked their depth, edited a chunk and wrote
+/// the roots back -- separately, and identically, and both refusing any
+/// tree more than one block deep. A 4 KiB root holds 252 chunk records,
+/// which is 16,128 inodes, so a filesystem of any size has a deeper one
+/// and neither could write to it.
+pub struct Trees<'a> {
+    sb: &'a Superblock,
+    device: &'a dyn fs_core::BlockRead,
+    agno: u32,
+    ag_start: u64,
+    agi_raw: Vec<u8>,
+    agi: Agi,
+    /// Every chunk in the group, in inode order.
+    chunks: Vec<InodeChunk>,
+    inobt_blocks: Vec<u32>,
+    /// Empty where the filesystem has no free-inode tree, which
+    /// `mkfs.xfs -m finobt=0` makes and is ordinary.
+    finobt_blocks: Vec<u32>,
+    before: std::collections::HashMap<u32, Vec<u8>>,
+    /// The group's free list, which is where a growing tree gets a
+    /// block and where a shrinking one puts it back.
+    agfl: crate::agfl::Agfl,
+    agfl_raw: Vec<u8>,
+    /// The group's free-space header, kept only because the free list's
+    /// counters live in it.
+    agf_raw: Vec<u8>,
+    /// What the header's counters should say afterwards, where the
+    /// caller has decided: allocated inodes, free inodes, and the chunk
+    /// most recently made.
+    counts: Option<(u32, u32, Option<u32>)>,
+    changed: bool,
+}
+
+impl<'a> Trees<'a> {
+    /// Read the group's inode header and both its trees, at whatever
+    /// depth they are.
+    pub fn open(sb: &'a Superblock, device: &'a dyn fs_core::BlockRead, agno: u32) -> Result<Self> {
+        let blocksize = u64::from(sb.blocksize);
+        let sector = u64::from(sb.sectsize);
+        let ag_start = u64::from(agno) * u64::from(sb.agblocks) * blocksize;
+
+        let mut agi_raw = vec![0u8; sb.sectsize as usize];
+        device.read_at(ag_start + sector * 2, &mut agi_raw)?;
+        let agi = Agi::parse(&agi_raw, sb, agno)?;
+
+        // The free list lives with the AGF rather than the AGI, and
+        // both pairs of trees take their blocks from it.
+        let mut agf_raw = vec![0u8; sb.sectsize as usize];
+        device.read_at(ag_start + sector, &mut agf_raw)?;
+        let agf = crate::ag::Agf::parse(&agf_raw, sb, agno)?;
+        let mut agfl_raw = vec![0u8; sb.sectsize as usize];
+        device.read_at(ag_start + sector * 3, &mut agfl_raw)?;
+        let agfl = crate::agfl::Agfl::parse(&agfl_raw, sb, &agf, agno)?;
+
+        let mut before: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        let mut read = |agblock: u32| -> Result<Vec<u8>> {
+            let mut raw = vec![0u8; sb.blocksize as usize];
+            device.read_at(ag_start + u64::from(agblock) * blocksize, &mut raw)?;
+            Ok(raw)
+        };
+
+        let sparse = sb.has_sparse_inodes();
+        let (chunks, inobt_blocks) = crate::ag_btree::walk_blocks(
+            sb,
+            shape(Which::All, sb.is_v5()),
+            agno,
+            agi.root,
+            agi.level,
+            &mut read,
+            move |buf, at| {
+                // A record this walk has already bounds-checked; the
+                // only way it can fail is a plain free count larger than
+                // a chunk holds, which `record` refuses and which cannot
+                // be expressed as a value here.
+                record(buf, at, sparse).unwrap_or(InodeChunk {
+                    startino: 0,
+                    holemask: 0,
+                    count: 0,
+                    freecount: 0,
+                    free: 0,
+                })
+            },
+        )?;
+
+        let finobt_blocks = if sb.has_finobt() && agi.free_level > 0 {
+            let (_, blocks) = crate::ag_btree::walk_blocks(
+                sb,
+                shape(Which::WithFreeInodes, sb.is_v5()),
+                agno,
+                agi.free_root,
+                agi.free_level,
+                &mut read,
+                |_buf, _at| (),
+            )?;
+            blocks
+        } else {
+            Vec::new()
+        };
+
+        for &agblock in inobt_blocks.iter().chain(finobt_blocks.iter()) {
+            let mut raw = vec![0u8; sb.blocksize as usize];
+            device.read_at(ag_start + u64::from(agblock) * blocksize, &mut raw)?;
+            before.insert(agblock, raw);
+        }
+
+        Ok(Trees {
+            sb,
+            device,
+            agno,
+            ag_start,
+            agi_raw,
+            agi,
+            chunks,
+            inobt_blocks,
+            finobt_blocks,
+            before,
+            agfl,
+            agfl_raw,
+            agf_raw,
+            counts: None,
+            changed: false,
+        })
+    }
+
+    /// The group's inode header as it was read.
+    pub fn agi(&self) -> &Agi {
+        &self.agi
+    }
+
+    /// Every chunk in the group, in inode order.
+    pub fn chunks(&self) -> &[InodeChunk] {
+        &self.chunks
+    }
+
+    /// The chunks, to be edited.
+    ///
+    /// Whatever the caller does to them, both trees are laid out again
+    /// from what is left: the free-inode tree is the chunks with a free
+    /// inode in them, so it follows rather than being maintained
+    /// separately.
+    pub fn chunks_mut(&mut self) -> &mut Vec<InodeChunk> {
+        self.changed = true;
+        &mut self.chunks
+    }
+
+    /// What the group's counters should say afterwards.
+    ///
+    /// `newino` names the most recently allocated chunk and moves only
+    /// when one is made; `None` leaves it as it was.
+    pub fn set_counts(&mut self, count: u32, freecount: u32, newino: Option<u32>) {
+        self.counts = Some((count, freecount, newino));
+        self.changed = true;
+    }
+
+    /// The buffer items: the group's inode header, and every block of
+    /// either tree whose bytes changed.
+    ///
+    /// One item per buffer however many edits there were. Nothing is
+    /// written; the items are the change, and the caller puts them in a
+    /// record.
+    pub fn into_items(mut self) -> Result<Vec<crate::buf_write::BufferItem>> {
+        use crate::ag::offsets::agi;
+        use crate::format::log_items::buf_log_format::buf_type::BLFT_AGI;
+        use crate::log::BBSIZE;
+
+        if !self.changed {
+            return Ok(Vec::new());
+        }
+
+        let sparse = self.sb.has_sparse_inodes();
+        let mut items = Vec::new();
+
+        let chunks = std::mem::take(&mut self.chunks);
+        let held = std::mem::take(&mut self.inobt_blocks);
+        let inobt_blocks = crate::ag_btree::relay(
+            self.sb,
+            self.device,
+            self.ag_start,
+            shape(Which::All, self.sb.is_v5()),
+            self.agno,
+            &chunks,
+            &held,
+            &self.before,
+            &mut self.agfl,
+            |buf, at, chunk: &InodeChunk| encode(buf, at, chunk, sparse),
+            |buf: &mut [u8], at, under: &[InodeChunk]| encode_key(buf, at, &under[0]),
+            &mut items,
+        )?;
+
+        // The free-inode tree follows from the chunks rather than being
+        // kept beside them: it holds exactly those with a free inode.
+        let with_free: Vec<InodeChunk> =
+            chunks.iter().copied().filter(|c| c.freecount > 0).collect();
+        let held = std::mem::take(&mut self.finobt_blocks);
+        let finobt_blocks = if held.is_empty() {
+            Vec::new()
+        } else {
+            crate::ag_btree::relay(
+                self.sb,
+                self.device,
+                self.ag_start,
+                shape(Which::WithFreeInodes, self.sb.is_v5()),
+                self.agno,
+                &with_free,
+                &held,
+                &self.before,
+                &mut self.agfl,
+                |buf, at, chunk: &InodeChunk| encode(buf, at, chunk, sparse),
+                |buf: &mut [u8], at, under: &[InodeChunk]| encode_key(buf, at, &under[0]),
+                &mut items,
+            )?
+        };
+
+        let mut new_agi = self.agi_raw.clone();
+        let put = |buf: &mut [u8], at: usize, v: u32| {
+            buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        };
+        let level_of = |blocks: &[u32], which: Which, records: usize| -> Result<u32> {
+            let plan = crate::ag_btree::plan(
+                shape(which, self.sb.is_v5()),
+                self.sb.blocksize,
+                self.sb.is_v5(),
+                records,
+            )?;
+            debug_assert_eq!(plan.iter().sum::<usize>(), blocks.len());
+            Ok(plan.len() as u32)
+        };
+        put(
+            &mut new_agi,
+            agi::ROOT,
+            *inobt_blocks.last().expect("a tree has a root"),
+        );
+        put(
+            &mut new_agi,
+            agi::LEVEL,
+            level_of(&inobt_blocks, Which::All, chunks.len())?,
+        );
+        if !finobt_blocks.is_empty() {
+            put(
+                &mut new_agi,
+                agi::FREE_ROOT,
+                *finobt_blocks.last().expect("a tree has a root"),
+            );
+            put(
+                &mut new_agi,
+                agi::FREE_LEVEL,
+                level_of(&finobt_blocks, Which::WithFreeInodes, with_free.len())?,
+            );
+        }
+        if let Some((count, freecount, newino)) = self.counts {
+            put(&mut new_agi, agi::COUNT, count);
+            put(&mut new_agi, agi::FREECOUNT, freecount);
+            if let Some(newino) = newino {
+                put(&mut new_agi, agi::NEWINO, newino);
+            }
+        }
+        // The checksum is left stale on purpose — recovery recomputes it.
+
+        let ag_bb = self.ag_start / BBSIZE as u64;
+        let sector = u64::from(self.sb.sectsize);
+        items.insert(
+            0,
+            crate::group_write::changed_chunks(
+                ag_bb + sector * 2 / BBSIZE as u64,
+                &self.agi_raw,
+                new_agi,
+                BLFT_AGI,
+            ),
+        );
+
+        // A tree that took a block or gave one back changed the free
+        // list, and the list is the AGF's rather than the AGI's -- so
+        // the counters that describe it are in the AGF, and both have
+        // to be logged.
+        let after = self.agfl.after(self.sb);
+        if after != self.agfl_raw {
+            use crate::ag::offsets::agf;
+            use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_AGFL};
+            let mut new_agf = self.agf_raw.clone();
+            put(&mut new_agf, agf::FLFIRST, self.agfl.first());
+            put(&mut new_agf, agf::FLLAST, self.agfl.last());
+            put(&mut new_agf, agf::FLCOUNT, self.agfl.count());
+            items.push(crate::group_write::changed_chunks(
+                ag_bb + sector / BBSIZE as u64,
+                &self.agf_raw,
+                new_agf,
+                BLFT_AGF,
+            ));
+            items.push(crate::group_write::changed_chunks(
+                ag_bb + sector * 3 / BBSIZE as u64,
+                &self.agfl_raw,
+                after,
+                BLFT_AGFL,
+            ));
+        }
+
+        Ok(items)
+    }
 }
 
 #[cfg(test)]

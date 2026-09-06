@@ -140,11 +140,20 @@ fn letting_go_of_a_shared_extent_leaves_the_blocks_with_the_other_file() {
          the allocator would hand it out again"
     );
 
-    // The record is gone because one owner is not sharing, which is what
-    // the kernel does, and the surviving file is untouched.
+    // WHAT IS LEFT IS WHAT IS STILL SHARED. The fixture has three files
+    // over these blocks -- data.bin, its reflink copy, and a third copy
+    // with its middle overwritten -- so letting one go does not end the
+    // sharing, it reduces it. Every record that remains says two owners:
+    // one fewer than before, and never one, because a run with a single
+    // owner needs no record at all.
+    let left = fs.refcount_records(0).unwrap();
     assert!(
-        fs.refcount_records(0).unwrap().is_empty(),
-        "with one owner left the extent is no longer shared and keeps no record"
+        !left.is_empty(),
+        "two files still share these blocks, so the tree must still say so"
+    );
+    assert!(
+        left.iter().all(|r| r.refcount == 2),
+        "every remaining record should have dropped to two owners: {left:?}"
     );
     let (inode, raw) = fs.read_inode_raw(survivor).expect("read the survivor");
     assert_eq!(
@@ -156,6 +165,10 @@ fn letting_go_of_a_shared_extent_leaves_the_blocks_with_the_other_file() {
 
 /// And the last owner does free them — otherwise the blocks leak, which
 /// leaves a perfectly consistent filesystem that has lost space.
+///
+/// EVERY owner, not two of them. The fixture shares these blocks three
+/// ways, and a test that let go of two and expected the blocks back
+/// would be asserting that this driver frees blocks a file still holds.
 #[test]
 fn the_last_owner_gives_the_blocks_back() {
     let Some(source) = fixture() else {
@@ -165,19 +178,25 @@ fn the_last_owner_gives_the_blocks_back() {
     let scratch = Scratch::from(&source, "refcount-last-scratch.img");
     let img = scratch.path();
 
-    let (first, second, block) = {
+    let (owners, block) = {
         let fs = open(img);
-        let first = fs.lookup_path("/sf/data.bin").expect("the file").ino;
-        let second = fs.lookup_path("/sf/shared.bin").expect("the copy").ino;
-        let (inode, raw) = fs.read_inode_raw(first).expect("read it");
+        let mut owners = vec![
+            fs.lookup_path("/sf/data.bin").expect("the file").ino,
+            fs.lookup_path("/sf/shared.bin").expect("the copy").ino,
+        ];
+        // The partly shared copy, where the fixture has one.
+        if let Ok(partial) = fs.lookup_path("/sf/partial.bin") {
+            owners.push(partial.ino);
+        }
+        let (inode, raw) = fs.read_inode_raw(owners[0]).expect("read it");
         let extents = fs.data_extents(&inode, &raw).expect("its extents");
         let (_, agblock) = fs.superblock().split_fsblock(extents[0].startblock);
-        (first, second, agblock)
+        (owners, agblock)
     };
 
     // One owner at a time: this driver logs one checkpoint per mount, so
     // each free is its own mount and its own replay.
-    for ino in [first, second] {
+    for ino in owners {
         let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(img).expect("rw")))
             .expect("mount read-write");
         fs.truncate_to_zero(ino).expect("truncate");

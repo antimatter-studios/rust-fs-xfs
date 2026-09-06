@@ -58,18 +58,13 @@
 //! which is the better failure of the two, and it is what
 //! [`crate::dir_write`] already does for the same reason.
 
-use crate::ag::{offsets::agi as agi_at, Agi};
-use crate::alloc_btree::expected_blkno;
 use crate::dir;
 use crate::dir_block;
 use crate::error::{Error, Result};
-use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGI, BLFT_BTREE};
 use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
-use crate::group_write::{changed_chunks, rebuild_inode_leaf};
 use crate::inode::Format;
-use crate::inode_btree::{choose_free_inode, walk_from_agi, InodeChunk, Taken, Which};
-use crate::log::BBSIZE;
+use crate::inode_btree::{choose_free_inode, InodeChunk, Taken};
 use crate::log_write::{
     append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
     InodeBuffer, Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
@@ -467,43 +462,15 @@ impl Filesystem {
         // The new inode comes from the parent's own group, which is what
         // keeps a directory's files near the directory.
         let (agno, _, _) = self.sb.split_ino(parent);
-        let block = u64::from(self.sb.blocksize);
-        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
-        let sector = u64::from(self.sb.sectsize);
 
-        let mut agi_raw = vec![0u8; self.sb.sectsize as usize];
-        self.device().read_at(ag_start + 2 * sector, &mut agi_raw)?;
-        let agi = Agi::parse(&agi_raw, &self.sb, agno)?;
-
-        // The free-inode tree is optional. `mkfs.xfs -m finobt=0` makes a
-        // filesystem without one, which is legal and ordinary, and its
-        // AGI then reports level 0 because there is no tree rather than
-        // because the tree is unusable. Demanding a single level of it
-        // refused a filesystem this driver can write to perfectly well.
-        let finobt = self.sb.has_finobt();
-        let levels: &[(u32, &str)] = if finobt {
-            &[(agi.level, "inode"), (agi.free_level, "free-inode")]
-        } else {
-            &[(agi.level, "inode")]
-        };
-        for &(level, what) in levels {
-            if level != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s {what} tree is {level} levels deep, where \
-                     changing a record can reshape a node; only a single-level tree is \
-                     supported"
-                )));
-            }
-        }
-
-        let read = |agblock: u32| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; self.sb.blocksize as usize];
-            self.device()
-                .read_at(ag_start + u64::from(agblock) * block, &mut buf)?;
-            Ok(buf)
-        };
-        let mut chunks = walk_from_agi(&self.sb, &agi, Which::All, read)?
-            .expect("every filesystem has an inode tree");
+        // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
+        // are. This read the AGI, refused either tree deeper than one
+        // block, edited a chunk and wrote both roots back. A 1 KiB root
+        // holds 60 chunk records and a chunk is 64 inodes, so a group
+        // with four thousand inodes already has a deeper tree and could
+        // not be created in.
+        let mut trees = crate::inode_btree::Trees::open(&self.sb, self.device(), agno)?;
+        let mut chunks = trees.chunks().to_vec();
 
         // NO FREE INODE: MAKE SIXTY-FOUR MORE.
         //
@@ -597,50 +564,31 @@ impl Filesystem {
         // entry names and what the inode itself records.
         let ino = self.sb.join_ino(agno, agino);
 
-        let mut inobt_raw = read(agi.root)?;
-        // Only read when there is a tree to read.
-        let mut finobt_raw = if finobt {
-            read(agi.free_root)?
-        } else {
-            Vec::new()
-        };
-        let sparse = self.sb.has_sparse_inodes();
-
-        let new_inobt = rebuild_inode_leaf(&inobt_raw, &chunks, sparse);
-
-        // The free-inode tree holds only the chunks with something free,
-        // so a chunk that has just been filled leaves it.
-        let with_free: Vec<InodeChunk> =
-            chunks.iter().copied().filter(|c| c.freecount > 0).collect();
-        let new_finobt = if finobt {
-            rebuild_inode_leaf(&finobt_raw, &with_free, sparse)
-        } else {
-            Vec::new()
-        };
+        // The free-inode tree holds only the chunks with something
+        // free, so a chunk that has just been filled leaves it -- and
+        // the editor works that out from the chunks rather than being
+        // told twice.
         debug_assert_eq!(
             outcome == Taken::ChunkNowFull,
-            !with_free
-                .iter()
-                .any(|c| c.startino == chunks[index].startino),
-            "a chunk that is now full must have left the free-inode tree"
+            chunks[index].freecount == 0,
+            "a chunk that is now full must leave the free-inode tree"
         );
-        let _ = finobt; // read below; named here so the guard reads plainly
 
-        let mut new_agi = agi_raw.clone();
+        *trees.chunks_mut() = chunks.clone();
         let freecount: u32 = chunks.iter().map(|c| u32::from(c.freecount)).sum();
-        new_agi[agi_at::FREECOUNT..agi_at::FREECOUNT + 4].copy_from_slice(&freecount.to_be_bytes());
         if added_inodes > 0 {
             // The group holds more inodes than it did, and `agi_newino`
             // names the chunk a search should start from -- the kernel
             // set it to the new chunk's first inode.
-            let count = agi.count + added_inodes;
-            new_agi[agi_at::COUNT..agi_at::COUNT + 4].copy_from_slice(&count.to_be_bytes());
-            new_agi[agi_at::NEWINO..agi_at::NEWINO + 4]
-                .copy_from_slice(&chunks[index].startino.to_be_bytes());
+            trees.set_counts(
+                trees.agi().count + added_inodes,
+                freecount,
+                Some(chunks[index].startino),
+            );
+        } else {
+            trees.set_counts(trees.agi().count, freecount, None);
         }
-        // The checksum is left stale on purpose — recovery recomputes it,
-        // and writing it here would dirty a chunk nothing else touches and
-        // add an operation to the record. See `group_write::restamp_crc`.
+        let inode_tree_items = trees.into_items()?;
 
         // The parent gains an entry, so its fork and its size change —
         // unless the entry will not fit, in which case the directory
@@ -744,32 +692,6 @@ impl Filesystem {
         let mut fork_op = fork;
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
-        let ag_bb = ag_start / BBSIZE as u64;
-        let agi_item = changed_chunks(
-            ag_bb + 2 * sector / BBSIZE as u64,
-            &agi_raw,
-            new_agi,
-            BLFT_AGI,
-        );
-        let inobt_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agi.root),
-            &inobt_raw,
-            new_inobt,
-            BLFT_BTREE,
-        );
-        let finobt_item = finobt.then(|| {
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agi.free_root),
-                &finobt_raw,
-                new_finobt,
-                BLFT_BTREE,
-            )
-        });
-        inobt_raw.clear();
-        finobt_raw.clear();
-
-        // Three operations for the parent — format, core and entries —
-        // and two for the new inode, which logs no fork of its own.
         // The new inode's own fork operation, when it has one.
         let new_dsize = new_fork.len();
         let mut new_fork_op = new_fork;
@@ -792,9 +714,7 @@ impl Filesystem {
 
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + usize::from(icreate.is_some())
-            + agi_item.op_count()
-            + inobt_item.op_count()
-            + finobt_item.as_ref().map_or(0, |i| i.op_count())
+            + inode_tree_items.iter().map(|i| i.op_count()).sum::<usize>()
             + extra.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + new_ops;
@@ -827,9 +747,7 @@ impl Filesystem {
                     data: data.clone(),
                 });
             }
-            ops.extend(agi_item.ops());
-            ops.extend(inobt_item.ops());
-            if let Some(item) = &finobt_item {
+            for item in &inode_tree_items {
                 ops.extend(item.ops());
             }
             for item in &extra {

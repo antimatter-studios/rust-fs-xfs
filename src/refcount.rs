@@ -75,6 +75,7 @@ pub fn shape() -> crate::ag_btree::Shape {
         magic_v5: XFS_REFC_CRC_MAGIC,
         record_len: RECORD,
         key_len: KEY,
+        overlapping: false,
     }
 }
 
@@ -87,6 +88,34 @@ pub fn decode(buf: &[u8], at: usize) -> Refcount {
         refcount: u32::from_be_bytes(buf[at + 8..at + 12].try_into().expect("4 bytes")),
         cow: raw & COW_FLAG != 0,
     }
+}
+
+/// One record written at `at` bytes into `buf`.
+///
+/// The copy-on-write flag rides in the top bit of the start block,
+/// which is why the start is not simply written out: a staging record
+/// whose flag was folded into its block number would name a block a
+/// billion blocks away.
+pub fn encode(buf: &mut [u8], at: usize, record: &Refcount) {
+    let start = if record.cow {
+        record.startblock | COW_FLAG
+    } else {
+        record.startblock
+    };
+    buf[at..at + 4].copy_from_slice(&start.to_be_bytes());
+    buf[at + 4..at + 8].copy_from_slice(&record.blockcount.to_be_bytes());
+    buf[at + 8..at + 12].copy_from_slice(&record.refcount.to_be_bytes());
+}
+
+/// The key that stands for a record in a node: its start block alone,
+/// four bytes where a record is twelve.
+pub fn encode_key(buf: &mut [u8], at: usize, record: &Refcount) {
+    let start = if record.cow {
+        record.startblock | COW_FLAG
+    } else {
+        record.startblock
+    };
+    buf[at..at + 4].copy_from_slice(&start.to_be_bytes());
 }
 
 /// Every reference-count record in a group, however deep its tree.

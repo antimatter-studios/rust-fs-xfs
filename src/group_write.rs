@@ -271,33 +271,51 @@ pub fn split_fsblock(sb: &Superblock, fsblock: u64) -> (u32, u32) {
 /// diffs of the same buffer from reaching the log.
 pub(crate) struct GroupAlloc<'a> {
     sb: &'a Superblock,
+    device: &'a dyn fs_core::BlockRead,
     agno: u32,
     /// Byte offset of the group on the device.
     ag_start: u64,
-    /// The group header and the tree roots as they were before any of
-    /// this, which is what every change is diffed against.
+    /// The group header as it was, which every change is diffed
+    /// against.
     agf_raw: Vec<u8>,
-    agf: crate::ag::Agf,
-    bno_raw: Vec<u8>,
-    cnt_raw: Vec<u8>,
+    /// Every block of every tree read here, as it was. A tree laid out
+    /// again writes over the blocks it already had, and a block whose
+    /// bytes come out the same is not logged at all.
+    before: std::collections::HashMap<u32, Vec<u8>>,
+    /// The blocks each tree occupies, leaves first and root last --
+    /// the order [`crate::ag_btree::build`] wants them in.
+    bno_blocks: Vec<u32>,
+    cnt_blocks: Vec<u32>,
     /// Free space in block order, as it stands after the takes so far.
     by_block: Vec<FreeExtent>,
-    /// The reverse-mapping root and its records, where the filesystem
-    /// has that tree.
-    rmap: Option<(Vec<u8>, Vec<crate::rmap::Rmap>)>,
+    /// The reverse-mapping tree's records and blocks, where the
+    /// filesystem has that tree.
+    rmap: Option<(Vec<crate::rmap::Rmap>, Vec<u32>)>,
+    /// The group's free list: where a growing tree gets a block and
+    /// where a shrinking one puts it back.
+    agfl: crate::agfl::Agfl,
+    agfl_raw: Vec<u8>,
+    /// The reference-count tree's records and blocks, where the
+    /// filesystem has reflink and the tree exists. A reflink filesystem
+    /// that has never shared anything has the feature and no tree.
+    refcount: Option<(Vec<crate::refcount::Refcount>, Vec<u32>)>,
     /// Whether anything has actually been taken. Nothing taken means
-    /// nothing to log, rather than four items whose diffs are empty.
+    /// nothing to log, rather than items whose diffs are empty.
     took: bool,
 }
 
 impl<'a> GroupAlloc<'a> {
-    /// Read the group's header and trees, and check that all of them
-    /// are shapes this can maintain.
+    /// Read the group's header, its free list and its trees.
+    ///
+    /// The trees are read whole, however deep they are: a group in use
+    /// has more free runs than one block holds, and the edit below lays
+    /// the tree out again rather than reaching into it.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] when any of the trees is more than
-    /// one level deep, where taking a record out can collapse a node.
+    /// Whatever reading the group's trees returns, and
+    /// [`Error::BadSuperblock`] for a free list whose header does not
+    /// describe the blocks it holds.
     pub(crate) fn open(
         sb: &'a Superblock,
         device: &'a dyn fs_core::BlockRead,
@@ -314,62 +332,114 @@ impl<'a> GroupAlloc<'a> {
         device.read_at(ag_start + sector, &mut agf_raw)?;
         let agf = Agf::parse(&agf_raw, sb, agno)?;
 
-        for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
-            if agf.levels[which] != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s {name} free-space tree is {} levels deep, \
-                     where taking a record out can collapse a node; only a single-level \
-                     tree is supported",
-                    agf.levels[which]
-                )));
-            }
-        }
+        // THE FREE LIST. A tree that grows takes a block from here and
+        // one that shrinks puts it back, because the block cannot come
+        // out of the free-space tree -- taking it is the edit that
+        // needed it. Its header has to describe the blocks it holds
+        // before anything here edits the group: a count that disagrees
+        // with the indices means the group's own accounting is already
+        // wrong, and laying its trees out again on top of that would
+        // bury the evidence.
+        let mut agfl_raw = vec![0u8; sb.sectsize as usize];
+        device.read_at(ag_start + sector * 3, &mut agfl_raw)?;
+        let agfl = crate::agfl::Agfl::parse(&agfl_raw, sb, &agf, agno)?;
 
-        let mut bno_raw = vec![0u8; sb.blocksize as usize];
-        device.read_at(
-            ag_start + u64::from(agf.roots[BNO]) * blocksize,
-            &mut bno_raw,
+        let mut before: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+
+        // Reading through the walker records every block as it goes, so
+        // the before-images cost nothing beyond the read the walk was
+        // making anyway.
+        let mut read = |agblock: u32| -> Result<Vec<u8>> {
+            let mut raw = vec![0u8; sb.blocksize as usize];
+            device.read_at(ag_start + u64::from(agblock) * blocksize, &mut raw)?;
+            Ok(raw)
+        };
+
+        let (by_block, bno_blocks) = crate::ag_btree::walk_blocks(
+            sb,
+            crate::alloc_btree::Order::ByBlock.shape(),
+            agno,
+            agf.roots[BNO],
+            agf.levels[BNO],
+            &mut read,
+            crate::alloc_btree::decode_free_extent,
         )?;
-        let mut cnt_raw = vec![0u8; sb.blocksize as usize];
-        device.read_at(
-            ag_start + u64::from(agf.roots[CNT]) * blocksize,
-            &mut cnt_raw,
+        // The by-length tree holds the same records in another order, so
+        // only its blocks are wanted -- but they have to be read to be
+        // known, and their contents are what the new tree is diffed
+        // against.
+        let (_, cnt_blocks) = crate::ag_btree::walk_blocks(
+            sb,
+            crate::alloc_btree::Order::ByCount.shape(),
+            agno,
+            agf.roots[CNT],
+            agf.levels[CNT],
+            &mut read,
+            crate::alloc_btree::decode_free_extent,
         )?;
 
-        let numrecs = leaf_numrecs(&bno_raw, btree::RECORD)?;
-        let by_block = leaf_records(&bno_raw, numrecs);
-
-        let rmap = if sb.has_rmapbt() {
-            if agf.levels[RMAP] != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
-                     where inserting a record can split a node; only a single-level tree \
-                     is supported",
-                    agf.levels[RMAP]
-                )));
-            }
-            let mut rmap_raw = vec![0u8; sb.blocksize as usize];
-            device.read_at(
-                ag_start + u64::from(agf.roots[RMAP]) * blocksize,
-                &mut rmap_raw,
+        // A FILESYSTEM CAN HAVE THE FEATURE AND A GROUP NO TREE.
+        //
+        // `has_rmapbt` is the superblock's, and the group's own header
+        // is what says whether this group has the tree yet. Reading the
+        // feature and then trusting `roots[RMAP]` walks whatever block
+        // zero happens to be -- which is the superblock, and the error
+        // says "rmapbt block 0 has magic XFSB".
+        let rmap = if sb.has_rmapbt() && agf.levels[RMAP] > 0 {
+            let (records, blocks) = crate::ag_btree::walk_blocks(
+                sb,
+                crate::rmap::shape(),
+                agno,
+                agf.roots[RMAP],
+                agf.levels[RMAP],
+                &mut read,
+                crate::rmap::decode,
             )?;
-            let n = leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
-            let records = crate::rmap::leaf_records(&rmap_raw, n);
-            Some((rmap_raw, records))
+            Some((records, blocks))
         } else {
             None
         };
 
+        let refcount = if sb.has_reflink() && agf.refcount_level > 0 {
+            let (records, blocks) = crate::ag_btree::walk_blocks(
+                sb,
+                crate::refcount::shape(),
+                agno,
+                agf.refcount_root,
+                agf.refcount_level,
+                &mut read,
+                crate::refcount::decode,
+            )?;
+            Some((records, blocks))
+        } else {
+            None
+        };
+
+        for &agblock in bno_blocks
+            .iter()
+            .chain(cnt_blocks.iter())
+            .chain(rmap.iter().flat_map(|(_, b)| b.iter()))
+            .chain(refcount.iter().flat_map(|(_, b)| b.iter()))
+        {
+            let mut raw = vec![0u8; sb.blocksize as usize];
+            device.read_at(ag_start + u64::from(agblock) * blocksize, &mut raw)?;
+            before.insert(agblock, raw);
+        }
+
         Ok(GroupAlloc {
             sb,
+            device,
             agno,
             ag_start,
             agf_raw,
-            agf,
-            bno_raw,
-            cnt_raw,
+            before,
+            bno_blocks,
+            cnt_blocks,
             by_block,
             rmap,
+            refcount,
+            agfl,
+            agfl_raw,
             took: false,
         })
     }
@@ -391,9 +461,7 @@ impl<'a> GroupAlloc<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] when no single run is long enough,
-    /// or when the result would need more records than a tree root
-    /// holds.
+    /// [`Error::UnsupportedFeature`] when no single run is long enough.
     pub(crate) fn take(&mut self, want: u32, owner: i64, offset: u64) -> Result<u32> {
         use crate::alloc_btree::{alloc_extent, longest};
 
@@ -416,20 +484,11 @@ impl<'a> GroupAlloc<'a> {
         };
         alloc_extent(&mut self.by_block, taking)?;
 
-        let capacity = leaf_capacity(self.sb.blocksize);
-        if self.by_block.len() > capacity {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno} would need {} free-space records and its tree root \
-                 holds {capacity}; splitting a node is not implemented",
-                self.by_block.len()
-            )));
-        }
-
         // The reverse map, where the filesystem has one. Blocks that
         // have just left free space belong to `owner` from here on, and
         // a tree that does not say so describes a filesystem where they
         // belong to nobody.
-        if let Some((_, records)) = self.rmap.as_mut() {
+        if let Some((records, _)) = self.rmap.as_mut() {
             crate::rmap::insert(
                 records,
                 crate::rmap::Rmap {
@@ -439,87 +498,286 @@ impl<'a> GroupAlloc<'a> {
                     offset,
                 },
             )?;
-            let rmap_capacity = crate::rmap::capacity(self.sb.blocksize);
-            if records.len() > rmap_capacity {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno} would need {} reverse-mapping records and its \
-                     tree root holds {rmap_capacity}; splitting a node is not implemented",
-                    records.len()
-                )));
-            }
         }
 
         self.took = true;
         Ok(taking.startblock)
     }
 
+    /// Give an extent back to free space, merging it with whatever it
+    /// adjoins.
+    ///
+    /// The counterpart of [`GroupAlloc::take`], and the reason both live
+    /// on the same type: an operation that frees in one group and
+    /// allocates in it -- a truncate that returns blocks and a directory
+    /// that grows in the same record -- has to see one free list, not
+    /// two readings of the same one.
+    pub(crate) fn give_back(&mut self, extent: FreeExtent) -> Result<crate::alloc_btree::Freed> {
+        let freed = crate::alloc_btree::free_extent(&mut self.by_block, extent)?;
+        self.took = true;
+        Ok(freed)
+    }
+
+    /// Take an extent's ownership record out of the reverse map.
+    ///
+    /// Matched exactly: a record that does not line up with the extent
+    /// means the tree and the inode disagree, and the free must not go
+    /// ahead on top of that. Does nothing where the filesystem has no
+    /// reverse-mapping tree.
+    pub(crate) fn forget_rmap(&mut self, record: crate::rmap::Rmap) -> Result<()> {
+        if let Some((records, _)) = self.rmap.as_mut() {
+            crate::rmap::remove(records, record)?;
+            self.took = true;
+        }
+        Ok(())
+    }
+
+    /// Give up one reference to `startblock..+blockcount`, and say which
+    /// of those blocks may go back to free space.
+    ///
+    /// Everything on a filesystem without the reference-count tree, and
+    /// on one with it, whatever [`crate::refcount::release`] decides --
+    /// which is never the blocks another file still holds.
+    pub(crate) fn release_shared(
+        &mut self,
+        startblock: u32,
+        blockcount: u32,
+    ) -> Result<Vec<FreeExtent>> {
+        let Some((records, _)) = self.refcount.as_mut() else {
+            return Ok(vec![FreeExtent {
+                startblock,
+                blockcount,
+            }]);
+        };
+        let before = records.clone();
+        let ranges = crate::refcount::release(records, startblock, blockcount)?;
+        if *records != before {
+            self.took = true;
+        }
+        Ok(ranges)
+    }
+
+    /// Lay one tree out again, through the shared layout.
+    fn relay<T, E, K>(
+        &mut self,
+        shape: crate::ag_btree::Shape,
+        records: &[T],
+        held: &[u32],
+        encode_record: E,
+        write_keys: K,
+        items: &mut Vec<BufferItem>,
+    ) -> Result<Vec<u32>>
+    where
+        E: Fn(&mut [u8], usize, &T),
+        K: Fn(&mut [u8], usize, &[T]),
+    {
+        crate::ag_btree::relay(
+            self.sb,
+            self.device,
+            self.ag_start,
+            shape,
+            self.agno,
+            records,
+            held,
+            &self.before,
+            &mut self.agfl,
+            encode_record,
+            write_keys,
+            items,
+        )
+    }
+
     /// The buffer items recording everything taken.
     ///
     /// One item per buffer however many takes there were: the group
-    /// header, the by-block tree, the by-length tree and — where the
-    /// filesystem has one — the reverse-mapping tree, in that order.
-    /// Nothing is written; the items are the change, and the caller
-    /// puts them in a record.
-    pub(crate) fn into_items(self) -> Result<Vec<BufferItem>> {
+    /// header, the free list where it moved, and every block of every
+    /// tree whose bytes changed. Nothing is written; the items are the
+    /// change, and the caller puts them in a record.
+    pub(crate) fn into_items(mut self) -> Result<Vec<BufferItem>> {
         use crate::ag::agf_btree::{BNO, CNT, RMAP};
-        use crate::alloc_btree::{expected_blkno, longest, total_free};
-        use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
+        use crate::ag::offsets::agf;
+        use crate::alloc_btree::{longest, total_free};
+        use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_AGFL};
         use crate::log::BBSIZE;
 
         if !self.took {
             return Ok(Vec::new());
         }
 
-        let sb = self.sb;
         let agno = self.agno;
-        let sector = u64::from(sb.sectsize);
+        let sector = u64::from(self.sb.sectsize);
+        let mut items = Vec::new();
 
-        let mut by_count = self.by_block.clone();
+        let by_block = std::mem::take(&mut self.by_block);
+        let mut by_count = by_block.clone();
         by_count.sort_by_key(|e| (e.blockcount, e.startblock));
 
-        let new_bno = rebuild_leaf(&self.bno_raw, &self.by_block);
-        let new_cnt = rebuild_leaf(&self.cnt_raw, &by_count);
+        let held = std::mem::take(&mut self.bno_blocks);
+        let bno_blocks = self.relay(
+            crate::alloc_btree::Order::ByBlock.shape(),
+            &by_block,
+            &held,
+            crate::alloc_btree::encode_free_extent,
+            |buf, at, recs: &[FreeExtent]| {
+                crate::alloc_btree::encode_free_extent(buf, at, &recs[0])
+            },
+            &mut items,
+        )?;
 
+        let held = std::mem::take(&mut self.cnt_blocks);
+        let cnt_blocks = self.relay(
+            crate::alloc_btree::Order::ByCount.shape(),
+            &by_count,
+            &held,
+            crate::alloc_btree::encode_free_extent,
+            |buf, at, recs: &[FreeExtent]| {
+                crate::alloc_btree::encode_free_extent(buf, at, &recs[0])
+            },
+            &mut items,
+        )?;
+
+        let (rmap_blocks, rmap_records) = match self.rmap.take() {
+            None => (Vec::new(), 0),
+            Some((records, held)) => {
+                let count = records.len();
+                let blocks = self.relay(
+                    crate::rmap::shape(),
+                    &records,
+                    &held,
+                    crate::rmap::encode,
+                    crate::rmap::write_keys,
+                    &mut items,
+                )?;
+                (blocks, count)
+            }
+        };
+
+        let (refcount_blocks, refcount_records) = match self.refcount.take() {
+            None => (Vec::new(), 0),
+            Some((records, held)) => {
+                let count = records.len();
+                let blocks = self.relay(
+                    crate::refcount::shape(),
+                    &records,
+                    &held,
+                    crate::refcount::encode,
+                    |buf, at, recs: &[crate::refcount::Refcount]| {
+                        crate::refcount::encode_key(buf, at, &recs[0])
+                    },
+                    &mut items,
+                )?;
+                (blocks, count)
+            }
+        };
+
+        // THE HEADER LAST, because it describes what the trees came out
+        // as rather than what they were asked for.
         let mut new_agf = self.agf_raw.clone();
-        let freeblks = u32::try_from(total_free(&self.by_block)).map_err(|_| {
+        let freeblks = u32::try_from(total_free(&by_block)).map_err(|_| {
             Error::CorruptLog(format!(
                 "allocation group {agno} has more free blocks than fit"
             ))
         })?;
         new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
-        new_agf[agf::LONGEST..agf::LONGEST + 4]
-            .copy_from_slice(&longest(&self.by_block).to_be_bytes());
+        new_agf[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&longest(&by_block).to_be_bytes());
+
+        let root_of = |blocks: &[u32]| *blocks.last().expect("a tree has at least one block");
+        let level_of =
+            |blocks: &[u32], shape: crate::ag_btree::Shape, records: usize| -> Result<u32> {
+                let plan =
+                    crate::ag_btree::plan(shape, self.sb.blocksize, self.sb.is_v5(), records)?;
+                debug_assert_eq!(plan.iter().sum::<usize>(), blocks.len());
+                Ok(plan.len() as u32)
+            };
+
+        let bno_level = level_of(
+            &bno_blocks,
+            crate::alloc_btree::Order::ByBlock.shape(),
+            by_block.len(),
+        )?;
+        let cnt_level = level_of(
+            &cnt_blocks,
+            crate::alloc_btree::Order::ByCount.shape(),
+            by_count.len(),
+        )?;
+        let put = |buf: &mut [u8], at: usize, v: u32| {
+            buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        };
+        put(&mut new_agf, agf::ROOTS + BNO * 4, root_of(&bno_blocks));
+        put(&mut new_agf, agf::ROOTS + CNT * 4, root_of(&cnt_blocks));
+        put(&mut new_agf, agf::LEVELS + BNO * 4, bno_level);
+        put(&mut new_agf, agf::LEVELS + CNT * 4, cnt_level);
+
+        // MEASURED, on a fixture whose three trees are all two levels
+        // deep: `btreeblks` 21 with a by-block tree of 4 blocks, a
+        // by-length tree of 4 and a reverse-mapping tree of 16 --
+        // (4-1) + (4-1) + (16-1). It counts what the trees hold BELOW
+        // their roots, across all three. `rmap_blocks` counts that tree
+        // whole, root included: 16.
+        let mut btreeblks = (bno_blocks.len() - 1) + (cnt_blocks.len() - 1);
+        if !rmap_blocks.is_empty() {
+            btreeblks += rmap_blocks.len() - 1;
+            put(&mut new_agf, agf::ROOTS + RMAP * 4, root_of(&rmap_blocks));
+            put(
+                &mut new_agf,
+                agf::LEVELS + RMAP * 4,
+                level_of(&rmap_blocks, crate::rmap::shape(), rmap_records)?,
+            );
+            put(&mut new_agf, agf::RMAP_BLOCKS, rmap_blocks.len() as u32);
+        }
+        // The reference-count tree keeps its own count and its own
+        // root, and is NOT part of `btreeblks` -- that field is the
+        // free-space and reverse-mapping trees, which is what the
+        // measurement above covers.
+        if !refcount_blocks.is_empty() {
+            put(&mut new_agf, agf::REFCOUNT_ROOT, root_of(&refcount_blocks));
+            put(
+                &mut new_agf,
+                agf::REFCOUNT_LEVEL,
+                level_of(&refcount_blocks, crate::refcount::shape(), refcount_records)?,
+            );
+            put(
+                &mut new_agf,
+                agf::REFCOUNT_BLOCKS,
+                refcount_blocks.len() as u32,
+            );
+        }
+
+        put(
+            &mut new_agf,
+            agf::BTREEBLKS,
+            u32::try_from(btreeblks).map_err(|_| {
+                Error::CorruptLog(format!(
+                    "allocation group {agno}'s trees hold more blocks than fit"
+                ))
+            })?,
+        );
+
+        // The free list, which the trees may have taken from or given
+        // back to.
+        put(&mut new_agf, agf::FLFIRST, self.agfl.first());
+        put(&mut new_agf, agf::FLLAST, self.agfl.last());
+        put(&mut new_agf, agf::FLCOUNT, self.agfl.count());
         // The checksum is left stale on purpose — recovery recomputes it.
 
         let ag_bb = self.ag_start / BBSIZE as u64;
-        let mut items = vec![
+        items.insert(
+            0,
             changed_chunks(
                 ag_bb + sector / BBSIZE as u64,
                 &self.agf_raw,
                 new_agf,
                 BLFT_AGF,
             ),
-            changed_chunks(
-                expected_blkno(sb, agno, self.agf.roots[BNO]),
-                &self.bno_raw,
-                new_bno,
-                BLFT_BTREE,
-            ),
-            changed_chunks(
-                expected_blkno(sb, agno, self.agf.roots[CNT]),
-                &self.cnt_raw,
-                new_cnt,
-                BLFT_BTREE,
-            ),
-        ];
+        );
 
-        if let Some((rmap_raw, records)) = self.rmap {
-            let new_rmap = crate::rmap::rebuild_leaf(&rmap_raw, &records);
+        let after = self.agfl.after(self.sb);
+        if after != self.agfl_raw {
             items.push(changed_chunks(
-                expected_blkno(sb, agno, self.agf.roots[RMAP]),
-                &rmap_raw,
-                new_rmap,
-                BLFT_BTREE,
+                ag_bb + sector * 3 / BBSIZE as u64,
+                &self.agfl_raw,
+                after,
+                BLFT_AGFL,
             ));
         }
 
@@ -660,6 +918,24 @@ mod tests {
             let at = SECTSIZE as usize;
             dev[at..at + agf_raw.len()].copy_from_slice(&agf_raw);
 
+            // THE FREE LIST, empty but present. A group without one is
+            // not a group: the editor checks that the list's header
+            // describes the blocks it holds before it changes anything,
+            // and a fixture missing the sector would be exercising the
+            // editor against a filesystem that could not exist.
+            let mut agfl_raw = vec![0u8; SECTSIZE as usize];
+            agfl_raw[crate::agfl::offsets::MAGIC..crate::agfl::offsets::MAGIC + 4]
+                .copy_from_slice(&crate::ag::XFS_AGFL_MAGIC.to_be_bytes());
+            agfl_raw[crate::agfl::offsets::SEQNO..crate::agfl::offsets::SEQNO + 4]
+                .copy_from_slice(&0u32.to_be_bytes());
+            agfl_raw[crate::agfl::offsets::UUID..crate::agfl::offsets::UUID + 16]
+                .copy_from_slice(&sb.meta_uuid);
+            let crc = crc32c_with_zeroed_crc(&agfl_raw, crate::agfl::offsets::CRC);
+            agfl_raw[crate::agfl::offsets::CRC..crate::agfl::offsets::CRC + 4]
+                .copy_from_slice(&crc.to_le_bytes());
+            let at = SECTSIZE as usize * 3;
+            dev[at..at + agfl_raw.len()].copy_from_slice(&agfl_raw);
+
             let free = vec![FreeExtent {
                 startblock: FREE_START,
                 blockcount: FREE_LEN,
@@ -681,7 +957,15 @@ mod tests {
                 block[16..24].copy_from_slice(&blkno.to_be_bytes());
                 block[32..48].copy_from_slice(&sb.meta_uuid);
                 block[48..52].copy_from_slice(&0u32.to_be_bytes()); // owner
-                let filled = rebuild_leaf(&block, &free);
+                let mut filled = rebuild_leaf(&block, &free);
+                // CHECKSUMMED, because the editor reads these through
+                // the same walker the driver reads a real filesystem
+                // with, and that walker checks. A fixture the reader
+                // would refuse is a fixture that proves nothing about
+                // the writer.
+                let crc = crc32c_with_zeroed_crc(&filled, crate::ag_btree::offsets::CRC);
+                filled[crate::ag_btree::offsets::CRC..crate::ag_btree::offsets::CRC + 4]
+                    .copy_from_slice(&crc.to_le_bytes());
                 let at = root as usize * BLOCKSIZE as usize;
                 dev[at..at + filled.len()].copy_from_slice(&filled);
             }
