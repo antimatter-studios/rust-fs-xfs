@@ -186,6 +186,23 @@ fn mount_counting(img: &Path) -> (Filesystem, Arc<CountingDevice>) {
     (fs, counter)
 }
 
+/// The same, with the block cache switched off.
+///
+/// For the tests that COUNT reads rather than check bytes. `mount`
+/// puts a 512-block cache in front of the device, and the counter sits
+/// below it, so a cached mount reports what survived the cache rather
+/// than what the driver asked for. That is the right thing to measure
+/// when the question is "what does this cost a user", and the wrong
+/// thing entirely when the question is "does this code path ask for
+/// less than that one" -- with a warm cache both ask for nothing, and
+/// the comparison silently becomes one of which test ran first.
+fn mount_counting_uncached(img: &Path) -> (Filesystem, Arc<CountingDevice>) {
+    let file = FileDevice::open(img).expect("open the fixture");
+    let counter = CountingDevice::new(Arc::new(file));
+    let fs = Filesystem::mount_with_cache(counter.clone(), 0).expect("mount the fixture");
+    (fs, counter)
+}
+
 /// Walk every directory, so the assertions below run against whatever
 /// the fixture actually contains rather than a path assumed to exist.
 fn walk(fs: &Filesystem, path: &str, out: &mut Vec<(String, bool)>) {
@@ -335,13 +352,30 @@ fn ranged_reads_agree_with_the_whole_file() {
 /// only the parsed inode, so a caller that goes on to read the file
 /// fetches the last inode a second time. `open` keeps it. This counts
 /// the device reads on both routes and requires the handle to do fewer.
+///
+/// # Why this one mounts without a cache
+///
+/// It broke when `mount` gained one, and the way it broke is worth
+/// keeping in view: it did not fail, it started measuring something
+/// else. The counter sits below the cache, so once the cache holds the
+/// inode both routes reach the device zero times -- and the comparison
+/// becomes "which of the two ran first and warmed it", which is not a
+/// property of either route. The run that caught this reported
+/// `handle=1 reads, low-level=0 reads`: the handle looked WORSE, purely
+/// because it went first and paid for the fetch the other one then got
+/// free.
+///
+/// Nothing was wrong with the driver, and nothing was wrong with the
+/// cache. The measurement had quietly stopped being about the thing it
+/// names. With the cache off, every read reaches the counter and the
+/// question the test asks is the one in its title again.
 #[test]
 fn the_handle_does_strictly_less_io_than_the_low_level_route() {
     let Some(img) = fixture_with_content() else {
         eprintln!("no fixture with content in .vm-share — skipping");
         return;
     };
-    let (fs, counter) = mount_counting(&img);
+    let (fs, counter) = mount_counting_uncached(&img);
 
     let mut found = Vec::new();
     walk(&fs, "/", &mut found);
