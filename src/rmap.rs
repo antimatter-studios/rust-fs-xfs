@@ -142,6 +142,11 @@ pub fn shape() -> crate::ag_btree::Shape {
         magic_v5: XFS_RMAP_CRC_MAGIC,
         record_len: RECORD,
         key_len: KEY,
+        // AN INTERVAL TREE. A node entry carries the lowest key below
+        // it and the highest, so a search for an overlapping range can
+        // tell whether it need descend at all -- and so a node holds
+        // fewer entries than its key width alone suggests.
+        overlapping: true,
     }
 }
 
@@ -172,6 +177,43 @@ pub fn encode_key(buf: &mut [u8], at: usize, record: &Rmap) {
     buf[at..at + 4].copy_from_slice(&record.startblock.to_be_bytes());
     buf[at + 4..at + 12].copy_from_slice(&record.owner.to_be_bytes());
     buf[at + 12..at + 20].copy_from_slice(&record.offset.to_be_bytes());
+}
+
+/// The keys a node entry holds for the subtree beneath it: the lowest,
+/// then the highest.
+///
+/// THE HIGH KEY IS THE MAXIMUM OVER THE WHOLE SUBTREE, not the key of
+/// its last record. This is an interval tree because an extent can be
+/// owned twice -- that is what a reflink filesystem is -- so a record
+/// early in the subtree can reach past every record after it, and a
+/// search that trusted the last record's end would miss it.
+///
+/// Measured against a kernel-written node: its first entry reads
+/// `[0,-3,0,0,0]` low and `[388,95,0,0,0]` high, over a leaf whose
+/// first record is `[0,2,-3,0]` -- so the low key is the first record's
+/// key, and the high key is a record's END, `startblock + blockcount -
+/// 1`, taken from whichever record reaches furthest.
+pub fn write_keys(buf: &mut [u8], at: usize, records: &[Rmap]) {
+    let Some(first) = records.first() else {
+        return;
+    };
+    encode_key(buf, at, first);
+
+    let high = records
+        .iter()
+        .map(|r| {
+            (
+                u64::from(r.startblock) + u64::from(r.blockcount) - 1,
+                r.owner,
+                r.offset + u64::from(r.blockcount) - 1,
+            )
+        })
+        .max()
+        .expect("at least one record");
+    let at = at + KEY;
+    buf[at..at + 4].copy_from_slice(&(high.0 as u32).to_be_bytes());
+    buf[at + 4..at + 12].copy_from_slice(&high.1.to_be_bytes());
+    buf[at + 12..at + 20].copy_from_slice(&high.2.to_be_bytes());
 }
 
 /// Every reverse-mapping record in a group, however deep its tree.

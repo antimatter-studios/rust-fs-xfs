@@ -119,6 +119,7 @@ impl Order {
             magic_v5: self.magic(true),
             record_len: RECORD_LEN,
             key_len: KEY_LEN,
+            overlapping: false,
         }
     }
 

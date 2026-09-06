@@ -291,6 +291,10 @@ pub(crate) struct GroupAlloc<'a> {
     /// The reverse-mapping tree's records and blocks, where the
     /// filesystem has that tree.
     rmap: Option<(Vec<crate::rmap::Rmap>, Vec<u32>)>,
+    /// The group's free list: where a growing tree gets a block and
+    /// where a shrinking one puts it back.
+    agfl: crate::agfl::Agfl,
+    agfl_raw: Vec<u8>,
     /// The reference-count tree's records and blocks, where the
     /// filesystem has reflink and the tree exists. A reflink filesystem
     /// that has never shared anything has the feature and no tree.
@@ -328,14 +332,17 @@ impl<'a> GroupAlloc<'a> {
         device.read_at(ag_start + sector, &mut agf_raw)?;
         let agf = Agf::parse(&agf_raw, sb, agno)?;
 
-        // THE FREE LIST IS READ TO BE CHECKED, not yet to be used. Its
-        // header has to describe the blocks it holds before anything
-        // here edits the group: a count that disagrees with the indices
-        // means the group's own accounting is wrong, and laying its
-        // trees out again on top of that would bury the evidence.
+        // THE FREE LIST. A tree that grows takes a block from here and
+        // one that shrinks puts it back, because the block cannot come
+        // out of the free-space tree -- taking it is the edit that
+        // needed it. Its header has to describe the blocks it holds
+        // before anything here edits the group: a count that disagrees
+        // with the indices means the group's own accounting is already
+        // wrong, and laying its trees out again on top of that would
+        // bury the evidence.
         let mut agfl_raw = vec![0u8; sb.sectsize as usize];
         device.read_at(ag_start + sector * 3, &mut agfl_raw)?;
-        crate::agfl::Agfl::parse(&agfl_raw, sb, &agf, agno)?;
+        let agfl = crate::agfl::Agfl::parse(&agfl_raw, sb, &agf, agno)?;
 
         let mut before: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
 
@@ -371,7 +378,14 @@ impl<'a> GroupAlloc<'a> {
             crate::alloc_btree::decode_free_extent,
         )?;
 
-        let rmap = if sb.has_rmapbt() {
+        // A FILESYSTEM CAN HAVE THE FEATURE AND A GROUP NO TREE.
+        //
+        // `has_rmapbt` is the superblock's, and the group's own header
+        // is what says whether this group has the tree yet. Reading the
+        // feature and then trusting `roots[RMAP]` walks whatever block
+        // zero happens to be -- which is the superblock, and the error
+        // says "rmapbt block 0 has magic XFSB".
+        let rmap = if sb.has_rmapbt() && agf.levels[RMAP] > 0 {
             let (records, blocks) = crate::ag_btree::walk_blocks(
                 sb,
                 crate::rmap::shape(),
@@ -424,6 +438,8 @@ impl<'a> GroupAlloc<'a> {
             by_block,
             rmap,
             refcount,
+            agfl,
+            agfl_raw,
             took: false,
         })
     }
@@ -541,33 +557,31 @@ impl<'a> GroupAlloc<'a> {
         Ok(ranges)
     }
 
-    /// The blocks one tree should occupy after the edit.
+    /// The blocks one tree should occupy after the edit: the ones it
+    /// had, with the group's free list making up any difference.
     ///
-    /// THE SAME ONES, or this refuses. A tree that needs a block more
-    /// than it has must take one from the group's free list, and a tree
-    /// that needs one fewer must put it back -- both of which change the
-    /// free list, and a changed free list has to be logged with the
-    /// buffer type recovery expects for it. That code is not in the
-    /// corpus this driver's log format was read off: `buf_type`
-    /// records six codes as never exercised and names the AGFL as one
-    /// of the candidates, in an order it says outright is a guess.
-    /// Logging it as a guess would be recovery writing the free list
-    /// somewhere on the strength of a number nobody measured.
+    /// Surplus blocks come off the end, so the block that was the root
+    /// is the first to go back. Which block plays which part does not
+    /// matter -- every block states its own address and its parent
+    /// points at it by number -- so there is nothing to preserve beyond
+    /// the count.
     ///
-    /// So: records can be edited in a tree of any depth, and a tree
-    /// whose shape has to change says so. [`crate::agfl`] has the ring
-    /// arithmetic ready for when the type is measured.
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when the free list is empty and a
+    /// block is wanted, or full and one is being returned. Refilling it
+    /// from free space is a second edit of the trees this one is
+    /// already changing, and is not implemented.
     fn assign(&mut self, held: &[u32], wanted: usize) -> Result<Vec<u32>> {
-        if wanted != held.len() {
-            let agno = self.agno;
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno}: this edit needs a tree of {wanted} blocks where it \
-                 holds {}, and moving blocks on and off the group's free list is not \
-                 implemented",
-                held.len()
-            )));
+        let mut blocks = held.to_vec();
+        while blocks.len() < wanted {
+            blocks.push(self.agfl.take(self.sb, self.agno)?);
         }
-        Ok(held.to_vec())
+        while blocks.len() > wanted {
+            let spare = blocks.pop().expect("more blocks than wanted");
+            self.agfl.put(self.sb, self.agno, spare)?;
+        }
+        Ok(blocks)
     }
 
     /// Lay one tree out again over the blocks it should occupy, and
@@ -583,7 +597,7 @@ impl<'a> GroupAlloc<'a> {
     ) -> Result<Vec<u32>>
     where
         E: Fn(&mut [u8], usize, &T),
-        K: Fn(&mut [u8], usize, &T),
+        K: Fn(&mut [u8], usize, &[T]),
     {
         use crate::alloc_btree::expected_blkno;
         use crate::format::log_items::buf_log_format::buf_type::BLFT_BTREE;
@@ -641,7 +655,7 @@ impl<'a> GroupAlloc<'a> {
         use crate::ag::agf_btree::{BNO, CNT, RMAP};
         use crate::ag::offsets::agf;
         use crate::alloc_btree::{longest, total_free};
-        use crate::format::log_items::buf_log_format::buf_type::BLFT_AGF;
+        use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_AGFL};
         use crate::log::BBSIZE;
 
         if !self.took {
@@ -662,7 +676,9 @@ impl<'a> GroupAlloc<'a> {
             &by_block,
             &held,
             crate::alloc_btree::encode_free_extent,
-            crate::alloc_btree::encode_free_extent,
+            |buf, at, recs: &[FreeExtent]| {
+                crate::alloc_btree::encode_free_extent(buf, at, &recs[0])
+            },
             &mut items,
         )?;
 
@@ -672,7 +688,9 @@ impl<'a> GroupAlloc<'a> {
             &by_count,
             &held,
             crate::alloc_btree::encode_free_extent,
-            crate::alloc_btree::encode_free_extent,
+            |buf, at, recs: &[FreeExtent]| {
+                crate::alloc_btree::encode_free_extent(buf, at, &recs[0])
+            },
             &mut items,
         )?;
 
@@ -685,7 +703,7 @@ impl<'a> GroupAlloc<'a> {
                     &records,
                     &held,
                     crate::rmap::encode,
-                    crate::rmap::encode_key,
+                    crate::rmap::write_keys,
                     &mut items,
                 )?;
                 (blocks, count)
@@ -701,7 +719,9 @@ impl<'a> GroupAlloc<'a> {
                     &records,
                     &held,
                     crate::refcount::encode,
-                    crate::refcount::encode_key,
+                    |buf, at, recs: &[crate::refcount::Refcount]| {
+                        crate::refcount::encode_key(buf, at, &recs[0])
+                    },
                     &mut items,
                 )?;
                 (blocks, count)
@@ -791,6 +811,11 @@ impl<'a> GroupAlloc<'a> {
             })?,
         );
 
+        // The free list, which the trees may have taken from or given
+        // back to.
+        put(&mut new_agf, agf::FLFIRST, self.agfl.first());
+        put(&mut new_agf, agf::FLLAST, self.agfl.last());
+        put(&mut new_agf, agf::FLCOUNT, self.agfl.count());
         // The checksum is left stale on purpose — recovery recomputes it.
 
         let ag_bb = self.ag_start / BBSIZE as u64;
@@ -803,6 +828,16 @@ impl<'a> GroupAlloc<'a> {
                 BLFT_AGF,
             ),
         );
+
+        let after = self.agfl.after(self.sb);
+        if after != self.agfl_raw {
+            items.push(changed_chunks(
+                ag_bb + sector * 3 / BBSIZE as u64,
+                &self.agfl_raw,
+                after,
+                BLFT_AGFL,
+            ));
+        }
 
         Ok(items)
     }

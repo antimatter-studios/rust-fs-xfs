@@ -249,6 +249,7 @@ pub fn shape(which: Which, is_v5: bool) -> crate::ag_btree::Shape {
         magic_v5,
         record_len: RECORD_LEN,
         key_len: KEY_LEN,
+        overlapping: false,
     }
 }
 

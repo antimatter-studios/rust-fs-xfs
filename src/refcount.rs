@@ -75,6 +75,7 @@ pub fn shape() -> crate::ag_btree::Shape {
         magic_v5: XFS_REFC_CRC_MAGIC,
         record_len: RECORD,
         key_len: KEY,
+        overlapping: false,
     }
 }
 

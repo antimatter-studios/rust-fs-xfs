@@ -128,7 +128,7 @@ fn relay(img: &Path, fs: &Filesystem, agno: u32, order: Order) -> Result<usize, 
         &records,
         &blocks,
         encode_run,
-        encode_run,
+        |buf: &mut [u8], at, runs: &[FreeExtent]| encode_run(buf, at, &runs[0]),
     )
     .map_err(|e| e.to_string())?;
 
@@ -369,5 +369,74 @@ fn every_write_into_a_group_with_deep_trees_is_sound() {
     assert!(
         judged > 0,
         "no operation was judged — the test proved nothing"
+    );
+}
+
+/// Every record of every group tree, at whatever depth, read without
+/// error and in the tree's own order.
+///
+/// The reverse-mapping tree is the one that matters here. It is an
+/// interval tree -- a node entry carries the lowest key below it and the
+/// highest -- so its pointer array starts twice as far into the block as
+/// the other three. Reading it as though it held one key per entry took
+/// a pointer out of the middle of the key array, which came back as
+/// block zero, and block zero is the superblock. It could only happen at
+/// two levels or more, which is why no fixture caught it until these.
+#[test]
+fn every_group_tree_reads_at_whatever_depth_it_is() {
+    let fixtures = deep_fixtures();
+    if fixtures.is_empty() {
+        eprintln!("no xfsdeep-* fixtures — skipping");
+        return;
+    }
+
+    let mut deep = 0;
+    for src in &fixtures {
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fixture");
+        let device = FileDevice::open(src).expect("open the fixture");
+        let fs = Filesystem::mount(Arc::new(device)).expect("mount the fixture");
+        let sb = fs.superblock();
+
+        for agno in 0..sb.agcount {
+            let agf = fs.agf(agno).expect("the group header");
+
+            let free = fs
+                .free_extents(agno)
+                .unwrap_or_else(|e| panic!("{name} ag {agno}: free space: {e}"));
+            assert!(
+                free.windows(2).all(|w| w[0].startblock < w[1].startblock),
+                "{name} ag {agno}: free space came back out of order"
+            );
+
+            let rmap = fs
+                .rmap_records(agno)
+                .unwrap_or_else(|e| panic!("{name} ag {agno}: reverse map: {e}"));
+            assert!(
+                rmap.windows(2).all(|w| w[0].startblock <= w[1].startblock),
+                "{name} ag {agno}: the reverse map came back out of order"
+            );
+
+            if agf.levels[fs_xfs::ag::agf_btree::BNO] > 1
+                || agf.levels[fs_xfs::ag::agf_btree::RMAP] > 1
+            {
+                deep += 1;
+                eprintln!(
+                    "{name} ag {agno}: bno {} levels, rmap {} levels, {} free runs, {} \
+                     ownership records",
+                    agf.levels[fs_xfs::ag::agf_btree::BNO],
+                    agf.levels[fs_xfs::ag::agf_btree::RMAP],
+                    free.len(),
+                    rmap.len()
+                );
+            }
+        }
+    }
+
+    assert!(
+        deep > 0,
+        "no fixture had a tree deeper than one block — the test proved nothing"
     );
 }

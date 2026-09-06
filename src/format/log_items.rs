@@ -999,6 +999,16 @@ pub mod buf_log_format {
         pub const BLFT_BTREE: u16 = 4;
         /// `XAGF`.
         pub const BLFT_AGF: u16 = 5;
+        /// `XAFL` — the allocation group free list.
+        ///
+        /// Measured rather than guessed, and it was one of the guesses:
+        /// this constant was missing and 6 sat in `UNEXERCISED` below
+        /// with a note naming the free list as a candidate "in some
+        /// order -- but that ordering is a guess". Deleting three
+        /// hundred files from a fragmented group makes the kernel log
+        /// the list, and the item comes out as `start blkno: 3, flags:
+        /// 0x3000` -- which is 6 at [`super::BLF_TYPE_SHIFT`].
+        pub const BLFT_AGFL: u16 = 6;
         /// `XAGI`.
         pub const BLFT_AGI: u16 = 7;
         /// `IN` — an inode cluster. Always seen together with
@@ -1027,11 +1037,14 @@ pub mod buf_log_format {
         pub const BLFT_NONE: u16 = 0;
 
         /// Codes never exercised by any workload in the corpus: 1, 2, 3,
-        /// 6, 17 and everything from 19 up. Realtime bitmap and summary,
-        /// the AGFL, dquots, and the rmap and refcount btrees are the
-        /// obvious candidates, in some order — but that ordering is a
-        /// guess and is not recorded as one of the constants above.
-        pub const UNEXERCISED: &[u16] = &[1, 2, 3, 6, 17];
+        /// 17 and everything from 19 up. Realtime bitmap and summary,
+        /// dquots, and the rmap and refcount btrees are the obvious
+        /// candidates, in some order — but that ordering is a guess and
+        /// is not recorded as one of the constants above.
+        ///
+        /// 6 was on this list until the free list was made to move and
+        /// the log read back; it is [`BLFT_AGFL`] now.
+        pub const UNEXERCISED: &[u16] = &[1, 2, 3, 17];
 
         /// Code to the block magic observed at that address, as a table
         /// for anything that wants to check one against the other.
@@ -1039,6 +1052,7 @@ pub mod buf_log_format {
             (BLFT_NONE, "(cancel only)"),
             (BLFT_BTREE, "AB3B/AB3C/IAB3/FIB3/BMA3"),
             (BLFT_AGF, "XAGF"),
+            (BLFT_AGFL, "XAFL"),
             (BLFT_AGI, "XAGI"),
             (BLFT_DINO, "IN"),
             (BLFT_SYMLINK, "XSLM"),

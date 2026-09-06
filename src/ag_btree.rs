@@ -62,6 +62,33 @@ pub struct Shape {
     /// How wide one key is, in a node. Not always the record's width:
     /// a reference-count record is twelve bytes and its key is four.
     pub key_len: usize,
+    /// Whether a node entry carries TWO keys rather than one.
+    ///
+    /// The reverse-mapping tree is an interval tree: a node entry holds
+    /// the lowest key in the subtree below it AND the highest, so that a
+    /// search for an overlapping range can tell whether it need descend
+    /// at all. Measured on a real filesystem -- `xfs_db` prints its node
+    /// keys as `[startblock,owner,offset,attrfork,bmbtblock,
+    /// startblock_hi,owner_hi,offset_hi,attrfork_hi,bmbtblock_hi]`,
+    /// which is two twenty-byte keys and not one forty-byte one.
+    ///
+    /// It changes two things: how many entries fit in a node, and where
+    /// the pointer array starts. Getting the second wrong reads a
+    /// pointer out of the middle of the key array -- which came back as
+    /// block zero, and block zero is the superblock.
+    pub overlapping: bool,
+}
+
+impl Shape {
+    /// One key per node entry, or two where the tree is an interval
+    /// tree.
+    pub fn keys_per_entry(self) -> usize {
+        if self.overlapping {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 /// A header that has been read and checked.
@@ -182,7 +209,7 @@ pub fn parse_block(
     let per = if level == 0 {
         shape.record_len
     } else {
-        shape.key_len + PTR_LEN
+        shape.keys_per_entry() * shape.key_len + PTR_LEN
     };
     let max = maxrecs(space, per);
     let numrecs = be16(buf, offsets::NUMRECS);
@@ -308,8 +335,9 @@ where
         }
 
         // The pointers start after room for the maximum number of keys,
-        // not after the keys in use.
-        let first = node.body + node.maxrecs * shape.key_len;
+        // not after the keys in use -- and an overlapping tree has two
+        // keys per entry, so there is twice as much of that room.
+        let first = node.body + node.maxrecs * shape.keys_per_entry() * shape.key_len;
         let end = first + usize::from(node.numrecs) * PTR_LEN;
         if end > buf.len() {
             return Err(Error::BadSuperblock(format!(
@@ -352,7 +380,7 @@ pub fn plan(shape: Shape, blocksize: u32, is_v5: bool, records: usize) -> Result
     let header = if is_v5 { V5_HEADER_LEN } else { V4_HEADER_LEN };
     let space = blocksize as usize - header;
     let per_leaf = maxrecs(space, shape.record_len);
-    let per_node = maxrecs(space, shape.key_len + PTR_LEN);
+    let per_node = maxrecs(space, shape.keys_per_entry() * shape.key_len + PTR_LEN);
     if per_leaf == 0 || per_node < 2 {
         return Err(Error::UnsupportedFeature(format!(
             "a {} block of {blocksize} bytes holds {per_leaf} records and {per_node} \
@@ -401,10 +429,17 @@ pub struct Built {
 /// tree, leaves first and in the order [`plan`] describes; the caller
 /// owns where they come from, because taking one and giving one back
 /// are the group's business rather than the tree's. `encode_record`
-/// writes one record at an offset, and `key_of` writes the key that
-/// stands for a subtree -- which is the key of its first record, and
-/// not always its first bytes: a reference-count record is twelve bytes
-/// and its key is the four-byte start block.
+/// writes one record at an offset.
+///
+/// `write_keys` is handed the records beneath one child and writes the
+/// key or keys that stand for them. One key for three of the trees --
+/// the key of the first record, and not always its first bytes: a
+/// reference-count record is twelve bytes and its key is the four-byte
+/// start block. Two for the reverse map, which is an interval tree: the
+/// lowest key below the child and the highest, and the highest is the
+/// maximum over the whole subtree rather than any one record's. Giving
+/// the callback the subtree rather than its first record is what lets
+/// it say so.
 ///
 /// Blocks come back in the same order as `blocks`, so the caller can
 /// diff each against what was there before.
@@ -421,11 +456,11 @@ pub fn build<T, E, K>(
     records: &[T],
     blocks: &[u32],
     encode_record: E,
-    key_of: K,
+    write_keys: K,
 ) -> Result<Vec<Built>>
 where
     E: Fn(&mut [u8], usize, &T),
-    K: Fn(&mut [u8], usize, &T),
+    K: Fn(&mut [u8], usize, &[T]),
 {
     let levels = plan(shape, sb.blocksize, sb.is_v5(), records.len())?;
     let wanted: usize = levels.iter().sum();
@@ -444,7 +479,8 @@ where
         V4_HEADER_LEN
     };
     let space = sb.blocksize as usize - header;
-    let per_node = maxrecs(space, shape.key_len + PTR_LEN);
+    let per_node = maxrecs(space, shape.keys_per_entry() * shape.key_len + PTR_LEN);
+    let keys_wide = shape.keys_per_entry() * shape.key_len;
 
     let mut out: Vec<Built> = Vec::with_capacity(wanted);
     // Where each level's blocks start in `blocks`, and how many entries
@@ -473,10 +509,10 @@ where
     // Each level above indexes the level below it. `first` is the index
     // into `records` of the first record under each block of the level
     // below, which is the key that stands for it.
-    let mut below_first: Vec<usize> = Vec::new();
+    let mut below_span: Vec<(usize, usize)> = Vec::new();
     let mut running = 0usize;
     for &count in &counts {
-        below_first.push(running);
+        below_span.push((running, running + count));
         running += count;
     }
     let mut below_blocks: Vec<u32> = blocks[at..at + levels[0]].to_vec();
@@ -484,7 +520,7 @@ where
 
     for (up, &count_of_blocks) in levels.iter().enumerate().skip(1) {
         let counts = share(below_blocks.len(), count_of_blocks);
-        let mut this_first: Vec<usize> = Vec::new();
+        let mut this_span: Vec<(usize, usize)> = Vec::new();
         let mut this_blocks: Vec<u32> = Vec::new();
         let mut taken = 0usize;
         for (i, &count) in counts.iter().enumerate() {
@@ -492,16 +528,13 @@ where
             let mut buf = vec![0u8; sb.blocksize as usize];
             for j in 0..count {
                 let child = taken + j;
-                key_of(
-                    &mut buf,
-                    header + j * shape.key_len,
-                    &records[below_first[child]],
-                );
-                let ptr = header + per_node * shape.key_len + j * PTR_LEN;
+                let (from, to) = below_span[child];
+                write_keys(&mut buf, header + j * keys_wide, &records[from..to]);
+                let ptr = header + per_node * keys_wide + j * PTR_LEN;
                 buf[ptr..ptr + PTR_LEN].copy_from_slice(&below_blocks[child].to_be_bytes());
             }
             stamp(&mut buf, sb, shape, agno, agblock, up as u16, count as u16);
-            this_first.push(below_first[taken]);
+            this_span.push((below_span[taken].0, below_span[taken + count - 1].1));
             this_blocks.push(agblock);
             out.push(Built {
                 agblock,
@@ -510,7 +543,7 @@ where
             taken += count;
         }
         debug_assert_eq!(taken, below_blocks.len());
-        below_first = this_first;
+        below_span = this_span;
         below_blocks = this_blocks;
         at += count_of_blocks;
     }
@@ -799,6 +832,108 @@ mod tests {
         );
     }
 
+    /// A NODE OF AN INTERVAL TREE HOLDS TWO KEYS PER ENTRY.
+    ///
+    /// The reverse-mapping tree's node entries carry the lowest key in
+    /// the subtree below them and the highest, so a search for an
+    /// overlapping range can tell whether it need descend. `xfs_db`
+    /// prints them as one row of ten fields --
+    /// `[startblock,owner,offset,attrfork,bmbtblock,startblock_hi,...]`
+    /// -- which is two twenty-byte keys, not one forty-byte key.
+    ///
+    /// Reading it as one key puts the pointer array twenty bytes per
+    /// entry too early, so the pointers come out of the middle of the
+    /// key array. On a real filesystem that read as block zero, and
+    /// block zero is the superblock: "rmapbt block 0 has magic XFSB".
+    #[test]
+    fn a_node_of_an_interval_tree_keeps_its_pointers_after_both_keys() {
+        let sb = v5_superblock();
+        let shape = crate::rmap::shape();
+        assert!(shape.overlapping, "the reverse map is the interval tree");
+
+        let space = sb.blocksize as usize - V5_HEADER_LEN;
+        let per_entry = 2 * shape.key_len + PTR_LEN;
+        let node_max = maxrecs(space, per_entry);
+
+        // A record per leaf, so what comes back says which leaf was
+        // reached rather than only that something was.
+        let leaf_at = |agblock: u32, startblock: u32| -> Vec<u8> {
+            let mut buf = vec![0u8; sb.blocksize as usize];
+            let at = V5_HEADER_LEN;
+            crate::rmap::encode(
+                &mut buf,
+                at,
+                &crate::rmap::Rmap {
+                    startblock,
+                    blockcount: 4,
+                    owner: 131,
+                    offset: 0,
+                },
+            );
+            buf[offsets::MAGIC..offsets::MAGIC + 4].copy_from_slice(&shape.magic_v5.to_be_bytes());
+            buf[offsets::LEVEL..offsets::LEVEL + 2].copy_from_slice(&0u16.to_be_bytes());
+            buf[offsets::NUMRECS..offsets::NUMRECS + 2].copy_from_slice(&1u16.to_be_bytes());
+            let blkno = crate::alloc_btree::expected_blkno(&sb, 0, agblock);
+            buf[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
+            buf[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
+            buf[offsets::OWNER..offsets::OWNER + 4].copy_from_slice(&0u32.to_be_bytes());
+            let crc = crc32c_with_zeroed_crc(&buf, offsets::CRC);
+            buf[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+            buf
+        };
+
+        let mut root = vec![0u8; sb.blocksize as usize];
+        // Two entries. Each key is written twice -- low then high --
+        // exactly as the kernel writes them, and the pointers follow
+        // room for `node_max` PAIRS.
+        for (i, &(low, high, _child)) in [(10u32, 13u32, 2u32), (100, 103, 3)].iter().enumerate() {
+            let key_at = V5_HEADER_LEN + i * 2 * shape.key_len;
+            let rec = |startblock| crate::rmap::Rmap {
+                startblock,
+                blockcount: 4,
+                owner: 131,
+                offset: 0,
+            };
+            crate::rmap::encode_key(&mut root, key_at, &rec(low));
+            crate::rmap::encode_key(&mut root, key_at + shape.key_len, &rec(high));
+        }
+        let ptrs = V5_HEADER_LEN + node_max * 2 * shape.key_len;
+        root[ptrs..ptrs + 4].copy_from_slice(&2u32.to_be_bytes());
+        root[ptrs + 4..ptrs + 8].copy_from_slice(&3u32.to_be_bytes());
+        root[offsets::MAGIC..offsets::MAGIC + 4].copy_from_slice(&shape.magic_v5.to_be_bytes());
+        root[offsets::LEVEL..offsets::LEVEL + 2].copy_from_slice(&1u16.to_be_bytes());
+        root[offsets::NUMRECS..offsets::NUMRECS + 2].copy_from_slice(&2u16.to_be_bytes());
+        let blkno = crate::alloc_btree::expected_blkno(&sb, 0, 1);
+        root[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
+        root[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
+        root[offsets::OWNER..offsets::OWNER + 4].copy_from_slice(&0u32.to_be_bytes());
+        let crc = crc32c_with_zeroed_crc(&root, offsets::CRC);
+        root[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let blocks = std::collections::HashMap::from([
+            (1u32, root),
+            (2u32, leaf_at(2, 10)),
+            (3u32, leaf_at(3, 100)),
+        ]);
+
+        let out = walk(
+            &sb,
+            shape,
+            0,
+            1,
+            2,
+            |b| Ok(blocks[&b].clone()),
+            crate::rmap::decode,
+        )
+        .expect("a two-level interval tree walks");
+
+        assert_eq!(
+            out.iter().map(|r| r.startblock).collect::<Vec<_>>(),
+            vec![10, 100],
+            "both leaves were reached, in order"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Laying a tree out again
     // -----------------------------------------------------------------
@@ -897,14 +1032,9 @@ mod tests {
                 &records,
                 &blocks,
                 encode_run,
-                // A free-space record's key is its start block, which is
-                // its first four bytes -- but written through the same
-                // encoder, so a key that is not the record's head would
-                // be written the same way.
-                |buf, at, run: &(u32, u32)| {
-                    buf[at..at + 4].copy_from_slice(&run.0.to_be_bytes());
-                    buf[at + 4..at + 8].copy_from_slice(&run.1.to_be_bytes());
-                },
+                // A free-space entry holds one key, and it is the key
+                // of the first record beneath it.
+                |buf: &mut [u8], at, runs: &[(u32, u32)]| encode_run(buf, at, &runs[0]),
             )
             .expect("a tree lays out");
 
@@ -933,8 +1063,16 @@ mod tests {
     fn laying_out_over_the_wrong_number_of_blocks_is_refused() {
         let sb = v5_superblock();
         let records = runs(600);
-        let err = build(&sb, bno(), 0, &records, &[1, 2], encode_run, encode_run)
-            .expect_err("two blocks cannot hold 600 records");
+        let err = build(
+            &sb,
+            bno(),
+            0,
+            &records,
+            &[1, 2],
+            encode_run,
+            |buf: &mut [u8], at, runs: &[(u32, u32)]| encode_run(buf, at, &runs[0]),
+        )
+        .expect_err("two blocks cannot hold 600 records");
         assert!(format!("{err}").contains("needs 3 blocks"), "{err}");
     }
 
