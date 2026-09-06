@@ -66,6 +66,16 @@ pub struct Filesystem {
     pub(crate) checkpointed: std::sync::atomic::AtomicBool,
 }
 
+/// How many filesystem blocks a mount caches by default.
+///
+/// 512 blocks is 2 MiB at the usual 4 KiB block size, and 512 KiB at the
+/// 1 KiB one. Chosen to hold a group's trees and the directories being
+/// walked rather than the file data passing through: the measurement in
+/// `docs/read-path-cost.md` shows the expense is metadata, and data
+/// blocks evicting metadata is the way a cache this size makes things
+/// worse rather than better.
+const DEFAULT_CACHE_BLOCKS: usize = 512;
+
 impl Filesystem {
     /// Claim the right to write one checkpoint, or refuse.
     ///
@@ -143,12 +153,45 @@ impl Filesystem {
     /// [`Error::DirtyLog`] if the log needs replaying, and any parse
     /// failure from the superblock itself.
     pub fn mount(device: Arc<dyn BlockRead>) -> Result<Self> {
+        Self::mount_with_cache(device, DEFAULT_CACHE_BLOCKS)
+    }
+
+    /// Open `device` for reading, caching `blocks` metadata blocks.
+    ///
+    /// # Why a cache belongs here rather than in the caller
+    ///
+    /// The block size is the filesystem's, not the caller's. A cache
+    /// sized in blocks can only be built once the superblock has been
+    /// read, and the superblock is read here — a caller wanting to wrap
+    /// the device itself would have to parse one first to know what to
+    /// wrap it with.
+    ///
+    /// # What it is for
+    ///
+    /// Reading a directory means the inode B+tree, then the inode, then
+    /// its block map, then its blocks; the tree blocks near the root are
+    /// shared by every inode in the group and were re-read for each one.
+    /// Measured before this existed, resolving 64 paths on one fixture
+    /// cost 360 calls to the device, because every path walked the root
+    /// directory again — 64 reads of bytes that had not changed. See
+    /// `docs/read-path-cost.md`.
+    ///
+    /// `blocks` of zero disables it, which is what the measurement uses
+    /// to take a baseline.
+    pub fn mount_with_cache(device: Arc<dyn BlockRead>, blocks: usize) -> Result<Self> {
         // The superblock lives in the first sector. Read a generous
         // fixed amount: the sector size is not known until it has been
         // parsed, and 4 KiB covers every sector size XFS supports.
         let mut buf = vec![0u8; 4096];
         device.read_at(0, &mut buf)?;
         let sb = Superblock::parse(&buf)?;
+
+        // ONLY NOW is there a block size to cache by.
+        let device: Arc<dyn BlockRead> = if blocks == 0 {
+            device
+        } else {
+            fs_core::CachingDevice::read_only(device, u64::from(sb.blocksize), blocks)
+        };
 
         let fs = Filesystem {
             device,
