@@ -6,6 +6,33 @@ never does.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-06
+
+### Fixed
+
+- Every write path works in a group whose B+trees are more than one
+  block deep. There were 27 places that refused one, and a 4 KiB root
+  holds 505 free-space records or 252 inode chunks, so any filesystem
+  with real fragmentation or more than sixteen thousand inodes hit them.
+- The reverse-mapping tree is read as the interval tree it is: a node
+  entry carries the lowest key beneath it and the highest, so its
+  pointer array starts twice as far into the block. Reading it as one
+  key per entry took a pointer out of the middle of the key array, which
+  came back as block zero -- the superblock. Only reachable at two
+  levels or more.
+- One operation allocates once from a group however many times it takes
+  from it. A create that needed both a new inode chunk and a directory
+  block read the group twice and handed out the same run twice.
+- Freeing part of a shared extent splits the reference-count record
+  rather than refusing, and records that adjoin and say the same thing
+  are merged -- xfs_repair reads three records where one belongs as a
+  reference count that is simply wrong.
+
+### Added
+
+- `ag_btree`, the one descent and one layout for a group's four
+  short-form trees, and `agfl`, the group's free list.
+
 ## [0.6.0] — 2026-09-04
 
 Minor rather than patch: `File` and the three constructors that return
