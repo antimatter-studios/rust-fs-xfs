@@ -151,13 +151,53 @@ fn what_a_read_costs_in_calls_to_the_device() {
     };
     eprintln!("measuring {}", img.display());
 
-    for (label, blocks) in [("uncached", 0usize), ("cached", 512)] {
-        eprintln!("--- {label} ---");
-        measure_one(&img, blocks);
+    eprintln!("--- uncached ---");
+    let uncached = measure_one(&img, 0);
+    eprintln!("--- cached ---");
+    let cached = measure_one(&img, 512);
+
+    // THE ASSERTIONS ARE ON THE UNCACHED PASS, because it is the one
+    // that must reach the device: if the counter reports nothing there,
+    // it is not wired to the mount and every figure above is fiction.
+    // The cached pass is allowed to reach zero -- it does, for `stat`,
+    // once the cache holds the directories every path walks through --
+    // so asserting on it would be asserting that the cache failed.
+    assert!(
+        uncached.walk.items > 0,
+        "the fixture had nothing to walk — the measurement is of nothing"
+    );
+    assert!(
+        uncached.walk.reads > 0 && uncached.stat.reads > 0,
+        "no calls reached the device, so the counter is not wired to the mount"
+    );
+    for (what, un, ca) in [
+        ("walk", &uncached.walk, &cached.walk),
+        ("stat", &uncached.stat, &cached.stat),
+        ("read", &uncached.read, &cached.read),
+    ] {
+        assert!(
+            ca.reads <= un.reads,
+            "{what}: the cache made it ask for more ({} vs {})",
+            ca.reads,
+            un.reads
+        );
+        assert_eq!(
+            ca.items, un.items,
+            "{what}: the two passes did different amounts of work, so the \
+             figures are not comparable"
+        );
     }
 }
 
-fn measure_one(img: &Path, blocks: usize) {
+/// What one pass measured, so the two can be compared rather than each
+/// asserting on itself.
+struct Pass {
+    walk: Cost,
+    stat: Cost,
+    read: Cost,
+}
+
+fn measure_one(img: &Path, blocks: usize) -> Pass {
     let (fs, counting) = mount_counting(img, blocks);
 
     let mut paths = Vec::new();
@@ -195,12 +235,5 @@ fn measure_one(img: &Path, blocks: usize) {
     });
     report("read", &read);
 
-    assert!(
-        !paths.is_empty(),
-        "the fixture had nothing to walk — the measurement is of nothing"
-    );
-    assert!(
-        walk.reads > 0 && stat.reads > 0,
-        "no calls reached the device, so the counter is not wired to the mount"
-    );
+    Pass { walk, stat, read }
 }
