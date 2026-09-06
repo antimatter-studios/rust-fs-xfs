@@ -232,6 +232,48 @@ fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> {
     })
 }
 
+/// What tells one inode tree from the other, for the shared descent and
+/// the shared layout in [`crate::ag_btree`].
+///
+/// A key is the chunk's first inode alone: four bytes, where a record is
+/// sixteen.
+pub fn shape(which: Which, is_v5: bool) -> crate::ag_btree::Shape {
+    let _ = is_v5;
+    let (name, magic_v4, magic_v5) = match which {
+        Which::All => ("inobt", XFS_IBT_MAGIC, XFS_IBT_CRC_MAGIC),
+        Which::WithFreeInodes => ("finobt", XFS_FIBT_MAGIC, XFS_FIBT_CRC_MAGIC),
+    };
+    crate::ag_btree::Shape {
+        name,
+        magic_v4: Some(magic_v4),
+        magic_v5,
+        record_len: RECORD_LEN,
+        key_len: KEY_LEN,
+    }
+}
+
+/// One chunk record written at `at` bytes into `buf`.
+///
+/// `sparse` selects between the two shapes of the middle four bytes, the
+/// same way [`record`] does when reading them: it is the feature that
+/// decides, not the format version.
+pub fn encode(buf: &mut [u8], at: usize, chunk: &InodeChunk, sparse: bool) {
+    buf[at..at + 4].copy_from_slice(&chunk.startino.to_be_bytes());
+    if sparse {
+        buf[at + 4..at + 6].copy_from_slice(&chunk.holemask.to_be_bytes());
+        buf[at + 6] = chunk.count;
+        buf[at + 7] = chunk.freecount;
+    } else {
+        buf[at + 4..at + 8].copy_from_slice(&u32::from(chunk.freecount).to_be_bytes());
+    }
+    buf[at + 8..at + 16].copy_from_slice(&chunk.free.to_be_bytes());
+}
+
+/// The key that stands for a chunk in a node: its first inode.
+pub fn encode_key(buf: &mut [u8], at: usize, chunk: &InodeChunk) {
+    buf[at..at + 4].copy_from_slice(&chunk.startino.to_be_bytes());
+}
+
 /// A header that has been read and checked.
 struct Node {
     level: u16,

@@ -233,22 +233,37 @@ fn a_tree_laid_out_again_is_one_xfs_repair_accepts() {
     );
 }
 
-/// A write into a group whose trees are two levels deep, judged the way
-/// every other write here is: the kernel replays what was logged, and
-/// `xfs_repair` says whether what came out is a filesystem.
+/// Every write path, into a group whose trees are two levels deep,
+/// judged the way every other write here is: the kernel replays what was
+/// logged, and `xfs_repair` says whether what came out is a filesystem.
 ///
 /// This is the point of the whole exercise. Reading a deep tree was
 /// fixed separately; until now every write path refused outright, so a
 /// filesystem with any real fragmentation was read-only in practice.
+///
+/// A refusal is reported rather than passed over, because a run where
+/// every operation refused would otherwise read exactly like a run where
+/// every operation worked.
 #[test]
-fn a_write_into_a_group_with_deep_trees_is_sound() {
+fn every_write_into_a_group_with_deep_trees_is_sound() {
     let fixtures = deep_fixtures();
     if fixtures.is_empty() {
         eprintln!("no xfsdeep-* fixtures — skipping");
         return;
     }
 
+    // One per write path that touches a group's trees: taking blocks for
+    // a new file, taking them for a file's data, giving them back, and
+    // giving back the inode as well.
+    const OPS: &[&str] = &[
+        "create_file",
+        "write_into_empty_file",
+        "truncate_to_zero",
+        "unlink_file",
+    ];
+
     let mut judged = 0;
+    let mut refused = 0;
     let mut broken: Vec<String> = Vec::new();
 
     for src in &fixtures {
@@ -256,72 +271,96 @@ fn a_write_into_a_group_with_deep_trees_is_sound() {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("fixture");
-        let Some(copy) = copy_of(src, &format!("wrote-{name}")) else {
-            broken.push(format!("{name}: could not be copied"));
-            continue;
-        };
-
-        {
-            let device = fs_core::FileDevice::open_rw(&copy.0).expect("open the copy for writing");
-            let fs = Filesystem::mount_rw(Arc::new(device)).expect("mount the copy");
-            let sf = match fs.lookup_path("/sf") {
-                Ok(i) => i.ino,
-                Err(e) => {
-                    broken.push(format!("{name}: /sf is missing: {e}"));
-                    continue;
-                }
+        for op in OPS {
+            let scratch = format!("wrote-{op}-{name}");
+            let Some(copy) = copy_of(src, &scratch) else {
+                broken.push(format!("{name} {op}: could not be copied"));
+                continue;
             };
-            match fs.create_file(sf, b"deep", 0o100644) {
-                Ok(_) => {}
-                Err(e) => {
-                    // A refusal is a result, not a failure -- but say
-                    // which, so a run that refused everything cannot
-                    // read as a run that wrote everything.
-                    eprintln!("{name}: refused: {e}");
+
+            {
+                let device =
+                    fs_core::FileDevice::open_rw(&copy.0).expect("open the copy for writing");
+                let fs = Filesystem::mount_rw(Arc::new(device)).expect("mount the copy");
+                let ino = |path: &str| -> Result<u64, String> {
+                    fs.lookup_path(path)
+                        .map(|i| i.ino)
+                        .map_err(|e| e.to_string())
+                };
+                let outcome = match *op {
+                    "create_file" => ino("/sf").and_then(|dir| {
+                        fs.create_file(dir, b"deep", 0o100644)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                    "write_into_empty_file" => ino("/sf/empty.bin").and_then(|f| {
+                        fs.write_into_empty_file(f, b"written into a fragmented group")
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                    // A one-block file among the fragments, so what it
+                    // gives back lands in the middle of a deep tree
+                    // rather than at either end of it.
+                    "truncate_to_zero" => ino("/frag/f1").and_then(|f| {
+                        fs.truncate_to_zero(f)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                    "unlink_file" => ino("/sf").and_then(|dir| {
+                        fs.unlink_file(dir, b"victim")
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                    other => Err(format!("no such operation: {other}")),
+                };
+                if let Err(why) = outcome {
+                    eprintln!("{name} {op}: refused: {why}");
+                    refused += 1;
                     continue;
                 }
             }
-        }
 
-        let script = format!(
-            r#"
-            img=$(mktemp -u /tmp/deepw-XXXXXX.img)
-            cp /share/scratch/wrote-{name} "$img"
-            m=$(mktemp -d)
-            mounted=0
-            for attempt in 1 2 3; do
-                if mount -o loop,nouuid "$img" "$m"; then
-                    umount "$m"
-                    mounted=$((mounted + 1))
-                fi
-                out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
-                case "$out" in
-                    *"valuable metadata changes in a log"*) continue ;;
-                    *) break ;;
-                esac
-            done
-            rmdir "$m" 2>/dev/null
-            [ "$mounted" -gt 0 ] || echo "MOUNT_FAILED"
-            rm -f "$img"
-            echo "REPAIR_BEGIN"
-            echo "$out"
-            echo "REPAIR_RC=$rc"
-            echo "REPAIR_END"
-            echo DONE
-            "#
-        );
-        let Some(out) = kernel_run(&script) else {
-            eprintln!("{name}: no kernel to judge with — skipping");
-            continue;
-        };
-        judged += 1;
-        if !out.contains("REPAIR_RC=0") || out.contains("MOUNT_FAILED") {
-            broken.push(format!("{name}: the kernel objected:\n{out}"));
-        } else {
-            eprintln!("{name}: created a file in a group with two-level trees, sound");
+            let script = format!(
+                r#"
+                img=$(mktemp -u /tmp/deepw-XXXXXX.img)
+                cp /share/scratch/{scratch} "$img"
+                m=$(mktemp -d)
+                mounted=0
+                for attempt in 1 2 3; do
+                    if mount -o loop,nouuid "$img" "$m"; then
+                        umount "$m"
+                        mounted=$((mounted + 1))
+                    fi
+                    out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+                    case "$out" in
+                        *"valuable metadata changes in a log"*) continue ;;
+                        *) break ;;
+                    esac
+                done
+                rmdir "$m" 2>/dev/null
+                [ "$mounted" -gt 0 ] || echo "MOUNT_FAILED"
+                rm -f "$img"
+                echo "REPAIR_BEGIN"
+                echo "$out"
+                echo "REPAIR_RC=$rc"
+                echo "REPAIR_END"
+                echo DONE
+                "#
+            );
+            let Some(out) = kernel_run(&script) else {
+                eprintln!("{name} {op}: no kernel to judge with — skipping");
+                continue;
+            };
+            judged += 1;
+            if !out.contains("REPAIR_RC=0") || out.contains("MOUNT_FAILED") {
+                broken.push(format!("{name} {op}: the kernel objected:\n{out}"));
+            } else {
+                eprintln!("{name} {op}: sound");
+            }
         }
     }
 
+    eprintln!("{judged} judged, {refused} refused");
     assert!(
         broken.is_empty(),
         "a write into a deep-tree group did not survive:\n{}",
@@ -329,6 +368,6 @@ fn a_write_into_a_group_with_deep_trees_is_sound() {
     );
     assert!(
         judged > 0,
-        "no fixture was judged — the test proved nothing"
+        "no operation was judged — the test proved nothing"
     );
 }

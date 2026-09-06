@@ -291,6 +291,10 @@ pub(crate) struct GroupAlloc<'a> {
     /// The reverse-mapping tree's records and blocks, where the
     /// filesystem has that tree.
     rmap: Option<(Vec<crate::rmap::Rmap>, Vec<u32>)>,
+    /// The reference-count tree's records and blocks, where the
+    /// filesystem has reflink and the tree exists. A reflink filesystem
+    /// that has never shared anything has the feature and no tree.
+    refcount: Option<(Vec<crate::refcount::Refcount>, Vec<u32>)>,
     /// Whether anything has actually been taken. Nothing taken means
     /// nothing to log, rather than items whose diffs are empty.
     took: bool,
@@ -382,10 +386,26 @@ impl<'a> GroupAlloc<'a> {
             None
         };
 
+        let refcount = if sb.has_reflink() && agf.refcount_level > 0 {
+            let (records, blocks) = crate::ag_btree::walk_blocks(
+                sb,
+                crate::refcount::shape(),
+                agno,
+                agf.refcount_root,
+                agf.refcount_level,
+                &mut read,
+                crate::refcount::decode,
+            )?;
+            Some((records, blocks))
+        } else {
+            None
+        };
+
         for &agblock in bno_blocks
             .iter()
             .chain(cnt_blocks.iter())
             .chain(rmap.iter().flat_map(|(_, b)| b.iter()))
+            .chain(refcount.iter().flat_map(|(_, b)| b.iter()))
         {
             let mut raw = vec![0u8; sb.blocksize as usize];
             device.read_at(ag_start + u64::from(agblock) * blocksize, &mut raw)?;
@@ -403,6 +423,7 @@ impl<'a> GroupAlloc<'a> {
             cnt_blocks,
             by_block,
             rmap,
+            refcount,
             took: false,
         })
     }
@@ -465,6 +486,59 @@ impl<'a> GroupAlloc<'a> {
 
         self.took = true;
         Ok(taking.startblock)
+    }
+
+    /// Give an extent back to free space, merging it with whatever it
+    /// adjoins.
+    ///
+    /// The counterpart of [`GroupAlloc::take`], and the reason both live
+    /// on the same type: an operation that frees in one group and
+    /// allocates in it -- a truncate that returns blocks and a directory
+    /// that grows in the same record -- has to see one free list, not
+    /// two readings of the same one.
+    pub(crate) fn give_back(&mut self, extent: FreeExtent) -> Result<crate::alloc_btree::Freed> {
+        let freed = crate::alloc_btree::free_extent(&mut self.by_block, extent)?;
+        self.took = true;
+        Ok(freed)
+    }
+
+    /// Take an extent's ownership record out of the reverse map.
+    ///
+    /// Matched exactly: a record that does not line up with the extent
+    /// means the tree and the inode disagree, and the free must not go
+    /// ahead on top of that. Does nothing where the filesystem has no
+    /// reverse-mapping tree.
+    pub(crate) fn forget_rmap(&mut self, record: crate::rmap::Rmap) -> Result<()> {
+        if let Some((records, _)) = self.rmap.as_mut() {
+            crate::rmap::remove(records, record)?;
+            self.took = true;
+        }
+        Ok(())
+    }
+
+    /// Give up one reference to `startblock..+blockcount`, and say which
+    /// of those blocks may go back to free space.
+    ///
+    /// Everything on a filesystem without the reference-count tree, and
+    /// on one with it, whatever [`crate::refcount::release`] decides --
+    /// which is never the blocks another file still holds.
+    pub(crate) fn release_shared(
+        &mut self,
+        startblock: u32,
+        blockcount: u32,
+    ) -> Result<Vec<FreeExtent>> {
+        let Some((records, _)) = self.refcount.as_mut() else {
+            return Ok(vec![FreeExtent {
+                startblock,
+                blockcount,
+            }]);
+        };
+        let before = records.clone();
+        let ranges = crate::refcount::release(records, startblock, blockcount)?;
+        if *records != before {
+            self.took = true;
+        }
+        Ok(ranges)
     }
 
     /// The blocks one tree should occupy after the edit.
@@ -618,6 +692,22 @@ impl<'a> GroupAlloc<'a> {
             }
         };
 
+        let (refcount_blocks, refcount_records) = match self.refcount.take() {
+            None => (Vec::new(), 0),
+            Some((records, held)) => {
+                let count = records.len();
+                let blocks = self.relay(
+                    crate::refcount::shape(),
+                    &records,
+                    &held,
+                    crate::refcount::encode,
+                    crate::refcount::encode_key,
+                    &mut items,
+                )?;
+                (blocks, count)
+            }
+        };
+
         // THE HEADER LAST, because it describes what the trees came out
         // as rather than what they were asked for.
         let mut new_agf = self.agf_raw.clone();
@@ -673,6 +763,24 @@ impl<'a> GroupAlloc<'a> {
             );
             put(&mut new_agf, agf::RMAP_BLOCKS, rmap_blocks.len() as u32);
         }
+        // The reference-count tree keeps its own count and its own
+        // root, and is NOT part of `btreeblks` -- that field is the
+        // free-space and reverse-mapping trees, which is what the
+        // measurement above covers.
+        if !refcount_blocks.is_empty() {
+            put(&mut new_agf, agf::REFCOUNT_ROOT, root_of(&refcount_blocks));
+            put(
+                &mut new_agf,
+                agf::REFCOUNT_LEVEL,
+                level_of(&refcount_blocks, crate::refcount::shape(), refcount_records)?,
+            );
+            put(
+                &mut new_agf,
+                agf::REFCOUNT_BLOCKS,
+                refcount_blocks.len() as u32,
+            );
+        }
+
         put(
             &mut new_agf,
             agf::BTREEBLKS,
