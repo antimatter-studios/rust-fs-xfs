@@ -52,9 +52,9 @@
 //! that is not full, which is most of them.
 
 use crate::ag::Agf;
-use crate::endian::{be16, be32, be64, le32, uuid_at};
+use crate::endian::be32;
 use crate::error::{Error, Result};
-use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
+use crate::superblock::Superblock;
 
 /// `ABTB` — free space by block, v4.
 pub const XFS_ABTB_MAGIC: u32 = 0x4142_5442;
@@ -65,36 +65,10 @@ pub const XFS_ABTC_MAGIC: u32 = 0x4142_5443;
 /// `AB3C` — free space by count, v5.
 pub const XFS_ABTC_CRC_MAGIC: u32 = 0x4142_3343;
 
-/// The v4 short-form header: magic, level, record count and two
-/// siblings.
-const V4_HEADER_LEN: usize = 16;
-
-/// The v5 short-form header, which adds the block's own address, a
-/// sequence number, the filesystem UUID, the owning group and a
-/// checksum.
-const V5_HEADER_LEN: usize = 56;
-
 /// A record: a start block and a length, both relative to the group.
 const RECORD_LEN: usize = 8;
 /// A key is the same shape as the record it indexes.
 const KEY_LEN: usize = 8;
-/// A child pointer is an allocation-group block number.
-const PTR_LEN: usize = 4;
-
-/// A tree deeper than this is not a tree, and the bound stops a cycle
-/// in a corrupt image from being walked forever.
-const MAX_LEVELS: u16 = 9;
-
-/// Byte offsets within the short-form block header.
-mod offsets {
-    pub const MAGIC: usize = 0;
-    pub const LEVEL: usize = 4;
-    pub const NUMRECS: usize = 6;
-    pub const BLKNO: usize = 16;
-    pub const UUID: usize = 32;
-    pub const OWNER: usize = 48;
-    pub const CRC: usize = 52;
-}
 
 /// Which of the two trees, which decides both the magic to expect and
 /// the order the records come back in.
@@ -114,6 +88,17 @@ impl Order {
             (Order::ByBlock, false) => XFS_ABTB_MAGIC,
             (Order::ByCount, true) => XFS_ABTC_CRC_MAGIC,
             (Order::ByCount, false) => XFS_ABTC_MAGIC,
+        }
+    }
+
+    /// What tells this tree from the group's other three.
+    pub fn shape(self) -> crate::ag_btree::Shape {
+        crate::ag_btree::Shape {
+            name: self.name(),
+            magic_v4: Some(self.magic(false)),
+            magic_v5: self.magic(true),
+            record_len: RECORD_LEN,
+            key_len: KEY_LEN,
         }
     }
 
@@ -145,128 +130,6 @@ impl FreeExtent {
     pub fn end(&self) -> u64 {
         u64::from(self.startblock) + u64::from(self.blockcount)
     }
-}
-
-/// A header that has been read and checked.
-struct Node {
-    level: u16,
-    numrecs: u16,
-    /// Where the records or keys begin.
-    body: usize,
-    /// How many records the block could hold.
-    maxrecs: usize,
-}
-
-/// How many records of `len` bytes fit in a block's body.
-fn maxrecs(space: usize, len: usize) -> usize {
-    space / len
-}
-
-/// Read and check one block of the tree.
-///
-/// `expect_level` is the level the parent said this child sits at and
-/// `agno` the group the tree belongs to. Checking both is what makes
-/// the descent self-verifying: a block that belongs to another group,
-/// or sits at a different depth than its parent believed, is rejected
-/// before its contents are read as free space — which matters more here
-/// than in a file's tree, since the consequence of believing a stale
-/// block is handing out space that is in use.
-fn parse_block(
-    buf: &[u8],
-    sb: &Superblock,
-    order: Order,
-    agno: u32,
-    agblock: u32,
-    expect_level: u16,
-) -> Result<Node> {
-    let header = if sb.is_v5() {
-        V5_HEADER_LEN
-    } else {
-        V4_HEADER_LEN
-    };
-    let what = order.name();
-    if buf.len() < header {
-        return Err(Error::BadSuperblock(format!(
-            "AG {agno}: {what} block {agblock} is {} bytes, shorter than its {header}-byte header",
-            buf.len()
-        )));
-    }
-
-    let want = order.magic(sb.is_v5());
-    let magic = be32(buf, offsets::MAGIC);
-    if magic != want {
-        return Err(Error::BadSuperblock(format!(
-            "AG {agno}: {what} block {agblock} has magic {magic:#010x}, expected {want:#010x}"
-        )));
-    }
-
-    if sb.is_v5() {
-        let stored = le32(buf, offsets::CRC);
-        if stored != crc32c_with_zeroed_crc(buf, offsets::CRC) {
-            return Err(Error::ChecksumMismatch {
-                what: "free-space btree block",
-                block: u64::from(agblock),
-            });
-        }
-        if uuid_at(buf, offsets::UUID) != sb.meta_uuid {
-            return Err(Error::BlockIdentityMismatch {
-                what: "free-space btree block",
-                expected: u64::from(agblock),
-                found: u64::MAX, // a UUID mismatch says nothing about the address
-            });
-        }
-        // The owner is the group. A block from a different group would
-        // otherwise decode into entirely plausible extents belonging to
-        // somewhere else.
-        let owner = be32(buf, offsets::OWNER);
-        if owner != agno {
-            return Err(Error::BlockIdentityMismatch {
-                what: "free-space btree block owner",
-                expected: u64::from(agno),
-                found: u64::from(owner),
-            });
-        }
-        // The block records its own address, so a block read from the
-        // wrong place says so rather than being believed.
-        let stated = be64(buf, offsets::BLKNO);
-        let expected = expected_blkno(sb, agno, agblock);
-        if stated != expected {
-            return Err(Error::BlockIdentityMismatch {
-                what: "free-space btree block address",
-                expected,
-                found: stated,
-            });
-        }
-    }
-
-    let level = be16(buf, offsets::LEVEL);
-    if level != expect_level {
-        return Err(Error::BadSuperblock(format!(
-            "AG {agno}: {what} block {agblock} is at level {level}, but its parent points to it \
-             as level {expect_level}"
-        )));
-    }
-
-    let space = buf.len() - header;
-    let per = if level == 0 {
-        RECORD_LEN
-    } else {
-        KEY_LEN + PTR_LEN
-    };
-    let max = maxrecs(space, per);
-    let numrecs = be16(buf, offsets::NUMRECS);
-    if usize::from(numrecs) > max {
-        return Err(Error::BadSuperblock(format!(
-            "AG {agno}: {what} block {agblock} claims {numrecs} records but has room for {max}"
-        )));
-    }
-
-    Ok(Node {
-        level,
-        numrecs,
-        body: header,
-        maxrecs: max,
-    })
 }
 
 /// Where a group's block sits on the device, in 512-byte basic blocks.
@@ -321,88 +184,23 @@ pub fn walk<F>(
     agno: u32,
     root: u32,
     levels: u32,
-    mut read_agblock: F,
+    read_agblock: F,
 ) -> Result<Vec<FreeExtent>>
 where
     F: FnMut(u32) -> Result<Vec<u8>>,
 {
-    if levels == 0 || levels > u32::from(MAX_LEVELS) {
-        return Err(Error::BadSuperblock(format!(
-            "AG {agno}: {} claims {levels} levels, which is not a tree",
-            order.name()
-        )));
-    }
-
-    let mut out = Vec::new();
-    // Depth-first, left to right, so records arrive in the tree's own
-    // order and a caller can check that ordering rather than impose it.
-    let mut stack = vec![(root, (levels - 1) as u16)];
-    // HOW MANY BLOCKS THE WALK MAY VISIT.
-    //
-    // `MAX_LEVELS` bounds how deep the tree goes and says nothing about
-    // how wide it is, and the two are not the same bound. Nine blocks,
-    // each at its own address, each stating a level one below its
-    // parent's and pointing every one of its slots at the block below,
-    // pass the magic, CRC, owner, level and self-address checks --
-    // because each one genuinely is the block at its own address -- and
-    // cost 336^8 visits at a 4 KiB block size. The record vector grows
-    // per leaf, so it is memory exhaustion within seconds rather than a
-    // pure hang.
-    //
-    // A tree inside an allocation group cannot have more blocks than
-    // the group has.
-    let mut budget = u64::from(sb.agblocks).max(64);
-
-    while let Some((agblock, expect_level)) = stack.pop() {
-        budget = budget.checked_sub(1).ok_or_else(|| {
-            Error::BadSuperblock(format!(
-                "AG {agno}: the walk visited more blocks than the group holds; the \
-                 tree points back into itself"
-            ))
-        })?;
-        let buf = read_agblock(agblock)?;
-        let node = parse_block(&buf, sb, order, agno, agblock, expect_level)?;
-
-        if node.level == 0 {
-            let end = node.body + usize::from(node.numrecs) * RECORD_LEN;
-            if end > buf.len() {
-                return Err(Error::BadSuperblock(format!(
-                    "AG {agno}: {} leaf {agblock} needs {end} bytes for its {} records \
-                     but is only {} long",
-                    order.name(),
-                    node.numrecs,
-                    buf.len()
-                )));
-            }
-            for i in 0..usize::from(node.numrecs) {
-                let at = node.body + i * RECORD_LEN;
-                out.push(FreeExtent {
-                    startblock: be32(&buf, at),
-                    blockcount: be32(&buf, at + 4),
-                });
-            }
-            continue;
-        }
-
-        // The pointers start after room for the maximum number of keys,
-        // not after the keys in use.
-        let first = node.body + node.maxrecs * KEY_LEN;
-        let end = first + usize::from(node.numrecs) * PTR_LEN;
-        if end > buf.len() {
-            return Err(Error::BadSuperblock(format!(
-                "AG {agno}: {} node {agblock} needs {end} bytes for its pointer array \
-                 but is only {} long",
-                order.name(),
-                buf.len()
-            )));
-        }
-        // Pushed in reverse so the leftmost child is visited first.
-        for i in (0..usize::from(node.numrecs)).rev() {
-            stack.push((be32(&buf, first + i * PTR_LEN), node.level - 1));
-        }
-    }
-
-    Ok(out)
+    crate::ag_btree::walk(
+        sb,
+        order.shape(),
+        agno,
+        root,
+        levels,
+        read_agblock,
+        |buf, at| FreeExtent {
+            startblock: be32(buf, at),
+            blockcount: be32(buf, at + 4),
+        },
+    )
 }
 
 /// Walk the tree an allocation-group header points at.
@@ -476,19 +274,6 @@ mod tests {
         assert_eq!(&Order::ByCount.magic(true).to_be_bytes(), b"AB3C");
         assert_eq!(&Order::ByBlock.magic(false).to_be_bytes(), b"ABTB");
         assert_eq!(&Order::ByCount.magic(false).to_be_bytes(), b"ABTC");
-    }
-
-    /// The two header sizes, which are the thing most likely to be got
-    /// wrong by analogy with the block-map tree's 72-byte v5 header.
-    #[test]
-    fn the_short_form_headers_are_smaller_than_the_long_form() {
-        assert_eq!(V4_HEADER_LEN, 16);
-        assert_eq!(V5_HEADER_LEN, 56);
-        // Where the v5 header's fields land, as read off a real root.
-        assert_eq!(offsets::BLKNO + 8, 24);
-        assert_eq!(offsets::UUID + 16, offsets::OWNER);
-        assert_eq!(offsets::OWNER + 4, offsets::CRC);
-        assert_eq!(offsets::CRC + 4, V5_HEADER_LEN);
     }
 
     fn free(pairs: &[(u32, u32)]) -> Vec<FreeExtent> {
@@ -700,9 +485,12 @@ mod tests {
     /// fewer because each entry carries a pointer as well as a key.
     #[test]
     fn an_internal_node_holds_fewer_entries_than_a_leaf() {
-        let space = 4096 - V5_HEADER_LEN;
-        assert_eq!(maxrecs(space, RECORD_LEN), 505);
-        assert_eq!(maxrecs(space, KEY_LEN + PTR_LEN), 336);
+        let space = 4096 - crate::ag_btree::V5_HEADER_LEN;
+        assert_eq!(crate::ag_btree::maxrecs(space, RECORD_LEN), 505);
+        assert_eq!(
+            crate::ag_btree::maxrecs(space, KEY_LEN + crate::ag_btree::PTR_LEN),
+            336
+        );
     }
 }
 
