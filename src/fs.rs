@@ -261,12 +261,34 @@ impl Filesystem {
     /// whole filesystem. Everything else on a reflink filesystem is
     /// sound, which the feature matrix shows rather than assumes.
     ///
-    /// Nothing is refused at mount today. The check stays because the
-    /// next `ro_compat` bit will need it, and because leaving the shape
-    /// here records what the rule is: a feature that changes what a
-    /// write must maintain is either maintained or refused.
+    /// # What it refuses now
+    ///
+    /// Anything outside [`ro_compat::SUPPORTED`]. That set is the four
+    /// bits this driver maintains, and every other bit — the metadata
+    /// directory tree, realtime groups, whatever comes next — describes
+    /// structures a write here would leave behind.
+    ///
+    /// This check used to be `Ok(())`, and was called from `mount` as
+    /// well as `mount_rw`, so the rule its own comment stated was
+    /// enforced in neither direction: an unknown bit permitted reading
+    /// (correct) and writing (not). A create on such a volume updated
+    /// what this driver knows about and silently left the rest, which is
+    /// the failure the bit exists to prevent — and worse than a refusal,
+    /// because nothing reports it and `xfs_repair` finds it weeks later.
     fn refuse_unmaintained_features(&self) -> Result<()> {
-        Ok(())
+        let unmaintained = self.sb.features_ro_compat & !crate::superblock::ro_compat::SUPPORTED;
+        if unmaintained == 0 {
+            return Ok(());
+        }
+        let named = if unmaintained & crate::superblock::ro_compat::METADIR != 0 {
+            " (the metadata directory tree)"
+        } else {
+            ""
+        };
+        Err(Error::UnsupportedFeature(format!(
+            "this volume sets read-only-compatible feature bits {unmaintained:#x}{named} \
+             that this driver does not maintain, so it can be read but not written"
+        )))
     }
 
     /// An allocation group's header.

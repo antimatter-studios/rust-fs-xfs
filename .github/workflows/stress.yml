@@ -18,7 +18,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  FS_CORE_REF: v0.2.8
+  FS_CORE_REF: v0.2.10
   CARGO_INCREMENTAL: 0
 
 jobs:
