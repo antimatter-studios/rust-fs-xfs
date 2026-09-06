@@ -61,7 +61,10 @@ pub struct Refcount {
 
 /// The records of a single-level tree, read straight out of its root.
 pub fn leaf_records(buf: &[u8], numrecs: u16) -> Vec<Refcount> {
-    (0..usize::from(numrecs))
+    // A backstop: the count comes from `group_write::leaf_numrecs`,
+    // which has already checked it against the block.
+    let fit = buf.len().saturating_sub(btree::V5_BODY) / RECORD;
+    (0..usize::from(numrecs).min(fit))
         .map(|i| {
             let at = btree::V5_BODY + i * RECORD;
             let raw = u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes"));

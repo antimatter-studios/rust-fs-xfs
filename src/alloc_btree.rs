@@ -337,8 +337,29 @@ where
     // Depth-first, left to right, so records arrive in the tree's own
     // order and a caller can check that ordering rather than impose it.
     let mut stack = vec![(root, (levels - 1) as u16)];
+    // HOW MANY BLOCKS THE WALK MAY VISIT.
+    //
+    // `MAX_LEVELS` bounds how deep the tree goes and says nothing about
+    // how wide it is, and the two are not the same bound. Nine blocks,
+    // each at its own address, each stating a level one below its
+    // parent's and pointing every one of its slots at the block below,
+    // pass the magic, CRC, owner, level and self-address checks --
+    // because each one genuinely is the block at its own address -- and
+    // cost 336^8 visits at a 4 KiB block size. The record vector grows
+    // per leaf, so it is memory exhaustion within seconds rather than a
+    // pure hang.
+    //
+    // A tree inside an allocation group cannot have more blocks than
+    // the group has.
+    let mut budget = u64::from(sb.agblocks).max(64);
 
     while let Some((agblock, expect_level)) = stack.pop() {
+        budget = budget.checked_sub(1).ok_or_else(|| {
+            Error::BadSuperblock(format!(
+                "AG {agno}: the walk visited more blocks than the group holds; the \
+                 tree points back into itself"
+            ))
+        })?;
         let buf = read_agblock(agblock)?;
         let node = parse_block(&buf, sb, order, agno, agblock, expect_level)?;
 

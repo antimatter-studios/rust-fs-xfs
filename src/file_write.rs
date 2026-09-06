@@ -218,11 +218,7 @@ impl Filesystem {
             &mut cnt_raw,
         )?;
 
-        let numrecs = u16::from_be_bytes(
-            bno_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                .try_into()
-                .expect("2 bytes"),
-        );
+        let numrecs = crate::group_write::leaf_numrecs(&bno_raw, btree::RECORD)?;
         let mut by_block = leaf_records(&bno_raw, numrecs);
 
         // First fit, in block order. See the note on policy at the top:
@@ -282,11 +278,7 @@ impl Filesystem {
                 ag_start + u64::from(agf.roots[RMAP]) * blocksize,
                 &mut rmap_raw,
             )?;
-            let n = u16::from_be_bytes(
-                rmap_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                    .try_into()
-                    .expect("2 bytes"),
-            );
+            let n = crate::group_write::leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
             rmap_records = crate::rmap::leaf_records(&rmap_raw, n);
             crate::rmap::insert(
                 &mut rmap_records,

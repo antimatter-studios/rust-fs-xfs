@@ -318,7 +318,13 @@ where
     F: FnMut(u64) -> Result<Vec<u8>>,
 {
     let root = parse_root(fork, ino)?;
-    let mut extents = Vec::with_capacity(nextents as usize);
+    // Reserved for a plausible file, not for whatever `di_nextents`
+    // claimed. Nothing validates that count -- `Inode::validate` checks
+    // it only for `Format::Dev` -- and an `Extent` is 32 bytes, so
+    // 0xFFFF_FFFF asked for 128 GB and a 64-bit count under `nrext64`
+    // overflowed `isize` into "capacity overflow". The vector grows to
+    // what the tree really holds.
+    let mut extents = Vec::with_capacity((nextents as usize).min(4096));
 
     // Depth-first, left to right, so records arrive in file order and
     // the check below is a plain comparison rather than a sort.

@@ -359,8 +359,18 @@ where
 
     let mut out = Vec::new();
     let mut stack = vec![(root, (levels - 1) as u16)];
+    // A tree inside an allocation group cannot have more blocks than
+    // the group has. `MAX_LEVELS` bounds depth only, and depth is not
+    // fan-out: see the note in `alloc_btree::walk`.
+    let mut budget = u64::from(sb.agblocks).max(64);
 
     while let Some((agblock, expect_level)) = stack.pop() {
+        budget = budget.checked_sub(1).ok_or_else(|| {
+            Error::BadSuperblock(format!(
+                "AG {agno}: the walk visited more blocks than the group holds; the \
+                 tree points back into itself"
+            ))
+        })?;
         let buf = read_agblock(agblock)?;
         let node = parse_block(&buf, sb, which, agno, agblock, expect_level)?;
 

@@ -373,6 +373,12 @@ pub struct Superblock {
 
 /// Read a **little-endian** `u32` at `off`.
 ///
+/// The largest block XFS defines, of any kind.
+///
+/// 64 KiB. A filesystem block, a sector and a directory block are all
+/// bounded by it.
+pub const MAX_BLOCKSIZE: u32 = 65536;
+
 impl Superblock {
     /// Parse and validate a superblock from the first [`XFS_SB_SIZE`]
     /// bytes of `buf`.
@@ -586,6 +592,44 @@ impl Superblock {
                 self.inopblock, self.blocksize, self.inodesize
             ));
         }
+        // `split_ino` shifts by `inopblog`, so a value at or above 64 is
+        // a panic in a checked build and a masked shift in release --
+        // where it silently returns the wrong allocation group and the
+        // wrong block for every inode number, including the one
+        // `check_entry_ino` asks about for every directory entry.
+        if 1u32.checked_shl(u32::from(self.inopblog)) != Some(u32::from(self.inopblock)) {
+            return bad(format!(
+                "inopblog {} does not describe inopblock {}",
+                self.inopblog, self.inopblock
+            ));
+        }
+        // THE DIRECTORY BLOCK SIZE, which had no check at all.
+        //
+        // `dirblocksize()` is `blocksize << dirblklog` in a `u32`, so
+        // a 512-byte block with dirblklog 23 -- or any dirblklog at or
+        // above 32 minus blocklog -- truncates to ZERO. `read_dir` then
+        // advances the file block by `dir_block_size / blocksize`,
+        // which is also zero, and the loop never moves: it allocates a
+        // zero-length buffer and issues a device read, forever. That is
+        // reached from `fs_xfs_dir_open`, and a hang is not something
+        // `capi::guard`'s `catch_unwind` can turn into an error.
+        //
+        // One below that, dirblklog 22 at 512-byte blocks, gives a 2 GiB
+        // allocation per directory block instead.
+        //
+        // A directory block is between one filesystem block and 64 KiB,
+        // which is XFS's largest block of any kind.
+        let dirblocksize = self
+            .blocksize
+            .checked_shl(u32::from(self.dirblklog))
+            .filter(|size| *size >= self.blocksize && *size <= MAX_BLOCKSIZE);
+        if dirblocksize.is_none() {
+            return bad(format!(
+                "dirblklog {} does not describe a directory block between {} and \
+                 {MAX_BLOCKSIZE} bytes",
+                self.dirblklog, self.blocksize
+            ));
+        }
         if self.agcount == 0 {
             return bad("agcount is zero".into());
         }
@@ -593,11 +637,15 @@ impl Superblock {
             return bad("agblocks is zero".into());
         }
         // agblklog must be large enough to hold an AG-relative block
-        // number; it is log2(agblocks) rounded up.
+        // number; it is log2(agblocks) rounded up. It must also not be
+        // wider than a block number is: `split_fsblock` shifts by it,
+        // and at 64 or more that is a panic in a checked build and a
+        // masked shift in release, which silently names a different
+        // allocation group.
         let need = 32 - (self.agblocks - 1).leading_zeros();
-        if u32::from(self.agblklog) < need {
+        if u32::from(self.agblklog) < need || self.agblklog > 32 {
             return bad(format!(
-                "agblklog {} too small for agblocks {}",
+                "agblklog {} does not describe agblocks {}",
                 self.agblklog, self.agblocks
             ));
         }
@@ -897,6 +945,68 @@ mod tests {
         let crc = crc32c_with_zeroed_crc(&b, SB_CRC_OFFSET);
         b[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         Superblock::parse(&b).expect("superblock")
+    }
+
+    /// Rebuild a v4 superblock with one byte changed, and say whether
+    /// it parses.
+    fn v4_with_byte(at: usize, value: u8) -> Result<Superblock> {
+        let mut b = v4_superblock();
+        b[at] = value;
+        Superblock::parse(&b)
+    }
+
+    /// `dirblocksize()` is `blocksize << dirblklog` in a `u32`, and
+    /// nothing checked the field. At a 512-byte block, dirblklog 23 --
+    /// or any value at or above 32 minus blocklog -- truncates the
+    /// product to ZERO, and `read_dir` then advances the file block by
+    /// `dir_block_size / blocksize`, which is also zero. The loop never
+    /// moves: it allocates a zero-length buffer and issues a device
+    /// read, forever, out of `fs_xfs_dir_open`. A hang is not something
+    /// `catch_unwind` can turn into an error.
+    #[test]
+    fn a_directory_block_size_that_truncates_to_zero_is_refused() {
+        // blocklog is 12 in the fixture, so 20 is the first that wraps.
+        assert!(
+            v4_with_byte(offsets::DIRBLKLOG, 20).is_err(),
+            "a directory block size of 4096 << 20 -- which is zero -- was accepted"
+        );
+        assert!(v4_with_byte(offsets::DIRBLKLOG, 23).is_err());
+        assert!(v4_with_byte(offsets::DIRBLKLOG, 255).is_err());
+        // And the one below the wrap, which is a 2 GiB allocation per
+        // directory block rather than a loop.
+        assert!(v4_with_byte(offsets::DIRBLKLOG, 19).is_err());
+        // A directory block is between one block and 64 KiB: 4 KiB,
+        // 8 KiB, 16 KiB, 32 KiB and 64 KiB at this block size.
+        for log in 0..=4 {
+            assert!(
+                v4_with_byte(offsets::DIRBLKLOG, log).is_ok(),
+                "dirblklog {log} describes a {} byte directory block",
+                4096u32 << log
+            );
+        }
+        assert!(v4_with_byte(offsets::DIRBLKLOG, 5).is_err());
+    }
+
+    /// `split_ino` shifts by `inopblog` and `split_fsblock` by
+    /// `agblklog`. At 64 or more that is a panic in a checked build and
+    /// a masked shift in release, where it silently names a different
+    /// allocation group -- for every directory entry `check_entry_ino`
+    /// looks at.
+    #[test]
+    fn a_log2_field_that_does_not_describe_its_value_is_refused() {
+        // inopblock is 8 in the fixture, so 3 is the only right answer.
+        assert!(v4_with_byte(offsets::INOPBLOG, 3).is_ok());
+        assert!(v4_with_byte(offsets::INOPBLOG, 2).is_err());
+        assert!(v4_with_byte(offsets::INOPBLOG, 4).is_err());
+        assert!(v4_with_byte(offsets::INOPBLOG, 64).is_err());
+        assert!(v4_with_byte(offsets::INOPBLOG, 255).is_err());
+
+        // agblocks is 1000, so agblklog must be at least 10 and no
+        // wider than a block number.
+        assert!(v4_with_byte(offsets::AGBLKLOG, 10).is_ok());
+        assert!(v4_with_byte(offsets::AGBLKLOG, 9).is_err());
+        assert!(v4_with_byte(offsets::AGBLKLOG, 64).is_err());
+        assert!(v4_with_byte(offsets::AGBLKLOG, 255).is_err());
     }
 
     /// The cluster is 8 KiB scaled by how many minimum-size inodes fit

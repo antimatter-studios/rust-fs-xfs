@@ -109,10 +109,43 @@ pub fn changed_chunks(blkno: u64, before: &[u8], after: Vec<u8>, buf_type: u16) 
     item
 }
 
+/// The record count in a tree root, checked against the block holding it.
+///
+/// `bb_numrecs` is two bytes off a block this driver has not verified in
+/// any other way -- no magic, no CRC, no owner, no self-address, unlike
+/// `alloc_btree::parse_block`, which checks all four. It was then used
+/// directly as a loop bound over `buf[at..at + RECORD]`, so 0xFFFF at a
+/// 4 KiB block size indexed past the end and panicked: out of
+/// `free_extents`, `rmap_records` and `refcount_records` alike, and out
+/// of the read paths `create` and `unlink` take.
+///
+/// A root holds as many records as fit in it. One claiming more is not
+/// describing this block.
+pub fn leaf_numrecs(buf: &[u8], record_bytes: usize) -> crate::error::Result<u16> {
+    let numrecs = u16::from_be_bytes(
+        buf[btree::NUMRECS..btree::NUMRECS + 2]
+            .try_into()
+            .expect("2 bytes"),
+    );
+    let capacity = buf.len().saturating_sub(btree::V5_BODY) / record_bytes;
+    if usize::from(numrecs) > capacity {
+        return Err(crate::error::Error::CorruptLog(format!(
+            "a tree root says it holds {numrecs} records, where {capacity} fit in \
+             its {}-byte block",
+            buf.len()
+        )));
+    }
+    Ok(numrecs)
+}
+
 /// The records of a single-level free-space tree, read straight out of
 /// its root.
+///
+/// `numrecs` must have come from [`leaf_numrecs`]; the `min` is a
+/// backstop so a future caller that forgets cannot index past the end.
 pub fn leaf_records(buf: &[u8], numrecs: u16) -> Vec<FreeExtent> {
-    (0..usize::from(numrecs))
+    let fit = buf.len().saturating_sub(btree::V5_BODY) / btree::RECORD;
+    (0..usize::from(numrecs).min(fit))
         .map(|i| {
             let at = btree::V5_BODY + i * btree::RECORD;
             FreeExtent {
@@ -301,11 +334,7 @@ impl crate::fs::Filesystem {
             &mut cnt_raw,
         )?;
 
-        let numrecs = u16::from_be_bytes(
-            bno_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                .try_into()
-                .expect("2 bytes"),
-        );
+        let numrecs = crate::group_write::leaf_numrecs(&bno_raw, btree::RECORD)?;
         let mut by_block = leaf_records(&bno_raw, numrecs);
 
         let chosen = by_block
@@ -385,11 +414,7 @@ impl crate::fs::Filesystem {
                 ag_start + u64::from(agf.roots[RMAP]) * blocksize,
                 &mut rmap_raw,
             )?;
-            let n = u16::from_be_bytes(
-                rmap_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                    .try_into()
-                    .expect("2 bytes"),
-            );
+            let n = crate::group_write::leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
             let mut records = crate::rmap::leaf_records(&rmap_raw, n);
             crate::rmap::insert(
                 &mut records,
@@ -431,6 +456,42 @@ mod tests {
 
     /// Only the chunks that differ are logged, and a byte written back
     /// to what it already was is not a change.
+    /// `bb_numrecs` is two bytes off a block this driver verifies in no
+    /// other way -- no magic, no CRC, no owner, no self-address, unlike
+    /// `alloc_btree::parse_block`, which checks all four. It was then a
+    /// loop bound over `buf[at..at + RECORD]`, so 0xFFFF at a 4 KiB
+    /// block size indexed past the end and panicked out of
+    /// `free_extents`, `rmap_records` and `refcount_records` alike.
+    #[test]
+    fn a_root_may_not_claim_more_records_than_fit_in_it() {
+        let mut buf = vec![0u8; 4096];
+        let fits = (4096 - btree::V5_BODY) / btree::RECORD; // 505
+        let put = |buf: &mut [u8], n: u16| {
+            buf[btree::NUMRECS..btree::NUMRECS + 2].copy_from_slice(&n.to_be_bytes());
+        };
+
+        put(&mut buf, fits as u16);
+        assert_eq!(leaf_numrecs(&buf, btree::RECORD).unwrap(), fits as u16);
+
+        put(&mut buf, fits as u16 + 1);
+        assert!(leaf_numrecs(&buf, btree::RECORD).is_err());
+
+        put(&mut buf, 0xFFFF);
+        assert!(leaf_numrecs(&buf, btree::RECORD).is_err());
+
+        // A wider record leaves room for fewer of them: 168 reverse
+        // mappings, 336 reference counts.
+        put(&mut buf, 169);
+        assert!(leaf_numrecs(&buf, crate::rmap::RECORD).is_err());
+        put(&mut buf, 168);
+        assert!(leaf_numrecs(&buf, crate::rmap::RECORD).is_ok());
+
+        // And the records themselves stop where the block does, so a
+        // count that slipped past the check cannot index off the end.
+        put(&mut buf, 0xFFFF);
+        assert_eq!(leaf_records(&buf, 0xFFFF).len(), fits);
+    }
+
     #[test]
     fn only_the_changed_chunks_are_logged() {
         let before = vec![7u8; 4096];
