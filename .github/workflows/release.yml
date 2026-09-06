@@ -17,6 +17,13 @@ on:
   push:
     tags: ['v*']
 
+# THE ONE PLACE THIS VERSION IS WRITTEN IN THIS FILE. `ci.yml` has its
+# own copy for the branch gate; they must be raised together, and the
+# `rust-deps-pinned` pre-commit hook refuses a lock that names a version
+# no workflow pins, which is what catches them being raised apart.
+env:
+  FS_CORE_REF: v0.2.10
+
 jobs:
   # Cheap and release-specific: a tag that disagrees with Cargo.toml
   # would publish a version nobody asked for, and a version number taken
@@ -63,9 +70,17 @@ jobs:
       # Clone the sibling repo that satisfies the am-fs-core path
       # dependency. `cargo publish` rewrites the path into its registry
       # equivalent, but the manifest still has to resolve locally first.
+      # PINNED THROUGH THE SHARED VARIABLE, not a literal. This line
+      # said v0.2.7 while the manifest had moved to ^0.2.10, and nothing
+      # noticed: the branch gate reads FS_CORE_REF and was raised with
+      # the manifest, while this one kept a number somebody had typed
+      # once. A drift like that only ever surfaces at the moment of a
+      # release, from a job that has never run against the current
+      # manifest, with a message about a candidate version that did not
+      # match rather than about a stale pin.
       - name: clone am-fs-core sibling
         shell: bash
-        run: git clone --depth 1 --branch v0.2.7 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
       # A version already on crates.io cannot be published again, and a
       # re-tag — or a first release published by hand before trusted
