@@ -78,6 +78,49 @@ Serving those from the block already cached is tracked as
 reduction is, and this measurement is what says so rather than a guess
 about where time goes.
 
+## 2026-09-06 — with `am-fs-core` 0.2.8, which serves partial reads
+
+Same fixture, same walk, same 512-block cache. The only change is
+underneath: `CachingDevice` now serves a read from the blocks it falls
+in, whatever its size or alignment, instead of only an exactly-aligned
+whole block.
+
+| shape | reads | bytes | wall | vs uncached | vs the aligned-only cache |
+|---|---:|---:|---:|---|---|
+| walk | 22 | 90 KB | 1564 µs | reads −98%, bytes −92% | reads −98% |
+| stat | 0 | 0 | 310 µs | reads −100%, bytes −100% | reads −100% |
+| read | 42 | 172 KB | 463 µs | reads −92%, bytes −77% | reads −90% |
+
+### `stat` reaches zero, and that is the whole point
+
+Resolving 64 paths from the root now costs **no calls to the device at
+all**. Every directory those paths walk through was read during the
+walk that preceded them and is still held; nothing has to be fetched
+again. The uncached figure for the same work was 360 reads.
+
+The walk falls from 1155 reads to 22 — a factor of 52. What is left is
+the mount itself plus the first touch of each block; everything after
+that is served from memory.
+
+`read` keeps the largest residue, at 42, which is right: file contents
+are the one thing that genuinely has to come off the device, and the
+bypass rule sends a read spanning more than half the cache straight
+through rather than evicting the metadata to hold it.
+
+### What the previous entry got right, and what it under-called
+
+The diagnosis was correct — three quarters of reads were sub-block and
+missed by construction — but the size of the fix was under-called.
+Serving partial reads was described as "the next large reduction". It
+was not a reduction so much as the difference between a cache that
+works and one that does not: **the aligned-only cache was removing 11%
+of reads on `stat`; the same cache serving partial reads removes all of
+them.**
+
+The lesson is worth keeping: a cache whose hit condition does not match
+the caller's access pattern reports plausible-looking small wins, and
+the small wins are what make it look tuned rather than broken.
+
 ## How to take the measurement again
 
 ```sh
