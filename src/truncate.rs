@@ -220,25 +220,33 @@ impl Filesystem {
 
         let mut refcount_changed = false;
         for extent in freeing_here {
-            let release = if reflink && refcount_level > 0 {
-                let before = refcount_records.len();
-                let r = crate::refcount::release(
+            // ONE EXTENT CAN BE PART SHARED AND PART NOT.
+            //
+            // The reference-count tree holds a record per shared run, and
+            // a file's extent may cover several of them with unshared
+            // gaps between -- that is what an overwrite in the middle of
+            // a reflinked file leaves behind. So the question is not
+            // whether this extent may be freed but WHICH OF ITS BLOCKS
+            // may, and the tree answers per range.
+            //
+            // Blocks another file still holds are never returned here.
+            // Dropping from two owners to one leaves them with whoever
+            // remains; only blocks nobody else holds go back.
+            let freeable = if reflink && refcount_level > 0 {
+                let before = refcount_records.clone();
+                let ranges = crate::refcount::release(
                     &mut refcount_records,
                     extent.startblock,
                     extent.blockcount,
                 )?;
-                refcount_changed |=
-                    r == crate::refcount::Release::StillShared || refcount_records.len() != before;
-                r
+                refcount_changed |= refcount_records != before;
+                ranges
             } else {
-                crate::refcount::Release::Free
+                vec![*extent]
             };
 
-            // Only the last owner returns the blocks. The rmap record
-            // comes out either way: this inode has stopped holding them
-            // whether or not anyone else still does.
-            if release == crate::refcount::Release::Free {
-                free_extent(&mut by_block, *extent)?;
+            for range in &freeable {
+                free_extent(&mut by_block, *range)?;
             }
         }
 

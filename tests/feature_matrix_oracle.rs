@@ -128,11 +128,44 @@ const OPS: &[&str] = &[
     // Only meaningful where an extent is actually shared, and skipped
     // as "not applicable" elsewhere -- see `perform`.
     "truncate_shared",
+    "truncate_partly_shared",
     // The only operation here that allocates for a directory.
     "convert_directory",
     // An operation in an allocation group above the first.
     "create_in_later_group",
 ];
+
+/// The rows and columns this run covers.
+///
+/// The whole matrix is twenty images times eleven operations, and every
+/// pair is a copy, a mount and a check inside the kernel. Iterating on
+/// one failing pair should not cost the other two hundred, so
+/// `XFS_MATRIX_COMBOS` and `XFS_MATRIX_OPS` take a comma-separated list
+/// of names to keep. Unset means all of them, which is what CI runs.
+///
+/// A name that matches nothing is a typo, and a typo that quietly
+/// selected an empty matrix would report a green run that checked
+/// nothing.
+fn selected(var: &str, all: &[&'static str]) -> Vec<&'static str> {
+    let Ok(list) = std::env::var(var) else {
+        return all.to_vec();
+    };
+    let wanted: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    for name in &wanted {
+        assert!(
+            all.contains(name),
+            "{var} names {name:?}, which is not one of {all:?}"
+        );
+    }
+    all.iter()
+        .copied()
+        .filter(|name| wanted.contains(name))
+        .collect()
+}
 
 /// Perform one operation on one image.
 fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
@@ -217,6 +250,21 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
                 Err(_) => return Err("not applicable: no shared extent on this filesystem".into()),
             };
             fs.truncate_to_zero(shared)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        // Freeing a file that is part shared and part not. One extent,
+        // three answers: the middle is this file's alone and goes back
+        // to free space, and the two ends stay with the file that still
+        // holds them.
+        "truncate_partly_shared" => {
+            let partial = match fs.lookup_path("/sf/partial.bin") {
+                Ok(i) => i.ino,
+                Err(_) => {
+                    return Err("not applicable: no partly shared file on this filesystem".into())
+                }
+            };
+            fs.truncate_to_zero(partial)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
@@ -312,14 +360,17 @@ fn every_feature_combination_is_written_correctly_or_refused() {
     let mut broken: Vec<String> = Vec::new();
     let mut unjudged = 0;
 
-    for combo in COMBOS {
+    let combos = selected("XFS_MATRIX_COMBOS", COMBOS);
+    let ops = selected("XFS_MATRIX_OPS", OPS);
+
+    for combo in &combos {
         let source = share().join(format!("xfsfeat-{combo}.img"));
         if !source.exists() {
             eprintln!("no xfsfeat-{combo} fixture — skipping");
             continue;
         }
 
-        for op in OPS {
+        for op in &ops {
             // A fresh copy per operation: the previous one may have
             // left a record in the log, and the next must start from
             // the filesystem as mkfs made it.

@@ -163,6 +163,20 @@ for combo in "${COMBOS[@]}"; do
     # nothing shared does not test that at all.
     if $SUDO cp --reflink=always "$m/sf/data.bin" "$m/sf/shared.bin" 2>/dev/null; then
         echo "  (shared extent created: sf/shared.bin reflinks sf/data.bin)"
+
+        # PART SHARED AND PART NOT, which is the harder case and the
+        # ordinary one: overwriting the middle of a reflinked file
+        # breaks the shared run in two and leaves the middle belonging to
+        # this file alone. Measured -- [24,16,2] becomes [24,6,2] and
+        # [34,6,2], with the middle keeping no record because a single
+        # owner needs none.
+        #
+        # Freeing it is then three different answers in one extent: give
+        # back the middle, leave the two ends with the other file.
+        $SUDO cp --reflink=always "$m/sf/data.bin" "$m/sf/partial.bin" 2>/dev/null
+        $SUDO dd if=/dev/urandom of="$m/sf/partial.bin" bs=4096 count=8 seek=12 \
+            conv=notrunc status=none 2>/dev/null
+        echo "  (partly shared file created: sf/partial.bin, middle overwritten)"
     else
         echo "  (no reflink support here; sf/shared.bin not created)"
     fi
