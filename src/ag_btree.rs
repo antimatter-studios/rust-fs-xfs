@@ -301,6 +301,234 @@ where
     Ok(out)
 }
 
+/// How a tree of `records` records is laid out: how many blocks each
+/// level holds, leaves first, root last.
+///
+/// The root is the last entry and is always one block. A tree of no
+/// records is one empty leaf, which is what an empty group's root is.
+///
+/// # How full each block is
+///
+/// Evenly, not greedily. Filling each leaf to its maximum and leaving
+/// the remainder in the last one produces a final leaf that can hold as
+/// little as one record, and `xfs_repair` requires every block below
+/// the root to hold at least `maxrecs / 2`. Spreading the records
+/// across the leaves satisfies that without a special case: with `l`
+/// leaves each holds `n / l` or one more, and `n` is above
+/// `(l - 1) * maxrecs`, so `n / l` cannot fall below half.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the records need a tree deeper
+/// than [`MAX_LEVELS`], which no allocation group can have.
+pub fn plan(shape: Shape, blocksize: u32, is_v5: bool, records: usize) -> Result<Vec<usize>> {
+    let header = if is_v5 { V5_HEADER_LEN } else { V4_HEADER_LEN };
+    let space = blocksize as usize - header;
+    let per_leaf = maxrecs(space, shape.record_len);
+    let per_node = maxrecs(space, shape.key_len + PTR_LEN);
+    if per_leaf == 0 || per_node < 2 {
+        return Err(Error::UnsupportedFeature(format!(
+            "a {} block of {blocksize} bytes holds {per_leaf} records and {per_node} \
+             pointers, which cannot make a tree",
+            shape.name
+        )));
+    }
+
+    let mut levels = vec![records.div_ceil(per_leaf).max(1)];
+    while *levels.last().expect("never empty") > 1 {
+        let below = *levels.last().expect("never empty");
+        levels.push(below.div_ceil(per_node));
+        if levels.len() > usize::from(MAX_LEVELS) {
+            return Err(Error::UnsupportedFeature(format!(
+                "{records} {} records need a tree more than {MAX_LEVELS} levels deep",
+                shape.name
+            )));
+        }
+    }
+    Ok(levels)
+}
+
+/// How many records each block at one level holds, given how many
+/// entries that level has to carry between how many blocks.
+fn share(entries: usize, blocks: usize) -> Vec<usize> {
+    if blocks == 0 {
+        return Vec::new();
+    }
+    let each = entries / blocks;
+    let extra = entries % blocks;
+    (0..blocks).map(|i| each + usize::from(i < extra)).collect()
+}
+
+/// One block of a laid-out tree, ready to be written.
+#[derive(Debug)]
+pub struct Built {
+    /// Where in the group it goes.
+    pub agblock: u32,
+    /// Its contents.
+    pub bytes: Vec<u8>,
+}
+
+/// Lay `records` out as a whole tree over `blocks`.
+///
+/// `blocks` is the group-relative block number for every block of the
+/// tree, leaves first and in the order [`plan`] describes; the caller
+/// owns where they come from, because taking one and giving one back
+/// are the group's business rather than the tree's. `encode_record`
+/// writes one record at an offset, and `key_of` writes the key that
+/// stands for a subtree -- which is the key of its first record, and
+/// not always its first bytes: a reference-count record is twelve bytes
+/// and its key is the four-byte start block.
+///
+/// Blocks come back in the same order as `blocks`, so the caller can
+/// diff each against what was there before.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when `blocks` is not the number of
+/// blocks the records need, which is a caller that did not ask [`plan`]
+/// first.
+pub fn build<T, E, K>(
+    sb: &Superblock,
+    shape: Shape,
+    agno: u32,
+    records: &[T],
+    blocks: &[u32],
+    encode_record: E,
+    key_of: K,
+) -> Result<Vec<Built>>
+where
+    E: Fn(&mut [u8], usize, &T),
+    K: Fn(&mut [u8], usize, &T),
+{
+    let levels = plan(shape, sb.blocksize, sb.is_v5(), records.len())?;
+    let wanted: usize = levels.iter().sum();
+    if blocks.len() != wanted {
+        return Err(Error::UnsupportedFeature(format!(
+            "laying out {} {} records needs {wanted} blocks and {} were given",
+            records.len(),
+            shape.name,
+            blocks.len()
+        )));
+    }
+
+    let header = if sb.is_v5() {
+        V5_HEADER_LEN
+    } else {
+        V4_HEADER_LEN
+    };
+    let space = sb.blocksize as usize - header;
+    let per_node = maxrecs(space, shape.key_len + PTR_LEN);
+
+    let mut out: Vec<Built> = Vec::with_capacity(wanted);
+    // Where each level's blocks start in `blocks`, and how many entries
+    // each of those blocks carries.
+    let mut at = 0usize;
+
+    // The leaves, in record order.
+    let counts = share(records.len(), levels[0]);
+    let mut taken = 0usize;
+    for (i, &count) in counts.iter().enumerate() {
+        let agblock = blocks[at + i];
+        let mut buf = vec![0u8; sb.blocksize as usize];
+        for (j, record) in records[taken..taken + count].iter().enumerate() {
+            encode_record(&mut buf, header + j * shape.record_len, record);
+        }
+        // The first record of each leaf, kept for the level above.
+        stamp(&mut buf, sb, shape, agno, agblock, 0, count as u16);
+        out.push(Built {
+            agblock,
+            bytes: buf,
+        });
+        taken += count;
+    }
+    debug_assert_eq!(taken, records.len());
+
+    // Each level above indexes the level below it. `first` is the index
+    // into `records` of the first record under each block of the level
+    // below, which is the key that stands for it.
+    let mut below_first: Vec<usize> = Vec::new();
+    let mut running = 0usize;
+    for &count in &counts {
+        below_first.push(running);
+        running += count;
+    }
+    let mut below_blocks: Vec<u32> = blocks[at..at + levels[0]].to_vec();
+    at += levels[0];
+
+    for (up, &count_of_blocks) in levels.iter().enumerate().skip(1) {
+        let counts = share(below_blocks.len(), count_of_blocks);
+        let mut this_first: Vec<usize> = Vec::new();
+        let mut this_blocks: Vec<u32> = Vec::new();
+        let mut taken = 0usize;
+        for (i, &count) in counts.iter().enumerate() {
+            let agblock = blocks[at + i];
+            let mut buf = vec![0u8; sb.blocksize as usize];
+            for j in 0..count {
+                let child = taken + j;
+                key_of(
+                    &mut buf,
+                    header + j * shape.key_len,
+                    &records[below_first[child]],
+                );
+                let ptr = header + per_node * shape.key_len + j * PTR_LEN;
+                buf[ptr..ptr + PTR_LEN].copy_from_slice(&below_blocks[child].to_be_bytes());
+            }
+            stamp(&mut buf, sb, shape, agno, agblock, up as u16, count as u16);
+            this_first.push(below_first[taken]);
+            this_blocks.push(agblock);
+            out.push(Built {
+                agblock,
+                bytes: buf,
+            });
+            taken += count;
+        }
+        debug_assert_eq!(taken, below_blocks.len());
+        below_first = this_first;
+        below_blocks = this_blocks;
+        at += count_of_blocks;
+    }
+
+    Ok(out)
+}
+
+/// The header every block of a group tree carries, and its checksum.
+///
+/// The checksum is written here rather than left stale: these blocks are
+/// laid out from nothing, so there is no earlier checksum for recovery
+/// to recompute from.
+fn stamp(
+    buf: &mut [u8],
+    sb: &Superblock,
+    shape: Shape,
+    agno: u32,
+    agblock: u32,
+    level: u16,
+    numrecs: u16,
+) {
+    let magic = if sb.is_v5() {
+        shape.magic_v5
+    } else {
+        shape.magic_v4.unwrap_or(shape.magic_v5)
+    };
+    buf[offsets::MAGIC..offsets::MAGIC + 4].copy_from_slice(&magic.to_be_bytes());
+    buf[offsets::LEVEL..offsets::LEVEL + 2].copy_from_slice(&level.to_be_bytes());
+    buf[offsets::NUMRECS..offsets::NUMRECS + 2].copy_from_slice(&numrecs.to_be_bytes());
+    // No siblings. A tree laid out again has none to point at until
+    // every block has an address, and nothing in this driver reads them
+    // -- the walk descends rather than following a leaf chain.
+    buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+    buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+    if !sb.is_v5() {
+        return;
+    }
+    let blkno = crate::alloc_btree::expected_blkno(sb, agno, agblock);
+    buf[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&blkno.to_be_bytes());
+    buf[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
+    buf[offsets::OWNER..offsets::OWNER + 4].copy_from_slice(&agno.to_be_bytes());
+    let crc = crc32c_with_zeroed_crc(buf, offsets::CRC);
+    buf[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +770,145 @@ mod tests {
             format!("{err}").contains("more blocks than the group holds"),
             "{err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Laying a tree out again
+    // -----------------------------------------------------------------
+
+    fn encode_run(buf: &mut [u8], at: usize, run: &(u32, u32)) {
+        buf[at..at + 4].copy_from_slice(&run.0.to_be_bytes());
+        buf[at + 4..at + 8].copy_from_slice(&run.1.to_be_bytes());
+    }
+
+    /// Runs at every third block, so each one is its own record and
+    /// none of them merge.
+    fn runs(n: usize) -> Vec<(u32, u32)> {
+        (0..n).map(|i| (100 + i as u32 * 3, 1)).collect()
+    }
+
+    /// How many records a leaf and a node hold at this block size,
+    /// which every count below is stated against.
+    fn capacities() -> (usize, usize) {
+        let space = 4096 - V5_HEADER_LEN;
+        (
+            maxrecs(space, bno().record_len),
+            maxrecs(space, bno().key_len + PTR_LEN),
+        )
+    }
+
+    /// The counts a plan produces, stated rather than derived, because
+    /// getting them from the same arithmetic the code uses would agree
+    /// with a mistake.
+    #[test]
+    fn a_plan_grows_a_level_when_the_records_stop_fitting() {
+        let sb = v5_superblock();
+        let (leaf, _node) = capacities();
+        assert_eq!(leaf, 505, "505 eight-byte records in 4096 - 56 bytes");
+
+        let plan_for = |n| plan(bno(), sb.blocksize, sb.is_v5(), n).expect("a legal plan");
+
+        // No records is still a tree: one empty leaf, which is the root.
+        assert_eq!(plan_for(0), vec![1]);
+        assert_eq!(plan_for(1), vec![1]);
+        assert_eq!(plan_for(leaf), vec![1], "a full root is still one block");
+        assert_eq!(
+            plan_for(leaf + 1),
+            vec![2, 1],
+            "one record more than a root holds is two leaves under a root"
+        );
+        assert_eq!(plan_for(leaf * 2), vec![2, 1]);
+        assert_eq!(plan_for(leaf * 2 + 1), vec![3, 1]);
+    }
+
+    /// Every block below the root holds at least half of what it could,
+    /// which is what `xfs_repair` requires and what filling greedily
+    /// would break: 506 records into 505 + 1 leaves the second leaf
+    /// with one record in it.
+    #[test]
+    fn no_block_below_the_root_is_less_than_half_full() {
+        let sb = v5_superblock();
+        let (leaf, _) = capacities();
+
+        for n in [leaf + 1, leaf + 2, leaf * 2 - 1, leaf * 3 + 7, 5000] {
+            let levels = plan(bno(), sb.blocksize, sb.is_v5(), n).expect("a legal plan");
+            let counts = share(n, levels[0]);
+            let least = *counts.iter().min().expect("at least one leaf");
+            assert!(
+                least >= leaf / 2,
+                "{n} records over {} leaves put {least} in one, under the {} minimum",
+                levels[0],
+                leaf / 2
+            );
+            assert_eq!(counts.iter().sum::<usize>(), n, "every record is somewhere");
+        }
+    }
+
+    /// THE ROUND TRIP. A tree laid out from a list of records gives that
+    /// list back when it is walked, at whatever depth the records
+    /// needed.
+    ///
+    /// This is the whole contract in one assertion: the walker is the
+    /// reader the rest of the driver uses, so a tree it agrees with is
+    /// a tree the driver can read, and the records coming back in order
+    /// is what makes the tree a tree rather than a heap.
+    #[test]
+    fn a_tree_laid_out_again_walks_back_to_the_records_it_was_given() {
+        let sb = v5_superblock();
+
+        for n in [0usize, 1, 200, 505, 506, 1200, 3000] {
+            let records = runs(n);
+            let levels = plan(bno(), sb.blocksize, sb.is_v5(), n).expect("a legal plan");
+            let total: usize = levels.iter().sum();
+            // Block 1 upwards; the group's own headers are below that.
+            let blocks: Vec<u32> = (1..=total as u32).collect();
+
+            let built = build(
+                &sb,
+                bno(),
+                0,
+                &records,
+                &blocks,
+                encode_run,
+                // A free-space record's key is its start block, which is
+                // its first four bytes -- but written through the same
+                // encoder, so a key that is not the record's head would
+                // be written the same way.
+                |buf, at, run: &(u32, u32)| {
+                    buf[at..at + 4].copy_from_slice(&run.0.to_be_bytes());
+                    buf[at + 4..at + 8].copy_from_slice(&run.1.to_be_bytes());
+                },
+            )
+            .expect("a tree lays out");
+
+            assert_eq!(built.len(), total, "{n}: one block per block planned");
+            let by_block: std::collections::HashMap<u32, Vec<u8>> =
+                built.into_iter().map(|b| (b.agblock, b.bytes)).collect();
+
+            let root = *blocks.last().expect("at least one block");
+            let out = walk(
+                &sb,
+                bno(),
+                0,
+                root,
+                levels.len() as u32,
+                |b| Ok(by_block[&b].clone()),
+                decode_run,
+            )
+            .unwrap_or_else(|e| panic!("{n} records: walking what was just built failed: {e}"));
+
+            assert_eq!(out, records, "{n}: the records came back changed");
+        }
+    }
+
+    /// The number of blocks is the plan's, not the caller's idea of it.
+    #[test]
+    fn laying_out_over_the_wrong_number_of_blocks_is_refused() {
+        let sb = v5_superblock();
+        let records = runs(600);
+        let err = build(&sb, bno(), 0, &records, &[1, 2], encode_run, encode_run)
+            .expect_err("two blocks cannot hold 600 records");
+        assert!(format!("{err}").contains("needs 3 blocks"), "{err}");
     }
 
     /// A depth no tree has is refused before a block is read, so a
