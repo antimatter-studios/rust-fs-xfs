@@ -161,11 +161,7 @@ impl Filesystem {
             rmap_raw = vec![0u8; self.sb.blocksize as usize];
             self.device()
                 .read_at(ag_start + u64::from(agf.roots[RMAP]) * block, &mut rmap_raw)?;
-            let n = u16::from_be_bytes(
-                rmap_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                    .try_into()
-                    .expect("2 bytes"),
-            );
+            let n = crate::group_write::leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
             rmap_records = crate::rmap::leaf_records(&rmap_raw, n);
 
             // One record per extent, matched exactly: this frees a
@@ -186,11 +182,7 @@ impl Filesystem {
             }
         }
 
-        let numrecs = u16::from_be_bytes(
-            bno_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                .try_into()
-                .expect("2 bytes"),
-        );
+        let numrecs = crate::group_write::leaf_numrecs(&bno_raw, btree::RECORD)?;
         let mut by_block = leaf_records(&bno_raw, numrecs);
 
         // WHAT MAY ACTUALLY GO BACK TO FREE SPACE.
@@ -222,11 +214,7 @@ impl Filesystem {
                 ag_start + u64::from(agf.refcount_root) * block,
                 &mut refcount_raw,
             )?;
-            let n = u16::from_be_bytes(
-                refcount_raw[btree::NUMRECS..btree::NUMRECS + 2]
-                    .try_into()
-                    .expect("2 bytes"),
-            );
+            let n = crate::group_write::leaf_numrecs(&refcount_raw, crate::refcount::RECORD)?;
             refcount_records = crate::refcount::leaf_records(&refcount_raw, n);
         }
 

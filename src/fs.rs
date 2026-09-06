@@ -262,11 +262,7 @@ impl Filesystem {
             ag_start + u64::from(agf.roots[crate::ag::agf_btree::BNO]) * block,
             &mut raw,
         )?;
-        let numrecs = u16::from_be_bytes(
-            raw[crate::group_write::btree::NUMRECS..crate::group_write::btree::NUMRECS + 2]
-                .try_into()
-                .expect("2 bytes"),
-        );
+        let numrecs = crate::group_write::leaf_numrecs(&raw, crate::group_write::btree::RECORD)?;
         Ok(crate::group_write::leaf_records(&raw, numrecs))
     }
 
@@ -296,11 +292,7 @@ impl Filesystem {
         let mut raw = vec![0u8; self.sb.blocksize as usize];
         self.device
             .read_at(ag_start + u64::from(agf.refcount_root) * block, &mut raw)?;
-        let numrecs = u16::from_be_bytes(
-            raw[crate::group_write::btree::NUMRECS..crate::group_write::btree::NUMRECS + 2]
-                .try_into()
-                .expect("2 bytes"),
-        );
+        let numrecs = crate::group_write::leaf_numrecs(&raw, crate::refcount::RECORD)?;
         Ok(crate::refcount::leaf_records(&raw, numrecs))
     }
 
@@ -332,11 +324,7 @@ impl Filesystem {
             ag_start + u64::from(agf.roots[crate::ag::agf_btree::RMAP]) * block,
             &mut raw,
         )?;
-        let numrecs = u16::from_be_bytes(
-            raw[crate::group_write::btree::NUMRECS..crate::group_write::btree::NUMRECS + 2]
-                .try_into()
-                .expect("2 bytes"),
-        );
+        let numrecs = crate::group_write::leaf_numrecs(&raw, crate::rmap::RECORD)?;
         Ok(crate::rmap::leaf_records(&raw, numrecs))
     }
 
@@ -577,7 +565,23 @@ impl Filesystem {
     }
 
     /// Read a whole file into a new buffer.
+    ///
+    /// Materialises the file, so it is bounded by the size of the
+    /// filesystem: a whole-file read cannot need more memory than the
+    /// filesystem has bytes. `di_size` is unconstrained for a
+    /// `Format::Extents` regular file -- `Inode::validate` bounds it
+    /// only for `Format::Local` -- so 0xFFFF_FFFF_FFFF_FFFF reached
+    /// this allocation as "capacity overflow", and merely large values
+    /// reached it as an abort.
     pub fn read_file(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<u8>> {
+        let filesystem_bytes = self.sb.dblocks.saturating_mul(u64::from(self.sb.blocksize));
+        if inode.size > filesystem_bytes {
+            return Err(Error::BadSuperblock(format!(
+                "inode {} says it is {} bytes, and reading it whole would need more \
+                 memory than the {filesystem_bytes} the filesystem holds",
+                inode.ino, inode.size
+            )));
+        }
         let mut out = vec![0u8; inode.size as usize];
         let n = self.read_at(inode, raw, 0, &mut out)?;
         out.truncate(n);
@@ -642,6 +646,27 @@ impl Filesystem {
                     "inode {}: a symlink's target is in an unwritten extent, which holds \
                      no target to read",
                     inode.ino
+                )));
+            }
+            // A SYMLINK'S EXTENT IS AS LONG AS A SYMLINK, no longer.
+            //
+            // `blockcount` is 21 bits off the disk, which at a 4 KiB
+            // block is 8.6 GB and at 64 KiB is 137 GB -- and this
+            // allocated it before reading anything. That size of
+            // allocation does not fail politely: `handle_alloc_error`
+            // aborts, which `capi::guard`'s `catch_unwind` cannot turn
+            // into an error, so `fs_xfs_readlink` took the process with
+            // it.
+            //
+            // The target is at most XFS_SYMLINK_MAXLEN bytes, so the
+            // blocks that can hold one are countable.
+            let per_block = sym::buf_space(self.sb.blocksize as usize, v5).max(1);
+            let most_blocks = sym::XFS_SYMLINK_MAXLEN.div_ceil(per_block).max(1);
+            if e.blockcount as usize > most_blocks {
+                return Err(Error::BadSuperblock(format!(
+                    "inode {}: a symlink's extent is {} blocks, where {most_blocks} hold \
+                     the longest target there is",
+                    inode.ino, e.blockcount
                 )));
             }
             let bytes = (e.blockcount * blocksize) as usize;
