@@ -557,92 +557,34 @@ impl<'a> GroupAlloc<'a> {
         Ok(ranges)
     }
 
-    /// The blocks one tree should occupy after the edit: the ones it
-    /// had, with the group's free list making up any difference.
-    ///
-    /// Surplus blocks come off the end, so the block that was the root
-    /// is the first to go back. Which block plays which part does not
-    /// matter -- every block states its own address and its parent
-    /// points at it by number -- so there is nothing to preserve beyond
-    /// the count.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedFeature`] when the free list is empty and a
-    /// block is wanted, or full and one is being returned. Refilling it
-    /// from free space is a second edit of the trees this one is
-    /// already changing, and is not implemented.
-    fn assign(&mut self, held: &[u32], wanted: usize) -> Result<Vec<u32>> {
-        let mut blocks = held.to_vec();
-        while blocks.len() < wanted {
-            blocks.push(self.agfl.take(self.sb, self.agno)?);
-        }
-        while blocks.len() > wanted {
-            let spare = blocks.pop().expect("more blocks than wanted");
-            self.agfl.put(self.sb, self.agno, spare)?;
-        }
-        Ok(blocks)
-    }
-
-    /// Lay one tree out again over the blocks it should occupy, and
-    /// collect an item for every block whose bytes changed.
+    /// Lay one tree out again, through the shared layout.
     fn relay<T, E, K>(
         &mut self,
         shape: crate::ag_btree::Shape,
         records: &[T],
         held: &[u32],
         encode_record: E,
-        key_of: K,
+        write_keys: K,
         items: &mut Vec<BufferItem>,
     ) -> Result<Vec<u32>>
     where
         E: Fn(&mut [u8], usize, &T),
         K: Fn(&mut [u8], usize, &[T]),
     {
-        use crate::alloc_btree::expected_blkno;
-        use crate::format::log_items::buf_log_format::buf_type::BLFT_BTREE;
-
-        let plan = crate::ag_btree::plan(shape, self.sb.blocksize, self.sb.is_v5(), records.len())?;
-        let wanted: usize = plan.iter().sum();
-        let blocks = self.assign(held, wanted)?;
-
-        let built = crate::ag_btree::build(
+        crate::ag_btree::relay(
             self.sb,
+            self.device,
+            self.ag_start,
             shape,
             self.agno,
             records,
-            &blocks,
+            held,
+            &self.before,
+            &mut self.agfl,
             encode_record,
-            key_of,
-        )?;
-
-        for block in built {
-            // A block that came off the free list has contents of its
-            // own, and the item has to be the difference from those
-            // rather than from nothing.
-            let before = match self.before.get(&block.agblock) {
-                Some(raw) => raw.clone(),
-                None => {
-                    let mut raw = vec![0u8; self.sb.blocksize as usize];
-                    self.device.read_at(
-                        self.ag_start + u64::from(block.agblock) * u64::from(self.sb.blocksize),
-                        &mut raw,
-                    )?;
-                    raw
-                }
-            };
-            if before == block.bytes {
-                continue;
-            }
-            items.push(changed_chunks(
-                expected_blkno(self.sb, self.agno, block.agblock),
-                &before,
-                block.bytes,
-                BLFT_BTREE,
-            ));
-        }
-
-        Ok(blocks)
+            write_keys,
+            items,
+        )
     }
 
     /// The buffer items recording everything taken.

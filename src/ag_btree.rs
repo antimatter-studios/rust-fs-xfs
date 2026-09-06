@@ -551,6 +551,88 @@ where
     Ok(out)
 }
 
+/// Lay one of a group's trees out again over the blocks it should
+/// occupy, and collect an item for every block whose bytes changed.
+///
+/// The blocks it should occupy are the ones it has, with the group's
+/// free list making up any difference: a tree that grew takes from the
+/// list, one that shrank puts back. Surplus comes off the end, so the
+/// block that was the root is the first to go back -- which block plays
+/// which part does not matter, because every block states its own
+/// address and its parent points at it by number.
+///
+/// `before` holds the blocks as they were, so an unchanged block costs
+/// nothing; a block that has just come off the free list is not in
+/// there and is read, because an item is a difference from what was
+/// on disk rather than from nothing.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the free list is empty and a
+/// block is wanted, or full and one is being returned, and whatever
+/// [`plan`] and [`build`] return.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn relay<T, E, K>(
+    sb: &Superblock,
+    device: &dyn fs_core::BlockRead,
+    ag_start: u64,
+    shape: Shape,
+    agno: u32,
+    records: &[T],
+    held: &[u32],
+    before: &std::collections::HashMap<u32, Vec<u8>>,
+    agfl: &mut crate::agfl::Agfl,
+    encode_record: E,
+    write_keys: K,
+    items: &mut Vec<crate::buf_write::BufferItem>,
+) -> Result<Vec<u32>>
+where
+    E: Fn(&mut [u8], usize, &T),
+    K: Fn(&mut [u8], usize, &[T]),
+{
+    use crate::alloc_btree::expected_blkno;
+    use crate::format::log_items::buf_log_format::buf_type::BLFT_BTREE;
+
+    let levels = plan(shape, sb.blocksize, sb.is_v5(), records.len())?;
+    let wanted: usize = levels.iter().sum();
+
+    let mut blocks = held.to_vec();
+    while blocks.len() < wanted {
+        blocks.push(agfl.take(sb, agno)?);
+    }
+    while blocks.len() > wanted {
+        let spare = blocks.pop().expect("more blocks than wanted");
+        agfl.put(sb, agno, spare)?;
+    }
+
+    let built = build(sb, shape, agno, records, &blocks, encode_record, write_keys)?;
+
+    for block in built {
+        let was = match before.get(&block.agblock) {
+            Some(raw) => raw.clone(),
+            None => {
+                let mut raw = vec![0u8; sb.blocksize as usize];
+                device.read_at(
+                    ag_start + u64::from(block.agblock) * u64::from(sb.blocksize),
+                    &mut raw,
+                )?;
+                raw
+            }
+        };
+        if was == block.bytes {
+            continue;
+        }
+        items.push(crate::group_write::changed_chunks(
+            expected_blkno(sb, agno, block.agblock),
+            &was,
+            block.bytes,
+            BLFT_BTREE,
+        ));
+    }
+
+    Ok(blocks)
+}
+
 /// The header every block of a group tree carries, and its checksum.
 ///
 /// The checksum is written here rather than left stale: these blocks are

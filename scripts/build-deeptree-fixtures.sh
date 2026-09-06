@@ -54,6 +54,14 @@ FIXTURES=(
     # grows with the free space, so it is a second tree at two levels in
     # the same group.
     "rmap2:-m crc=1,rmapbt=1,reflink=0 -b size=1024 -d agcount=2:600"
+    # THE INODE TREES at two levels, which is a different pair of trees
+    # and a different builder: they are indexed by inode rather than by
+    # block, so fragmenting free space does nothing to them. A 1 KiB
+    # block holds 60 chunk records and a chunk is 64 inodes, so a second
+    # level needs about 3,900 inodes -- four thousand files, made in
+    # batches because four thousand separate `touch` calls into a
+    # virtual machine is slower than the filesystem work being measured.
+    "inobt2:-m crc=1,rmapbt=0,reflink=0,finobt=1 -b size=1024 -d agcount=2:0"
 )
 
 built=0
@@ -79,6 +87,14 @@ for spec in "${FIXTURES[@]}"; do
     m=$(mktemp -d)
     $SUDO mount -o loop "$img" "$m"
 
+    # The inode-tree fixture wants inodes rather than fragments: four
+    # thousand empty files in one directory, which is 62 chunks of 64.
+    if [ "$name" = inobt2 ]; then
+        $SUDO mkdir -p "$m/many"
+        seq 1 4000 | sed "s|^|$m/many/f|" | $SUDO xargs -n 200 touch
+        sync
+    fi
+
     $SUDO mkdir -p "$m/frag"
     n=0
     while [ "$n" -lt "$files" ]; do
@@ -98,6 +114,15 @@ for spec in "${FIXTURES[@]}"; do
     done
     sync
 
+    # A FILE WITH A BLOCK IN IT, always. The fragment loop leaves the
+    # odd-numbered ones behind, so `frag/f1` is already there for the
+    # fixtures that run it -- and the inode-tree fixture does not run it
+    # at all, so a truncate had nothing to free and the oracle recorded
+    # "no such file or directory" as though the driver had refused.
+    if [ ! -f "$m/frag/f1" ]; then
+        $SUDO dd if=/dev/zero of="$m/frag/f1" bs=1024 count=1 status=none
+    fi
+
     # A directory one entry short of leaving its inode, and a file to
     # write into, so the write oracles have something to do here that
     # allocates.
@@ -114,13 +139,19 @@ for spec in "${FIXTURES[@]}"; do
     # have a two-level tree and holding a one-level tree looks like a
     # passing test and proves nothing, so the depth is read back off the
     # image and the fixture is thrown away if it is not there.
-    levels=$(xfs_db -r -c 'agf 0' -c 'p levels[0]' "$img" 2>/dev/null | awk -F'= ' '{print $2}')
+    if [ "$name" = inobt2 ]; then
+        levels=$(xfs_db -r -c 'agi 0' -c 'p level' "$img" 2>/dev/null | awk -F'= ' '{print $2}')
+        what="inode tree"
+    else
+        levels=$(xfs_db -r -c 'agf 0' -c 'p levels[0]' "$img" 2>/dev/null | awk -F'= ' '{print $2}')
+        what="by-block tree"
+    fi
     if [ "${levels:-0}" -lt 2 ]; then
-        echo "SKIP  $name (by-block tree came out ${levels:-unknown} level(s), wanted 2+)"
+        echo "SKIP  $name ($what came out ${levels:-unknown} level(s), wanted 2+)"
         rm -f "$img"
         continue
     fi
-    echo "OK    xfsdeep-$name.img (by-block tree $levels levels)"
+    echo "OK    xfsdeep-$name.img ($what $levels levels)"
     built=$((built + 1))
 done
 

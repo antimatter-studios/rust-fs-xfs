@@ -48,17 +48,11 @@
 //!   the chunk this may put back;
 //! - a v4 filesystem.
 
-use crate::ag::{offsets::agi as agi_at, Agi};
-use crate::alloc_btree::expected_blkno;
 use crate::dir;
 use crate::error::{Error, Result};
-use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGI, BLFT_BTREE};
 use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
-use crate::group_write::{btree, changed_chunks, rebuild_inode_leaf, INODE_RECORD_LEN};
 use crate::inode::Format;
-use crate::inode_btree::{walk_from_agi, InodeChunk, Which};
-use crate::log::BBSIZE;
 use crate::log_write::{
     append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
     InodeBuffer, Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
@@ -170,48 +164,20 @@ impl Filesystem {
         }
 
         let (agno, _, _) = self.sb.split_ino(ino);
-        let block = u64::from(self.sb.blocksize);
-        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
-        let sector = u64::from(self.sb.sectsize);
 
-        let mut agi_raw = vec![0u8; self.sb.sectsize as usize];
-        self.device().read_at(ag_start + 2 * sector, &mut agi_raw)?;
-        let agi = Agi::parse(&agi_raw, &self.sb, agno)?;
-
-        // The free-inode tree is optional. `mkfs.xfs -m finobt=0` makes a
-        // filesystem without one, which is legal and ordinary, and its
-        // AGI then reports level 0 because there is no tree rather than
-        // because the tree is unusable. Demanding a single level of it
-        // refused a filesystem this driver can write to perfectly well.
-        let finobt = self.sb.has_finobt();
-        let levels: &[(u32, &str)] = if finobt {
-            &[(agi.level, "inode"), (agi.free_level, "free-inode")]
-        } else {
-            &[(agi.level, "inode")]
-        };
-        for &(level, what) in levels {
-            if level != 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "allocation group {agno}'s {what} tree is {level} levels deep, where \
-                     changing a record can reshape a node; only a single-level tree is \
-                     supported"
-                )));
-            }
-        }
-
-        let read = |agblock: u32| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; self.sb.blocksize as usize];
-            self.device()
-                .read_at(ag_start + u64::from(agblock) * block, &mut buf)?;
-            Ok(buf)
-        };
-        let mut chunks = walk_from_agi(&self.sb, &agi, Which::All, read)?
-            .expect("every filesystem has an inode tree");
+        // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
+        // are. This read the AGI, checked both trees were a single block
+        // deep, edited a chunk and wrote the roots back. A 1 KiB root
+        // holds 60 chunk records and a chunk is 64 inodes, so a group
+        // with four thousand inodes in it already has a deeper tree and
+        // could not be unlinked from.
+        let mut trees = crate::inode_btree::Trees::open(&self.sb, self.device(), agno)?;
 
         // Which chunk holds it, and where in that chunk.
         let (_, ag_block, offset) = self.sb.split_ino(ino);
         let agino = (ag_block << self.sb.inopblog) | offset;
-        let index = chunks
+        let index = trees
+            .chunks()
             .iter()
             .position(|c| {
                 agino >= c.startino
@@ -222,53 +188,16 @@ impl Filesystem {
                     "inode {ino} is in no chunk of allocation group {agno}'s inode tree"
                 ))
             })?;
-        let slot = (agino - chunks[index].startino) as u8;
-        chunks[index].give_back(slot)?;
+        let slot = (agino - trees.chunks()[index].startino) as u8;
+        trees.chunks_mut()[index].give_back(slot)?;
 
-        let inobt_raw = read(agi.root)?;
-        let finobt_raw = if finobt {
-            read(agi.free_root)?
-        } else {
-            Vec::new()
-        };
-        let sparse = self.sb.has_sparse_inodes();
-
-        let new_inobt = rebuild_inode_leaf(&inobt_raw, &chunks, sparse);
-
-        // A chunk that had nothing free now has something, so the
-        // free-inode tree gains a record — which is the one direction in
-        // which this tree can run out of room.
-        let with_free: Vec<InodeChunk> =
-            chunks.iter().copied().filter(|c| c.freecount > 0).collect();
-        let capacity = (self.sb.blocksize as usize - btree::V5_BODY) / INODE_RECORD_LEN;
-        if with_free.len() > capacity {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno}'s free-inode tree would need {} records and its \
-                 root holds {capacity}; splitting a node is not implemented",
-                with_free.len()
-            )));
-        }
-        let new_finobt = if finobt {
-            rebuild_inode_leaf(&finobt_raw, &with_free, sparse)
-        } else {
-            Vec::new()
-        };
-        // The chunk an inode was just given back to has one free by
-        // definition, so it must be in the tree that holds the chunks
-        // with free inodes. When it was full a moment ago, that is the
-        // membership change this whole case is about.
-        debug_assert!(
-            with_free
-                .iter()
-                .any(|c| c.startino == chunks[index].startino),
-            "the chunk an inode was given back to must be in the free-inode tree"
-        );
-
-        let mut new_agi = agi_raw.clone();
-        let freecount: u32 = chunks.iter().map(|c| u32::from(c.freecount)).sum();
-        new_agi[agi_at::FREECOUNT..agi_at::FREECOUNT + 4].copy_from_slice(&freecount.to_be_bytes());
-        // The checksum is left stale on purpose — recovery recomputes it.
-        // See `group_write::restamp_crc`.
+        // The count of allocated inodes does not move: freeing one
+        // inside a chunk leaves the chunk where it was, and the count is
+        // of chunks' worth of inodes rather than of inodes in use.
+        let count = trees.agi().count;
+        let freecount: u32 = trees.chunks().iter().map(|c| u32::from(c.freecount)).sum();
+        trees.set_counts(count, freecount, None);
+        let group_items = trees.into_items()?;
 
         let fork = self.short_form_without_entry(&parsed, name, fork_end - fork_start)?;
         let mut dir_core = dir_raw.clone();
@@ -293,33 +222,7 @@ impl Filesystem {
         let mut fork_op = fork;
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
-        let ag_bb = ag_start / BBSIZE as u64;
-        let agi_item = changed_chunks(
-            ag_bb + 2 * sector / BBSIZE as u64,
-            &agi_raw,
-            new_agi,
-            BLFT_AGI,
-        );
-        let inobt_item = changed_chunks(
-            expected_blkno(&self.sb, agno, agi.root),
-            &inobt_raw,
-            new_inobt,
-            BLFT_BTREE,
-        );
-        let finobt_item = finobt.then(|| {
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agi.free_root),
-                &finobt_raw,
-                new_finobt,
-                BLFT_BTREE,
-            )
-        });
-
-        let item_ops = agi_item.op_count()
-            + inobt_item.op_count()
-            + finobt_item.as_ref().map_or(0, |i| i.op_count())
-            + 3
-            + 2;
+        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 3 + 2;
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -337,9 +240,7 @@ impl Filesystem {
                     data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
             ];
-            ops.extend(agi_item.ops());
-            ops.extend(inobt_item.ops());
-            if let Some(item) = &finobt_item {
+            for item in &group_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
