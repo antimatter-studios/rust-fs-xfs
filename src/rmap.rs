@@ -155,6 +155,25 @@ pub fn decode(buf: &[u8], at: usize) -> Rmap {
     }
 }
 
+/// One record written at `at` bytes into `buf`.
+pub fn encode(buf: &mut [u8], at: usize, record: &Rmap) {
+    buf[at..at + 4].copy_from_slice(&record.startblock.to_be_bytes());
+    buf[at + 4..at + 8].copy_from_slice(&record.blockcount.to_be_bytes());
+    buf[at + 8..at + 16].copy_from_slice(&record.owner.to_be_bytes());
+    buf[at + 16..at + 24].copy_from_slice(&record.offset.to_be_bytes());
+}
+
+/// The key that stands for a record in a node: the three fields the
+/// tree is ordered by, and not the whole record.
+///
+/// Twenty bytes where a record is twenty-four: the block count is not
+/// part of the ordering, so it is not part of the key.
+pub fn encode_key(buf: &mut [u8], at: usize, record: &Rmap) {
+    buf[at..at + 4].copy_from_slice(&record.startblock.to_be_bytes());
+    buf[at + 4..at + 12].copy_from_slice(&record.owner.to_be_bytes());
+    buf[at + 12..at + 20].copy_from_slice(&record.offset.to_be_bytes());
+}
+
 /// Every reverse-mapping record in a group, however deep its tree.
 pub fn walk<F>(
     sb: &crate::superblock::Superblock,

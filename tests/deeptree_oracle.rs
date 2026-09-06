@@ -232,3 +232,103 @@ fn a_tree_laid_out_again_is_one_xfs_repair_accepts() {
         "no fixture was judged — the test proved nothing"
     );
 }
+
+/// A write into a group whose trees are two levels deep, judged the way
+/// every other write here is: the kernel replays what was logged, and
+/// `xfs_repair` says whether what came out is a filesystem.
+///
+/// This is the point of the whole exercise. Reading a deep tree was
+/// fixed separately; until now every write path refused outright, so a
+/// filesystem with any real fragmentation was read-only in practice.
+#[test]
+fn a_write_into_a_group_with_deep_trees_is_sound() {
+    let fixtures = deep_fixtures();
+    if fixtures.is_empty() {
+        eprintln!("no xfsdeep-* fixtures — skipping");
+        return;
+    }
+
+    let mut judged = 0;
+    let mut broken: Vec<String> = Vec::new();
+
+    for src in &fixtures {
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fixture");
+        let Some(copy) = copy_of(src, &format!("wrote-{name}")) else {
+            broken.push(format!("{name}: could not be copied"));
+            continue;
+        };
+
+        {
+            let device = fs_core::FileDevice::open_rw(&copy.0).expect("open the copy for writing");
+            let fs = Filesystem::mount_rw(Arc::new(device)).expect("mount the copy");
+            let sf = match fs.lookup_path("/sf") {
+                Ok(i) => i.ino,
+                Err(e) => {
+                    broken.push(format!("{name}: /sf is missing: {e}"));
+                    continue;
+                }
+            };
+            match fs.create_file(sf, b"deep", 0o100644) {
+                Ok(_) => {}
+                Err(e) => {
+                    // A refusal is a result, not a failure -- but say
+                    // which, so a run that refused everything cannot
+                    // read as a run that wrote everything.
+                    eprintln!("{name}: refused: {e}");
+                    continue;
+                }
+            }
+        }
+
+        let script = format!(
+            r#"
+            img=$(mktemp -u /tmp/deepw-XXXXXX.img)
+            cp /share/scratch/wrote-{name} "$img"
+            m=$(mktemp -d)
+            mounted=0
+            for attempt in 1 2 3; do
+                if mount -o loop,nouuid "$img" "$m"; then
+                    umount "$m"
+                    mounted=$((mounted + 1))
+                fi
+                out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?
+                case "$out" in
+                    *"valuable metadata changes in a log"*) continue ;;
+                    *) break ;;
+                esac
+            done
+            rmdir "$m" 2>/dev/null
+            [ "$mounted" -gt 0 ] || echo "MOUNT_FAILED"
+            rm -f "$img"
+            echo "REPAIR_BEGIN"
+            echo "$out"
+            echo "REPAIR_RC=$rc"
+            echo "REPAIR_END"
+            echo DONE
+            "#
+        );
+        let Some(out) = kernel_run(&script) else {
+            eprintln!("{name}: no kernel to judge with — skipping");
+            continue;
+        };
+        judged += 1;
+        if !out.contains("REPAIR_RC=0") || out.contains("MOUNT_FAILED") {
+            broken.push(format!("{name}: the kernel objected:\n{out}"));
+        } else {
+            eprintln!("{name}: created a file in a group with two-level trees, sound");
+        }
+    }
+
+    assert!(
+        broken.is_empty(),
+        "a write into a deep-tree group did not survive:\n{}",
+        broken.join("\n")
+    );
+    assert!(
+        judged > 0,
+        "no fixture was judged — the test proved nothing"
+    );
+}

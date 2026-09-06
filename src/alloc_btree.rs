@@ -80,6 +80,26 @@ pub enum Order {
     ByCount,
 }
 
+/// One free-space record, decoded from `at` bytes into `buf`.
+///
+/// Both trees hold the same record; only the order differs.
+pub fn decode_free_extent(buf: &[u8], at: usize) -> FreeExtent {
+    FreeExtent {
+        startblock: u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes")),
+        blockcount: u32::from_be_bytes(buf[at + 4..at + 8].try_into().expect("4 bytes")),
+    }
+}
+
+/// One free-space record written at `at` bytes into `buf`.
+///
+/// Also the key: a free-space key is the record, in both trees -- the
+/// by-block tree is ordered by the start and the by-length tree by the
+/// length, and each carries both fields either way.
+pub fn encode_free_extent(buf: &mut [u8], at: usize, record: &FreeExtent) {
+    buf[at..at + 4].copy_from_slice(&record.startblock.to_be_bytes());
+    buf[at + 4..at + 8].copy_from_slice(&record.blockcount.to_be_bytes());
+}
+
 impl Order {
     /// The magic a block of this tree carries.
     fn magic(self, v5: bool) -> u32 {
