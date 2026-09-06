@@ -74,10 +74,13 @@ fn fixture() -> Option<PathBuf> {
     None
 }
 
-fn mount_counting(img: &Path) -> (Filesystem, Arc<CountingDevice>) {
+/// The counter sits BELOW the cache, so what it reports is what
+/// actually reached the device rather than what the driver asked for.
+/// `blocks` of zero mounts without a cache, which is the baseline.
+fn mount_counting(img: &Path, blocks: usize) -> (Filesystem, Arc<CountingDevice>) {
     let file = FileDevice::open(img).expect("open the fixture");
     let counting = Arc::new(CountingDevice::new(Arc::new(file)));
-    let fs = Filesystem::mount(counting.clone()).expect("mount");
+    let fs = Filesystem::mount_with_cache(counting.clone(), blocks).expect("mount");
     (fs, counting)
 }
 
@@ -148,7 +151,14 @@ fn what_a_read_costs_in_calls_to_the_device() {
     };
     eprintln!("measuring {}", img.display());
 
-    let (fs, counting) = mount_counting(&img);
+    for (label, blocks) in [("uncached", 0usize), ("cached", 512)] {
+        eprintln!("--- {label} ---");
+        measure_one(&img, blocks);
+    }
+}
+
+fn measure_one(img: &Path, blocks: usize) {
+    let (fs, counting) = mount_counting(img, blocks);
 
     let mut paths = Vec::new();
     let walk = measure(&counting, 0, || walk_paths(&fs, "/", 8, &mut paths));
