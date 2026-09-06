@@ -668,18 +668,25 @@ impl Superblock {
         // runs before every one of them, so it chose how long that
         // takes.
         //
-        // An internal log lives in the data section, so it starts
-        // inside it and ends inside it.
+        // `sb_logstart` IS A PACKED BLOCK NUMBER, not a linear one: the
+        // top bits are the allocation group and the rest the block
+        // within it. Comparing it to `sb_dblocks` refuses ordinary
+        // filesystems -- mkfs.xfs put a 16384-block log at fsbno 65542
+        // on a 76800-block volume, which is AG 1 block 6 and entirely
+        // legitimate.
+        //
+        // An internal log occupies one allocation group, so what has to
+        // hold is that the group exists and the log fits inside it.
         if self.has_internal_log() {
-            let end = self
-                .logstart
+            let (agno, agbno) = self.split_fsblock(self.logstart);
+            let fits = u64::from(agbno)
                 .checked_add(u64::from(self.logblocks))
-                .filter(|end| *end <= self.dblocks);
-            if end.is_none() {
+                .is_some_and(|end| end <= u64::from(self.agblocks));
+            if agno >= self.agcount || !fits {
                 return bad(format!(
-                    "the internal log is {} blocks at {}, which is not inside the \
-                     {}-block data section",
-                    self.logblocks, self.logstart, self.dblocks
+                    "the internal log is {} blocks at block {agbno} of group {agno}, \
+                     where the filesystem has {} groups of {} blocks",
+                    self.logblocks, self.agcount, self.agblocks
                 ));
             }
         }
@@ -1059,7 +1066,10 @@ mod tests {
     /// allocation-group header, or in the middle of a file. The same
     /// pair bounds the ring scan that runs before every one of them.
     #[test]
-    fn an_internal_log_outside_the_data_section_is_refused() {
+    fn an_internal_log_outside_its_allocation_group_is_refused() {
+        // The fixture: 4 groups of 1000 blocks, agblklog 10, so a
+        // packed block number is `agno << 10 | agbno`.
+        let packed = |agno: u64, agbno: u64| (agno << 10) | agbno;
         let put_start = |b: &mut Vec<u8>, at: u64| {
             b[offsets::LOGSTART..offsets::LOGSTART + 8].copy_from_slice(&at.to_be_bytes());
         };
@@ -1067,35 +1077,44 @@ mod tests {
             b[offsets::LOGBLOCKS..offsets::LOGBLOCKS + 4].copy_from_slice(&n.to_be_bytes());
         };
 
-        // The fixture: 4000 data blocks, a 200-block log at block 100.
-        let ok = v4_superblock();
-        assert!(Superblock::parse(&ok).is_ok());
-
-        // Past the end of the data section.
+        // A log inside group 1, which is where mkfs.xfs puts one.
         let mut b = v4_superblock();
-        put_start(&mut b, 4000);
-        assert!(Superblock::parse(&b).is_err());
-
-        // Starting inside it and running out of it.
-        let mut b = v4_superblock();
-        put_start(&mut b, 3900);
-        put_blocks(&mut b, 200);
-        assert!(Superblock::parse(&b).is_err());
-
-        // Ending exactly at the end is where a log usually is.
-        let mut b = v4_superblock();
-        put_start(&mut b, 3800);
+        put_start(&mut b, packed(1, 6));
         put_blocks(&mut b, 200);
         assert!(Superblock::parse(&b).is_ok());
 
-        // A start that leaves the address space entirely.
+        // THE ONE THAT MATTERS: a packed number is not a linear one.
+        // mkfs.xfs put a 16384-block log at fsbno 65542 on a
+        // 76800-block volume -- larger than dblocks as a plain number,
+        // and perfectly ordinary as AG 1 block 6.
         let mut b = v4_superblock();
-        put_start(&mut b, u64::MAX - 8);
+        put_start(&mut b, packed(3, 6));
+        put_blocks(&mut b, 900);
+        assert!(
+            Superblock::parse(&b).is_ok(),
+            "a log in the last group was refused"
+        );
+
+        // A group that does not exist.
+        let mut b = v4_superblock();
+        put_start(&mut b, packed(4, 0));
         put_blocks(&mut b, 200);
         assert!(Superblock::parse(&b).is_err());
 
-        // An external log -- logstart zero -- is not judged by any of
-        // this; it is not on this device at all.
+        // Inside a group that exists, running out of it.
+        let mut b = v4_superblock();
+        put_start(&mut b, packed(1, 900));
+        put_blocks(&mut b, 200);
+        assert!(Superblock::parse(&b).is_err());
+
+        // Ending exactly at the group's end is where a log usually is.
+        let mut b = v4_superblock();
+        put_start(&mut b, packed(1, 800));
+        put_blocks(&mut b, 200);
+        assert!(Superblock::parse(&b).is_ok());
+
+        // An external log -- logstart zero -- is not on this device at
+        // all and is not judged by any of this.
         let mut b = v4_superblock();
         put_start(&mut b, 0);
         put_blocks(&mut b, 0xFFFF_FFFF);
