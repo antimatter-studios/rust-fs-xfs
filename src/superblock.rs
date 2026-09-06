@@ -776,7 +776,20 @@ impl Superblock {
     /// Byte offset of a filesystem block within the device.
     pub fn fsblock_offset(&self, fsblock: u64) -> u64 {
         let (ag, ag_block) = self.split_fsblock(fsblock);
-        (u64::from(ag) * u64::from(self.agblocks) + u64::from(ag_block)) * u64::from(self.blocksize)
+        // Saturating. `fsblock` is packed: the top bits are the
+        // allocation-group number and the rest the block within it, and
+        // both halves come out of an extent record or a tree pointer
+        // off the disk. `agblocks` is a `u32` bounded only by the
+        // covers-dblocks check, so the product can leave a `u64` -- and
+        // in release, where this crate ships with `overflow-checks`
+        // off, it wrapped to an offset somewhere else on the device,
+        // which then read as though it were the block asked for.
+        // Saturating gives an offset no device reaches, so the read
+        // fails and says so.
+        (u64::from(ag))
+            .saturating_mul(u64::from(self.agblocks))
+            .saturating_add(u64::from(ag_block))
+            .saturating_mul(u64::from(self.blocksize))
     }
 
     /// Whether inode chunks may be sparse — that is, whether a chunk of
@@ -1007,6 +1020,37 @@ mod tests {
         assert!(v4_with_byte(offsets::AGBLKLOG, 9).is_err());
         assert!(v4_with_byte(offsets::AGBLKLOG, 64).is_err());
         assert!(v4_with_byte(offsets::AGBLKLOG, 255).is_err());
+    }
+
+    /// `fsblock` is packed -- the top bits are the allocation group,
+    /// the rest the block within it -- and both halves come out of an
+    /// extent record or a tree pointer off the disk. In release, where
+    /// this crate ships with `overflow-checks` off, an unchecked
+    /// product wrapped to an offset somewhere else on the device, which
+    /// then read as though it were the block asked for.
+    #[test]
+    fn a_block_number_past_the_address_space_does_not_wrap_to_one_inside_it() {
+        let mut b = v4_superblock();
+        // agblocks 2^31, agblklog 31, blocksize 4096: one allocation
+        // group is already 8 TB, and the group number is what is left
+        // of a 64-bit block number above 31 bits.
+        b[84..88].copy_from_slice(&(1u32 << 31).to_be_bytes());
+        b[88..92].copy_from_slice(&(1u32 << 21).to_be_bytes()); // agcount, to cover dblocks
+        b[124] = 31;
+        b[8..16].copy_from_slice(&(1u64 << 52).to_be_bytes()); // dblocks
+        let sb = Superblock::parse(&b).expect("a large but legal superblock");
+
+        // The last block of the last group the packing can express.
+        let offset = sb.fsblock_offset(u64::MAX);
+        assert_eq!(
+            offset,
+            u64::MAX,
+            "a block number past the address space produced offset {offset}, which is \
+             a real place on a real device"
+        );
+        // And an ordinary one still lands where it should.
+        assert_eq!(sb.fsblock_offset(0), 0);
+        assert_eq!(sb.fsblock_offset(1), 4096);
     }
 
     /// The cluster is 8 KiB scaled by how many minimum-size inodes fit
