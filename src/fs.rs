@@ -242,28 +242,37 @@ impl Filesystem {
         crate::ag::Agf::parse(&raw, &self.sb, agno)
     }
 
-    /// Every free extent in an allocation group, in block order.
+    /// Read one block of an allocation group, by its group-relative
+    /// number.
     ///
-    /// Reads the by-block tree's root alone, so it answers only for a
-    /// single-level tree — the same shape the write paths require.
-    pub fn free_extents(&self, agno: u32) -> Result<Vec<crate::alloc_btree::FreeExtent>> {
-        let agf = self.agf(agno)?;
-        let level = agf.levels[crate::ag::agf_btree::BNO];
-        if level != 1 {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno}'s by-block free-space tree is {level} levels deep, \
-                 and this reads the root alone"
-            )));
-        }
+    /// The closure the tree walkers want: they never assume a block is
+    /// where a cache would put it.
+    fn ag_block_reader(&self, agno: u32) -> impl FnMut(u32) -> Result<Vec<u8>> + '_ {
         let block = u64::from(self.sb.blocksize);
         let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
-        let mut raw = vec![0u8; self.sb.blocksize as usize];
-        self.device.read_at(
-            ag_start + u64::from(agf.roots[crate::ag::agf_btree::BNO]) * block,
-            &mut raw,
-        )?;
-        let numrecs = crate::group_write::leaf_numrecs(&raw, crate::group_write::btree::RECORD)?;
-        Ok(crate::group_write::leaf_records(&raw, numrecs))
+        move |agblock: u32| {
+            let mut raw = vec![0u8; self.sb.blocksize as usize];
+            self.device
+                .read_at(ag_start + u64::from(agblock) * block, &mut raw)?;
+            Ok(raw)
+        }
+    }
+
+    /// Every free extent in an allocation group, in block order.
+    ///
+    /// Walks the by-block tree however deep it is. A group with more
+    /// free runs than a single block holds -- 505 at a 4 KiB block
+    /// size, which any filesystem in use exceeds -- keeps them in a
+    /// tree of nodes over leaves, and reading the root alone answered
+    /// for none of it.
+    pub fn free_extents(&self, agno: u32) -> Result<Vec<crate::alloc_btree::FreeExtent>> {
+        let agf = self.agf(agno)?;
+        crate::alloc_btree::walk_from_agf(
+            &self.sb,
+            &agf,
+            crate::alloc_btree::Order::ByBlock,
+            self.ag_block_reader(agno),
+        )
     }
 
     /// Every reference-count record in an allocation group: the extents
@@ -280,20 +289,13 @@ impl Filesystem {
         if agf.refcount_level == 0 {
             return Ok(Vec::new());
         }
-        if agf.refcount_level != 1 {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno}'s reference-count tree is {} levels deep, and this \
-                 reads the root alone",
-                agf.refcount_level
-            )));
-        }
-        let block = u64::from(self.sb.blocksize);
-        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
-        let mut raw = vec![0u8; self.sb.blocksize as usize];
-        self.device
-            .read_at(ag_start + u64::from(agf.refcount_root) * block, &mut raw)?;
-        let numrecs = crate::group_write::leaf_numrecs(&raw, crate::refcount::RECORD)?;
-        Ok(crate::refcount::leaf_records(&raw, numrecs))
+        crate::refcount::walk(
+            &self.sb,
+            agno,
+            agf.refcount_root,
+            agf.refcount_level,
+            self.ag_block_reader(agno),
+        )
     }
 
     /// Every reverse-mapping record in an allocation group: which extent
@@ -302,30 +304,19 @@ impl Filesystem {
     /// Empty when the filesystem has no such tree, which is a filesystem
     /// where nothing owns anything in this sense rather than a failure.
     ///
-    /// Reads the root alone, so it answers only for a single-level tree
-    /// — the same shape the write paths require, and it says so rather
-    /// than returning half a tree.
+    /// Walks the tree however deep it is.
     pub fn rmap_records(&self, agno: u32) -> Result<Vec<crate::rmap::Rmap>> {
         if !self.sb.has_rmapbt() {
             return Ok(Vec::new());
         }
         let agf = self.agf(agno)?;
-        let level = agf.levels[crate::ag::agf_btree::RMAP];
-        if level != 1 {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno}'s reverse-mapping tree is {level} levels deep, \
-                 and this reads the root alone"
-            )));
-        }
-        let block = u64::from(self.sb.blocksize);
-        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * block;
-        let mut raw = vec![0u8; self.sb.blocksize as usize];
-        self.device.read_at(
-            ag_start + u64::from(agf.roots[crate::ag::agf_btree::RMAP]) * block,
-            &mut raw,
-        )?;
-        let numrecs = crate::group_write::leaf_numrecs(&raw, crate::rmap::RECORD)?;
-        Ok(crate::rmap::leaf_records(&raw, numrecs))
+        crate::rmap::walk(
+            &self.sb,
+            agno,
+            agf.roots[crate::ag::agf_btree::RMAP],
+            agf.levels[crate::ag::agf_btree::RMAP],
+            self.ag_block_reader(agno),
+        )
     }
 
     /// The parsed superblock.

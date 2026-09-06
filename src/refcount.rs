@@ -59,6 +59,50 @@ pub struct Refcount {
     pub cow: bool,
 }
 
+/// `R3FC` — the reference-count tree. A v5 feature, so there is no v4
+/// magic to pair it with.
+pub const XFS_REFC_CRC_MAGIC: u32 = 0x5233_4643;
+
+/// A key is the record's start block alone: four bytes, where a record
+/// is twelve.
+const KEY: usize = 4;
+
+/// What tells this tree from the group's other three.
+pub fn shape() -> crate::ag_btree::Shape {
+    crate::ag_btree::Shape {
+        name: "refcountbt",
+        magic_v4: None,
+        magic_v5: XFS_REFC_CRC_MAGIC,
+        record_len: RECORD,
+        key_len: KEY,
+    }
+}
+
+/// One record, decoded from `at` bytes into `buf`.
+pub fn decode(buf: &[u8], at: usize) -> Refcount {
+    let raw = u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes"));
+    Refcount {
+        startblock: raw & !COW_FLAG,
+        blockcount: u32::from_be_bytes(buf[at + 4..at + 8].try_into().expect("4 bytes")),
+        refcount: u32::from_be_bytes(buf[at + 8..at + 12].try_into().expect("4 bytes")),
+        cow: raw & COW_FLAG != 0,
+    }
+}
+
+/// Every reference-count record in a group, however deep its tree.
+pub fn walk<F>(
+    sb: &crate::superblock::Superblock,
+    agno: u32,
+    root: u32,
+    levels: u32,
+    read_agblock: F,
+) -> Result<Vec<Refcount>>
+where
+    F: FnMut(u32) -> Result<Vec<u8>>,
+{
+    crate::ag_btree::walk(sb, shape(), agno, root, levels, read_agblock, decode)
+}
+
 /// The records of a single-level tree, read straight out of its root.
 pub fn leaf_records(buf: &[u8], numrecs: u16) -> Vec<Refcount> {
     // A backstop: the count comes from `group_write::leaf_numrecs`,

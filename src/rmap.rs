@@ -125,6 +125,50 @@ impl Rmap {
     }
 }
 
+/// `RMB3` — the reverse-mapping tree. A v5 feature, so there is no v4
+/// magic to pair it with.
+pub const XFS_RMAP_CRC_MAGIC: u32 = 0x524d_4233;
+
+/// A key is the record's start block, owner and offset -- the three
+/// fields the tree is ordered by. Twenty bytes, where a record is
+/// twenty-four.
+const KEY: usize = 20;
+
+/// What tells this tree from the group's other three.
+pub fn shape() -> crate::ag_btree::Shape {
+    crate::ag_btree::Shape {
+        name: "rmapbt",
+        magic_v4: None,
+        magic_v5: XFS_RMAP_CRC_MAGIC,
+        record_len: RECORD,
+        key_len: KEY,
+    }
+}
+
+/// One record, decoded from `at` bytes into `buf`.
+pub fn decode(buf: &[u8], at: usize) -> Rmap {
+    Rmap {
+        startblock: u32::from_be_bytes(buf[at..at + 4].try_into().expect("4 bytes")),
+        blockcount: u32::from_be_bytes(buf[at + 4..at + 8].try_into().expect("4 bytes")),
+        owner: i64::from_be_bytes(buf[at + 8..at + 16].try_into().expect("8 bytes")),
+        offset: u64::from_be_bytes(buf[at + 16..at + 24].try_into().expect("8 bytes")),
+    }
+}
+
+/// Every reverse-mapping record in a group, however deep its tree.
+pub fn walk<F>(
+    sb: &crate::superblock::Superblock,
+    agno: u32,
+    root: u32,
+    levels: u32,
+    read_agblock: F,
+) -> Result<Vec<Rmap>>
+where
+    F: FnMut(u32) -> Result<Vec<u8>>,
+{
+    crate::ag_btree::walk(sb, shape(), agno, root, levels, read_agblock, decode)
+}
+
 /// The records of a single-level tree, read straight out of its root.
 pub fn leaf_records(buf: &[u8], numrecs: u16) -> Vec<Rmap> {
     // A backstop: the count comes from `group_write::leaf_numrecs`,
