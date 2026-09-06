@@ -96,8 +96,44 @@ fn fixture_with_content() -> Option<PathBuf> {
             })
         }
 
+        // AND A DIRECTORY, because the test compares directory
+        // listings as well as file contents and asserts it compared at
+        // least one of each.
+        //
+        // `xfscrossag-plain` is two files at the root and nothing else.
+        // It satisfies "has a readable file", sorts before every fixture
+        // that has a directory, and so was chosen -- and then the run
+        // ended on "no directory was compared". A picker that does not
+        // ask for everything the test needs chooses a fixture the test
+        // cannot use.
+        fn has_a_directory(fs: &Filesystem, path: &str, depth: u32) -> bool {
+            if depth == 0 {
+                return false;
+            }
+            let Ok(dir) = fs.open(path) else {
+                return false;
+            };
+            let Ok(entries) = dir.entries() else {
+                return false;
+            };
+            entries.iter().any(|e| {
+                if e.name == b"." || e.name == b".." {
+                    return false;
+                }
+                let name = String::from_utf8_lossy(&e.name);
+                let child = if path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{path}/{name}")
+                };
+                matches!(fs.open(&child), Ok(f) if f.is_dir())
+                    || has_a_directory(fs, &child, depth - 1)
+            })
+        }
+
         entries.iter().any(|e| e.name != b"." && e.name != b"..")
             && has_a_readable_file(&fs, "/", 4)
+            && has_a_directory(&fs, "/", 4)
     })
 }
 
