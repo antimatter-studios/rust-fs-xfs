@@ -657,6 +657,32 @@ impl Superblock {
                 self.agcount, self.agblocks, self.dblocks
             ));
         }
+        // WHERE THE LOG IS, AND HOW BIG.
+        //
+        // Neither field was checked, and every journalled operation --
+        // create, mkdir, unlink, rename, truncate -- writes its
+        // checkpoint record at `fsblock_offset(logstart) + block * 512`.
+        // So `sb_logstart` chose where those writes land: on the
+        // primary superblock, on an allocation-group header, or in the
+        // middle of a file. `sb_logblocks` bounds the ring scan that
+        // runs before every one of them, so it chose how long that
+        // takes.
+        //
+        // An internal log lives in the data section, so it starts
+        // inside it and ends inside it.
+        if self.has_internal_log() {
+            let end = self
+                .logstart
+                .checked_add(u64::from(self.logblocks))
+                .filter(|end| *end <= self.dblocks);
+            if end.is_none() {
+                return bad(format!(
+                    "the internal log is {} blocks at {}, which is not inside the \
+                     {}-block data section",
+                    self.logblocks, self.logstart, self.dblocks
+                ));
+            }
+        }
         if self.rootino == 0 {
             return bad("root inode number is zero".into());
         }
@@ -920,6 +946,9 @@ mod tests {
         b[4..8].copy_from_slice(&4096u32.to_be_bytes()); // blocksize
         b[8..16].copy_from_slice(&4000u64.to_be_bytes()); // dblocks
         b[48..56].copy_from_slice(&100u64.to_be_bytes()); // logstart
+                                                          // An internal log has to have blocks and has to be inside the
+                                                          // data section; validate() checks both, so the fixture says so.
+        b[96..100].copy_from_slice(&200u32.to_be_bytes()); // logblocks
         b[56..64].copy_from_slice(&128u64.to_be_bytes()); // rootino
         b[84..88].copy_from_slice(&1000u32.to_be_bytes()); // agblocks
         b[88..92].copy_from_slice(&4u32.to_be_bytes()); // agcount
@@ -1020,6 +1049,57 @@ mod tests {
         assert!(v4_with_byte(offsets::AGBLKLOG, 9).is_err());
         assert!(v4_with_byte(offsets::AGBLKLOG, 64).is_err());
         assert!(v4_with_byte(offsets::AGBLKLOG, 255).is_err());
+    }
+
+    /// Every journalled operation -- create, mkdir, unlink, rename,
+    /// truncate -- writes its checkpoint record at
+    /// `fsblock_offset(logstart) + block * 512`, and neither
+    /// `sb_logstart` nor `sb_logblocks` was checked. So the superblock
+    /// chose where those writes land: on the primary superblock, on an
+    /// allocation-group header, or in the middle of a file. The same
+    /// pair bounds the ring scan that runs before every one of them.
+    #[test]
+    fn an_internal_log_outside_the_data_section_is_refused() {
+        let put_start = |b: &mut Vec<u8>, at: u64| {
+            b[offsets::LOGSTART..offsets::LOGSTART + 8].copy_from_slice(&at.to_be_bytes());
+        };
+        let put_blocks = |b: &mut Vec<u8>, n: u32| {
+            b[offsets::LOGBLOCKS..offsets::LOGBLOCKS + 4].copy_from_slice(&n.to_be_bytes());
+        };
+
+        // The fixture: 4000 data blocks, a 200-block log at block 100.
+        let ok = v4_superblock();
+        assert!(Superblock::parse(&ok).is_ok());
+
+        // Past the end of the data section.
+        let mut b = v4_superblock();
+        put_start(&mut b, 4000);
+        assert!(Superblock::parse(&b).is_err());
+
+        // Starting inside it and running out of it.
+        let mut b = v4_superblock();
+        put_start(&mut b, 3900);
+        put_blocks(&mut b, 200);
+        assert!(Superblock::parse(&b).is_err());
+
+        // Ending exactly at the end is where a log usually is.
+        let mut b = v4_superblock();
+        put_start(&mut b, 3800);
+        put_blocks(&mut b, 200);
+        assert!(Superblock::parse(&b).is_ok());
+
+        // A start that leaves the address space entirely.
+        let mut b = v4_superblock();
+        put_start(&mut b, u64::MAX - 8);
+        put_blocks(&mut b, 200);
+        assert!(Superblock::parse(&b).is_err());
+
+        // An external log -- logstart zero -- is not judged by any of
+        // this; it is not on this device at all.
+        let mut b = v4_superblock();
+        put_start(&mut b, 0);
+        put_blocks(&mut b, 0xFFFF_FFFF);
+        assert!(Superblock::parse(&b).is_ok());
     }
 
     /// `fsblock` is packed -- the top bits are the allocation group,
