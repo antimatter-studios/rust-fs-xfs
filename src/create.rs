@@ -303,11 +303,12 @@ impl Filesystem {
     ///
     /// # Errors
     ///
-    /// As [`crate::group_write::Allocated`], and
+    /// As [`crate::group_write::GroupAlloc::take`], and
     /// [`Error::UnsupportedFeature`] if the entries do not fit in one
     /// block — that is the leaf form.
     fn convert_to_block_form(
         &self,
+        alloc: &mut crate::group_write::GroupAlloc<'_>,
         parent: u64,
         parsed: &dir::ShortFormDir,
         new: dir_block::Entry,
@@ -334,12 +335,18 @@ impl Filesystem {
         let blocks = 1u32 << self.sb.dirblklog;
 
         // The block comes from the directory's own group, which keeps it
-        // near the inode that names it.
+        // near the inode that names it -- and the caller opened that
+        // group, because this may not be the operation's only take.
         let (agno, _, _) = self.sb.split_ino(parent);
+        debug_assert_eq!(
+            alloc.agno(),
+            agno,
+            "the allocator is not the parent's group"
+        );
         // The directory's own inode owns the block, at file offset 0:
         // this is the first block of a directory that had none.
-        let allocated = self.allocate_in_group(agno, blocks, parent as i64, 0)?;
-        let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(allocated.agblock);
+        let agblock = alloc.take(blocks, parent as i64, 0)?;
+        let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(agblock);
 
         let entries = {
             let mut e = dir_block::entries_from_short_form(parsed, parent, None);
@@ -371,8 +378,9 @@ impl Filesystem {
             unwritten: false,
         };
 
-        let mut items = allocated.items;
-        items.push(block_item);
+        // Only the block itself. What the allocation touched is logged
+        // once for the whole operation, by whoever holds the allocator.
+        let items = vec![block_item];
         Ok(Converted {
             fork: extent.to_bytes()?.to_vec(),
             size: dirblocksize as u64,
@@ -514,7 +522,14 @@ impl Filesystem {
         // 192 is not a coincidence: a chunk's first inode is its first
         // block times the inodes a block holds, 24 x 8, which is what
         // ties the two together and why nothing has to be searched for.
-        let mut allocation_items = Vec::new();
+        // EVERY TAKE THIS OPERATION MAKES GOES THROUGH THIS.
+        //
+        // A create can allocate twice -- a new inode chunk, and the
+        // block a short-form directory moves into when it overflows --
+        // and nothing is on disk until the record is written, so two
+        // allocators reading the group separately both pick the same
+        // run. See `group_write::GroupAlloc`.
+        let mut allocations = crate::group_write::Allocations::new();
         let mut icreate: Option<Vec<u8>> = None;
         let mut added_inodes = 0u32;
 
@@ -534,8 +549,12 @@ impl Filesystem {
                 // The inodes own the blocks, which is what the reverse
                 // map records: XFS_RMAP_OWN_INODES, the -7 that appears
                 // beside the group's own headers and trees.
-                let allocated = self.allocate_in_group(agno, blocks, crate::rmap::OWN_INODES, 0)?;
-                let startino = allocated.agblock * inopblock;
+                let agblock = allocations.group(&self.sb, self.device(), agno)?.take(
+                    blocks,
+                    crate::rmap::OWN_INODES,
+                    0,
+                )?;
+                let startino = agblock * inopblock;
 
                 if chunks.iter().any(|c| c.startino == startino) {
                     return Err(Error::UnsupportedFeature(format!(
@@ -546,13 +565,12 @@ impl Filesystem {
 
                 icreate = Some(crate::format::log_items::icreate_log_format::build(
                     agno,
-                    allocated.agblock,
+                    agblock,
                     per_chunk,
                     u32::from(self.sb.inodesize),
                     blocks,
                     NEW_CHUNK_GENERATION,
                 ));
-                allocation_items = allocated.items;
                 added_inodes = per_chunk;
 
                 let at = chunks
@@ -634,6 +652,7 @@ impl Filesystem {
         let converted = match &short_form {
             Some(_) => None,
             None => Some(self.convert_to_block_form(
+                allocations.group(&self.sb, self.device(), self.sb.split_ino(parent).0)?,
                 parent,
                 &parsed,
                 dir_block::Entry {
@@ -762,11 +781,14 @@ impl Filesystem {
         // a create's fourteen and a mkdir's fifteen.
         let new_ops = if new_dsize == 0 { 2 } else { 3 };
 
-        // The conversion's own items, when there was one: the group
-        // header, the two free-space trees and the directory block.
-        // Empty otherwise, which is why the ordinary create's shape is
-        // unchanged by any of this.
+        // The conversion's own item, when there was one: the directory
+        // block itself. Empty otherwise, which is why the ordinary
+        // create's shape is unchanged by any of this. What the
+        // allocation touched is not here -- it is in `allocation_items`,
+        // once for the operation however many takes it made.
         let extra: Vec<crate::buf_write::BufferItem> = converted.map_or_else(Vec::new, |c| c.items);
+
+        let allocation_items = allocations.into_items()?;
 
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + usize::from(icreate.is_some())

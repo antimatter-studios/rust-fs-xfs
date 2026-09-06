@@ -250,67 +250,69 @@ pub fn split_fsblock(sb: &Superblock, fsblock: u64) -> (u32, u32) {
 // Taking blocks out of a group
 // ---------------------------------------------------------------------
 
-/// Blocks taken out of an allocation group, and the items that say so.
-pub struct Allocated {
-    /// Where the run starts, relative to the group.
-    pub agblock: u32,
-    /// The group header, the by-block tree, the by-length tree and —
-    /// where the filesystem has one — the reverse-mapping tree, in that
-    /// order.
-    pub items: Vec<BufferItem>,
+/// One allocation group's free space, read once and then edited in
+/// memory, so that several allocations in one operation see each other.
+///
+/// ONE OPERATION CAN ALLOCATE TWICE. Creating a file in a group whose
+/// inode chunks are all full needs blocks for a new chunk, and if the
+/// parent's short-form directory overflows at the same moment it needs
+/// blocks for the directory's first block as well. A journalled
+/// operation writes nothing until its record is written, so an
+/// allocator that re-reads the group from the device cannot see what an
+/// earlier one in the same operation took: both pick the same run. The
+/// record then carries two AGF items and two free-space tree items,
+/// each diffed against the same before-image, so recovery applies both
+/// and the last one wins -- the chunk and the directory block get the
+/// same blocks, and the trees still list one of them as free. No
+/// hostile image is needed; an ordinary filesystem does it.
+///
+/// Reading once and taking twice is what makes the second take see the
+/// first, and emitting the items once at the end is what stops two
+/// diffs of the same buffer from reaching the log.
+pub(crate) struct GroupAlloc<'a> {
+    sb: &'a Superblock,
+    agno: u32,
+    /// Byte offset of the group on the device.
+    ag_start: u64,
+    /// The group header and the tree roots as they were before any of
+    /// this, which is what every change is diffed against.
+    agf_raw: Vec<u8>,
+    agf: crate::ag::Agf,
+    bno_raw: Vec<u8>,
+    cnt_raw: Vec<u8>,
+    /// Free space in block order, as it stands after the takes so far.
+    by_block: Vec<FreeExtent>,
+    /// The reverse-mapping root and its records, where the filesystem
+    /// has that tree.
+    rmap: Option<(Vec<u8>, Vec<crate::rmap::Rmap>)>,
+    /// Whether anything has actually been taken. Nothing taken means
+    /// nothing to log, rather than four items whose diffs are empty.
+    took: bool,
 }
 
-impl crate::fs::Filesystem {
-    /// Take `want` contiguous blocks out of allocation group `agno`, for
-    /// `owner` at file offset `offset`.
-    ///
-    /// Returns where they start and the buffer items recording the
-    /// change. Nothing is written: the items are the change, and the
-    /// caller puts them in a record.
-    ///
-    /// # Why the owner is an argument
-    ///
-    /// Where the filesystem has a reverse-mapping tree, an allocation is
-    /// not complete until the tree says who the blocks belong to. That
-    /// is not something an allocator can work out — only the caller
-    /// knows what it is allocating for — so it comes in with the
-    /// request rather than being inferred here.
-    ///
-    /// # Which blocks
-    ///
-    /// The first free run long enough, in block order. That policy is
-    /// this driver's rather than XFS's — XFS weighs locality,
-    /// contiguity and several other things, none of which is visible in
-    /// a record. Any run that is genuinely free produces a filesystem
-    /// the kernel accepts, so the choice affects layout rather than
-    /// correctness.
+impl<'a> GroupAlloc<'a> {
+    /// Read the group's header and trees, and check that all of them
+    /// are shapes this can maintain.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] when the group's free-space trees
-    /// are more than one level deep, when no single run is long enough,
-    /// or when the result would need more records than a tree root
-    /// holds.
-    pub(crate) fn allocate_in_group(
-        &self,
+    /// [`Error::UnsupportedFeature`] when any of the trees is more than
+    /// one level deep, where taking a record out can collapse a node.
+    pub(crate) fn open(
+        sb: &'a Superblock,
+        device: &'a dyn fs_core::BlockRead,
         agno: u32,
-        want: u32,
-        owner: i64,
-        offset: u64,
-    ) -> Result<Allocated> {
+    ) -> Result<Self> {
         use crate::ag::agf_btree::{BNO, CNT, RMAP};
         use crate::ag::Agf;
-        use crate::alloc_btree::{alloc_extent, expected_blkno, longest, total_free, FreeExtent};
-        use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
-        use crate::log::BBSIZE;
 
-        let blocksize = u64::from(self.sb.blocksize);
-        let sector = u64::from(self.sb.sectsize);
-        let ag_start = u64::from(agno) * u64::from(self.sb.agblocks) * blocksize;
+        let blocksize = u64::from(sb.blocksize);
+        let sector = u64::from(sb.sectsize);
+        let ag_start = u64::from(agno) * u64::from(sb.agblocks) * blocksize;
 
-        let mut agf_raw = vec![0u8; self.sb.sectsize as usize];
-        self.device().read_at(ag_start + sector, &mut agf_raw)?;
-        let agf = Agf::parse(&agf_raw, &self.sb, agno)?;
+        let mut agf_raw = vec![0u8; sb.sectsize as usize];
+        device.read_at(ag_start + sector, &mut agf_raw)?;
+        let agf = Agf::parse(&agf_raw, sb, agno)?;
 
         for (which, name) in [(BNO, "by-block"), (CNT, "by-length")] {
             if agf.levels[which] != 1 {
@@ -323,84 +325,21 @@ impl crate::fs::Filesystem {
             }
         }
 
-        let mut bno_raw = vec![0u8; self.sb.blocksize as usize];
-        self.device().read_at(
+        let mut bno_raw = vec![0u8; sb.blocksize as usize];
+        device.read_at(
             ag_start + u64::from(agf.roots[BNO]) * blocksize,
             &mut bno_raw,
         )?;
-        let mut cnt_raw = vec![0u8; self.sb.blocksize as usize];
-        self.device().read_at(
+        let mut cnt_raw = vec![0u8; sb.blocksize as usize];
+        device.read_at(
             ag_start + u64::from(agf.roots[CNT]) * blocksize,
             &mut cnt_raw,
         )?;
 
-        let numrecs = crate::group_write::leaf_numrecs(&bno_raw, btree::RECORD)?;
-        let mut by_block = leaf_records(&bno_raw, numrecs);
+        let numrecs = leaf_numrecs(&bno_raw, btree::RECORD)?;
+        let by_block = leaf_records(&bno_raw, numrecs);
 
-        let chosen = by_block
-            .iter()
-            .find(|run| run.blockcount >= want)
-            .copied()
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "allocation group {agno} has no single free run of {want} blocks — its \
-                     longest is {}, and splitting across extents is not implemented",
-                    longest(&by_block)
-                ))
-            })?;
-        let taking = FreeExtent {
-            startblock: chosen.startblock,
-            blockcount: want,
-        };
-        alloc_extent(&mut by_block, taking)?;
-
-        let capacity = leaf_capacity(self.sb.blocksize);
-        if by_block.len() > capacity {
-            return Err(Error::UnsupportedFeature(format!(
-                "allocation group {agno} would need {} free-space records and its tree root \
-                 holds {capacity}; splitting a node is not implemented",
-                by_block.len()
-            )));
-        }
-
-        let mut by_count = by_block.clone();
-        by_count.sort_by_key(|e| (e.blockcount, e.startblock));
-
-        let new_bno = rebuild_leaf(&bno_raw, &by_block);
-        let new_cnt = rebuild_leaf(&cnt_raw, &by_count);
-
-        let mut new_agf = agf_raw.clone();
-        let freeblks = u32::try_from(total_free(&by_block)).map_err(|_| {
-            Error::CorruptLog(format!(
-                "allocation group {agno} has more free blocks than fit"
-            ))
-        })?;
-        new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
-        new_agf[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&longest(&by_block).to_be_bytes());
-        // The checksum is left stale on purpose — recovery recomputes it.
-
-        let ag_bb = ag_start / BBSIZE as u64;
-        // The reverse map, where the filesystem has one. Blocks that
-        // have just left free space belong to `owner` from here on, and
-        // a tree that does not say so describes a filesystem where they
-        // belong to nobody.
-        let mut items = vec![
-            changed_chunks(ag_bb + sector / BBSIZE as u64, &agf_raw, new_agf, BLFT_AGF),
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agf.roots[BNO]),
-                &bno_raw,
-                new_bno,
-                BLFT_BTREE,
-            ),
-            changed_chunks(
-                expected_blkno(&self.sb, agno, agf.roots[CNT]),
-                &cnt_raw,
-                new_cnt,
-                BLFT_BTREE,
-            ),
-        ];
-
-        if self.sb.has_rmapbt() {
+        let rmap = if sb.has_rmapbt() {
             if agf.levels[RMAP] != 1 {
                 return Err(Error::UnsupportedFeature(format!(
                     "allocation group {agno}'s reverse-mapping tree is {} levels deep, \
@@ -409,15 +348,90 @@ impl crate::fs::Filesystem {
                     agf.levels[RMAP]
                 )));
             }
-            let mut rmap_raw = vec![0u8; self.sb.blocksize as usize];
-            self.device().read_at(
+            let mut rmap_raw = vec![0u8; sb.blocksize as usize];
+            device.read_at(
                 ag_start + u64::from(agf.roots[RMAP]) * blocksize,
                 &mut rmap_raw,
             )?;
-            let n = crate::group_write::leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
-            let mut records = crate::rmap::leaf_records(&rmap_raw, n);
+            let n = leaf_numrecs(&rmap_raw, crate::rmap::RECORD)?;
+            let records = crate::rmap::leaf_records(&rmap_raw, n);
+            Some((rmap_raw, records))
+        } else {
+            None
+        };
+
+        Ok(GroupAlloc {
+            sb,
+            agno,
+            ag_start,
+            agf_raw,
+            agf,
+            bno_raw,
+            cnt_raw,
+            by_block,
+            rmap,
+            took: false,
+        })
+    }
+
+    /// Which group this is taking from.
+    pub(crate) fn agno(&self) -> u32 {
+        self.agno
+    }
+
+    /// Take `want` contiguous blocks for `owner` at file offset
+    /// `offset`, and say where they start.
+    ///
+    /// The first free run long enough, in block order. That policy is
+    /// this driver's rather than XFS's — XFS weighs locality,
+    /// contiguity and several other things, none of which is visible in
+    /// a record. Any run that is genuinely free produces a filesystem
+    /// the kernel accepts, so the choice affects layout rather than
+    /// correctness.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when no single run is long enough,
+    /// or when the result would need more records than a tree root
+    /// holds.
+    pub(crate) fn take(&mut self, want: u32, owner: i64, offset: u64) -> Result<u32> {
+        use crate::alloc_btree::{alloc_extent, longest};
+
+        let agno = self.agno;
+        let chosen = self
+            .by_block
+            .iter()
+            .find(|run| run.blockcount >= want)
+            .copied()
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "allocation group {agno} has no single free run of {want} blocks — its \
+                     longest is {}, and splitting across extents is not implemented",
+                    longest(&self.by_block)
+                ))
+            })?;
+        let taking = FreeExtent {
+            startblock: chosen.startblock,
+            blockcount: want,
+        };
+        alloc_extent(&mut self.by_block, taking)?;
+
+        let capacity = leaf_capacity(self.sb.blocksize);
+        if self.by_block.len() > capacity {
+            return Err(Error::UnsupportedFeature(format!(
+                "allocation group {agno} would need {} free-space records and its tree root \
+                 holds {capacity}; splitting a node is not implemented",
+                self.by_block.len()
+            )));
+        }
+
+        // The reverse map, where the filesystem has one. Blocks that
+        // have just left free space belong to `owner` from here on, and
+        // a tree that does not say so describes a filesystem where they
+        // belong to nobody.
+        if let Some((_, records)) = self.rmap.as_mut() {
             crate::rmap::insert(
-                &mut records,
+                records,
                 crate::rmap::Rmap {
                     startblock: taking.startblock,
                     blockcount: taking.blockcount,
@@ -433,25 +447,308 @@ impl crate::fs::Filesystem {
                     records.len()
                 )));
             }
+        }
+
+        self.took = true;
+        Ok(taking.startblock)
+    }
+
+    /// The buffer items recording everything taken.
+    ///
+    /// One item per buffer however many takes there were: the group
+    /// header, the by-block tree, the by-length tree and — where the
+    /// filesystem has one — the reverse-mapping tree, in that order.
+    /// Nothing is written; the items are the change, and the caller
+    /// puts them in a record.
+    pub(crate) fn into_items(self) -> Result<Vec<BufferItem>> {
+        use crate::ag::agf_btree::{BNO, CNT, RMAP};
+        use crate::alloc_btree::{expected_blkno, longest, total_free};
+        use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_BTREE};
+        use crate::log::BBSIZE;
+
+        if !self.took {
+            return Ok(Vec::new());
+        }
+
+        let sb = self.sb;
+        let agno = self.agno;
+        let sector = u64::from(sb.sectsize);
+
+        let mut by_count = self.by_block.clone();
+        by_count.sort_by_key(|e| (e.blockcount, e.startblock));
+
+        let new_bno = rebuild_leaf(&self.bno_raw, &self.by_block);
+        let new_cnt = rebuild_leaf(&self.cnt_raw, &by_count);
+
+        let mut new_agf = self.agf_raw.clone();
+        let freeblks = u32::try_from(total_free(&self.by_block)).map_err(|_| {
+            Error::CorruptLog(format!(
+                "allocation group {agno} has more free blocks than fit"
+            ))
+        })?;
+        new_agf[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&freeblks.to_be_bytes());
+        new_agf[agf::LONGEST..agf::LONGEST + 4]
+            .copy_from_slice(&longest(&self.by_block).to_be_bytes());
+        // The checksum is left stale on purpose — recovery recomputes it.
+
+        let ag_bb = self.ag_start / BBSIZE as u64;
+        let mut items = vec![
+            changed_chunks(
+                ag_bb + sector / BBSIZE as u64,
+                &self.agf_raw,
+                new_agf,
+                BLFT_AGF,
+            ),
+            changed_chunks(
+                expected_blkno(sb, agno, self.agf.roots[BNO]),
+                &self.bno_raw,
+                new_bno,
+                BLFT_BTREE,
+            ),
+            changed_chunks(
+                expected_blkno(sb, agno, self.agf.roots[CNT]),
+                &self.cnt_raw,
+                new_cnt,
+                BLFT_BTREE,
+            ),
+        ];
+
+        if let Some((rmap_raw, records)) = self.rmap {
             let new_rmap = crate::rmap::rebuild_leaf(&rmap_raw, &records);
             items.push(changed_chunks(
-                expected_blkno(&self.sb, agno, agf.roots[RMAP]),
+                expected_blkno(sb, agno, self.agf.roots[RMAP]),
                 &rmap_raw,
                 new_rmap,
                 BLFT_BTREE,
             ));
         }
 
-        Ok(Allocated {
-            agblock: taking.startblock,
-            items,
-        })
+        Ok(items)
+    }
+}
+
+/// The groups one operation has taken blocks from.
+///
+/// An operation allocates in at most a couple of groups, and it has to
+/// hold each one open across every take it makes there -- see
+/// [`GroupAlloc`] for what happens when it does not. Keyed by group so
+/// that two takes in the same group share a [`GroupAlloc`] and two in
+/// different groups do not.
+pub(crate) struct Allocations<'a> {
+    groups: Vec<GroupAlloc<'a>>,
+}
+
+impl<'a> Allocations<'a> {
+    pub(crate) fn new() -> Self {
+        Allocations { groups: Vec::new() }
+    }
+
+    /// The open allocator for `agno`, opening it if this is the first
+    /// take there.
+    pub(crate) fn group(
+        &mut self,
+        sb: &'a Superblock,
+        device: &'a dyn fs_core::BlockRead,
+        agno: u32,
+    ) -> Result<&mut GroupAlloc<'a>> {
+        if let Some(i) = self.groups.iter().position(|g| g.agno() == agno) {
+            return Ok(&mut self.groups[i]);
+        }
+        self.groups.push(GroupAlloc::open(sb, device, agno)?);
+        Ok(self.groups.last_mut().expect("just pushed"))
+    }
+
+    /// Every item, group by group in group order, so a record built
+    /// twice from the same takes is the same record.
+    pub(crate) fn into_items(mut self) -> Result<Vec<BufferItem>> {
+        self.groups.sort_by_key(GroupAlloc::agno);
+        let mut items = Vec::new();
+        for group in self.groups {
+            items.extend(group.into_items()?);
+        }
+        Ok(items)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Two allocations in one operation
+    // -----------------------------------------------------------------
+
+    mod one_operation {
+        use super::*;
+        use crate::superblock::crc32c_with_zeroed_crc;
+        use std::sync::Mutex;
+
+        const BLOCKSIZE: u32 = 4096;
+        const SECTSIZE: u16 = 512;
+        const AGBLOCKS: u32 = 1000;
+        const BNO_ROOT: u32 = 1;
+        const CNT_ROOT: u32 = 2;
+        /// The one free run this group has: 500 blocks from block 100.
+        const FREE_START: u32 = 100;
+        const FREE_LEN: u32 = 500;
+
+        struct MemDev(Mutex<Vec<u8>>);
+
+        impl fs_core::BlockRead for MemDev {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+                let b = self.0.lock().unwrap();
+                let start = offset as usize;
+                let end = start + buf.len();
+                assert!(end <= b.len(), "read past the end of the device");
+                buf.copy_from_slice(&b[start..end]);
+                Ok(())
+            }
+            fn size_bytes(&self) -> u64 {
+                self.0.lock().unwrap().len() as u64
+            }
+        }
+
+        fn superblock() -> Superblock {
+            let mut b = vec![0u8; SECTSIZE as usize];
+            b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
+            b[4..8].copy_from_slice(&BLOCKSIZE.to_be_bytes());
+            b[8..16].copy_from_slice(&u64::from(AGBLOCKS).to_be_bytes()); // dblocks
+            for (i, slot) in b[32..48].iter_mut().enumerate() {
+                *slot = i as u8;
+            }
+            b[48..56].copy_from_slice(&600u64.to_be_bytes()); // logstart
+            b[56..64].copy_from_slice(&128u64.to_be_bytes()); // rootino
+            b[84..88].copy_from_slice(&AGBLOCKS.to_be_bytes());
+            b[88..92].copy_from_slice(&1u32.to_be_bytes()); // agcount
+            let versionnum = 5u16 | crate::superblock::version_flags::MOREBITSBIT;
+            b[100..102].copy_from_slice(&versionnum.to_be_bytes());
+            b[102..104].copy_from_slice(&SECTSIZE.to_be_bytes());
+            b[104..106].copy_from_slice(&512u16.to_be_bytes()); // inodesize
+            b[106..108].copy_from_slice(&8u16.to_be_bytes()); // inopblock
+            b[120] = 12; // blocklog
+            b[121] = 9; // sectlog
+            b[122] = 9; // inodelog
+            b[123] = 3; // inopblog
+            b[124] = 10; // agblklog
+            let crc = crc32c_with_zeroed_crc(&b, 224);
+            b[224..228].copy_from_slice(&crc.to_le_bytes());
+            Superblock::parse(&b).expect("v5 superblock")
+        }
+
+        /// A group with one free run, no reverse-mapping tree, and both
+        /// free-space trees a single leaf.
+        fn image(sb: &Superblock) -> MemDev {
+            use crate::ag::offsets::{agf, common};
+            let mut dev = vec![0u8; (AGBLOCKS as usize) * BLOCKSIZE as usize];
+
+            let mut agf_raw = vec![0u8; SECTSIZE as usize];
+            agf_raw[common::MAGIC..common::MAGIC + 4]
+                .copy_from_slice(&crate::ag::XFS_AGF_MAGIC.to_be_bytes());
+            agf_raw[common::VERSIONNUM..common::VERSIONNUM + 4]
+                .copy_from_slice(&1u32.to_be_bytes());
+            agf_raw[common::SEQNO..common::SEQNO + 4].copy_from_slice(&0u32.to_be_bytes());
+            agf_raw[common::LENGTH..common::LENGTH + 4].copy_from_slice(&AGBLOCKS.to_be_bytes());
+            agf_raw[agf::ROOTS..agf::ROOTS + 4].copy_from_slice(&BNO_ROOT.to_be_bytes());
+            agf_raw[agf::ROOTS + 4..agf::ROOTS + 8].copy_from_slice(&CNT_ROOT.to_be_bytes());
+            agf_raw[agf::LEVELS..agf::LEVELS + 4].copy_from_slice(&1u32.to_be_bytes());
+            agf_raw[agf::LEVELS + 4..agf::LEVELS + 8].copy_from_slice(&1u32.to_be_bytes());
+            agf_raw[agf::FREEBLKS..agf::FREEBLKS + 4].copy_from_slice(&FREE_LEN.to_be_bytes());
+            agf_raw[agf::LONGEST..agf::LONGEST + 4].copy_from_slice(&FREE_LEN.to_be_bytes());
+            agf_raw[agf::UUID..agf::UUID + 16].copy_from_slice(&sb.meta_uuid);
+            let crc = crc32c_with_zeroed_crc(&agf_raw, agf::CRC);
+            agf_raw[agf::CRC..agf::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+            let at = SECTSIZE as usize;
+            dev[at..at + agf_raw.len()].copy_from_slice(&agf_raw);
+
+            let free = vec![FreeExtent {
+                startblock: FREE_START,
+                blockcount: FREE_LEN,
+            }];
+            for (root, order) in [
+                (BNO_ROOT, crate::alloc_btree::Order::ByBlock),
+                (CNT_ROOT, crate::alloc_btree::Order::ByCount),
+            ] {
+                let mut block = vec![0u8; BLOCKSIZE as usize];
+                // The v5 magics, spelled as they appear in a hex dump.
+                let magic: &[u8; 4] = match order {
+                    crate::alloc_btree::Order::ByBlock => b"AB3B",
+                    crate::alloc_btree::Order::ByCount => b"AB3C",
+                };
+                block[0..4].copy_from_slice(magic);
+                block[4..6].copy_from_slice(&0u16.to_be_bytes()); // level
+                block[6..8].copy_from_slice(&1u16.to_be_bytes()); // numrecs
+                let blkno = crate::alloc_btree::expected_blkno(sb, 0, root);
+                block[16..24].copy_from_slice(&blkno.to_be_bytes());
+                block[32..48].copy_from_slice(&sb.meta_uuid);
+                block[48..52].copy_from_slice(&0u32.to_be_bytes()); // owner
+                let filled = rebuild_leaf(&block, &free);
+                let at = root as usize * BLOCKSIZE as usize;
+                dev[at..at + filled.len()].copy_from_slice(&filled);
+            }
+
+            MemDev(Mutex::new(dev))
+        }
+
+        /// THE DEFECT, at the smallest scale that shows it.
+        ///
+        /// One create can allocate twice: a new inode chunk when the
+        /// group has no free inode, and the block a short-form directory
+        /// moves into when it overflows. Nothing is on disk until the
+        /// record is written, so an allocator that re-reads the group
+        /// from the device sees the free space the first take had
+        /// already spent, and hands out the same blocks again.
+        #[test]
+        fn a_second_take_does_not_get_the_first_ones_blocks() {
+            let sb = superblock();
+            let dev = image(&sb);
+
+            let mut alloc = GroupAlloc::open(&sb, &dev, 0).expect("the group opens");
+            let chunk = alloc
+                .take(8, crate::rmap::OWN_INODES, 0)
+                .expect("first take");
+            let dir_block = alloc.take(1, 131, 0).expect("second take");
+
+            assert_eq!(chunk, FREE_START, "the first take gets the run's start");
+            assert_eq!(
+                dir_block,
+                FREE_START + 8,
+                "the second take must start where the first ended, not at {chunk}"
+            );
+        }
+
+        /// One buffer, one item, however many takes -- because a buffer
+        /// item is a diff against a before-image, and two diffs of the
+        /// same buffer against the same before-image do not compose:
+        /// recovery applies both and the last one wins.
+        #[test]
+        fn two_takes_log_each_buffer_once() {
+            let sb = superblock();
+            let dev = image(&sb);
+
+            let mut alloc = GroupAlloc::open(&sb, &dev, 0).expect("the group opens");
+            alloc
+                .take(8, crate::rmap::OWN_INODES, 0)
+                .expect("first take");
+            alloc.take(1, 131, 0).expect("second take");
+            let items = alloc.into_items().expect("items");
+
+            assert_eq!(
+                items.len(),
+                3,
+                "the group header and its two free-space trees, once each"
+            );
+        }
+
+        /// Taking nothing logs nothing, rather than three items whose
+        /// diffs are empty.
+        #[test]
+        fn a_group_nothing_was_taken_from_logs_nothing() {
+            let sb = superblock();
+            let dev = image(&sb);
+            let alloc = GroupAlloc::open(&sb, &dev, 0).expect("the group opens");
+            assert!(alloc.into_items().expect("items").is_empty());
+        }
+    }
     use crate::format::log_items::buf_log_format::buf_type::BLFT_BTREE;
 
     /// Only the chunks that differ are logged, and a byte written back
