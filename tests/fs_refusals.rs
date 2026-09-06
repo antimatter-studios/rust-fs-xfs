@@ -517,3 +517,147 @@ fn a_reverse_mapping_filesystem_is_writable_and_stays_consistent() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Read-only-compatible features
+// ---------------------------------------------------------------------
+
+/// A writable device over a `Vec<u8>`, so a fixture can be edited in
+/// memory without touching the file on disk.
+struct MemDev {
+    bytes: std::sync::Mutex<Vec<u8>>,
+}
+
+impl MemDev {
+    fn arc(bytes: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: std::sync::Mutex::new(bytes),
+        })
+    }
+}
+
+impl BlockRead for MemDev {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        let b = self.bytes.lock().unwrap();
+        let start = offset as usize;
+        let end = start + buf.len();
+        if end > b.len() {
+            return Err(fs_core::Error::ShortRead {
+                offset,
+                want: buf.len(),
+                got: b.len().saturating_sub(start),
+            });
+        }
+        buf.copy_from_slice(&b[start..end]);
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        self.bytes.lock().unwrap().len() as u64
+    }
+}
+
+impl fs_core::BlockDevice for MemDev {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        let mut b = self.bytes.lock().unwrap();
+        let start = offset as usize;
+        b[start..start + buf.len()].copy_from_slice(buf);
+        Ok(())
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+/// A copy of a fixture with `bits` added to `sb_features_ro_compat` and
+/// the superblock's checksum restored, so the volume is well-formed and
+/// differs only in the feature mask.
+fn fixture_with_ro_compat(bits: u32) -> Option<Arc<MemDev>> {
+    // `sb_features_ro_compat` is at offset 212, and the superblock is
+    // the first sector.
+    const FEATURES_RO_COMPAT: usize = 212;
+
+    let img = any_fixture()?;
+    let mut bytes = std::fs::read(&img).expect("read the fixture");
+    let sectsize = u16::from_be_bytes([bytes[102], bytes[103]]) as usize;
+
+    let existing = u32::from_be_bytes(
+        bytes[FEATURES_RO_COMPAT..FEATURES_RO_COMPAT + 4]
+            .try_into()
+            .unwrap(),
+    );
+    bytes[FEATURES_RO_COMPAT..FEATURES_RO_COMPAT + 4]
+        .copy_from_slice(&(existing | bits).to_be_bytes());
+    fs_xfs::super_write::stamp_crc(&mut bytes[..sectsize]);
+    Some(MemDev::arc(bytes))
+}
+
+/// A volume carrying a feature this driver does not maintain can be
+/// READ.
+///
+/// That is what `sb_features_ro_compat` means, and the mount path must
+/// not get stricter than the format: refusing to read such a volume
+/// would lock a user out of data that is perfectly readable.
+#[test]
+fn an_unmaintained_ro_compat_bit_still_mounts_for_reading() {
+    // Bit 4 is the metadata directory tree; bit 20 is nothing at all
+    // yet, which is the case that matters most since it is what a
+    // future feature looks like from here.
+    for bits in [1u32 << 4, 1 << 20] {
+        let Some(dev) = fixture_with_ro_compat(bits) else {
+            eprintln!("no fixture — skipping");
+            return;
+        };
+        Filesystem::mount(dev).unwrap_or_else(|e| {
+            panic!("ro_compat {bits:#x} must still be readable, got {e:?}");
+        });
+    }
+}
+
+/// The same volume cannot be WRITTEN.
+///
+/// The bit exists to say exactly this. A create here would update the
+/// structures this driver knows about and silently leave the ones the
+/// bit describes, which is worse than a refusal: nothing reports it,
+/// and `xfs_repair` finds it weeks later.
+#[test]
+fn an_unmaintained_ro_compat_bit_refuses_a_writable_mount() {
+    for bits in [1u32 << 4, 1 << 20] {
+        let Some(dev) = fixture_with_ro_compat(bits) else {
+            eprintln!("no fixture — skipping");
+            return;
+        };
+        match Filesystem::mount_rw(dev) {
+            Err(Error::UnsupportedFeature(msg)) => {
+                assert!(
+                    msg.contains("not maintain"),
+                    "the refusal should say why: {msg}"
+                );
+            }
+            Err(other) => panic!("ro_compat {bits:#x}: wrong refusal {other:?}"),
+            Ok(_) => panic!("ro_compat {bits:#x} must not be mounted for writing"),
+        }
+    }
+}
+
+/// An ordinary volume is not caught by the guard.
+///
+/// `mkfs.xfs` sets finobt, rmapbt, reflink and inobtcount by default,
+/// and all four are maintained. A guard that refused them would refuse
+/// almost every volume in existence, which is how this check is most
+/// likely to go wrong.
+#[test]
+fn a_default_volume_still_mounts_for_writing() {
+    let Some(img) = any_fixture() else {
+        eprintln!("no fixture — skipping");
+        return;
+    };
+    let bytes = std::fs::read(&img).expect("read the fixture");
+    let dev = MemDev::arc(bytes);
+    match Filesystem::mount_rw(dev) {
+        Ok(_) => {}
+        // A dirty log is a different refusal and not this test's
+        // business; anything else is.
+        Err(Error::DirtyLog) => eprintln!("fixture's log is dirty — the feature guard passed"),
+        Err(other) => panic!("a default volume must be writable, got {other:?}"),
+    }
+}

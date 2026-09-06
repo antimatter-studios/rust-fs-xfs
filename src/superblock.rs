@@ -233,6 +233,26 @@ pub mod ro_compat {
     pub const REFLINK: u32 = 1 << 2;
     /// Inode B+tree block counters are maintained.
     pub const INOBTCNT: u32 = 1 << 3;
+    /// The metadata directory tree: quota and realtime metadata reached
+    /// through a hidden directory rather than by superblock inode
+    /// number. Not read here, and named so a refusal can say which
+    /// feature stopped it.
+    pub const METADIR: u32 = 1 << 4;
+
+    /// Every read-only-compatible feature this driver **maintains**.
+    ///
+    /// The bit's meaning is precise: an implementation that does not
+    /// know it may READ the filesystem and must not WRITE it. So this
+    /// mask gates writing, not mounting — [`Filesystem::mount`] ignores
+    /// it entirely and [`Filesystem::mount_rw`] refuses anything outside
+    /// it.
+    ///
+    /// `REFLINK` is in the set because it is handled where it actually
+    /// matters rather than at mount: an inode that may share extents
+    /// cannot have them freed, so `truncate_to_zero` refuses that inode.
+    /// Refusing every reflink volume instead would refuse most volumes
+    /// `mkfs.xfs` makes with its defaults.
+    pub const SUPPORTED: u32 = FINOBT | RMAPBT | REFLINK | INOBTCNT;
 }
 
 /// A parsed XFS superblock.
