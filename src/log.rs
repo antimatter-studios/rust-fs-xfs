@@ -346,7 +346,36 @@ pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
     };
 
     let cycle = (newest.lsn >> 32) as u32;
+
+    // H_SIZE IS BOUNDED HERE BECAUSE EVERY LATER USE ASSUMES IT ALREADY
+    // WAS.
+    //
+    // Every other field this function reads off the newest record is
+    // checked — the ring bound below, and the refusals in `inspect` —
+    // and this one was not, while being the sole bound on how large a
+    // checkpoint may be. `log_write::append_at` computes
+    // `iclog_size - BBSIZE` from it, which underflows for anything below
+    // one basic block: in debug that panics, and in release, which is
+    // what CI runs and what ships, `0usize.wrapping_sub(512)` is
+    // `usize::MAX - 511` and the size guard admits everything.
+    //
+    // A zero here is not exotic. A partially written record, a log left
+    // behind by another filesystem, or a deliberately malformed image
+    // all produce one.
+    //
+    // The three conditions are the kernel's own: the in-core buffer size
+    // is a power of two, at least one basic block, and cannot exceed the
+    // log it lives in.
     let iclog_size = be32(&newest.header, offsets::SIZE);
+    if !iclog_size.is_power_of_two()
+        || u64::from(iclog_size) < BBSIZE as u64
+        || u64::from(iclog_size) > log_bytes
+    {
+        return Err(Error::CorruptLog(format!(
+            "the newest log record says its in-core buffers are {iclog_size} bytes, which              is not a power of two between {BBSIZE} and the log's own {log_bytes}"
+        )));
+    }
+
     let data_blocks = u64::from(newest.len).div_ceil(BBSIZE as u64);
     let next = newest.bb + newest.header_blocks + data_blocks;
 
@@ -363,9 +392,20 @@ pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
     // whole mechanism by which a reader tells a fresh record at block 0
     // from the stale one it overwrote.
     if next == u64::from(total) {
+        // A wrap increments the cycle, and the increment has to be able
+        // to happen. `cycle` comes off the disk, so a log whose newest
+        // record carries `0xFFFF_FFFF` panicked here in debug and wrapped
+        // to cycle 0 in release — and cycle 0 is the value that means
+        // "not a record at all", so every record written afterwards
+        // would have been invisible to a reader.
+        let Some(next_cycle) = cycle.checked_add(1) else {
+            return Err(Error::CorruptLog(format!(
+                "the newest log record is in cycle {cycle}, and the next record would wrap                  to a cycle this log cannot express"
+            )));
+        };
         return Ok(Head {
             block: 0,
-            cycle: cycle + 1,
+            cycle: next_cycle,
             prev_block: newest.bb as u32,
             free_blocks: total,
             iclog_size,
@@ -543,6 +583,154 @@ mod tests {
         let mut b = dev.0.lock().unwrap();
         let at = (log_at + bb * BBSIZE as u64) as usize;
         b[at + offsets::LEN..at + offsets::LEN + 4].copy_from_slice(&len.to_be_bytes());
+    }
+
+    /// Overwrite a record's `h_size`, the in-core buffer size a mount
+    /// declares and every later bound is taken from.
+    fn set_h_size(dev: &MemDev, log_at: u64, bb: u64, size: u32) {
+        let mut b = dev.0.lock().unwrap();
+        let at = (log_at + bb * BBSIZE as u64) as usize;
+        b[at + offsets::SIZE..at + offsets::SIZE + 4].copy_from_slice(&size.to_be_bytes());
+    }
+
+    /// Overwrite a record's cycle, in both `h_cycle` and `h_lsn`, so the
+    /// record remains self-consistent.
+    fn set_cycle(dev: &MemDev, log_at: u64, bb: u64, cycle: u32, block: u32) {
+        let mut b = dev.0.lock().unwrap();
+        let at = (log_at + bb * BBSIZE as u64) as usize;
+        b[at + offsets::CYCLE..at + offsets::CYCLE + 4].copy_from_slice(&cycle.to_be_bytes());
+        let lsn = (u64::from(cycle) << 32) | u64::from(block);
+        b[at + offsets::LSN..at + offsets::LSN + 8].copy_from_slice(&lsn.to_be_bytes());
+    }
+
+    /// `h_size` is the sole bound on how large a checkpoint may be, and
+    /// it comes off the disk. Anything below one basic block made
+    /// `log_write::append_at` compute `iclog_size - BBSIZE` as
+    /// `usize::MAX - 511` in a release build, which is the profile CI
+    /// runs and the profile that ships — so the size guard admitted
+    /// every payload there is.
+    #[test]
+    fn an_h_size_below_a_basic_block_is_refused() {
+        for size in [0u32, 1, 256, 511] {
+            let sb = sb();
+            let (dev, log_at) = device(&sb);
+            put_record(&dev, log_at, 0, 1, 0, 1);
+            set_h_size(&dev, log_at, 0, size);
+            let err = head(&dev, &sb).expect_err("h_size {size} must be refused");
+            assert!(
+                matches!(err, Error::CorruptLog(_)),
+                "h_size {size} gave {err:?}"
+            );
+        }
+    }
+
+    /// The kernel's in-core buffer size is a power of two. A value that
+    /// is not tells us the field was not written by a mount.
+    #[test]
+    fn an_h_size_that_is_not_a_power_of_two_is_refused() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        set_h_size(&dev, log_at, 0, 1536);
+        let err = head(&dev, &sb).expect_err("1536 is not a power of two");
+        assert!(matches!(err, Error::CorruptLog(_)), "got {err:?}");
+    }
+
+    /// And it cannot be larger than the log it lives in.
+    #[test]
+    fn an_h_size_larger_than_the_log_is_refused() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        let log_bytes = u64::from(sb.logblocks) * u64::from(sb.blocksize);
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        set_h_size(&dev, log_at, 0, (log_bytes * 2) as u32);
+        let err = head(&dev, &sb).expect_err("larger than the log");
+        assert!(matches!(err, Error::CorruptLog(_)), "got {err:?}");
+    }
+
+    /// A wrap increments the cycle. From the last cycle a `u32` can
+    /// express that panicked in debug and wrapped to cycle 0 in release
+    /// — and cycle 0 means "not a record at all", so every record
+    /// written afterwards would have been invisible to a reader.
+    #[test]
+    fn a_wrap_out_of_the_last_cycle_is_refused_rather_than_wrapping_to_zero() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        // One record whose payload runs exactly to the end of the ring,
+        // so the next record would wrap and the cycle would increment.
+        put_record(&dev, log_at, 0, u32::MAX, 0, 1);
+        set_cycle(&dev, log_at, 0, u32::MAX, 0);
+        set_len(&dev, log_at, 0, (RING_BLOCKS - 1) * BBSIZE as u32);
+        let err = head(&dev, &sb).expect_err("the cycle cannot be incremented");
+        assert!(matches!(err, Error::CorruptLog(_)), "got {err:?}");
+    }
+
+    /// The control: the ordinary `h_size` the rest of these tests use is
+    /// still accepted, so none of the above can be satisfied by refusing
+    /// every log.
+    #[test]
+    fn an_ordinary_h_size_is_accepted() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        let h = head(&dev, &sb).expect("an ordinary record must still be read");
+        assert_eq!(h.iclog_size, XLOG_HEADER_CYCLE_SIZE);
+    }
+
+    /// BOTH EDGES OF THE RULE, NOT JUST ITS MIDDLE.
+    ///
+    /// The rule is "a power of two, at least one basic block, and no
+    /// larger than the log". A control using an ordinary value proves
+    /// only that the check does not refuse everything — it cannot tell
+    /// `>= BBSIZE` from `> BBSIZE`, or `<= log_bytes` from
+    /// `< log_bytes`, so an off-by-one at either end would pass
+    /// unnoticed while refusing a log the kernel considers valid.
+    ///
+    /// Both edges are legal values. Exactly one basic block is an in-core
+    /// buffer that holds a header and no payload — useless, but
+    /// well-formed, and `max_payload` reports its capacity as zero rather
+    /// than refusing it. Exactly the log's own size is what a very small
+    /// log gives you.
+    #[test]
+    fn the_smallest_legal_h_size_is_accepted() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        set_h_size(&dev, log_at, 0, BBSIZE as u32);
+        let h = head(&dev, &sb).expect("exactly one basic block is legal");
+        assert_eq!(h.iclog_size, BBSIZE as u32);
+    }
+
+    #[test]
+    fn an_h_size_equal_to_the_whole_log_is_accepted() {
+        let sb = sb();
+        let (dev, log_at) = device(&sb);
+        let log_bytes = u64::from(sb.logblocks) * u64::from(sb.blocksize);
+        assert!(
+            log_bytes.is_power_of_two(),
+            "the fixture's log must be a power of two for this to test the size bound \
+             rather than the power-of-two bound"
+        );
+        put_record(&dev, log_at, 0, 1, 0, 1);
+        set_h_size(&dev, log_at, 0, log_bytes as u32);
+        let h = head(&dev, &sb).expect("exactly the log's size is legal");
+        assert_eq!(h.iclog_size, log_bytes as u32);
+    }
+
+    /// And one past each edge is refused, so the pair brackets the bound
+    /// rather than sitting on one side of it.
+    #[test]
+    fn one_past_each_edge_is_refused() {
+        let sb = sb();
+        let log_bytes = u64::from(sb.logblocks) * u64::from(sb.blocksize);
+        // Below a basic block, and the next power of two above the log.
+        for size in [(BBSIZE / 2) as u32, (log_bytes * 2) as u32] {
+            let (dev, log_at) = device(&sb);
+            put_record(&dev, log_at, 0, 1, 0, 1);
+            set_h_size(&dev, log_at, 0, size);
+            let err = head(&dev, &sb).expect_err("outside the rule");
+            assert!(matches!(err, Error::CorruptLog(_)), "{size} gave {err:?}");
+        }
     }
 
     /// Nothing written yet: the first record goes to the start of the
