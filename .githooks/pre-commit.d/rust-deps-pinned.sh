@@ -253,11 +253,126 @@ if [ -f Cargo.lock ] && [ -d .github/workflows ]; then
       # `path:` over separate lines, and a line filter sees none of
       # them -- which is how a second repository in this constellation
       # ran this check green with two pins it never examined.
-      bad=$(grep -rnE "$sib(\.git)?([^A-Za-z0-9._-]|\$)" \
-              .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null \
-            | grep -E "\.\./$sib([^A-Za-z0-9._-]|\$)" \
-            | grep -E "v[0-9]+\.[0-9]+\.[0-9]+" \
-            | grep -vE "v${lockver}([^0-9]|\$)")
+      # THREE SPELLINGS, and the third is the one that hid the bug this
+      # check was written for. A clone line may carry the tag as a
+      # literal, or as a variable -- `--branch "$FS_CORE_REF"` -- and
+      # reading only literals means the guard goes quiet exactly when a
+      # repository does the tidier thing.
+      #
+      # That is not a hypothetical ordering either. The fix for the
+      # original drift REPLACED release.yml's literal with the variable,
+      # so a check that reads literals only was blinded by the very
+      # commit that repaired the thing it was meant to catch. Verified:
+      # with `FS_CORE_REF: v0.2.7` in release.yml and the lock at
+      # 0.2.10, the literal-only version exits 0 and prints nothing.
+      bad=""
+      chores_file=""
+      [ -f chores.yml ] && chores_file=chores.yml
+      for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+        [ -f "$wf" ] || continue
+        wf_bad=$(awk -v sib="$sib" -v want="v$lockver" -v file="$wf" '
+          # `chores.yml` first, then this file`s own env:, so a name
+          # defined in both resolves to the workflow`s value.
+          #
+          # WHY chores.yml IS READ HERE. A repository may assign the pin
+          # from a shell helper rather than a workflow variable --
+          # `core_ref="$(pin FS_CORE_REF)"`, with the value in
+          # chores.yml -- which is a BETTER design than a per-file env:
+          # block, because one declaration then feeds every clone. It is
+          # also the design this resolver could not see, so the tidiest
+          # repository in the group was the one going unchecked. That is
+          # the third spelling this check has had to learn, and each
+          # time the blind spot was a repository doing something more
+          # careful than the ones it already handled.
+          FNR == NR {
+            if ($0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/) {
+              key = $1; sub(/:$/, "", key); env[key] = $2
+            }
+            next
+          }
+          # This file`s own env: assignments, which win over chores.yml.
+          /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/ {
+            key = $1; sub(/:$/, "", key); val = $2; env[key] = val
+          }
+          # ONE HOP THROUGH A SHELL ASSIGNMENT:
+          #
+          #   core_ref="$(pin FS_CORE_REF)"
+          #
+          # The clone then reads `$core_ref`, whose value comes from
+          # `FS_CORE_REF` in chores.yml. Without this the guard can see
+          # that it cannot resolve the name but not what the name means,
+          # and reports a shrug where it could report an answer.
+          /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=.*\$\(pin[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)/ {
+            lhs = $0
+            sub(/^[[:space:]]*/, "", lhs)
+            sub(/=.*$/, "", lhs)
+            rhs = $0
+            sub(/^.*\$\(pin[[:space:]]+/, "", rhs)
+            sub(/[[:space:]]*\).*$/, "", rhs)
+            if (rhs in env) { env[lhs] = env[rhs] }
+          }
+          # JOIN BACKSLASH CONTINUATIONS FIRST. A clone is routinely
+          # written across several physical lines:
+          #
+          #   git clone --quiet --depth 1 --branch "$core_ref" \\
+          #       https://…/rust-fs-core.git ../rust-fs-core
+          #
+          # so `--branch` and `../<sibling>` are never on the same line
+          # and a per-line match sees neither. That is the fourth
+          # spelling this check has had to learn, and it was silent
+          # rather than wrong -- the pattern matched nothing, so the
+          # guard reported nothing.
+          {
+            if (buf == "") { bufline = FNR }
+            line = $0
+            if (line ~ /\\[[:space:]]*$/) {
+              sub(/\\[[:space:]]*$/, "", line)
+              buf = buf line " "
+              next
+            }
+            buf = buf line
+            logical = buf
+            buf = ""
+          }
+          # A clone whose destination is the consumer`s own sibling slot.
+          logical ~ ("\\.\\./" sib "([^A-Za-z0-9._-]|$)") && logical ~ /--branch/ {
+            ref = ""
+            n = split(logical, tok, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+              if (tok[i] == "--branch" || tok[i] == "-b") { ref = tok[i + 1]; break }
+            }
+            gsub(/["\047]/, "", ref)
+            if (ref ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) {
+              name = ref
+              gsub(/[$\{\}]/, "", name)
+              resolved = (name in env) ? env[name] : ""
+              # AN UNRESOLVABLE NAME IS REPORTED, not skipped. The
+              # previous version dropped it silently, which meant the
+              # guard`s quietest output -- nothing at all -- covered
+              # both "this pin is correct" and "this pin was never
+              # read". Those are not the same answer and must not look
+              # the same. Naming it is noisy in the rare case the
+              # variable comes from somewhere this script cannot see;
+              # that is the right way round, because the failure of a
+              # silent skip is invisible and the failure of a false
+              # alarm is a person reading one line.
+              if (resolved == "") {
+                printf "%s:%d: --branch %s (cannot resolve; not checked)\n", file, bufline, ref
+                next
+              }
+              if (resolved != want) {
+                printf "%s:%d: --branch %s = %s\n", file, bufline, ref, resolved
+              }
+              next
+            }
+            if (ref ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && ref != want) {
+              printf "%s:%d: --branch %s\n", file, bufline, ref
+            }
+          }
+        ' "${chores_file:-/dev/null}" "$wf")
+        [ -n "$wf_bad" ] && bad="${bad:+$bad
+}$wf_bad"
+      done
 
       # The `actions/checkout` form. A `repository:` naming the sibling,
       # then within the next few lines a `ref:` giving the tag and a
