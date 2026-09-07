@@ -446,6 +446,31 @@ fn field_layout(version: u8, bigtime: bool, nrext64: bool) -> &'static [(usize, 
 /// [`crate::log_write`]'s note on what a record actually contains.
 pub const XFS_TRANS_CHECKPOINT: u32 = 0x28;
 
+/// The largest payload one record may carry on a log whose in-core
+/// buffers are `iclog_size` bytes.
+///
+/// # WHY IT IS CHECKED RATHER THAN SUBTRACTED
+///
+/// This was `head.iclog_size as usize - BBSIZE` inline. `log::head` now
+/// refuses an `h_size` below one basic block, so the underflow should be
+/// unreachable through that path — but [`Head`] has public fields and can
+/// be built by a caller, and a guard that switches itself off on exactly
+/// the input it exists to catch is worse than no guard at all.
+///
+/// The failure was profile-dependent and worst in the profile that ships.
+/// In debug `0usize - 512` panics; in release, which is what CI runs and
+/// what `chores.yml` builds, it is `usize::MAX - 511`, so the size check
+/// below it admits every payload there is and the record goes out sized
+/// against an `h_size` the kernel will size its recovery buffer from.
+fn max_payload(iclog_size: u32) -> Result<usize> {
+    (iclog_size as usize).checked_sub(BBSIZE).ok_or_else(|| {
+        Error::CorruptLog(format!(
+            "the log's records are {iclog_size} bytes, which cannot hold even the \
+             {BBSIZE}-byte header block"
+        ))
+    })
+}
+
 /// Write one checkpoint into the log at `head`.
 ///
 /// Returns the sequence number the record was given, which is what
@@ -482,7 +507,7 @@ pub fn append_at(
     // The kernel sizes its in-core buffers from `h_size` and reads a
     // record into one of them, so a payload larger than a buffer less
     // its header block cannot be read back however well it is written.
-    let max_payload = head.iclog_size as usize - BBSIZE;
+    let max_payload = max_payload(head.iclog_size)?;
     if payload.len() > max_payload {
         return Err(Error::UnsupportedFeature(format!(
             "the checkpoint is {} bytes and the log's records hold at most {max_payload}; \
@@ -651,6 +676,30 @@ mod tests {
 
     /// An identifier that ties a checkpoint's operations together, and
     /// which the kernel treats as absent if it is zero.
+    /// `Head` has public fields, so a caller can hand `append_at` an
+    /// in-core buffer size that `log::head` would have refused. The
+    /// bound must fail rather than wrap: in release
+    /// `0usize.wrapping_sub(512)` is `usize::MAX - 511`, which turns the
+    /// size guard into a no-op on exactly the input it exists to catch.
+    #[test]
+    fn a_buffer_too_small_for_a_header_block_has_no_payload_capacity() {
+        for size in [0u32, 1, 256, 511] {
+            let err = max_payload(size).expect_err("must be refused");
+            assert!(
+                matches!(err, Error::CorruptLog(_)),
+                "iclog_size {size} gave {err:?}"
+            );
+        }
+    }
+
+    /// The control: an ordinary buffer size still yields its capacity,
+    /// so the guard cannot be satisfied by refusing everything.
+    #[test]
+    fn an_ordinary_buffer_size_yields_its_capacity() {
+        assert_eq!(max_payload(BBSIZE as u32).expect("exactly a header"), 0);
+        assert_eq!(max_payload(32 * 1024).expect("32 KiB"), 32 * 1024 - BBSIZE);
+    }
+
     #[test]
     fn a_transaction_id_is_never_zero() {
         for cycle in [0u32, 1, 0xffff_ffff] {
