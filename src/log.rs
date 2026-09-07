@@ -91,7 +91,7 @@ const XLOG_VERSION_2: u32 = 2;
 
 /// `XLOG_HEADER_CYCLE_SIZE` — how much log a single header block
 /// describes, and so the divisor for a multi-block header.
-const XLOG_HEADER_CYCLE_SIZE: u32 = 32 * 1024;
+pub(crate) const XLOG_HEADER_CYCLE_SIZE: u32 = 32 * 1024;
 
 /// Byte offsets within `xlog_rec_header_t`.
 ///
@@ -473,7 +473,7 @@ fn scan_for_newest_record(
 /// Version 1 records always use one. Version 2 records may describe more
 /// log than a single header block can carry cycle data for, and then
 /// spill into further blocks.
-fn header_blocks(header: &[u8]) -> u64 {
+pub(crate) fn header_blocks(header: &[u8]) -> u64 {
     let version = be32(header, offsets::VERSION);
     if version & XLOG_VERSION_2 == 0 {
         return 1;
