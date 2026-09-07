@@ -65,6 +65,10 @@ fn errno_for(e: &Error) -> c_int {
         | Error::BlockIdentityMismatch { .. }
         | Error::CorruptLog(_)
         | Error::DirtyLog
+        // A failed internal invariant is not the caller's doing, but it
+        // is not something they can work around either, and the write
+        // did not happen. EIO is the honest answer.
+        | Error::Internal(_)
         | Error::Io(_) => libc_eio(),
     }
 }

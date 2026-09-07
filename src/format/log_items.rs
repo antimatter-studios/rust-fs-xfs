@@ -1135,7 +1135,15 @@ pub mod icreate_log_format {
         out.extend_from_slice(&isize.to_be_bytes());
         out.extend_from_slice(&length.to_be_bytes());
         out.extend_from_slice(&gen.to_be_bytes());
-        debug_assert_eq!(out.len(), SIZE);
+        // See `log_write::encode_record`: this is an encoded log item
+        // on its way into a journal record, and `debug_assert_eq!` never
+        // ran in any build this project produces.
+        assert_eq!(
+            out.len(),
+            SIZE,
+            "an encoded icreate item is {} bytes, not the {SIZE} its header declares",
+            out.len()
+        );
         out
     }
 }

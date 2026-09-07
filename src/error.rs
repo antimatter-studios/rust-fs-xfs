@@ -73,6 +73,19 @@ pub enum Error {
     /// The requested operation would write, but the volume is mounted
     /// read-only or the driver has no write path for this structure.
     ReadOnly,
+
+    /// An invariant of this driver's own layout arithmetic did not hold.
+    ///
+    /// Not a property of the volume: the caller did nothing wrong and
+    /// the disk is not damaged. It means a computation here disagreed
+    /// with itself — a re-derived plan not matching the blocks a tree
+    /// was laid out over, or an encoder producing a buffer of a length
+    /// it did not intend — and the only safe response is to abandon the
+    /// write rather than commit metadata built on the disagreement.
+    ///
+    /// These were `debug_assert!`, which every build this project
+    /// produces compiles out.
+    Internal(String),
 }
 
 impl fmt::Display for Error {
@@ -102,6 +115,7 @@ impl fmt::Display for Error {
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
+            Error::Internal(m) => write!(f, "internal consistency check failed: {m}"),
         }
     }
 }

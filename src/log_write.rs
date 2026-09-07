@@ -266,7 +266,17 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
 
     let mut out = header;
     out.extend_from_slice(&data);
-    debug_assert!(out.len() >= XLOG_REC_HEADER_SIZE);
+    // `assert!`, NOT `debug_assert!`. This guards the length of a record
+    // about to be written into the journal, where being wrong is a
+    // filesystem the kernel replays into an inconsistent state — and
+    // nothing here builds in debug, so the debug form never ran. The
+    // function returns `Vec<u8>` rather than `Result`, so a refusal has
+    // to be a panic; release still raises this one.
+    assert!(
+        out.len() >= XLOG_REC_HEADER_SIZE,
+        "a log record of {} bytes is shorter than its own {XLOG_REC_HEADER_SIZE}-byte header",
+        out.len()
+    );
     out
 }
 

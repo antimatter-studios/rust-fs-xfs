@@ -97,7 +97,18 @@ pub fn restamp_crc(buf: &mut [u8], crc_off: usize) {
 /// value is correctly not logged; a field changed as a side effect is
 /// correctly logged.
 pub fn changed_chunks(blkno: u64, before: &[u8], after: Vec<u8>, buf_type: u16) -> BufferItem {
-    debug_assert_eq!(before.len(), after.len());
+    // Same class as the two encoders: this diff becomes the regions of a
+    // buffer log item, so a length mismatch writes a journal record
+    // describing bytes that are not there. Not named in the issue, but
+    // it is the same `debug_assert` in the same path and leaving it
+    // behind would be leaving a small version of the defect.
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "a buffer diff compares {} bytes against {}",
+        before.len(),
+        after.len()
+    );
     let mut item = BufferItem::new(blkno, after, buf_type, 0);
     for chunk in 0..before.len().div_ceil(BLF_CHUNK) {
         let from = chunk * BLF_CHUNK;
@@ -686,7 +697,19 @@ impl<'a> GroupAlloc<'a> {
             |blocks: &[u32], shape: crate::ag_btree::Shape, records: usize| -> Result<u32> {
                 let plan =
                     crate::ag_btree::plan(shape, self.sb.blocksize, self.sb.is_v5(), records)?;
-                debug_assert_eq!(plan.iter().sum::<usize>(), blocks.len());
+                // THE DEPTH STAMPED INTO agf_levels COMES FROM THIS PLAN.
+                // If a re-derived plan disagrees with the blocks the tree
+                // was actually laid out over, the group header records a
+                // depth that does not match the disk. `debug_assert_eq!`
+                // never ran: nothing here builds in debug.
+                if plan.iter().sum::<usize>() != blocks.len() {
+                    return Err(Error::Internal(format!(
+                        "a re-derived plan covers {} blocks but the tree was laid out \
+                         over {}",
+                        plan.iter().sum::<usize>(),
+                        blocks.len()
+                    )));
+                }
                 Ok(plan.len() as u32)
             };
 

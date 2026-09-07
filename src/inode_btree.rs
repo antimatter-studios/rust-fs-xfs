@@ -719,7 +719,19 @@ impl<'a> Trees<'a> {
                 self.sb.is_v5(),
                 records,
             )?;
-            debug_assert_eq!(plan.iter().sum::<usize>(), blocks.len());
+            // THE DEPTH STAMPED INTO agi_level COMES FROM THIS PLAN.
+            // If a re-derived plan disagrees with the blocks the tree
+            // was actually laid out over, the group header records a
+            // depth that does not match the disk. `debug_assert_eq!`
+            // never ran: nothing here builds in debug.
+            if plan.iter().sum::<usize>() != blocks.len() {
+                return Err(Error::Internal(format!(
+                    "a re-derived plan covers {} blocks but the tree was laid out \
+                         over {}",
+                    plan.iter().sum::<usize>(),
+                    blocks.len()
+                )));
+            }
             Ok(plan.len() as u32)
         };
         put(
