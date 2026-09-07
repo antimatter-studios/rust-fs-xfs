@@ -48,8 +48,11 @@
 //! own output.
 
 use crate::error::{Error, Result};
+use crate::format::log_items::rec_header::XLOG_CYCLE_DATA_ENTRIES;
 use crate::fs::Filesystem;
-use crate::log::{record_checksum, Head, BBSIZE, XLOG_HEADER_MAGIC, XLOG_REC_HEADER_SIZE};
+use crate::log::{
+    record_checksum, Head, BBSIZE, XLOG_HEADER_CYCLE_SIZE, XLOG_HEADER_MAGIC, XLOG_REC_HEADER_SIZE,
+};
 use crate::superblock::Superblock;
 
 /// The log's own layout constants, defined once in
@@ -236,8 +239,22 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
     // Stamp each payload block's first word with the cycle, keeping the
     // displaced word in the header. A reader undoes this to recover the
     // payload; the checksum covers the stamped form.
+    // AN ASSERTION, NOT A CLAMP. `h_cycle_data` in a single header block
+    // holds 64 entries, and this used to write `blocks.min(64)` — a
+    // silent truncation, leaving blocks 64 and beyond neither
+    // cycle-stamped nor with their displaced first word saved anywhere.
+    // `max_payload` refuses every input that could reach here with more,
+    // so this states that invariant rather than papering over its
+    // failure. `assert!` and not `debug_assert!`, because every build
+    // this crate ships is `--release`.
     let blocks = padded / BBSIZE;
-    for k in 0..blocks.min(64) {
+    assert!(
+        blocks <= XLOG_CYCLE_DATA_ENTRIES,
+        "a record of {blocks} basic blocks needs more cycle-data entries than the \
+         {XLOG_CYCLE_DATA_ENTRIES} a single header block holds; max_payload should have \
+         refused it"
+    );
+    for k in 0..blocks {
         let at = k * BBSIZE;
         let original: [u8; 4] = data[at..at + 4].try_into().expect("4 bytes");
         header[44 + k * 4..48 + k * 4].copy_from_slice(&original);
@@ -463,6 +480,31 @@ pub const XFS_TRANS_CHECKPOINT: u32 = 0x28;
 /// below it admits every payload there is and the record goes out sized
 /// against an `h_size` the kernel will size its recovery buffer from.
 fn max_payload(iclog_size: u32) -> Result<usize> {
+    // A RECORD THIS WRITER CANNOT DESCRIBE IS REFUSED, NOT TRUNCATED.
+    //
+    // `encode_record` emits exactly one header block. A reader — this
+    // crate's own `log::header_blocks`, and the kernel's
+    // `l_iclog_heads` — works out how many header blocks a record has
+    // from `h_size` ALONE, and `encode_record` writes `h_size` straight
+    // back out of `placement.iclog_size`. So on a log whose `h_size` is
+    // above 32 KiB, which `logbsize=64k` and larger produce and which is
+    // an ordinary mount option, every record this writer emits declares
+    // two header blocks and carries one — whatever its payload size.
+    //
+    // That is worth being precise about, because it is not the
+    // payload-dependent problem it looks like: capping the payload does
+    // not make such a record well-formed, since the header still
+    // declares the larger `h_size`. Nothing short of emitting the extra
+    // header blocks does, and until that exists the honest answer is to
+    // refuse the write rather than lay down a record that recovery will
+    // reject or, worse, replay with its payload's first words replaced
+    // by cycle numbers.
+    if iclog_size > XLOG_HEADER_CYCLE_SIZE {
+        return Err(Error::UnsupportedFeature(format!(
+            "the log's records are {iclog_size} bytes, so their headers span more than \
+             one basic block; writing a multi-block record header is not implemented"
+        )));
+    }
     (iclog_size as usize).checked_sub(BBSIZE).ok_or_else(|| {
         Error::CorruptLog(format!(
             "the log's records are {iclog_size} bytes, which cannot hold even the \
@@ -676,6 +718,150 @@ mod tests {
 
     /// An identifier that ties a checkpoint's operations together, and
     /// which the kernel treats as absent if it is zero.
+    fn placement(iclog_size: u32) -> Placement {
+        Placement {
+            block: 0,
+            cycle: 1,
+            prev_block: u32::MAX,
+            tail_lsn: 0,
+            uuid: [0xAB; 16],
+            iclog_size,
+        }
+    }
+
+    /// THE RECORD THIS WRITER CANNOT DESCRIBE, AND IT IS NOT ABOUT THE
+    /// PAYLOAD.
+    ///
+    /// `encode_record` emits one header block and writes `h_size`
+    /// straight back out of `placement.iclog_size`. A reader works out
+    /// how many header blocks a record has from `h_size` alone. So on a
+    /// log whose `h_size` is above 32 KiB — `logbsize=64k`, an ordinary
+    /// mount option — a record with a ONE-BLOCK payload already declares
+    /// two header blocks and carries one.
+    ///
+    /// This is the measurement that says capping the payload is not a
+    /// fix, and that refusing the write is.
+    #[test]
+    fn a_64k_log_makes_even_a_tiny_record_claim_two_header_blocks() {
+        let bytes = encode_record(&placement(64 * 1024), 1, &[0x11; 64]);
+        assert_eq!(
+            crate::log::header_blocks(&bytes[..BBSIZE]),
+            2,
+            "the reader expects two header blocks"
+        );
+        // ...while the writer emitted one, followed immediately by the
+        // payload it stamped.
+        assert_eq!(
+            bytes.len(),
+            BBSIZE * 2,
+            "one header block plus one payload block"
+        );
+    }
+
+    /// So `max_payload` refuses such a log outright rather than handing
+    /// back a capacity for a record that cannot be written correctly.
+    #[test]
+    fn a_log_whose_headers_span_more_than_one_block_is_refused() {
+        for size in [64 * 1024u32, 128 * 1024, 256 * 1024] {
+            let err = max_payload(size).expect_err("must be refused");
+            assert!(
+                matches!(err, Error::UnsupportedFeature(_)),
+                "iclog_size {size} gave {err:?}"
+            );
+        }
+    }
+
+    /// The control, and the boundary: 32 KiB is the largest log whose
+    /// record headers fit in one block, and it must still work.
+    #[test]
+    fn a_32k_log_is_still_written_with_one_header_block() {
+        let capacity = max_payload(XLOG_HEADER_CYCLE_SIZE).expect("32 KiB is writable");
+        assert_eq!(capacity, XLOG_HEADER_CYCLE_SIZE as usize - BBSIZE);
+
+        let bytes = encode_record(&placement(XLOG_HEADER_CYCLE_SIZE), 1, &[0x22; 64]);
+        assert_eq!(
+            crate::log::header_blocks(&bytes[..BBSIZE]),
+            1,
+            "a 32 KiB log's records have a single header block"
+        );
+    }
+
+    /// THE LAST ACCEPTED PAYLOAD, which is the edge the refusal test
+    /// below cannot reach.
+    ///
+    /// `XLOG_CYCLE_DATA_ENTRIES` payload blocks is exactly what one
+    /// header block's `h_cycle_data` array describes, so it is legal and
+    /// must encode. `the_largest_admitted_payload_still_fits_the_cycle_data`
+    /// looks like it covers this and does not: it goes through
+    /// `max_payload(32 KiB)`, which is `32768 - 512` and therefore 63
+    /// blocks — one short. The refusal test uses 65, the first refused.
+    /// Without this, `blocks <= ENTRIES` could become `blocks <` and
+    /// nothing would fail.
+    #[test]
+    fn exactly_the_cycle_data_capacity_is_accepted() {
+        let payload = vec![0x55u8; XLOG_CYCLE_DATA_ENTRIES * BBSIZE];
+        let bytes = encode_record(&placement(XLOG_HEADER_CYCLE_SIZE), 1, &payload);
+        assert_eq!(
+            bytes.len(),
+            (XLOG_CYCLE_DATA_ENTRIES + 1) * BBSIZE,
+            "one header block plus {XLOG_CYCLE_DATA_ENTRIES} payload blocks"
+        );
+        // Every one of them stamped, including the last — the entry the
+        // array only just has room for.
+        for k in 0..XLOG_CYCLE_DATA_ENTRIES {
+            let at = BBSIZE + k * BBSIZE;
+            assert_eq!(
+                &bytes[at..at + 4],
+                &1u32.to_be_bytes(),
+                "payload block {k} was not cycle-stamped"
+            );
+        }
+    }
+
+    /// `encode_record` is `pub`, so a caller can reach it without going
+    /// through `append_at`'s bound — the same reachability that made
+    /// `max_payload` worth extracting.
+    ///
+    /// It must refuse loudly rather than clamp. The clamp was silent:
+    /// blocks 64 and beyond were neither cycle-stamped nor had their
+    /// displaced first word saved anywhere, so recovery would replay
+    /// them with four bytes of cycle number in place of the item bytes
+    /// that belong there — a corrupt replay from a write that reported
+    /// success.
+    #[test]
+    #[should_panic(expected = "cycle-data entries")]
+    fn a_payload_past_the_cycle_data_is_refused_rather_than_truncated() {
+        // 65 payload blocks: one more than a single header block can
+        // describe.
+        let payload = vec![0x44u8; 65 * BBSIZE];
+        let _ = encode_record(&placement(XLOG_HEADER_CYCLE_SIZE), 1, &payload);
+    }
+
+    /// Every payload `max_payload` admits must fit the 64 cycle-data
+    /// entries a single header block holds, so the assertion in
+    /// `encode_record` can never fire. This walks the largest one.
+    #[test]
+    fn the_largest_admitted_payload_still_fits_the_cycle_data() {
+        let capacity = max_payload(XLOG_HEADER_CYCLE_SIZE).expect("capacity");
+        let bytes = encode_record(&placement(XLOG_HEADER_CYCLE_SIZE), 1, &vec![0x33; capacity]);
+        let blocks = (bytes.len() / BBSIZE) - 1;
+        assert!(
+            blocks <= XLOG_CYCLE_DATA_ENTRIES,
+            "{blocks} payload blocks against {XLOG_CYCLE_DATA_ENTRIES} cycle-data entries"
+        );
+        // And every one of them was stamped: no block keeps its original
+        // first word, which is what the silent `.min(64)` truncation used
+        // to leave behind.
+        for k in 0..blocks {
+            let at = BBSIZE + k * BBSIZE;
+            assert_eq!(
+                &bytes[at..at + 4],
+                &1u32.to_be_bytes(),
+                "payload block {k} was not cycle-stamped"
+            );
+        }
+    }
+
     /// `Head` has public fields, so a caller can hand `append_at` an
     /// in-core buffer size that `log::head` would have refused. The
     /// bound must fail rather than wrap: in release
