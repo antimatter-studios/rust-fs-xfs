@@ -97,7 +97,18 @@ pub fn restamp_crc(buf: &mut [u8], crc_off: usize) {
 /// value is correctly not logged; a field changed as a side effect is
 /// correctly logged.
 pub fn changed_chunks(blkno: u64, before: &[u8], after: Vec<u8>, buf_type: u16) -> BufferItem {
-    debug_assert_eq!(before.len(), after.len());
+    // Same class as the two encoders: this diff becomes the regions of a
+    // buffer log item, so a length mismatch writes a journal record
+    // describing bytes that are not there. Not named in the issue, but
+    // it is the same `debug_assert` in the same path and leaving it
+    // behind would be leaving a small version of the defect.
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "a buffer diff compares {} bytes against {}",
+        before.len(),
+        after.len()
+    );
     let mut item = BufferItem::new(blkno, after, buf_type, 0);
     for chunk in 0..before.len().div_ceil(BLF_CHUNK) {
         let from = chunk * BLF_CHUNK;
@@ -686,7 +697,19 @@ impl<'a> GroupAlloc<'a> {
             |blocks: &[u32], shape: crate::ag_btree::Shape, records: usize| -> Result<u32> {
                 let plan =
                     crate::ag_btree::plan(shape, self.sb.blocksize, self.sb.is_v5(), records)?;
-                debug_assert_eq!(plan.iter().sum::<usize>(), blocks.len());
+                // THE DEPTH STAMPED INTO agf_levels COMES FROM THIS PLAN.
+                // If a re-derived plan disagrees with the blocks the tree
+                // was actually laid out over, the group header records a
+                // depth that does not match the disk. `debug_assert_eq!`
+                // never ran: nothing here builds in debug.
+                if plan.iter().sum::<usize>() != blocks.len() {
+                    return Err(Error::Internal(format!(
+                        "a re-derived plan covers {} blocks but the tree was laid out \
+                         over {}",
+                        plan.iter().sum::<usize>(),
+                        blocks.len()
+                    )));
+                }
                 Ok(plan.len() as u32)
             };
 
@@ -831,6 +854,71 @@ impl<'a> Allocations<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // The invariants run in the build that ships
+    // -----------------------------------------------------------------
+    //
+    // `changed_chunks` is the one converted invariant reachable from
+    // outside: both slices come from the caller, so a mismatch needs no
+    // fault injection to produce. The rest of them guard a disagreement
+    // between two internal computations -- `ag_btree::build` already
+    // refuses a caller-supplied block count upstream, with "needs N
+    // blocks" -- and cannot be reached through any public argument.
+    //
+    // This one is worth having because it is a genuine witness, and the
+    // lengths in it are chosen so that it is. The loop bounds come from
+    // `before`, while the item is built over `after`, so a LONGER
+    // `after` is the silent direction: nothing indexes out of range, and
+    // `changed_chunks` returns an item covering bytes it never examined.
+    // Every change in that unexamined tail is left unmarked and so never
+    // reaches the journal at all.
+    //
+    // Both lengths are whole basic blocks on purpose. A mismatch of
+    // 512 against 256 does fail on `main`, but by tripping
+    // `BufferItem::new`'s own "whole number of basic blocks" assert one
+    // frame later -- a downstream panic about the wrong thing, not the
+    // silent case. Testing against that would have proved less than it
+    // appeared to.
+
+    /// A diff of two different lengths is not a diff.
+    ///
+    /// `#[should_panic]` and not an `Err`, because the function returns
+    /// `BufferItem` rather than `Result` and a refusal therefore has to
+    /// be a panic. The point of the test is the build it runs in: this
+    /// suite is `--release` throughout, which is exactly where the
+    /// previous `debug_assert_eq!` had been compiled out.
+    #[test]
+    #[should_panic(expected = "compares 512 bytes against 1024")]
+    fn a_buffer_diff_of_mismatched_lengths_is_refused() {
+        let before = vec![0u8; 512];
+        let after = vec![0xffu8; 1024];
+        let _ = changed_chunks(1, &before, after, 0);
+    }
+
+    /// And the equal-length case still works, so the test above is
+    /// failing on the mismatch rather than on anything else in the call.
+    #[test]
+    fn a_buffer_diff_of_equal_lengths_still_describes_the_change() {
+        let before = vec![0u8; 512];
+
+        // Self-calibrating rather than a fixed count: an unchanged
+        // buffer establishes what "nothing logged" looks like, so the
+        // changed case cannot pass by the function returning something
+        // for every input.
+        let unchanged = changed_chunks(1, &before, before.clone(), 0);
+
+        let mut after = before.clone();
+        after[0] = 0xff;
+        let changed = changed_chunks(1, &before, after, 0);
+
+        assert_eq!(changed.data().len(), 512);
+        assert!(
+            changed.op_count() > unchanged.op_count(),
+            "a changed byte logged {} regions, the same as an unchanged buffer",
+            changed.op_count()
+        );
+    }
 
     // -----------------------------------------------------------------
     // Two allocations in one operation

@@ -504,7 +504,20 @@ where
         });
         taken += count;
     }
-    debug_assert_eq!(taken, records.len());
+    // A LAYOUT THAT DID NOT CONSUME WHAT IT WAS GIVEN IS NOT A LAYOUT.
+    //
+    // This was `debug_assert_eq!`, and nothing here builds in debug —
+    // CI is `cargo test --locked --release` throughout and the shipped
+    // artifact is `cargo build --release`. So the invariant was a
+    // comment, on the path that decides how many records the tree on
+    // disk claims to hold.
+    if taken != records.len() {
+        return Err(Error::Internal(format!(
+            "the leaf layout consumed {taken} of {} records; the tree on disk would \
+             claim a size it does not have",
+            records.len()
+        )));
+    }
 
     // Each level above indexes the level below it. `first` is the index
     // into `records` of the first record under each block of the level
@@ -542,7 +555,15 @@ where
             });
             taken += count;
         }
-        debug_assert_eq!(taken, below_blocks.len());
+        // Same reasoning as the leaf check above: a node level that did
+        // not point at every block below it writes a tree whose depth
+        // and contents disagree.
+        if taken != below_blocks.len() {
+            return Err(Error::Internal(format!(
+                "the node layout consumed {taken} of {} child blocks",
+                below_blocks.len()
+            )));
+        }
         below_span = this_span;
         below_blocks = this_blocks;
         at += count_of_blocks;

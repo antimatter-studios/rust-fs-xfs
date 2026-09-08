@@ -426,7 +426,16 @@ fn encode_short_form(
     } else {
         out.extend_from_slice(&(parsed.parent_ino as u32).to_be_bytes());
     }
-    debug_assert_eq!(out.len(), header);
+    // The encoded header's length is the offset every entry below is
+    // written at, so a mismatch lays the entries down in the wrong
+    // place. Same class as the log-item encoders, same dead assertion.
+    if out.len() != header {
+        return Err(Error::Internal(format!(
+            "a short-form directory header encoded to {} bytes, not the {header} its \
+             entries are placed against",
+            out.len()
+        )));
+    }
 
     for e in entries {
         // A cookie is two bytes, so a directory can outgrow the range

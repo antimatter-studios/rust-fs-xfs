@@ -333,11 +333,16 @@ impl Filesystem {
         // near the inode that names it -- and the caller opened that
         // group, because this may not be the operation's only take.
         let (agno, _, _) = self.sb.split_ino(parent);
-        debug_assert_eq!(
-            alloc.agno(),
-            agno,
-            "the allocator is not the parent's group"
-        );
+        // Which group a block is taken from decides where it lands on
+        // disk, so this is an invariant about bytes and not about
+        // tidiness. `debug_assert_eq!` never ran in any build produced
+        // here.
+        if alloc.agno() != agno {
+            return Err(Error::Internal(format!(
+                "the allocator is in group {} but the parent is in group {agno}",
+                alloc.agno()
+            )));
+        }
         // The directory's own inode owns the block, at file offset 0:
         // this is the first block of a directory that had none.
         let agblock = alloc.take(blocks, parent as i64, 0)?;
@@ -568,11 +573,16 @@ impl Filesystem {
         // free, so a chunk that has just been filled leaves it -- and
         // the editor works that out from the chunks rather than being
         // told twice.
-        debug_assert_eq!(
-            outcome == Taken::ChunkNowFull,
-            chunks[index].freecount == 0,
-            "a chunk that is now full must leave the free-inode tree"
-        );
+        // This decides whether the chunk leaves the free-inode tree, and
+        // so what the AGI records. Two derivations of one fact that must
+        // agree, guarded by an assertion no build ran.
+        if (outcome == Taken::ChunkNowFull) != (chunks[index].freecount == 0) {
+            return Err(Error::Internal(format!(
+                "a chunk reported as {outcome:?} has {} inodes free; the free-inode \
+                 tree and the chunk disagree",
+                chunks[index].freecount
+            )));
+        }
 
         *trees.chunks_mut() = chunks.clone();
         let freecount: u32 = chunks.iter().map(|c| u32::from(c.freecount)).sum();

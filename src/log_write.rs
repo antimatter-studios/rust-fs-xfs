@@ -266,7 +266,17 @@ pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> 
 
     let mut out = header;
     out.extend_from_slice(&data);
-    debug_assert!(out.len() >= XLOG_REC_HEADER_SIZE);
+    // `assert!`, NOT `debug_assert!`. This guards the length of a record
+    // about to be written into the journal, where being wrong is a
+    // filesystem the kernel replays into an inconsistent state — and
+    // nothing here builds in debug, so the debug form never ran. The
+    // function returns `Vec<u8>` rather than `Result`, so a refusal has
+    // to be a panic; release still raises this one.
+    assert!(
+        out.len() >= XLOG_REC_HEADER_SIZE,
+        "a log record of {} bytes is shorter than its own {XLOG_REC_HEADER_SIZE}-byte header",
+        out.len()
+    );
     out
 }
 
@@ -683,6 +693,71 @@ impl Filesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // The cycle-data assertion stays unreachable
+    // -----------------------------------------------------------------
+
+    /// `encode_record` asserts that a record fits in the 64 cycle-data
+    /// entries one header block holds, and says in its comment that
+    /// `max_payload` refuses everything that could break it. That is
+    /// true, and this is what keeps it true.
+    ///
+    /// The assertion cannot be reached from any argument, so there is no
+    /// test that trips it. What can go wrong instead is the gate moving:
+    /// raise `XLOG_HEADER_CYCLE_SIZE`, or relax the refusal to admit a
+    /// bigger `iclog_size`, and the assertion starts firing on ordinary
+    /// writes -- a panic in a shipped build, on a mount option as
+    /// ordinary as `logbsize=64k`.
+    ///
+    /// So the bound gets asserted directly, over every size the refusal
+    /// admits.
+    #[test]
+    fn no_payload_the_refusal_admits_needs_more_cycle_entries_than_exist() {
+        // The range is a fixed 128 KiB and NOT derived from
+        // `XLOG_HEADER_CYCLE_SIZE`, because the constant is one of the
+        // things being policed. A range that stops where the gate
+        // currently stops asks nothing about a gate that moved, and
+        // would pass unchanged after the exact edit this test exists to
+        // catch. 128 KiB covers `logbsize` up to twice the largest the
+        // kernel accepts.
+        let mut accepted = 0;
+        for iclog_size in (BBSIZE as u32..=128 * 1024).step_by(BBSIZE) {
+            let Ok(payload) = max_payload(iclog_size) else {
+                continue;
+            };
+            accepted += 1;
+            let blocks = payload.div_ceil(BBSIZE);
+            assert!(
+                blocks <= XLOG_CYCLE_DATA_ENTRIES,
+                "a {iclog_size}-byte record admits a {payload}-byte payload, which is \
+                 {blocks} basic blocks against the {XLOG_CYCLE_DATA_ENTRIES} entries a \
+                 single header block holds"
+            );
+        }
+        // Without this the loop above passes by admitting nothing, which
+        // is the shape of vacuous test this repository keeps finding.
+        assert!(accepted > 1, "the refusal admitted {accepted} sizes");
+    }
+
+    /// And the refusal really does refuse, at both ends. A `max_payload`
+    /// that returned `Ok` for everything would satisfy the bound above
+    /// only by accident of the loop's own range.
+    #[test]
+    fn a_record_size_outside_the_admitted_range_is_refused() {
+        // Above: the header would span more than one basic block.
+        let err = max_payload(XLOG_HEADER_CYCLE_SIZE + BBSIZE as u32)
+            .expect_err("a record whose header spans two blocks is refused");
+        assert!(
+            format!("{err}").contains("more than one basic block"),
+            "{err}"
+        );
+
+        // Below: too small to hold even the header block.
+        let err = max_payload(BBSIZE as u32 / 2)
+            .expect_err("a record smaller than its own header is refused");
+        assert!(format!("{err}").contains("cannot hold even"), "{err}");
+    }
 
     /// The buffer is the inode's address truncated to a whole cluster,
     /// with the remainder becoming the offset inside it — and the
