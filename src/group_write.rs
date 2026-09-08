@@ -856,6 +856,71 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------
+    // The invariants run in the build that ships
+    // -----------------------------------------------------------------
+    //
+    // `changed_chunks` is the one converted invariant reachable from
+    // outside: both slices come from the caller, so a mismatch needs no
+    // fault injection to produce. The rest of them guard a disagreement
+    // between two internal computations -- `ag_btree::build` already
+    // refuses a caller-supplied block count upstream, with "needs N
+    // blocks" -- and cannot be reached through any public argument.
+    //
+    // This one is worth having because it is a genuine witness, and the
+    // lengths in it are chosen so that it is. The loop bounds come from
+    // `before`, while the item is built over `after`, so a LONGER
+    // `after` is the silent direction: nothing indexes out of range, and
+    // `changed_chunks` returns an item covering bytes it never examined.
+    // Every change in that unexamined tail is left unmarked and so never
+    // reaches the journal at all.
+    //
+    // Both lengths are whole basic blocks on purpose. A mismatch of
+    // 512 against 256 does fail on `main`, but by tripping
+    // `BufferItem::new`'s own "whole number of basic blocks" assert one
+    // frame later -- a downstream panic about the wrong thing, not the
+    // silent case. Testing against that would have proved less than it
+    // appeared to.
+
+    /// A diff of two different lengths is not a diff.
+    ///
+    /// `#[should_panic]` and not an `Err`, because the function returns
+    /// `BufferItem` rather than `Result` and a refusal therefore has to
+    /// be a panic. The point of the test is the build it runs in: this
+    /// suite is `--release` throughout, which is exactly where the
+    /// previous `debug_assert_eq!` had been compiled out.
+    #[test]
+    #[should_panic(expected = "compares 512 bytes against 1024")]
+    fn a_buffer_diff_of_mismatched_lengths_is_refused() {
+        let before = vec![0u8; 512];
+        let after = vec![0xffu8; 1024];
+        let _ = changed_chunks(1, &before, after, 0);
+    }
+
+    /// And the equal-length case still works, so the test above is
+    /// failing on the mismatch rather than on anything else in the call.
+    #[test]
+    fn a_buffer_diff_of_equal_lengths_still_describes_the_change() {
+        let before = vec![0u8; 512];
+
+        // Self-calibrating rather than a fixed count: an unchanged
+        // buffer establishes what "nothing logged" looks like, so the
+        // changed case cannot pass by the function returning something
+        // for every input.
+        let unchanged = changed_chunks(1, &before, before.clone(), 0);
+
+        let mut after = before.clone();
+        after[0] = 0xff;
+        let changed = changed_chunks(1, &before, after, 0);
+
+        assert_eq!(changed.data().len(), 512);
+        assert!(
+            changed.op_count() > unchanged.op_count(),
+            "a changed byte logged {} regions, the same as an unchanged buffer",
+            changed.op_count()
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Two allocations in one operation
     // -----------------------------------------------------------------
 
