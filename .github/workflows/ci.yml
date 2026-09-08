@@ -61,6 +61,60 @@ jobs:
       # xfsprogs installed; the validate-kernel-xfs job below opts them in.
       - run: cargo test --locked --release
 
+      # AND ONCE WITHOUT `--release`, WHICH IS NOT THE SAME RUN.
+      #
+      # Overflow checks are on in debug and off in release, so a
+      # release-only gate cannot observe a defect whose only symptom is an
+      # arithmetic overflow.
+      #
+      # THIS COMMENT NO LONGER CARRIES THE ARGUMENT, and that is the point.
+      # It used to reason from the manifest -- `[profile.release]` sets
+      # `lto`, `codegen-units`, `opt-level` and `panic` and not
+      # `overflow-checks`, and there is no `.cargo/config.toml` override, so
+      # the defaults hold. Every clause of that was true and the conclusion
+      # was still only as good as the list: `.cargo/config.toml` was named
+      # as absent by a comment that nothing checked, and a
+      # CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable set at job level was not
+      # named at all. Both turn the checks off with this step running and
+      # green. A comment asserting an invariant is not the invariant. The
+      # step below asks the build instead.
+      #
+      # That is not hypothetical. The neighbouring NTFS driver had a live
+      # instance: `signed_bytes_needed` computed `1i64 << 63` -- which is
+      # `i64::MIN` -- and negated it. Measured there with the defect
+      # reintroduced and nothing else changed:
+      #
+      #     cargo test --locked --release --lib   ->  EXIT=0,   40 passed
+      #     cargo test --locked --lib             ->  EXIT=101, 4 failed
+      #
+      # In release the wrap left the function returning the right answer
+      # through its fallback, so the defect was invisible to every job that
+      # repository ran. Its tests were correct and thorough and would still
+      # have gone green with the bug present.
+      #
+      # `--lib` only: this is a second compile of the same sources, and the
+      # unit tests are where the arithmetic lives. The oracle and fixture
+      # suites need xfsprogs or a VM and are gated elsewhere; running them
+      # again in another profile buys nothing and costs a great deal.
+      #
+      # THE VARIABLE IS PART OF THE STEP, not decoration. It tells the
+      # suite that this is the run which is supposed to trap an overflow,
+      # and `overflow_checks::the_build_the_gate_asked_to_check_does_check`
+      # in src/lib.rs then performs one and fails if the build let it
+      # through. That is the only check immune to WHERE the setting was
+      # turned off: a manifest key in any of four spellings, a
+      # CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable at step or job level,
+      # a .cargo/config.toml, or whatever cargo adds next. Each of those
+      # was found separately while trying to scan for them.
+      #
+      # The release step must not set it -- the checks are off there on
+      # purpose, because that is what ships.
+      #
+      # Do not remove this as a duplicate of the line above it, and do not
+      # drop the variable from it. tests/ci_profile.rs asserts that a
+      # cargo test here runs without --release AND sets this, and says why.
+      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+
       # The VM-teardown guards, which decide whether a machine is left
       # running. They stub pgrep and vagrant, so they need neither.
       #
