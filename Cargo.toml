@@ -22,6 +22,17 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 # Linux kernel computes for it, so both sides have to agree on SHA-256.
 # MIT OR Apache-2.0, and it never reaches a consumer of this crate.
 sha2 = "0.10"
+# YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
+# and refuses if the debug run that lets the PR gate see an arithmetic
+# overflow has been removed or disabled. That guard hand-rolled its own
+# scanner and needed five separate patches -- comments, quoted keys,
+# block scalar styles, indentation, whole trigger names -- each of them
+# a rule a YAML parser already has. Pure Rust, YAML 1.2 (so GitHub's
+# `on:` key stays the string `on` and is not folded into a boolean),
+# MIT/Apache-2.0, and no C to transpile -- unlike serde_yaml, which is
+# deprecated and wraps unsafe-libyaml. Test-only, like sha2 above: it
+# never reaches a consumer of this crate.
+saphyr = "0.0.12"
 
 [profile.release]
 lto = true
