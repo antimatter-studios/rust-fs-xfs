@@ -773,7 +773,7 @@ fn a_truncate_is_visible_through_the_abi() {
     let fs = copy.open_rw();
     let path = cstr("/large.bin");
 
-    let rc = unsafe { fs_xfs_truncate(fs, path.as_ptr(), 1234, -1, 0) };
+    let rc = unsafe { fs_xfs_truncate(fs, path.as_ptr(), 1234, FS_XFS_LEAVE_TIME, 0) };
     assert_eq!(rc, 0, "{}", last_error());
 
     let mut st = zeroed_attr();
@@ -796,7 +796,15 @@ fn growing_by_truncate_is_enotsup() {
         return;
     };
     let fs = copy.open_rw();
-    let rc = unsafe { fs_xfs_truncate(fs, cstr("/small.txt").as_ptr(), 1 << 20, -1, 0) };
+    let rc = unsafe {
+        fs_xfs_truncate(
+            fs,
+            cstr("/small.txt").as_ptr(),
+            1 << 20,
+            FS_XFS_LEAVE_TIME,
+            0,
+        )
+    };
     assert_eq!(rc, -1);
     assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
     unsafe { fs_xfs_umount(fs) };
@@ -819,7 +827,7 @@ fn attributes_round_trip_through_the_abi() {
             0o640,
             FS_XFS_LEAVE,
             FS_XFS_LEAVE,
-            FS_XFS_LEAVE,
+            FS_XFS_LEAVE_TIME,
             0,
             1_500_000_000,
             42,
@@ -851,9 +859,9 @@ fn a_mode_with_type_bits_is_refused_through_the_abi() {
             0o040755,
             FS_XFS_LEAVE,
             FS_XFS_LEAVE,
-            FS_XFS_LEAVE,
+            FS_XFS_LEAVE_TIME,
             0,
-            FS_XFS_LEAVE,
+            FS_XFS_LEAVE_TIME,
             0,
         )
     };

@@ -6,6 +6,26 @@ never does.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (C ABI).** `fs_xfs_set_attributes` and `fs_xfs_truncate`
+  take a new sentinel for timestamps: `FS_XFS_LEAVE_TIME`
+  (`INT64_MIN`), not `FS_XFS_LEAVE` (`-1`). A caller that passed `-1`
+  to leave `atime_sec` or `mtime_sec` alone will now SET that timestamp
+  to one second before the epoch. There is no version of this fix that
+  is not a break: `-1` is a real date, 1969-12-31T23:59:59Z, and making
+  it reachable is the point. Every negative timestamp used to mean
+  "leave this alone", so no date before 1970 could be set at all — the
+  call returned 0 and the field did not move. `mode`, `uid` and `gid`
+  keep `FS_XFS_LEAVE`, which is the `chown(2)` convention and correct
+  for them.
+
+  Callers should replace `FS_XFS_LEAVE` with `FS_XFS_LEAVE_TIME` in the
+  `atime_sec` and `mtime_sec` positions, and in `fs_xfs_truncate`'s
+  `mtime_sec`. Dates earlier than 1901-12-13 are accepted by the ABI
+  and clamped by the on-disk encoding, which is unchanged.
+
+
 ## [0.7.0] — 2026-09-06
 
 ### Fixed

@@ -833,7 +833,9 @@ pub unsafe extern "C" fn fs_xfs_write_file(
 /// did before.
 ///
 /// `mtime_sec` and `mtime_nsec` set the modification and inode-change
-/// times; pass a negative `mtime_sec` to leave both alone.
+/// times; pass [`FS_XFS_LEAVE_TIME`] to leave both alone. A NEGATIVE
+/// `mtime_sec` is a date before 1970 and is applied -- it used to mean
+/// "leave alone", which made those dates unreachable.
 ///
 /// # Safety
 ///
@@ -858,10 +860,7 @@ pub unsafe extern "C" fn fs_xfs_truncate(
         let Some((inode, _)) = resolve_for_write(fs, path) else {
             return -1;
         };
-        let when = (mtime_sec >= 0).then_some(Timestamp {
-            sec: mtime_sec,
-            nsec: mtime_nsec,
-        });
+        let when = timestamp_arg(mtime_sec, mtime_nsec);
         match fs.truncate(&inode, new_size, when) {
             Ok(()) => 0,
             Err(e) => {
@@ -872,17 +871,59 @@ pub unsafe extern "C" fn fs_xfs_truncate(
     })
 }
 
-/// Sentinel meaning "leave this field alone" for the setters below.
+/// Sentinel meaning "leave this field alone" for `mode`, `uid` and
+/// `gid`.
 ///
-/// A negative value cannot be a real time, uid, gid or mode, so one
-/// signed parameter can carry both "set it to this" and "do not touch
-/// it" without a second flags argument for the caller to get wrong.
+/// None of the three is ever legitimately negative -- `chown(2)` uses
+/// exactly this convention for uid and gid -- so one signed parameter
+/// carries both "set it to this" and "do not touch it" without a second
+/// flags argument for the caller to get wrong.
+///
+/// NOT FOR TIMESTAMPS. See [`FS_XFS_LEAVE_TIME`].
 pub const FS_XFS_LEAVE: i64 = -1;
+
+/// Sentinel meaning "leave this timestamp alone".
+///
+/// TIMESTAMPS NEEDED THEIR OWN, because the argument for [`FS_XFS_LEAVE`]
+/// does not hold for them: a negative second count is a real time. This
+/// crate's own [`Timestamp`] says so -- "Seconds since the Unix epoch.
+/// Negative values predate 1970" -- and the on-disk format reaches
+/// further back than that, since the legacy 32-bit signed seconds span
+/// 1901 to 2038 and `bigtime` widens it again.
+///
+/// So `-1` meaning "leave alone" made every date before 1970
+/// unreachable through this ABI: the call returned 0 and the timestamp
+/// did not move. Measured before the fix, requesting `mtime_sec = -100`
+/// (1969-12-31T23:58:20Z) left the inode's mtime at its original value
+/// and reported success.
+///
+/// `i64::MIN` is outside the domain instead of inside it. It is one
+/// second before the earliest representable time and not a date anybody
+/// means, whereas `-1` is a date somebody might.
+///
+/// # This is an ABI change, not an addition
+///
+/// A caller that passed `-1` to leave a timestamp alone will now SET it
+/// to one second before the epoch. There is no way to fix this defect
+/// without that, because making `-1` reachable is the fix.
+pub const FS_XFS_LEAVE_TIME: i64 = i64::MIN;
+
+/// A timestamp argument pair as either a value or "leave it alone".
+///
+/// The comparison lives here, in one place both entry points call,
+/// because it was written twice -- `fs_xfs_set_attributes` and
+/// `fs_xfs_truncate` -- and both copies said `>= 0`.
+fn timestamp_arg(sec: i64, nsec: u32) -> Option<Timestamp> {
+    (sec != FS_XFS_LEAVE_TIME).then_some(Timestamp { sec, nsec })
+}
 
 /// Change a file's timestamps, permissions or ownership.
 ///
-/// Each parameter is either a value to set or [`FS_XFS_LEAVE`]. Fields
-/// left alone keep whatever they hold, including anything changed by
+/// `mode`, `uid` and `gid` are either a value to set or
+/// [`FS_XFS_LEAVE`]; `atime_sec` and `mtime_sec` are either a value or
+/// [`FS_XFS_LEAVE_TIME`]. The two sentinels differ because a negative
+/// second count is a real date and a negative mode is not. Fields left
+/// alone keep whatever they hold, including anything changed by
 /// something else since the caller last looked.
 ///
 /// `mode` takes permission bits only. A value with file-type bits set is
@@ -922,14 +963,8 @@ pub unsafe extern "C" fn fs_xfs_set_attributes(
             permissions: (mode >= 0).then_some(mode as u16),
             uid: (uid >= 0).then_some(uid as u32),
             gid: (gid >= 0).then_some(gid as u32),
-            atime: (atime_sec >= 0).then_some(Timestamp {
-                sec: atime_sec,
-                nsec: atime_nsec,
-            }),
-            mtime: (mtime_sec >= 0).then_some(Timestamp {
-                sec: mtime_sec,
-                nsec: mtime_nsec,
-            }),
+            atime: timestamp_arg(atime_sec, atime_nsec),
+            mtime: timestamp_arg(mtime_sec, mtime_nsec),
             ctime: None,
         };
         match fs.set_attributes(&inode, &change) {
@@ -960,5 +995,106 @@ fn resolve_for_write(fs: &Filesystem, path: &str) -> Option<(Inode, Vec<u8>)> {
             record(&e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A NEGATIVE SECOND COUNT IS A DATE, NOT A SENTINEL. This is the
+    /// filed defect: `-100` is 1969-12-31T23:58:20Z, and under `>= 0`
+    /// it was read as "leave the field alone", so the call reported
+    /// success and the timestamp did not move.
+    #[test]
+    fn a_time_before_1970_is_a_value_and_not_a_sentinel() {
+        // -2_147_483_648 is the floor both representations reach: it is
+        // exactly `i32::MIN` for the legacy encoding and exactly the
+        // bigtime epoch, 1901-12-13. Nothing earlier is claimed here --
+        // see `a_time_below_the_floor_is_a_value_here_and_clamped_later`.
+        for sec in [-1, -100, -2_147_483_648] {
+            assert_eq!(
+                timestamp_arg(sec, 7),
+                Some(Timestamp { sec, nsec: 7 }),
+                "{sec} is a representable date and must be applied"
+            );
+        }
+    }
+
+    /// A DATE EARLIER THAN THE FORMAT CAN HOLD IS STILL NOT THE
+    /// SENTINEL, and it is still not stored.
+    ///
+    /// Those are two different questions and the first version of this
+    /// file blurred them: it listed `i64::MIN + 1` among "representable"
+    /// dates on the strength of `timestamp_arg` accepting it. It does
+    /// accept it -- that function decides sentinel-versus-value and
+    /// nothing else -- but `Timestamp::encode` CLAMPS anything below the
+    /// floor rather than wrapping it, so a caller passing this through
+    /// the ABI gets 1901-12-13 stored, not the date asked for.
+    ///
+    /// Clamping is the right behaviour and is documented where it
+    /// happens: a wrapped date looks plausible on the way back out,
+    /// where a clamped one is wrong by a knowable amount and shows up as
+    /// an extreme value. It is pinned here so the boundary is a measured
+    /// fact rather than something the sentinel test appears to bless.
+    #[test]
+    fn a_time_below_the_floor_is_a_value_here_and_clamped_later() {
+        let sec = i64::MIN + 1;
+        assert_eq!(
+            timestamp_arg(sec, 0),
+            Some(Timestamp { sec, nsec: 0 }),
+            "it is not the sentinel, which is all this function decides"
+        );
+
+        let mut legacy = [0u8; 8];
+        Timestamp { sec, nsec: 0 }.encode(&mut legacy, 0, false);
+        assert_eq!(
+            i32::from_be_bytes(legacy[..4].try_into().expect("four bytes")),
+            i32::MIN,
+            "the legacy encoding clamps to its own floor"
+        );
+
+        let mut bigtime = [0u8; 8];
+        Timestamp { sec, nsec: 0 }.encode(&mut bigtime, 0, true);
+        assert_eq!(
+            u64::from_be_bytes(bigtime),
+            0,
+            "bigtime counts from 1901-12-13 and saturates at that epoch"
+        );
+    }
+
+    /// `-1` in particular, because it is the value the old sentinel
+    /// used and therefore the one date that was unreachable by
+    /// construction rather than by accident.
+    #[test]
+    fn minus_one_is_one_second_before_the_epoch() {
+        assert_eq!(
+            timestamp_arg(-1, 0),
+            Some(Timestamp { sec: -1, nsec: 0 }),
+            "1969-12-31T23:59:59Z is a date, and it was the sentinel"
+        );
+    }
+
+    /// And the sentinel still leaves the field alone, or every setter
+    /// would overwrite a timestamp its caller never asked to change.
+    #[test]
+    fn the_sentinel_leaves_the_field_alone() {
+        assert_eq!(timestamp_arg(FS_XFS_LEAVE_TIME, 0), None);
+        assert_eq!(timestamp_arg(FS_XFS_LEAVE_TIME, 999), None);
+    }
+
+    /// The two sentinels are not interchangeable, which is the whole
+    /// point of there being two.
+    #[test]
+    fn the_mode_sentinel_is_not_the_time_sentinel() {
+        assert_ne!(FS_XFS_LEAVE, FS_XFS_LEAVE_TIME);
+        assert_eq!(
+            timestamp_arg(FS_XFS_LEAVE, 0),
+            Some(Timestamp {
+                sec: FS_XFS_LEAVE,
+                nsec: 0
+            }),
+            "FS_XFS_LEAVE is -1, which for a timestamp is a date"
+        );
     }
 }
