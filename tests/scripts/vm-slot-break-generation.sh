@@ -70,6 +70,59 @@ check_eq() {
     fi
 }
 
+# --- the token cmd_acquire writes -------------------------------------
+
+# EVERYTHING BELOW COMPARES TOKENS. NOTHING BELOW PRODUCES ONE.
+#
+# `set_lock` takes the token as an argument, so every test in this file
+# hands itself `gen-A`, `gen-B`, `gen-live` and then checks that
+# `break_lock` and `delete_generation` compare them correctly. The
+# expression that actually makes a generation identifiable is never
+# executed by any of them, and a comparison is only worth as much as the
+# thing it compares.
+#
+# So a plausible simplification defeats the whole file. Replacing
+#
+#     "$(now)-$$-${RANDOM}"    with    "$(now)"
+#
+# leaves every other check here at EXIT=0 while two acquisitions in the
+# same second get the SAME token — at which point a breaker that read
+# the first passes its check against the second and deletes a live
+# replacement's lock. That is the production failure this slot exists to
+# prevent, measured elsewhere as two VMs 5401 seconds apart under a
+# 5400s limit.
+#
+# `cmd_acquire` on a free path is `mkdir` then `printf` and returns; it
+# boots nothing, so it can be called here directly. The two acquisitions
+# below land in the same second and the same process, which is the case
+# that matters: it is the part of the token that is neither the clock
+# nor the pid that has to carry the difference.
+#
+# IF THIS EVER FAILS, IT IS NOT FLAKY. `$RANDOM` is 0..32767, so two
+# draws repeat with probability 1/32768, and a failure here says two
+# generations really were given the same identity — which is the defect,
+# rarely, rather than a false alarm.
+rm -rf "$LOCK"
+cmd_acquire
+gen_first="$(record_field "$HOLDER" 4)"
+cmd_release
+cmd_acquire
+gen_second="$(record_field "$HOLDER" 4)"
+cmd_release
+
+# The control. Without it, an acquire that wrote no token at all would
+# make the comparison below "" against "" and report a defect nobody
+# could read, or -- worse, if the shape ever changes -- pass.
+check_eq "$([ -n "$gen_first" ] && echo written || echo empty)" written \
+    "cmd_acquire writes a generation token at all"
+if [ "$gen_first" != "$gen_second" ]; then
+    printf 'ok    two acquisitions in the same second get different tokens\n'
+else
+    printf 'FAIL  two acquisitions in the same second get different tokens: both %s\n' \
+        "$gen_first"
+    fails=$((fails + 1))
+fi
+
 # --- break_lock ------------------------------------------------------
 
 # THE CONTROL. Without this a `break_lock` that refused everything would
