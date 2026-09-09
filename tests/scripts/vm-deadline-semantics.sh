@@ -169,9 +169,16 @@ run_deadline_script() {
     if [ "$sd_exit" != NONE ]; then
     cat > "$stubs/shutdown" <<STUB
 #!/bin/sh
-# /bin/sh by ABSOLUTE path: this stub runs under a PATH holding only
-# the stub directory, so `env` would look up `bash` there and fail with
-# "No such file or directory". Neither stub needs bash.
+# /bin/sh by ABSOLUTE path, NOT a /usr/bin/env shebang: this stub runs
+# under a PATH holding only the stub directory, so env would look up
+# its interpreter there and fail. Neither stub needs bash.
+#
+# NO BACKTICKS ANYWHERE IN THIS HEREDOC. It is unquoted, because
+# $sandbox and $sd_exit below have to expand -- which means backticks
+# are command substitution too. A pair around a word in this comment
+# ran that word and spliced its output into the stub: the environment
+# landed in the middle of the file and the stub failed at "line 54"
+# with a PATH for a command name.
 # -c (cancel) always succeeds; the scheduling call is the one under test.
 case "\$1" in
   -c) exit 0 ;;
