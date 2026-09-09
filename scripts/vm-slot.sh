@@ -63,6 +63,31 @@ VAGRANT_DIR="$REPO/tests/vagrant"
 
 now() { date +%s; }
 
+# EVERY NAME THIS FILE INVENTS CARRIES ONE OF THESE, AND IT IS A COUNTER
+# RATHER THAN A DRAW.
+#
+# Two things here have to be unique per process and per second: the
+# generation token, so a breaker holding one generation's token cannot
+# match the generation that replaced it; and the directory a displaced
+# record is orphaned into, so a second displaced record does not land on
+# the first.
+#
+# Both used `$RANDOM` or nothing at all. `$RANDOM` is 0..32767, so two
+# draws repeat once in 32768 -- and the test that asserts two
+# acquisitions differ then fails that often and takes a required gate
+# with it. "Flaky, retry it" is the wrong reading, because when it fires
+# it is telling the truth: two generations really were given one
+# identity. A counter cannot repeat, so the property the test asserts is
+# one the code actually has.
+#
+# NOT A COMMAND SUBSTITUTION, and this is the whole reason it assigns to
+# a variable instead of printing. `x="$(next_serial)"` would run the
+# increment in a SUBSHELL, leaving `SERIAL` at its old value in the
+# caller -- so every call would yield 1, which reads as working because
+# 1 differs from whatever came before it often enough to look fine.
+SERIAL=0
+next_serial() { SERIAL=$((SERIAL + 1)); }
+
 # The holder record, or empty if the slot is free.
 #   vagrant_dir<TAB>repo<TAB>epoch
 #
@@ -178,7 +203,20 @@ restore_lock() {
     # Kept instead, under a name nothing looks for, and reported. A
     # visible orphan beside the lock is a state somebody can diagnose;
     # a silent double-hold is the failure this file exists to prevent.
-    orphan="${LOCK}.orphan.$$"
+    #
+    # THE SERIAL IS WHAT MAKES THAT TRUE MORE THAN ONCE. The name was
+    # `${LOCK}.orphan.$$`, and one process reaches here twice: a failed
+    # `break_lock` makes `cmd_acquire` `continue`, so the loop can
+    # displace a second record while the first is still parked. With the
+    # pid alone both wanted the same name and the `rm -rf` below threw
+    # the first record away -- losing exactly the evidence this branch
+    # exists to keep, and doing it silently.
+    next_serial
+    orphan="${LOCK}.orphan.$$.$SERIAL"
+    # Nothing can be at a name no other call can produce. Kept anyway
+    # because `mv` onto an EXISTING directory does not fail, it moves
+    # the source inside -- the trap `restore_lock` was written around,
+    # and one an empty directory left by anything else would spring.
     rm -rf "$orphan"
     if mv "$staged" "$orphan" 2>/dev/null; then
         echo "[vm-slot] a lock was staged aside and the slot was retaken before it" >&2
@@ -237,7 +275,12 @@ delete_generation() {
     if [ "$(holder_field 4 2>/dev/null || true)" != "$token" ]; then
         return 1
     fi
-    staged="${LOCK}.${tag}.$$"
+    # Serialised for the same reason the orphan is: `break_lock` can be
+    # called repeatedly from one `cmd_acquire` loop, and a name that
+    # repeats is a name that can collide with a copy still parked under
+    # it.
+    next_serial
+    staged="${LOCK}.${tag}.$$.$SERIAL"
     rm -rf "$staged"
     mv "$LOCK" "$staged" 2>/dev/null || return 1
     if [ "$(record_field "$staged/holder" 4)" != "$token" ]; then
@@ -269,8 +312,9 @@ cmd_acquire() {
             # which is what a breaker compares against before deleting
             # anything. Without it every generation at this path looks
             # like every other one.
+            next_serial
             printf '%s\t%s\t%s\t%s\n' "$VAGRANT_DIR" "$REPO_NAME" "$(now)" \
-                "$(now)-$$-${RANDOM}" > "$HOLDER"
+                "$(now)-$$-$SERIAL" > "$HOLDER"
             [ "$announced" = 1 ] && echo "[vm-slot] got the slot after $(pretty_age $waited)" >&2
             return 0
         fi

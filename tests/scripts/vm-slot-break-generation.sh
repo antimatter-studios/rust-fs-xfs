@@ -98,30 +98,52 @@ check_eq() {
 # that matters: it is the part of the token that is neither the clock
 # nor the pid that has to carry the difference.
 #
-# IF THIS EVER FAILS, IT IS NOT FLAKY. `$RANDOM` is 0..32767, so two
-# draws repeat with probability 1/32768, and a failure here says two
-# generations really were given the same identity — which is the defect,
-# rarely, rather than a false alarm.
+# THIS CHECK USED TO BE THE DEFECT IT WAS TESTING FOR. The token was
+# `"$(now)-$$-${RANDOM}"`; `$RANDOM` is 0..32767, so two draws repeat
+# once in 32768 and this assertion failed that often — in a required
+# gate, on a property the code did not actually have. The obvious
+# reaction to a 1-in-32768 red is to loosen the assertion, which puts
+# the file back where it started with a comment claiming otherwise. The
+# counter is the other remedy and the right one: the tokens differ
+# because nothing can make them equal, so the check asserts something
+# true rather than something usually true.
 rm -rf "$LOCK"
-cmd_acquire
-gen_first="$(record_field "$HOLDER" 4)"
-cmd_release
-cmd_acquire
-gen_second="$(record_field "$HOLDER" 4)"
-cmd_release
+acquisitions=5
+tokens=""
+for _ in $(seq "$acquisitions"); do
+    cmd_acquire
+    tokens="$tokens$(record_field "$HOLDER" 4)"$'\n'
+    cmd_release
+done
+gen_first="$(printf '%s' "$tokens" | head -1)"
+distinct="$(printf '%s' "$tokens" | sort -u | wc -l | tr -d ' ')"
 
 # The control. Without it, an acquire that wrote no token at all would
-# make the comparison below "" against "" and report a defect nobody
-# could read, or -- worse, if the shape ever changes -- pass.
+# compare "" against "" and report a defect nobody could read, or --
+# worse, if the shape ever changes -- pass.
 check_eq "$([ -n "$gen_first" ] && echo written || echo empty)" written \
     "cmd_acquire writes a generation token at all"
-if [ "$gen_first" != "$gen_second" ]; then
-    printf 'ok    two acquisitions in the same second get different tokens\n'
-else
-    printf 'FAIL  two acquisitions in the same second get different tokens: both %s\n' \
-        "$gen_first"
-    fails=$((fails + 1))
-fi
+check_eq "$distinct" "$acquisitions" \
+    "$acquisitions acquisitions in the same second and process get $acquisitions different tokens"
+
+# WHERE THE DIFFERENCE COMES FROM, pinned separately, because the check
+# above would also pass on a token that happened to straddle a second
+# boundary. Five acquisitions take microseconds, so in practice the
+# clock and the pid are constant across all of them and only the serial
+# moves -- but "in practice" is not an assertion.
+#
+# `next_serial` ASSIGNS RATHER THAN PRINTS, and this is what says so. A
+# `printf`-and-capture version would increment inside a subshell, leave
+# the caller's `SERIAL` untouched, and hand back 1 every time.
+serial_before="$SERIAL"
+next_serial
+serial_mid="$SERIAL"
+next_serial
+serial_after="$SERIAL"
+check_eq "$serial_mid" "$((serial_before + 1))" \
+    "next_serial advances the counter in its CALLER, not in a subshell"
+check_eq "$serial_after" "$((serial_before + 2))" \
+    "and again, so two names taken in one process cannot be equal"
 
 # --- break_lock ------------------------------------------------------
 
@@ -314,6 +336,37 @@ orphan="$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.orphan.*' | he
 check_eq "$(record_field "$orphan/holder" 4)" "gen-DISPLACED" "and it is the displaced generation"
 check_eq "$([ -e "$staged" ] && echo present || echo gone)" gone "with nothing left at the staging name"
 rm -rf "$orphan"
+
+# --- a SECOND displaced record does not land on the first --------------
+
+# `cmd_acquire` loops: a `break_lock` that returns non-zero makes it
+# `continue`, so ONE process can reach the orphan path more than once.
+# The name was `${LOCK}.orphan.$$` -- the same name both times -- and
+# `restore_lock` `rm -rf`s that name before moving into it. So the
+# second displaced record deleted the first, silently, and the first was
+# a generation this process had already decided it was NOT authorised to
+# break: its VM may still have been running, and the only trace of it
+# was gone.
+#
+# Two displacements, one process, and both records must still be there.
+find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.orphan.*' -exec rm -rf {} +
+set_lock "$OTHER" "gen-WINNER-2"
+for displaced in gen-DISPLACED-ONE gen-DISPLACED-TWO; do
+    staged="${LOCK}.breaking.$displaced"
+    rm -rf "$staged"
+    mkdir -p "$staged"
+    printf '%s\t%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(date +%s)" "$displaced" \
+        > "$staged/holder"
+    restore_lock "$staged"
+done
+orphan_count="$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.orphan.*' | wc -l | tr -d ' ')"
+check_eq "$orphan_count" 2 "two displaced records in one process are both kept"
+kept_tokens="$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.orphan.*' \
+    -exec awk -F'\t' '{print $4}' {}/holder \; | sort | tr '\n' ' ')"
+check_eq "$kept_tokens" "gen-DISPLACED-ONE gen-DISPLACED-TWO " \
+    "and the first is not overwritten by the second"
+check survived "the winner's lock is still untouched by either"
+find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.orphan.*' -exec rm -rf {} +
 
 if [ "$fails" -eq 0 ]; then
     echo "vm-slot-break-generation: all checks passed"
