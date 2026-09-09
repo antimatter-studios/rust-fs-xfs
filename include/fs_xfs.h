@@ -237,19 +237,39 @@ int64_t fs_xfs_write_file(fs_xfs_fs_t *fs, const char *path,
  * The file's blocks are NOT released — freeing them is allocation work
  * that needs a journal — so a shortened file still occupies what it did.
  *
- * `mtime_sec` sets the modification and inode-change times; pass a
- * negative value to leave both alone.
+ * `mtime_sec` sets the modification and inode-change times; pass
+ * FS_XFS_LEAVE_TIME to leave both alone. A NEGATIVE mtime_sec is a date
+ * before 1970 and is applied -- it used to mean "leave alone", which
+ * made those dates unreachable through this ABI.
  */
 int fs_xfs_truncate(fs_xfs_fs_t *fs, const char *path, uint64_t new_size,
                     int64_t mtime_sec, uint32_t mtime_nsec);
 
-/* Pass for any field of fs_xfs_set_attributes that should not change. */
+/*
+ * Pass for a mode, uid or gid that should not change. None of the three
+ * is ever legitimately negative -- chown(2) uses this same convention.
+ *
+ * NOT FOR TIMESTAMPS: see FS_XFS_LEAVE_TIME.
+ */
 #define FS_XFS_LEAVE ((int64_t)-1)
 
 /*
- * Change timestamps, permissions or ownership. Each parameter is either
- * a value to set or FS_XFS_LEAVE. Fields left alone keep whatever they
- * hold, including anything changed by something else in the meantime.
+ * Pass for a timestamp that should not change.
+ *
+ * Timestamps need their own sentinel because a negative second count is
+ * a real date: the legacy on-disk format spans 1901 to 2038 and bigtime
+ * widens it further. While -1 meant "leave alone", every date before
+ * 1970 was unreachable -- the call returned 0 and the timestamp did not
+ * move. INT64_MIN is outside the domain rather than inside it.
+ */
+#define FS_XFS_LEAVE_TIME ((int64_t)INT64_MIN)
+
+/*
+ * Change timestamps, permissions or ownership. mode, uid and gid are
+ * either a value to set or FS_XFS_LEAVE; atime_sec and mtime_sec are
+ * either a value or FS_XFS_LEAVE_TIME. Fields left alone keep whatever
+ * they hold, including anything changed by something else in the
+ * meantime.
  *
  * `mode` takes permission bits only. A value carrying file-type bits is
  * refused with ENOTSUP rather than masked: turning a file into a
