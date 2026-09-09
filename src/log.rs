@@ -323,6 +323,75 @@ pub struct Head {
 /// time.
 const DEFAULT_ICLOG_SIZE: u32 = 32 * 1024;
 
+/// Whether an `h_size` is one this log can carry.
+///
+/// THE INVARIANT LIVES HERE SO THAT BOTH PATHS SHARE IT. `head` reaches
+/// its answer two ways -- read off the newest record, or defaulted for a
+/// log nothing has written to -- and the bound was applied only to the
+/// first. The second returned [`DEFAULT_ICLOG_SIZE`] unchecked, and
+/// `log_write::append_at` stamps whatever `head` returns into the record
+/// it writes, so on a log smaller than 32 KiB the driver wrote a record
+/// that this very function then refused. First journalled write fine,
+/// every one after it permanently broken, against a record the driver
+/// put there itself.
+///
+/// The three conditions are the kernel's own: the in-core buffer size is
+/// a power of two, at least one basic block, and cannot exceed the log
+/// it lives in.
+fn iclog_size_fits(iclog_size: u32, log_bytes: u64) -> bool {
+    iclog_size.is_power_of_two()
+        && u64::from(iclog_size) >= BBSIZE as u64
+        && u64::from(iclog_size) <= log_bytes
+}
+
+/// The `h_size` to write into the first record of a log nothing has
+/// written to yet.
+///
+/// [`DEFAULT_ICLOG_SIZE`] is the kernel's default and the right answer
+/// for every log big enough to hold it. It is the wrong answer for a
+/// log smaller than itself, and clamping is what makes the value satisfy
+/// [`iclog_size_fits`] -- the same bound the record path enforces --
+/// rather than merely being unchecked.
+///
+/// It is a clamp rather than a refusal because the geometry is legal:
+/// `Superblock::validate` puts no floor on `sb_logblocks` beyond fitting
+/// inside its AG, so `logblocks=1, blocksize=4096` is a 4096-byte log
+/// that parses cleanly. Refusing it would turn a working read-only mount
+/// into a failure over a log the driver could have written correctly.
+///
+/// ROUNDED DOWN TO A POWER OF TWO, because a log's size is not required
+/// to be one: a 3-block 4 KiB-block log is 12288 bytes, and 12288 is not
+/// a value `h_size` may take.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] for a log too small to hold one basic block.
+/// That is **not reachable through [`Superblock::parse`]** today --
+/// `validate` bounds `blocksize` to 512..=65536 and [`extent`] refuses a
+/// zero-length log, so `log_bytes` is at least 512 -- and it is here
+/// because this function takes a byte count rather than a superblock,
+/// and returning 0 would hand `log_write::max_payload` a value it would
+/// have to refuse later and less clearly. Witnessed directly by
+/// `tests::a_log_too_small_for_one_basic_block_has_no_usable_buffer_size`
+/// rather than left as a branch nothing exercises.
+fn default_iclog_size(log_bytes: u64) -> Result<u32> {
+    let capped = u64::from(DEFAULT_ICLOG_SIZE).min(log_bytes);
+    // `capped` is at most `DEFAULT_ICLOG_SIZE`, so the floor fits a u32.
+    let floor = if capped == 0 {
+        0
+    } else {
+        1u64 << (u64::BITS - 1 - capped.leading_zeros())
+    };
+    let size = floor as u32;
+    if !iclog_size_fits(size, log_bytes) {
+        return Err(Error::BadSuperblock(format!(
+            "the log is {log_bytes} bytes, which cannot hold an in-core buffer of even \
+             the {BBSIZE} bytes one basic block requires"
+        )));
+    }
+    Ok(size)
+}
+
 /// Find where the next record may be written.
 ///
 /// # Errors
@@ -341,7 +410,10 @@ pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
             cycle: 1,
             prev_block: u32::MAX,
             free_blocks: total,
-            iclog_size: DEFAULT_ICLOG_SIZE,
+            // NOT `DEFAULT_ICLOG_SIZE` DIRECTLY. This value is stamped
+            // into the record `append_at` writes, and the bound below
+            // is what reads it back -- see `default_iclog_size`.
+            iclog_size: default_iclog_size(log_bytes)?,
         });
     };
 
@@ -363,14 +435,11 @@ pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
     // behind by another filesystem, or a deliberately malformed image
     // all produce one.
     //
-    // The three conditions are the kernel's own: the in-core buffer size
-    // is a power of two, at least one basic block, and cannot exceed the
-    // log it lives in.
+    // The three conditions are the kernel's own, and they live in
+    // `iclog_size_fits` because the empty-log path above has to satisfy
+    // the same bound rather than route around it.
     let iclog_size = be32(&newest.header, offsets::SIZE);
-    if !iclog_size.is_power_of_two()
-        || u64::from(iclog_size) < BBSIZE as u64
-        || u64::from(iclog_size) > log_bytes
-    {
+    if !iclog_size_fits(iclog_size, log_bytes) {
         return Err(Error::CorruptLog(format!(
             "the newest log record says its in-core buffers are {iclog_size} bytes, which              is not a power of two between {BBSIZE} and the log's own {log_bytes}"
         )));
@@ -516,6 +585,13 @@ mod tests {
     /// rather than through `Superblock::parse` so the geometry under
     /// test is stated outright.
     fn sb() -> Superblock {
+        sb_with_logblocks(LOGBLOCKS)
+    }
+
+    /// The same superblock with the log sized explicitly, so a log
+    /// smaller than `DEFAULT_ICLOG_SIZE` can be built. `logblocks` is
+    /// the only field that moves; everything else is `sb`'s.
+    fn sb_with_logblocks(logblocks: u32) -> Superblock {
         let mut b = vec![0u8; 512];
         b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&BLOCKSIZE.to_be_bytes());
@@ -525,7 +601,7 @@ mod tests {
         b[56..64].copy_from_slice(&128u64.to_be_bytes()); // rootino
         b[84..88].copy_from_slice(&1024u32.to_be_bytes()); // agblocks
         b[88..92].copy_from_slice(&4u32.to_be_bytes()); // agcount
-        b[96..100].copy_from_slice(&LOGBLOCKS.to_be_bytes());
+        b[96..100].copy_from_slice(&logblocks.to_be_bytes());
         b[100..102]
             .copy_from_slice(&(5u16 | crate::superblock::version_flags::MOREBITSBIT).to_be_bytes());
         b[102..104].copy_from_slice(&512u16.to_be_bytes()); // sectsize
@@ -550,6 +626,29 @@ mod tests {
 
     /// Write a record header into basic block `bb` of the log.
     fn put_record(dev: &MemDev, log_at: u64, bb: u64, cycle: u32, block: u32, num_logops: u32) {
+        put_record_with_size(
+            dev,
+            log_at,
+            bb,
+            cycle,
+            block,
+            num_logops,
+            XLOG_HEADER_CYCLE_SIZE,
+        );
+    }
+
+    /// The same, with `h_size` stated rather than defaulted -- so a test
+    /// can write back exactly what `head` offered and read it again.
+    #[allow(clippy::too_many_arguments)]
+    fn put_record_with_size(
+        dev: &MemDev,
+        log_at: u64,
+        bb: u64,
+        cycle: u32,
+        block: u32,
+        num_logops: u32,
+        iclog_size: u32,
+    ) {
         let mut b = dev.0.lock().unwrap();
         let at = (log_at + bb * BBSIZE as u64) as usize;
         let h = &mut b[at..at + BBSIZE];
@@ -563,7 +662,7 @@ mod tests {
         h[offsets::LSN..offsets::LSN + 8].copy_from_slice(&lsn.to_be_bytes());
         h[offsets::NUM_LOGOPS..offsets::NUM_LOGOPS + 4].copy_from_slice(&num_logops.to_be_bytes());
         h[offsets::FS_UUID..offsets::FS_UUID + 16].copy_from_slice(&UUID);
-        h[offsets::SIZE..offsets::SIZE + 4].copy_from_slice(&XLOG_HEADER_CYCLE_SIZE.to_be_bytes());
+        h[offsets::SIZE..offsets::SIZE + 4].copy_from_slice(&iclog_size.to_be_bytes());
         h[offsets::FMT..offsets::FMT + 4].copy_from_slice(&format::native().to_be_bytes());
     }
 
@@ -746,6 +845,106 @@ mod tests {
         assert_eq!(h.prev_block, u32::MAX, "there is no previous record");
         assert_eq!(h.free_blocks, RING_BLOCKS);
         assert_eq!(h.iclog_size, DEFAULT_ICLOG_SIZE);
+    }
+
+    /// A LOG SMALLER THAN THE DEFAULT BUFFER STILL GETS A HEAD ITS OWN
+    /// READER ACCEPTS.
+    ///
+    /// The empty-log path returned `DEFAULT_ICLOG_SIZE` without applying
+    /// the bound the record path enforces thirty lines below it.
+    /// `log_write::append_at` stamps whatever `head` returns into the
+    /// record it writes, so on a log smaller than 32 KiB the first
+    /// journalled write succeeded and every one after it failed --
+    /// permanently, because the refusing record is now on disk and the
+    /// driver is the one that put it there.
+    ///
+    /// The round trip is the point. Asserting only that `iclog_size` is
+    /// small enough would pass on a value the reader still refuses for
+    /// not being a power of two, which is the case a 3-block log makes:
+    /// 12288 bytes is under the limit and is not a legal `h_size`.
+    #[test]
+    fn the_head_of_a_small_empty_log_is_one_this_driver_can_read_back() {
+        for logblocks in [1u32, 2, 3, 5, 8, LOGBLOCKS] {
+            let sb = sb_with_logblocks(logblocks);
+            let (dev, log_at) = device(&sb);
+            let log_bytes = u64::from(logblocks) * u64::from(BLOCKSIZE);
+
+            let first = head(&dev, &sb).expect("an empty log has a head");
+            assert!(
+                iclog_size_fits(first.iclog_size, log_bytes),
+                "a {log_bytes}-byte log was offered h_size {}, which its own reader refuses",
+                first.iclog_size
+            );
+
+            // Write back exactly what the head offered, the way
+            // `append_at` does, and read it again.
+            put_record_with_size(&dev, log_at, 0, 1, 0, 0, first.iclog_size);
+            let second = head(&dev, &sb).unwrap_or_else(|e| {
+                panic!("a {log_bytes}-byte log refused the record it just described: {e}")
+            });
+            assert_eq!(
+                second.iclog_size, first.iclog_size,
+                "the h_size read back is the one written"
+            );
+        }
+    }
+
+    /// The rounding is to a power of two, not to the log's size. Stated
+    /// on the function directly because the geometries that show it are
+    /// the ones a superblock cannot currently express.
+    #[test]
+    fn the_default_buffer_is_rounded_down_to_a_power_of_two() {
+        for (log_bytes, expected) in [
+            (512u64, 512u32),
+            (1024, 1024),
+            (4096, 4096),
+            // Not powers of two: the answer is the one below, never the
+            // log's own size, which is not a legal `h_size`.
+            (12288, 8192),
+            (5000, 4096),
+            (32767, 16384),
+            // At and above the kernel's default, the default wins.
+            (32768, DEFAULT_ICLOG_SIZE),
+            (65536, DEFAULT_ICLOG_SIZE),
+        ] {
+            let got = default_iclog_size(log_bytes).expect("a log of at least one basic block");
+            assert_eq!(got, expected, "log of {log_bytes} bytes");
+            assert!(
+                iclog_size_fits(got, log_bytes),
+                "log of {log_bytes} bytes produced {got}, which its own reader refuses"
+            );
+        }
+    }
+
+    /// The one refusal, exercised directly. It cannot be reached through
+    /// `Superblock::parse` -- `validate` bounds `blocksize` to at least
+    /// 512 -- so testing it through a superblock is impossible and
+    /// leaving it untested would make it a branch nothing observes.
+    #[test]
+    fn a_log_too_small_for_one_basic_block_has_no_usable_buffer_size() {
+        for log_bytes in [0u64, 1, 256, 511] {
+            assert!(
+                default_iclog_size(log_bytes).is_err(),
+                "a {log_bytes}-byte log cannot hold a {BBSIZE}-byte header block"
+            );
+        }
+    }
+
+    /// The clamp is a clamp, not a floor applied to every log: a log
+    /// with room for the kernel's default still gets the default. Both
+    /// halves matter -- shrinking every log's buffer to fit the smallest
+    /// one would pass the test above and change every real filesystem.
+    #[test]
+    fn a_log_with_room_for_the_default_buffer_still_gets_it() {
+        for logblocks in [8u32, LOGBLOCKS, 64] {
+            let sb = sb_with_logblocks(logblocks);
+            let (dev, _) = device(&sb);
+            assert_eq!(
+                head(&dev, &sb).unwrap().iclog_size,
+                DEFAULT_ICLOG_SIZE,
+                "a {logblocks}-block log holds the kernel's default and should use it"
+            );
+        }
     }
 
     /// The head is past the newest record's header *and* its payload.
