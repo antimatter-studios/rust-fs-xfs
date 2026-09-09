@@ -121,10 +121,33 @@ impl Agfl {
         // The count is the authority and the indices have to agree with
         // it. They can disagree only if the header is wrong, and a
         // wrong span hands out blocks that belong to something else.
+        //
+        // THE INDICES ARE BOUNDED BEFORE THE SPAN IS COMPUTED, not by
+        // computing it. `agf_flfirst` and `agf_fllast` are `be32`
+        // straight off the disk (`ag.rs`) with nothing else checking
+        // them, and the span expression below used to be both their
+        // first use and their validation -- so it had to survive the
+        // values it existed to reject, and did not. `fllast + capacity`
+        // overflows a `u32` for any `fllast` above `u32::MAX -
+        // capacity`: a panic in a debug build, and in release a wrapped
+        // span that is then compared against `flcount`, so a corrupt
+        // header whose wrap happens to land on its own count is
+        // ACCEPTED. A ring index at or beyond the ring is wrong on its
+        // own terms and can be said so first.
+        let cap = capacity as u32;
+        if agf.flcount != 0 && (agf.flfirst >= cap || agf.fllast >= cap) {
+            return Err(Error::BadSuperblock(format!(
+                "AG {agno}: the free list runs between entries {} and {}, outside the \
+                 {capacity} entries the sector holds",
+                agf.flfirst, agf.fllast
+            )));
+        }
+        // Both indices are now below `cap`, so the addition cannot
+        // overflow and the subtraction cannot underflow.
         let span = if agf.flcount == 0 {
             0
         } else {
-            (agf.fllast + capacity as u32 - agf.flfirst) % capacity as u32 + 1
+            (agf.fllast + cap - agf.flfirst) % cap + 1
         };
         if agf.flcount as usize > capacity || span != agf.flcount {
             return Err(Error::BadSuperblock(format!(
@@ -308,6 +331,81 @@ mod tests {
             agf.fllast = first;
         }
         (raw, agf)
+    }
+
+    /// A FREE-LIST HEADER OUT OF AN IMAGE MUST NOT OVERFLOW THE SPAN
+    /// ARITHMETIC THAT CHECKS IT.
+    ///
+    /// `agf_flfirst` and `agf_fllast` are `be32` straight off the disk
+    /// (`ag.rs`) with nothing bounding them, and the span that validates
+    /// them is computed BEFORE the validation:
+    ///
+    ///     (agf.fllast + capacity - agf.flfirst) % capacity + 1
+    ///
+    /// At 119 entries a sector, any `fllast` above `u32::MAX - 119`
+    /// overflows the addition, and a `flfirst` above the sum underflows
+    /// the subtraction. Both are a panic in a debug build -- which is
+    /// what the debug CI job exists to see -- and a wrapped span in
+    /// release, which is worse: the wrapped value is then compared to
+    /// `flcount`, so a corrupt header whose wrap happens to land on its
+    /// own count is ACCEPTED.
+    ///
+    /// The refusal is the point; the values are refused for disagreeing
+    /// with the count, which is what they do.
+    #[test]
+    fn a_free_list_header_with_wild_indices_is_refused_not_wrapped() {
+        let sb = sb();
+        let (raw, mut agf) = list(&sb, 7, &[960, 961, 962]);
+
+        // Overflows `fllast + capacity`.
+        agf.fllast = u32::MAX;
+        assert!(
+            Agfl::parse(&raw, &sb, &agf, 0).is_err(),
+            "fllast {} was accepted",
+            u32::MAX
+        );
+
+        // Underflows `... - flfirst` without overflowing the addition.
+        let (raw2, mut agf2) = list(&sb, 7, &[960, 961, 962]);
+        agf2.fllast = 0;
+        agf2.flfirst = u32::MAX;
+        assert!(
+            Agfl::parse(&raw2, &sb, &agf2, 0).is_err(),
+            "flfirst {} was accepted",
+            u32::MAX
+        );
+
+        // And the boundary: the first fllast whose addition overflows.
+        let (raw3, mut agf3) = list(&sb, 7, &[960, 961, 962]);
+        agf3.fllast = u32::MAX - capacity(&sb) as u32 + 1;
+        assert!(
+            Agfl::parse(&raw3, &sb, &agf3, 0).is_err(),
+            "fllast at the overflow boundary was accepted"
+        );
+
+        // THE CASE THAT SURVIVES A RELEASE BUILD, and the reason this
+        // test is not merely a debug-profile assertion.
+        //
+        // The three above are caught in release anyway -- not by the
+        // guard, but because their wrapped span happens to disagree
+        // with `flcount`, so `is_err()` holds for the wrong reason. A
+        // test that only ever fails under `overflow-checks` is a test
+        // this crate's own release gate cannot run.
+        //
+        // These numbers are chosen so the wrap lands EXACTLY on the
+        // count. At 119 entries a sector, `0xFFFF_FFFF + 119` wraps to
+        // 118; with `flfirst` 0 that is a span of 119, and a full list
+        // has `flcount` 119. So the corrupt header agreed with itself
+        // and was ACCEPTED -- in release, silently, with `fllast`
+        // pointing 4 billion entries past a 119-entry ring.
+        let blocks: Vec<u32> = (0..119u32).map(|i| 1000 + i).collect();
+        let (raw4, mut agf4) = list(&sb, 0, &blocks);
+        assert_eq!(agf4.flcount, 119, "the fixture is a full list");
+        agf4.fllast = u32::MAX;
+        assert!(
+            Agfl::parse(&raw4, &sb, &agf4, 0).is_err(),
+            "a free list whose wrapped span happens to equal its own count was accepted"
+        );
     }
 
     /// The measured shape: 512-byte sectors hold 119 entries.
