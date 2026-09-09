@@ -182,6 +182,19 @@ Vagrant.configure("2") do |config|
   # changed. Measured: exporting 90 produced "powering off in 480".
   deadline_mins = ENV.fetch("AM_ORACLE_VM_DEADLINE_MINS", "480")
 
+  # VALIDATED BEFORE IT IS INTERPOLATED, because the next thing that
+  # happens to this string is a verbatim splice into a heredoc that
+  # Vagrant runs as root in the guest on every `up`. The default is a
+  # safe literal; a caller-supplied override was not checked at all.
+  #
+  # \A and \z, NOT ^ and $. Ruby's ^ and $ match at line boundaries, so
+  # /^[0-9]+$/ accepts "480\nrm -rf /" -- the first line satisfies the
+  # pattern and the rest becomes its own command inside the script.
+  unless deadline_mins =~ /\A[1-9][0-9]{0,5}\z/
+    raise "AM_ORACLE_VM_DEADLINE_MINS must be a positive integer of at " \
+          "most six digits, got #{deadline_mins.inspect}"
+  end
+
   config.vm.provision "deadline", type: "shell", run: "always",
                       inline: <<-SHELL
     set -euo pipefail
@@ -189,9 +202,64 @@ Vagrant.configure("2") do |config|
     shutdown -c >/dev/null 2>&1 || true
     if [ -f /run/am-oracle-vm-held ]; then
       echo "deadline: held by /run/am-oracle-vm-held, no shutdown scheduled"
+      exit 0
+    fi
+    # NOT BACKGROUNDED, AND ITS EXIT STATUS IS READ.
+    #
+    # This was `nohup shutdown -h "+${MINS}" >/dev/null 2>&1 &`, which
+    # put the one call this whole provisioner exists to make out of
+    # `set -e`'s reach -- backgrounding is exactly how a command opts
+    # out -- and discarded its status and its diagnostics. The
+    # unconditional echo below it then announced a timer that may never
+    # have been set. A backstop that reports success it did not verify
+    # is worse than no backstop, because the other two teardown layers
+    # are justified partly by this one working.
+    #
+    # There is nothing to background: shutdown returns as soon as the
+    # timer is armed.
+    if ! shutdown -h "+${MINS}"; then
+      echo "deadline: FAILED to schedule poweroff in ${MINS} minutes" >&2
+      exit 1
+    fi
+    # An accepted request and an armed timer are not the same claim, so
+    # where the guest can be asked what it has scheduled, ask it.
+    # CONFIRMED FROM LOGIND'S OWN RECORD, and only where that record
+    # is meaningful.
+    #
+    # This asked `systemctl show -p ScheduledShutdownUSec`, which was
+    # wrong twice over. Scheduled-shutdown state belongs to logind, not
+    # to the systemd manager, so the property does not exist -- and
+    # `systemctl show` EXITS 0 AND PRINTS NOTHING for a property it
+    # does not know. That collapsed three different states onto one
+    # empty string: no timer armed, property unsupported, and systemctl
+    # failing outright (which `2>/dev/null || true` made silent). All
+    # three then printed "no timer is armed", a claim the script had
+    # not established, and aborted provisioning on a false premise.
+    #
+    # An empty result read as a negative answer, with the stderr that
+    # would have distinguished them thrown away. This is the same
+    # defect as the one the provisioner itself was fixed for, pointing
+    # the other way: that one could report armed while unarmed, this
+    # reported unarmed while armed.
+    #
+    # logind writes /run/systemd/shutdown/scheduled when a shutdown is
+    # scheduled and removes it on cancel, so its absence is a real
+    # answer -- but ONLY on a guest systemd is running, which
+    # /run/systemd/system tells us. Where it is not, the script says it
+    # could not confirm rather than claiming the timer is missing.
+    if [ -d /run/systemd/system ]; then
+      if [ -r /run/systemd/shutdown/scheduled ]; then
+        echo "deadline: powering off in ${MINS} minutes unless held (timer armed)"
+      else
+        echo "deadline: shutdown returned 0 but logind has scheduled nothing" >&2
+        exit 1
+      fi
     else
-      nohup shutdown -h "+${MINS}" >/dev/null 2>&1 &
-      echo "deadline: powering off in ${MINS} minutes unless held"
+      # Said differently on purpose: this machine reported a weaker
+      # fact than the branch above, and the operator should be able to
+      # see which one they got rather than read the stronger claim into
+      # the weaker case.
+      echo "deadline: powering off in ${MINS} minutes unless held (request accepted, no systemd to confirm)"
     fi
   SHELL
 end
