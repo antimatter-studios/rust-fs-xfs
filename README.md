@@ -172,8 +172,13 @@ alongside sibling drivers in a C/Swift/Go consumer. Requires the sibling
 Install the git hooks once per clone:
 
 ```sh
-./scripts/install-hooks.sh
+~/.claude/skills/github-guard/install.sh .
 ```
+
+The guards live in `.git/hooks`, outside the working tree, so no branch
+checkout can rewrite the hook that is about to run. They are per-clone
+rather than tracked: re-run the installer in a fresh clone, and after the
+guards are updated.
 
 ## License
 
