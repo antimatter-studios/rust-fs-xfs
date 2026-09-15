@@ -6,6 +6,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR=""
 CHILD_PID=""
+CHILD_PGID=""
 SIGNAL_STATUS=""
 
 cleanup() {
@@ -22,8 +23,8 @@ forward_signal() {
     local signal="$1"
     local number="$2"
     SIGNAL_STATUS=$((128 + number))
-    if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
-        kill -s "$signal" "$CHILD_PID" 2>/dev/null || true
+    if [[ -n "$CHILD_PGID" ]] && kill -0 -- "-$CHILD_PGID" 2>/dev/null; then
+        kill -s "$signal" -- "-$CHILD_PGID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -68,8 +69,14 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 export FS_XFS_TEST_TEMP_ACTIVE=1
+# Job control gives the command and every descendant its own process group.
+# This is portable to the older Bash shipped by macOS, where `setsid` is not
+# available by default.
+set -m
 "$@" <&0 &
 CHILD_PID=$!
+CHILD_PGID=$CHILD_PID
+set +m
 set +e
 wait "$CHILD_PID"
 STATUS=$?

@@ -11,6 +11,19 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+wait_for_output() {
+    local pid="$1"
+    local attempts=100
+    while [[ ! -s "$OUTPUT" && "$attempts" -gt 0 ]]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.05
+        attempts=$((attempts - 1))
+    done
+    [[ -s "$OUTPUT" ]]
+}
+
 mkdir -p "$TEST_BASE"
 FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
     "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
@@ -56,7 +69,11 @@ FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
     "$REPO/scripts/with-test-temp.sh" sh -c 'printf "%s\n" "$TMPDIR"; sleep 2' \
     > "$OUTPUT" &
 WRAPPER_PID=$!
-while [[ ! -s "$OUTPUT" ]]; do sleep 0.05; done
+if ! wait_for_output "$WRAPPER_PID"; then
+    wait "$WRAPPER_PID" 2>/dev/null || true
+    echo "FAIL  wrapper exited or timed out before reporting its scratch directory" >&2
+    exit 1
+fi
 kill -TERM "$WRAPPER_PID"
 set +e
 wait "$WRAPPER_PID"
@@ -68,6 +85,67 @@ if [[ "$STATUS" -ne 143 || "$ELAPSED" -ge 2 || -e "$SELECTED" ]]; then
     echo "FAIL  TERM was not forwarded promptly with status 143 and cleanup: status=$STATUS elapsed=$ELAPSED path=$SELECTED" >&2
     exit 1
 fi
+
+: > "$OUTPUT"
+DESCENDANT_PID_FILE="$TEST_BASE/descendant.pid"
+FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
+    DESCENDANT_PID_FILE="$DESCENDANT_PID_FILE" \
+    "$REPO/scripts/with-test-temp.sh" sh -c \
+        'printf "%s\n" "$TMPDIR"; sleep 30 & echo "$!" > "$DESCENDANT_PID_FILE"; wait' \
+    > "$OUTPUT" &
+WRAPPER_PID=$!
+if ! wait_for_output "$WRAPPER_PID"; then
+    wait "$WRAPPER_PID" 2>/dev/null || true
+    echo "FAIL  descendant test wrapper exited or timed out during startup" >&2
+    exit 1
+fi
+for _ in $(seq 1 100); do
+    [[ -s "$DESCENDANT_PID_FILE" ]] && break
+    sleep 0.05
+done
+if [[ ! -s "$DESCENDANT_PID_FILE" ]]; then
+    kill -TERM "$WRAPPER_PID" 2>/dev/null || true
+    wait "$WRAPPER_PID" 2>/dev/null || true
+    echo "FAIL  descendant test did not report its pid" >&2
+    exit 1
+fi
+DESCENDANT_PID="$(cat "$DESCENDANT_PID_FILE")"
+kill -TERM "$WRAPPER_PID"
+set +e
+wait "$WRAPPER_PID"
+STATUS=$?
+set -e
+for _ in $(seq 1 100); do
+    ! kill -0 "$DESCENDANT_PID" 2>/dev/null && break
+    sleep 0.05
+done
+if [[ "$STATUS" -ne 143 || -e "$(cat "$OUTPUT")" ]] || kill -0 "$DESCENDANT_PID" 2>/dev/null; then
+    kill "$DESCENDANT_PID" 2>/dev/null || true
+    echo "FAIL  TERM did not stop the command's process group before cleanup: status=$STATUS" >&2
+    exit 1
+fi
+rm -f "$DESCENDANT_PID_FILE"
+
+STARTUP_BLOCKER="$TEST_BASE/not-a-directory"
+: > "$STARTUP_BLOCKER"
+: > "$OUTPUT"
+FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$STARTUP_BLOCKER/child" \
+    "$REPO/scripts/with-test-temp.sh" true > "$OUTPUT" 2>/dev/null &
+WRAPPER_PID=$!
+if wait_for_output "$WRAPPER_PID"; then
+    wait "$WRAPPER_PID" 2>/dev/null || true
+    echo "FAIL  invalid scratch base unexpectedly reached the child command" >&2
+    exit 1
+fi
+set +e
+wait "$WRAPPER_PID"
+STATUS=$?
+set -e
+if [[ "$STATUS" -eq 0 ]]; then
+    echo "FAIL  invalid scratch base returned success" >&2
+    exit 1
+fi
+rm -f "$STARTUP_BLOCKER"
 
 if sudo -n true 2>/dev/null; then
     set +e
