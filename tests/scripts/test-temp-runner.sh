@@ -50,6 +50,50 @@ if [[ "$STATUS" -ne 23 || -e "$SELECTED" ]]; then
     exit 1
 fi
 
+STARTED="$(date +%s)"
+: > "$OUTPUT"
+FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
+    "$REPO/scripts/with-test-temp.sh" sh -c 'printf "%s\n" "$TMPDIR"; sleep 2' \
+    > "$OUTPUT" &
+WRAPPER_PID=$!
+while [[ ! -s "$OUTPUT" ]]; do sleep 0.05; done
+kill -TERM "$WRAPPER_PID"
+set +e
+wait "$WRAPPER_PID"
+STATUS=$?
+set -e
+ELAPSED=$(( $(date +%s) - STARTED ))
+SELECTED="$(cat "$OUTPUT")"
+if [[ "$STATUS" -ne 143 || "$ELAPSED" -ge 2 || -e "$SELECTED" ]]; then
+    echo "FAIL  TERM was not forwarded promptly with status 143 and cleanup: status=$STATUS elapsed=$ELAPSED path=$SELECTED" >&2
+    exit 1
+fi
+
+if sudo -n true 2>/dev/null; then
+    set +e
+    FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
+        "$REPO/scripts/with-test-temp.sh" sh -c '
+            printf "%s\n" "$TMPDIR"
+            mkdir "$TMPDIR/mounted"
+            sudo mount -t tmpfs -o size=1m tmpfs "$TMPDIR/mounted"
+            touch "$TMPDIR/mounted/must-survive-cleanup"
+            exit 23
+        ' > "$OUTPUT" 2>/dev/null
+    STATUS=$?
+    set -e
+    SELECTED="$(cat "$OUTPUT")"
+    MOUNT_PROBE="$SELECTED/mounted/must-survive-cleanup"
+    if [[ "$STATUS" -ne 23 || ! -e "$MOUNT_PROBE" ]]; then
+        sudo umount "$SELECTED/mounted" 2>/dev/null || true
+        find "$SELECTED" -xdev -depth -mindepth 1 -delete 2>/dev/null || true
+        rmdir "$SELECTED" 2>/dev/null || true
+        echo "FAIL  cleanup crossed into a mounted filesystem or changed status: status=$STATUS" >&2
+        exit 1
+    fi
+    sudo umount "$SELECTED/mounted"
+    rmdir "$SELECTED/mounted" "$SELECTED"
+fi
+
 EXACT="$TEST_BASE/exact"
 FS_XFS_TEST_TMPDIR="$EXACT" "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
 SELECTED="$(cat "$OUTPUT")"

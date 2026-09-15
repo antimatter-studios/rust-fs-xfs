@@ -4,10 +4,14 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+mapfile -t NATIVE_BUILDERS < <(
+    rg -o '\./scripts/build-[a-z-]*fixtures[a-z-]*\.sh' "$REPO/.github/workflows/ci.yml" \
+        | sort -u \
+        | sed "s|^\./|$REPO/|"
+)
 matches="$({
     rg -n '/tmp' \
-        "$REPO/scripts/build-fixtures-native.sh" \
-        "$REPO/scripts/build-data-fixtures.sh" \
+        "${NATIVE_BUILDERS[@]}" \
         "$REPO/.github/workflows/ci.yml"
     if [[ -f "$REPO/scripts/test.sh" ]]; then
         rg -n '/tmp' "$REPO/scripts/test.sh" "$REPO/scripts/with-test-temp.sh" \

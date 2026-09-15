@@ -5,14 +5,31 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR=""
+CHILD_PID=""
+SIGNAL_STATUS=""
 
 cleanup() {
     if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
-        find "$RUN_DIR" -depth -mindepth 1 -delete
-        rmdir "$RUN_DIR"
+        if ! find "$RUN_DIR" -xdev -depth -mindepth 1 -delete; then
+            echo "warning: scratch cleanup stopped at a mounted filesystem below $RUN_DIR" >&2
+        fi
+        if ! rmdir "$RUN_DIR"; then
+            echo "warning: scratch directory remains for inspection: $RUN_DIR" >&2
+        fi
     fi
 }
-trap cleanup EXIT HUP INT TERM
+forward_signal() {
+    local signal="$1"
+    local number="$2"
+    SIGNAL_STATUS=$((128 + number))
+    if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        kill -s "$signal" "$CHILD_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'forward_signal HUP 1' HUP
+trap 'forward_signal INT 2' INT
+trap 'forward_signal TERM 15' TERM
 
 if [[ -n "${FS_XFS_TEST_TMPDIR:-}" ]]; then
     mkdir -p "$FS_XFS_TEST_TMPDIR"
@@ -51,4 +68,14 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 export FS_XFS_TEST_TEMP_ACTIVE=1
-"$@"
+"$@" <&0 &
+CHILD_PID=$!
+set +e
+wait "$CHILD_PID"
+STATUS=$?
+if [[ -n "$SIGNAL_STATUS" ]]; then
+    wait "$CHILD_PID" 2>/dev/null
+    STATUS="$SIGNAL_STATUS"
+fi
+set -e
+exit "$STATUS"
