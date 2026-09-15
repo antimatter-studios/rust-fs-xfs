@@ -20,6 +20,11 @@
 # reproduce it byte for byte.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${FS_XFS_TEST_TEMP_ACTIVE:-}" != "1" && -x "$SCRIPT_DIR/with-test-temp.sh" ]]; then
+    exec "$SCRIPT_DIR/with-test-temp.sh" "$0" "$@"
+fi
+
 # WHERE THIS RUNS. Anywhere with xfsprogs, attr, python3 and the
 # privilege to loop-mount: a CI runner, a container, or the oracle VM.
 # `vm-build-data-fixtures.sh` ships this same file into the VM, so the
@@ -186,7 +191,7 @@ rm -f "$work"
 # xfs_repair runs on a copy on local storage: inside the VM it cannot
 # work on a file in the shared folder, where it wants the host
 # filesystem's geometry and gets ENOTDIR from 9p.
-check=$(mktemp -u /tmp/repair-check-XXXXXX.img)
+check=$(mktemp -u -t repair-check-XXXXXX.img)
 cp "$img" "$check"
 xfs_repair -n "$check" > xfsdirty.repair 2>&1 || true
 rm -f "$check"

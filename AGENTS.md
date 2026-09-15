@@ -45,9 +45,9 @@ should not be used for anything else.
 ## Running tests
 
 ```sh
-cargo test                                   # unit + host-side oracle tests
-cargo test --test oracle_vm_fixtures -- --nocapture   # just the cross-validation
-cargo test -- --ignored                      # tests that shell out to xfsprogs (Linux)
+./scripts/test.sh                                   # unit + host-side oracle tests
+./scripts/test.sh --test oracle_vm_fixtures -- --nocapture   # just the cross-validation
+./scripts/test.sh -- --ignored                      # tests that shell out to xfsprogs (Linux)
 cargo clippy --all-targets -- -D warnings    # what the pre-commit hook runs
 ```
 

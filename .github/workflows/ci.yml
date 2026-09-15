@@ -214,7 +214,7 @@ jobs:
       # drifted, and the release gate silently stopped generating the
       # inode dumps its own test needed.
       - name: Build the XFS fixture matrix
-        run: ./scripts/build-fixtures-native.sh
+        run: ./scripts/with-test-temp.sh ./scripts/build-fixtures-native.sh
 
       # The directory-conversion fixtures, which need to mount and so
       # cannot come from build-fixtures-native.sh. Same script the VM
@@ -225,7 +225,7 @@ jobs:
       # Without this the block-form comparison in tests/dir_block_oracle.rs
       # finds no fixtures and skips, which reads exactly like passing.
       - name: Build the directory-conversion fixtures
-        run: ./scripts/build-dirconv-fixtures.sh
+        run: ./scripts/with-test-temp.sh ./scripts/build-dirconv-fixtures.sh
 
       # The write-path fixtures: the same filesystem before and after the
       # kernel truncated a file, and before and after it removed one.
@@ -244,13 +244,15 @@ jobs:
       - name: Build the write-path and data fixtures
         run: |
           sudo apt-get install -y -qq attr
-          ./scripts/build-truncate-fixtures.sh
-          ./scripts/build-unlink-fixtures.sh
-          ./scripts/build-create-fixtures.sh
-          ./scripts/build-log-fixtures.sh
-          ./scripts/build-data-fixtures.sh
-          ./scripts/build-feature-matrix-fixtures.sh
-          ./scripts/build-crossag-fixtures.sh
+          ./scripts/with-test-temp.sh bash -euo pipefail -c '
+            ./scripts/build-truncate-fixtures.sh
+            ./scripts/build-unlink-fixtures.sh
+            ./scripts/build-create-fixtures.sh
+            ./scripts/build-log-fixtures.sh
+            ./scripts/build-data-fixtures.sh
+            ./scripts/build-feature-matrix-fixtures.sh
+            ./scripts/build-crossag-fixtures.sh
+          '
 
       # Freeing an extent and freeing an inode are the two write
       # operations whose result cannot be checked by looking at it: a
@@ -310,8 +312,8 @@ jobs:
           mounted=0
           for img in "$share"/xfs-*.img; do
             name="$(basename "$img" .img)"
-            work="/tmp/$name.mnt.img"
-            mnt="/tmp/mnt-$name"
+            work="$RUNNER_TEMP/$name.mnt.img"
+            mnt="$RUNNER_TEMP/mnt-$name"
             cp --sparse=always "$img" "$work"
             sudo mkdir -p "$mnt"
 
@@ -375,10 +377,10 @@ jobs:
             | grep -i 'XFS' \
             | grep -v -i 'Deprecated V4 format' \
             | grep -v -i 'supports timestamps until' \
-            > /tmp/xfs-dmesg-warnings.txt || true
-          if [ -s /tmp/xfs-dmesg-warnings.txt ]; then
+            > "$RUNNER_TEMP/xfs-dmesg-warnings.txt" || true
+          if [ -s "$RUNNER_TEMP/xfs-dmesg-warnings.txt" ]; then
             echo "the kernel complained about the XFS images:" >&2
-            cat /tmp/xfs-dmesg-warnings.txt >&2
+            cat "$RUNNER_TEMP/xfs-dmesg-warnings.txt" >&2
             exit 1
           fi
           echo "no XFS warnings or errors in dmesg."

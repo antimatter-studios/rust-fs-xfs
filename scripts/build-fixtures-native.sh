@@ -21,6 +21,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${FS_XFS_TEST_TEMP_ACTIVE:-}" != "1" ]]; then
+    exec "$REPO/scripts/with-test-temp.sh" "$0" "$@"
+fi
 SHARE="$REPO/.vm-share"
 SIZE="${XFS_FIXTURE_SIZE:-400M}"
 
@@ -62,12 +65,13 @@ for geom in "${GEOMETRIES[@]}"; do
     img="$SHARE/xfs-$name.img"
     sbdump="$SHARE/xfs-$name.sbdump"
     inodedump="$SHARE/xfs-$name.inodedump"
+    mkfs_log="$(mktemp -t "fs-xfs-mkfs-$name.XXXXXX.log")"
 
     rm -f "$img" "$sbdump" "$inodedump"
     truncate -s "$SIZE" "$img"
 
     # shellcheck disable=SC2086 -- $args is a deliberate word split.
-    if mkfs.xfs $args -f -q "$img" > "/tmp/mkfs-$name.log" 2>&1; then
+    if mkfs.xfs $args -f -q "$img" > "$mkfs_log" 2>&1; then
         xfs_db -r -c 'sb 0' -c 'print' "$img" > "$sbdump"
 
         # The root inode dump as well. tests/oracle_vm_fixtures.rs
@@ -85,10 +89,11 @@ for geom in "${GEOMETRIES[@]}"; do
         # hole in the gate that nobody notices.
         echo "::warning title=XFS geometry skipped::xfs-$name — the installed mkfs.xfs rejected 'mkfs.xfs $args'"
         echo "SKIP   xfs-$name — mkfs.xfs rejected this geometry:"
-        sed 's/^/         /' "/tmp/mkfs-$name.log"
+        sed 's/^/         /' "$mkfs_log"
         rm -f "$img"
         skipped=$((skipped + 1))
     fi
+    rm -f "$mkfs_log"
 done
 
 echo
