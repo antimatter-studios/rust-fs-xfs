@@ -117,9 +117,15 @@ Every one of them is invisible to a round-trip test and fatal against a real
 filesystem. All three died on the first run against `xfs_db`.
 
 ```sh
-cargo test                 # unit tests; green on a fresh clone
-cargo test -- --ignored    # adds tests that shell out to xfsprogs (Linux)
+./scripts/test.sh                 # unit tests; green on a fresh clone
+./scripts/test.sh -- --ignored    # adds tests that shell out to xfsprogs (Linux)
 ```
+
+The wrapper exports an isolated `TMPDIR` and cleans the child it owns. An exact
+`FS_XFS_TEST_TMPDIR` is caller-managed; `FS_XFS_TEST_TMP_BASE` receives a unique
+child; GitHub Actions uses `RUNNER_TEMP`; and Raspberry Pi uses this checkout's
+`./tmp` so fixture churn follows the checkout onto NVMe rather than the system
+SD card. Other hosts use `TMPDIR` or their platform temporary mechanism.
 
 ### Generating fixtures
 
@@ -132,7 +138,7 @@ arm64 under QEMU, hardware-accelerated via HVF, so there is no emulation penalty
 ./scripts/vm-build-fixtures.sh       # the geometry matrix, for the superblock tests
 ./scripts/vm-build-log-fixtures.sh   # populated filesystems, for the log tests
 ./scripts/vm-build-stress-fixtures.sh  # trees built by a stress generator
-cargo test --test oracle_vm_fixtures -- --nocapture
+./scripts/test.sh --test oracle_vm_fixtures -- --nocapture
 ```
 
 The fixture scripts build different things. `vm-build-fixtures.sh` formats a
