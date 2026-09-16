@@ -25,7 +25,12 @@ set -euo pipefail
 # a summary line from a suite that had just passed. A gate that fails on
 # success is worse than no gate, so the patterns are anchored to how a
 # skip is actually phrased and `--self-test` holds them to it.
-SKIP_PATTERN='(^|[[:space:]])SKIPPED|no ([a-z0-9-]+ )?fixtures?|(VM|fixture) unavailable|skipped$|skipping( verification)?$'
+#
+# STILL ANCHORED, AND NAMING WHAT IS SKIPPED RATHER THAN MATCHING ANY
+# TAIL. `skipping the check` and `skipping that comparison` are listed
+# words, not `skipping.*`, for the reason above: the next progress line
+# to mention skipping must not fail a passing suite.
+SKIP_PATTERN='(^|[[:space:]])SKIPPED|no ([A-Za-z0-9-]+ )?fixtures?|(VM|fixture) unavailable|skipped$|skipping( verification| the check| that comparison)?$'
 
 if [ "${1:-}" = "--self-test" ]; then
     fail=0
@@ -40,12 +45,23 @@ if [ "${1:-}" = "--self-test" ]; then
         "no feature-matrix fixtures — skipping. Build them with sudo ./scripts/build-feature-matrix-fixtures.sh"
         "no xfsfeat-reflink-finobt fixture — skipping"
         "no xfslog-b4096-i512 fixture — skipping"
+        # The crate's own name in its own casing, and a skip that says
+        # what it skipped after the word (#164). Each returned from a test
+        # body with nothing asserted, and the pattern saw none of them:
+        # the class was lowercase-only and the `skipping` clause ended at
+        # the word.
+        "no XFS fixtures found; build them with ./scripts/vm-build-log-fixtures.sh"
+        "no kernel to replay the record — skipping the check"
+        "note: xfs_db did not report \`sb_icount\`, skipping that comparison"
     )
     must_not_match=(
         "977 inode cores reproduced from disk, 0 skipped as stale"
         "xfsstress-ops1k.img: 507 inodes matched, 1 records older than disk, 1 with a timestamp the disk moved on from"
         "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
         "MOUNTED xfs-default — the in-kernel XFS driver accepted this image"
+        # A progress line of the stale-cores shape, which a looser
+        # `skipp` clause would take for a skip.
+        "re-encoded 212 kernel buffer items (3 skipped as split across records)"
     )
     for line in "${must_match[@]}"; do
         echo "$line" | grep -qE "$SKIP_PATTERN" || { echo "MISSED a skip: $line" >&2; fail=1; }
