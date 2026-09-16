@@ -201,9 +201,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-kxfs-${{ hashFiles('**/Cargo.lock') }}
 
-      # Mirrors scripts/vm-build-fixtures.sh. Keep the geometry list in
-      # sync with that script: the two must produce the same fixture set,
-      # or CI and a developer's local run stop meaning the same thing.
+      # Builds the same fixture set as scripts/vm-build-fixtures.sh: both
+      # read scripts/fixture-geometries.sh, so CI and a developer's local
+      # run cannot drift apart (#110).
       #
       # The geometries are chosen to move the fields most likely to be
       # misread: block and inode size change every log2-derived field,

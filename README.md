@@ -101,9 +101,9 @@ while disagreeing with the rest of the world.
 **2. Cross-validation against real XFS tooling** (`tests/oracle_vm_fixtures.rs`).
 Filesystems are built by the canonical `mkfs.xfs` and dumped with `xfs_db`; this driver
 parses the same images and every field it reports must match the value `xfs_db` reports
-for that field. Currently 9 geometries — 1k/2k/4k blocks, 512b/1k inodes, explicit
-allocation-group counts, `reflink+rmapbt`, `bigtime`, and a v4 filesystem with no CRC
-at all.
+for that field. Currently 11 geometries, listed once in `scripts/fixture-geometries.sh`
+— 1k/2k/4k blocks, 512b/1k inodes, explicit allocation-group counts, `reflink+rmapbt`,
+`bigtime`, a v4 filesystem with no CRC at all, and a v5 one with sparse inodes off.
 
 The second layer is not optional decoration. Three bugs were live in this crate with
 the entire unit suite passing:

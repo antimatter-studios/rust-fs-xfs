@@ -32,34 +32,16 @@ SIZE="${XFS_FIXTURE_SIZE:-400M}"
 # must not be able to turn this into a no-op that reports success.
 MIN_FIXTURES="${XFS_MIN_FIXTURES:-6}"
 
-# "<name>:<mkfs.xfs args>"
-#
-# `default` is pinned to rmapbt=0 rather than left to mkfs. It is the
-# image log_replay_oracle WRITES to, and this driver refuses a read-write
-# mount of a filesystem with the reverse-mapping tree because it does not
-# maintain one. mkfs.xfs 6.6 turns rmapbt on by default and older ones do
-# not, so leaving it unpinned makes the write oracle's fixture depend on
-# which xfsprogs the host happens to have. The `reflink` case below keeps
-# an rmapbt=1 image, which is what the refusal itself is tested against.
-GEOMETRIES=(
-    "default:-m rmapbt=0"
-    "1k:-b size=1024"
-    "2k:-b size=2048"
-    "i512:-i size=512"
-    "i1k:-i size=1024"
-    "4ags:-d agcount=4"
-    "8ags:-d agcount=8"
-    "reflink:-m reflink=1,rmapbt=1"
-    "bigtime:-m bigtime=1"
-    "nocrc:-m crc=0"
-)
+# The geometry list is shared with vm-build-fixtures.sh; see there.
+# shellcheck source=scripts/fixture-geometries.sh
+source "$REPO/scripts/fixture-geometries.sh"
 
 mkdir -p "$SHARE"
 
 built=0
 skipped=0
 
-for geom in "${GEOMETRIES[@]}"; do
+for geom in "${XFS_GEOMETRIES[@]}"; do
     name="${geom%%:*}"
     args="${geom#*:}"
     img="$SHARE/xfs-$name.img"
