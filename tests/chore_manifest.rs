@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! floor 0.9.0, keys left plain            EXIT=101   <- the control
-//! floor 0.9.0, "timeout:" / "on_timeout:" EXIT=0     <- DEFEAT
+//! floor 0.9.0, "timeout": / "on_timeout": EXIT=0     <- DEFEAT
 //! floor 0.9.0, net: { timeout: 45m }      EXIT=0     <- DEFEAT
 //! ```
 //!
