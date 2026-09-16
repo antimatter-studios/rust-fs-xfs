@@ -193,6 +193,10 @@ pub fn encode_key(buf: &mut [u8], at: usize, record: &Rmap) {
 /// first record is `[0,2,-3,0]` -- so the low key is the first record's
 /// key, and the high key is a record's END, `startblock + blockcount -
 /// 1`, taken from whichever record reaches furthest.
+///
+/// Each record's end is computed as `xfs_rmapbt_init_high_key_from_rec`
+/// does, and the maximum is taken as `xfs_rmapbt_diff_two_keys` orders
+/// keys (#113). See [`high_key`].
 pub fn write_keys(buf: &mut [u8], at: usize, records: &[Rmap]) {
     let Some(first) = records.first() else {
         return;
@@ -201,19 +205,46 @@ pub fn write_keys(buf: &mut [u8], at: usize, records: &[Rmap]) {
 
     let high = records
         .iter()
-        .map(|r| {
-            (
-                u64::from(r.startblock) + u64::from(r.blockcount) - 1,
-                r.owner,
-                r.offset + u64::from(r.blockcount) - 1,
-            )
-        })
-        .max()
+        .map(high_key)
+        .max_by_key(|k| (k.startblock, k.owner as u64, k.offset & OFF_MASK))
         .expect("at least one record");
-    let at = at + KEY;
-    buf[at..at + 4].copy_from_slice(&(high.0 as u32).to_be_bytes());
-    buf[at + 4..at + 12].copy_from_slice(&high.1.to_be_bytes());
-    buf[at + 12..at + 20].copy_from_slice(&high.2.to_be_bytes());
+    encode_key(buf, at + KEY, &high);
+}
+
+/// The high key one record contributes: where it ends, as the kernel's
+/// `xfs_rmapbt_init_high_key_from_rec` computes it. Returned as an [`Rmap`]
+/// whose `blockcount` is unused.
+///
+/// Three things the plain `start + count - 1` on every field got wrong:
+///
+/// - the OFFSET advances only for a record a file owns through its data
+///   or attribute fork. A reserved owner (`OWN_FS`, `OWN_AG`, ...) or a
+///   block of an inode's own map keeps its offset as it is -- these fill
+///   every group's tree, and advancing their zero offset let one win a
+///   comparison the kernel's key would have lost;
+/// - the adjustment is added to the offset FIELD and the flags put back,
+///   so a carry cannot land in `OFF_ATTR_FORK`, `OFF_BMBT_BLOCK` or
+///   `OFF_UNWRITTEN`;
+/// - a zero-length record, which only a malformed tree carries, ends
+///   where it starts rather than underflowing -- a panic with overflow
+///   checks on, and a wrapped high key without them.
+///
+/// And the maximum is taken in the kernel's key order, which compares
+/// the owner UNSIGNED and the offset without its flags: a reserved owner
+/// is negative here and sorts above every inode there.
+pub fn high_key(r: &Rmap) -> Rmap {
+    let adjust = r.blockcount.saturating_sub(1);
+    let offset = if r.is_reserved_owner() || r.offset & OFF_BMBT_BLOCK != 0 {
+        r.offset
+    } else {
+        ((r.offset & OFF_MASK) + u64::from(adjust)) | r.flags()
+    };
+    Rmap {
+        startblock: r.startblock.saturating_add(adjust),
+        blockcount: 0,
+        owner: r.owner,
+        offset,
+    }
 }
 
 /// Every reverse-mapping record in a group, however deep its tree.
@@ -410,6 +441,78 @@ pub fn remove(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(startblock: u32, blockcount: u32, owner: i64, offset: u64) -> Rmap {
+        Rmap {
+            startblock,
+            blockcount,
+            owner,
+            offset,
+        }
+    }
+
+    fn keys_of(records: &[Rmap]) -> (Rmap, Rmap) {
+        let mut buf = vec![0u8; 2 * KEY];
+        write_keys(&mut buf, 0, records);
+        let key = |at: usize| Rmap {
+            startblock: u32::from_be_bytes(buf[at..at + 4].try_into().unwrap()),
+            blockcount: 0,
+            owner: i64::from_be_bytes(buf[at + 4..at + 12].try_into().unwrap()),
+            offset: u64::from_be_bytes(buf[at + 12..at + 20].try_into().unwrap()),
+        };
+        (key(0), key(KEY))
+    }
+
+    /// Each rule of `xfs_rmapbt_init_high_key_from_rec`, one record at a
+    /// time (#113).
+    #[test]
+    fn a_records_high_key_follows_the_kernels_rules() {
+        let end = |r: Rmap| {
+            let k = high_key(&r);
+            (k.startblock, k.owner, k.offset)
+        };
+        // A file's data extent: block and offset both advance.
+        assert_eq!(end(rec(10, 5, 95, 100)), (14, 95, 104));
+        // A reserved owner: the offset stays where it is.
+        assert_eq!(end(rec(0, 2, OWN_FS, 0)), (1, OWN_FS, 0));
+        // A block of an inode's own map: likewise.
+        assert_eq!(
+            end(rec(40, 3, 95, OFF_BMBT_BLOCK)),
+            (42, 95, OFF_BMBT_BLOCK)
+        );
+        // The flags ride along, outside the arithmetic.
+        assert_eq!(
+            end(rec(10, 3, 95, OFF_UNWRITTEN | OFF_ATTR_FORK | 7)),
+            (12, 95, OFF_UNWRITTEN | OFF_ATTR_FORK | 9)
+        );
+        // A zero-length record ends where it starts instead of
+        // underflowing.
+        assert_eq!(end(rec(7, 0, 95, 3)), (7, 95, 3));
+    }
+
+    /// Over the kernel's own leaf the high key is its inode chunks' end,
+    /// blocks 16..23 owned by -7, at offset ZERO: a reserved owner's
+    /// offset does not advance. The old arithmetic wrote offset 7.
+    #[test]
+    fn the_kernel_leafs_high_key_keeps_the_reserved_owners_offset() {
+        let (low, high) = keys_of(&kernel_leaf());
+        assert_eq!((low.startblock, low.owner, low.offset), (0, -3, 0));
+        assert_eq!((high.startblock, high.owner, high.offset), (23, -7, 0));
+    }
+
+    /// The maximum is taken in the kernel's key order, owner unsigned:
+    /// at the same end block a reserved owner outranks every inode.
+    #[test]
+    fn the_high_key_is_the_maximum_in_the_kernels_order() {
+        let records = [rec(0, 2, 95, 0), rec(1, 1, OWN_FS, 0)];
+        let (low, high) = keys_of(&records);
+        assert_eq!((low.startblock, low.owner, low.offset), (0, 95, 0));
+        assert_eq!(
+            (high.startblock, high.owner, high.offset),
+            (1, OWN_FS, 0),
+            "a signed comparison picked the inode"
+        );
+    }
 
     /// The kernel's own leaf, byte for byte, as `xfs_db` printed it for
     /// a freshly populated group. Six records: the filesystem's headers,
