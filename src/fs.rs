@@ -280,13 +280,13 @@ impl Filesystem {
         if unmaintained == 0 {
             return Ok(());
         }
-        let named = if unmaintained & crate::superblock::ro_compat::METADIR != 0 {
-            " (the metadata directory tree)"
-        } else {
-            ""
-        };
+        // No bit is named here: upstream defines `ro_compat` bits 0-3 and
+        // `SUPPORTED` holds all four, so anything reaching this is a
+        // feature newer than the format this driver was written against.
+        // The metadata directory tree is incompat bit 8, refused at parse
+        // (#126).
         Err(Error::UnsupportedFeature(format!(
-            "this volume sets read-only-compatible feature bits {unmaintained:#x}{named} \
+            "this volume sets read-only-compatible feature bits {unmaintained:#x} \
              that this driver does not maintain, so it can be read but not written"
         )))
     }
