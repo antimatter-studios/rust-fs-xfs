@@ -791,8 +791,6 @@ mod tests {
         }
     }
 
-    /// An identifier that ties a checkpoint's operations together, and
-    /// which the kernel treats as absent if it is zero.
     fn placement(iclog_size: u32) -> Placement {
         Placement {
             block: 0,
@@ -961,6 +959,8 @@ mod tests {
         assert_eq!(max_payload(32 * 1024).expect("32 KiB"), 32 * 1024 - BBSIZE);
     }
 
+    /// An identifier that ties a checkpoint's operations together, and
+    /// which the kernel treats as absent if it is zero.
     #[test]
     fn a_transaction_id_is_never_zero() {
         for cycle in [0u32, 1, 0xffff_ffff] {

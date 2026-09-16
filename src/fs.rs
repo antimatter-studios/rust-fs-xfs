@@ -256,10 +256,12 @@ impl Filesystem {
     /// which is most of them.
     ///
     /// `reflink` was never here, and is handled where it actually
-    /// matters instead: an inode that may share extents cannot have them
-    /// freed, so `truncate_to_zero` refuses that inode rather than the
-    /// whole filesystem. Everything else on a reflink filesystem is
-    /// sound, which the feature matrix shows rather than assumes.
+    /// matters instead, per inode rather than for the whole filesystem
+    /// (#127): `write_at` and the partial `truncate` refuse an inode that
+    /// may share extents, and `truncate_to_zero` frees one while holding
+    /// back every block the refcount tree says another file still
+    /// references. Everything else on a reflink filesystem is sound,
+    /// which the feature matrix shows rather than assumes.
     ///
     /// # What it refuses now
     ///

@@ -265,10 +265,14 @@ pub mod ro_compat {
     /// it.
     ///
     /// `REFLINK` is in the set because it is handled where it actually
-    /// matters rather than at mount: an inode that may share extents
-    /// cannot have them freed, so `truncate_to_zero` refuses that inode.
-    /// Refusing every reflink volume instead would refuse most volumes
-    /// `mkfs.xfs` makes with its defaults.
+    /// matters rather than at mount, per inode (#127): `write_at` and the
+    /// partial `truncate` in `write.rs` refuse an inode that may share
+    /// extents, since writing or zeroing one in place would change what
+    /// another inode reads; and `truncate_to_zero` does free such an
+    /// inode, asking the refcount tree per range and holding back every
+    /// block another file still references. Refusing every reflink volume
+    /// instead would refuse most volumes `mkfs.xfs` makes with its
+    /// defaults.
     pub const SUPPORTED: u32 = FINOBT | RMAPBT | REFLINK | INOBTCNT;
 }
 
