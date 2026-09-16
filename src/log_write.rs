@@ -213,6 +213,21 @@ pub struct Placement {
 /// Returns the bytes to write at `placement.block`, padded to whole
 /// basic blocks. The checksum is computed last, over the header struct
 /// and the stamped payload, because that is what the kernel verifies.
+///
+/// # Panics
+///
+/// If `payload` pads to more than [`XLOG_CYCLE_DATA_ENTRIES`] basic
+/// blocks, which is more than the one header block this writes can
+/// describe (#131). It is an `assert!`, not a `debug_assert!`, on
+/// purpose: a record past that limit would be laid down with blocks that
+/// recovery replays as garbage, and the artifacts this crate ships are
+/// release builds, where a `debug_assert!` would compile to nothing. The
+/// debug-profile test run in CI and local builds see the same panic.
+///
+/// It is a precondition a caller can check first: [`max_payload`] gives
+/// the largest payload a record of `placement.iclog_size` bytes may
+/// carry, or refuses an `iclog_size` this writer cannot describe at all,
+/// and a payload no longer than that never reaches the panic.
 pub fn encode_record(placement: &Placement, num_logops: u32, payload: &[u8]) -> Vec<u8> {
     let padded = payload.len().div_ceil(BBSIZE) * BBSIZE;
     let mut data = vec![0u8; padded];
@@ -489,7 +504,12 @@ pub const XFS_TRANS_CHECKPOINT: u32 = 0x28;
 /// what `chores.yml` builds, it is `usize::MAX - 511`, so the size check
 /// below it admits every payload there is and the record goes out sized
 /// against an `h_size` the kernel will size its recovery buffer from.
-fn max_payload(iclog_size: u32) -> Result<usize> {
+///
+/// # Public, so that `encode_record`'s precondition can be checked
+///
+/// [`encode_record`] panics past this size, and a documented panic a
+/// caller cannot test for is only half a contract (#131).
+pub fn max_payload(iclog_size: u32) -> Result<usize> {
     // A RECORD THIS WRITER CANNOT DESCRIBE IS REFUSED, NOT TRUNCATED.
     //
     // `encode_record` emits exactly one header block. A reader — this
