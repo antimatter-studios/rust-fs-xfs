@@ -170,6 +170,14 @@ fn what_a_read_costs_in_calls_to_the_device() {
         uncached.walk.reads > 0 && uncached.stat.reads > 0,
         "no calls reached the device, so the counter is not wired to the mount"
     );
+    // THE READ PASS REACHED THE DEVICE. Safe here and not in every sibling:
+    // this driver reads file data on demand, and `docs/read-path-cost.md`
+    // records the uncached read at 522 calls and 754 KB. (btrfs loads its
+    // tree at mount and legitimately records zero for one fixture.)
+    assert!(
+        uncached.read.bytes > 0,
+        "the read pass fetched no bytes from the device"
+    );
     for (what, un, ca) in [
         ("walk", &uncached.walk, &cached.walk),
         ("stat", &uncached.stat, &cached.stat),
@@ -217,23 +225,71 @@ fn measure_one(img: &Path, blocks: usize) -> Pass {
     // RESOLVING THE SAME PREFIXES AGAIN AND AGAIN is the shape a cache
     // is for: every path here walks the root and each directory above
     // its target, and each of those is a fresh call to the device today.
-    let stat = measure(&counting, files.len(), || {
+    //
+    // `items` FOR STAT AND READ COUNTS CALLS THAT SUCCEEDED (#163). Both
+    // loops discarded their results, so a pass that failed before any I/O
+    // recorded a cheaper cost, and `items` was `files.len()` in both
+    // passes whatever happened. A failure now panics, and what the reads
+    // returned is checked against the sizes the lookups declared.
+    let mut resolved = 0usize;
+    let mut regular = 0usize;
+    let mut declared = 0u64;
+    let stat = measure(&counting, 0, || {
         for p in &files {
-            let _ = fs.lookup_path(p);
-        }
-    });
-    report("stat", &stat);
-
-    let read = measure(&counting, files.len(), || {
-        for p in &files {
-            if let Ok(inode) = fs.lookup_path(p) {
-                if let Ok((inode, raw)) = fs.read_inode_raw(inode.ino) {
-                    let _ = fs.read_file(&inode, &raw);
+            match fs.lookup_path(p) {
+                Ok(inode) => {
+                    resolved += 1;
+                    if inode.is_regular_file() {
+                        regular += 1;
+                        declared += inode.size;
+                    }
                 }
+                Err(e) => panic!("lookup_path({p}) failed during the measurement: {e:?}"),
             }
         }
     });
+    let stat = Cost {
+        items: resolved,
+        ..stat
+    };
+    report("stat", &stat);
+
+    let mut read_ok = 0usize;
+    let mut returned = 0u64;
+    let read = measure(&counting, 0, || {
+        for p in &files {
+            let inode = fs
+                .lookup_path(p)
+                .unwrap_or_else(|e| panic!("lookup_path({p}) failed during the read pass: {e:?}"));
+            // Regular files only: a symlink's target is `read_link`'s, not
+            // `read_file`'s, and a device node has no data to read.
+            if !inode.is_regular_file() {
+                continue;
+            }
+            let (inode, raw) = fs
+                .read_inode_raw(inode.ino)
+                .unwrap_or_else(|e| panic!("read_inode_raw({p}) failed: {e:?}"));
+            let bytes = fs
+                .read_file(&inode, &raw)
+                .unwrap_or_else(|e| panic!("read_file({p}) failed: {e:?}"));
+            read_ok += 1;
+            returned += bytes.len() as u64;
+        }
+    });
+    let read = Cost {
+        items: read_ok,
+        ..read
+    };
     report("read", &read);
+    assert_eq!(
+        (resolved, read_ok),
+        (files.len(), regular),
+        "not every walked file was resolved, or not every regular file read"
+    );
+    assert_eq!(
+        returned, declared,
+        "the reads returned {returned} bytes where the files declare {declared}"
+    );
 
     Pass { walk, stat, read }
 }
