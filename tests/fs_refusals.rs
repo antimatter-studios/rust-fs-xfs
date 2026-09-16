@@ -599,9 +599,10 @@ fn fixture_with_ro_compat(bits: u32) -> Option<Arc<MemDev>> {
 /// would lock a user out of data that is perfectly readable.
 #[test]
 fn an_unmaintained_ro_compat_bit_still_mounts_for_reading() {
-    // Bit 4 is the metadata directory tree; bit 20 is nothing at all
-    // yet, which is the case that matters most since it is what a
-    // future feature looks like from here.
+    // Neither bit is defined upstream (`ro_compat` stops at bit 3), which
+    // is the case that matters most since it is what a future feature
+    // looks like from here. Bit 4 is not the metadata directory tree:
+    // that is incompat bit 8 (#126).
     for bits in [1u32 << 4, 1 << 20] {
         let Some(dev) = fixture_with_ro_compat(bits) else {
             eprintln!("no fixture — skipping");

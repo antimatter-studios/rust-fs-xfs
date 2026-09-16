@@ -201,10 +201,32 @@ pub mod incompat {
     pub const META_UUID: u32 = 1 << 2;
     /// Large (64-bit) timestamps.
     pub const BIGTIME: u32 = 1 << 3;
+    /// The volume needs `xfs_repair`: set when a repair was interrupted,
+    /// and by the kernel on damage it will not touch. Not a layout this
+    /// driver lacks, so it is refused with its own message (#99).
+    pub const NEEDSREPAIR: u32 = 1 << 4;
     /// 64-bit per-inode extent counters.
     pub const NREXT64: u32 = 1 << 5;
+    /// Atomic file extent exchange (`exchrange`). Named, not read (#99).
+    pub const EXCHRANGE: u32 = 1 << 6;
+    /// Parent pointers (`parent`): each inode records its parent
+    /// directory in an extended attribute. Named, not read (#99).
+    pub const PARENT: u32 = 1 << 7;
+    /// The metadata directory tree (`metadir`): quota and realtime
+    /// metadata reached through a hidden directory rather than by
+    /// superblock inode number. Named, not read.
+    ///
+    /// An INCOMPAT bit, 8, as `xfs_format.h` defines it. It used to be
+    /// declared as `ro_compat` bit 4, which upstream leaves undefined, so
+    /// the refusal that named it could never fire for a real metadir
+    /// volume and would have misnamed a future bit 4 (#126).
+    pub const METADIR: u32 = 1 << 8;
 
     /// Every incompatible feature this driver can read.
+    ///
+    /// NOT the named bits above that are absent from it: naming a bit is
+    /// what lets a refusal say what stopped the mount, and adding one here
+    /// would mount a volume whose layout this driver does not understand.
     pub const SUPPORTED: u32 = FTYPE | SPINODES | META_UUID | BIGTIME | NREXT64;
 }
 
@@ -233,11 +255,6 @@ pub mod ro_compat {
     pub const REFLINK: u32 = 1 << 2;
     /// Inode B+tree block counters are maintained.
     pub const INOBTCNT: u32 = 1 << 3;
-    /// The metadata directory tree: quota and realtime metadata reached
-    /// through a hidden directory rather than by superblock inode
-    /// number. Not read here, and named so a refusal can say which
-    /// feature stopped it.
-    pub const METADIR: u32 = 1 << 4;
 
     /// Every read-only-compatible feature this driver **maintains**.
     ///
@@ -941,13 +958,38 @@ fn verify_checksum(buf: &[u8], sectsize: u16) -> Result<()> {
 /// Read-only-compatible bits are deliberately not checked here — an
 /// unknown one still permits the read-only mount this driver performs.
 fn reject_unsupported_features(features_incompat: u32) -> Result<()> {
-    let unknown = features_incompat & !incompat::SUPPORTED;
-    if unknown != 0 {
-        return Err(Error::UnsupportedFeature(format!(
-            "incompatible feature bits {unknown:#010x} not implemented"
-        )));
+    // Checked first and on its own: the volume is not using something
+    // this driver lacks, it is asking to be repaired, and a message about
+    // an unimplemented feature sends its owner the wrong way (#99).
+    if features_incompat & incompat::NEEDSREPAIR != 0 {
+        return Err(Error::UnsupportedFeature(
+            "this volume is marked as needing repair (incompat needsrepair): run xfs_repair \
+             on it before mounting"
+                .to_string(),
+        ));
     }
-    Ok(())
+    let mut unknown = features_incompat & !incompat::SUPPORTED;
+    if unknown == 0 {
+        return Ok(());
+    }
+    let mut named = Vec::new();
+    for (bit, name) in [
+        (incompat::EXCHRANGE, "exchange-range (exchrange)"),
+        (incompat::PARENT, "parent pointers (parent)"),
+        (incompat::METADIR, "the metadata directory tree (metadir)"),
+    ] {
+        if unknown & bit != 0 {
+            named.push(name.to_string());
+            unknown &= !bit;
+        }
+    }
+    if unknown != 0 {
+        named.push(format!("unknown bits {unknown:#010x}"));
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "incompatible features not implemented: {}",
+        named.join(", ")
+    )))
 }
 
 /// CRC32C over `buf` with the four checksum bytes at `crc_off` treated
@@ -957,6 +999,68 @@ pub(crate) fn crc32c_with_zeroed_crc(buf: &[u8], crc_off: usize) -> u32 {
     let mut c = crc32c::crc32c(&buf[..crc_off]);
     c = crc32c::crc32c_append(c, &[0, 0, 0, 0]);
     crc32c::crc32c_append(c, &buf[crc_off + 4..])
+}
+
+#[cfg(test)]
+mod incompat_naming_tests {
+    use super::*;
+
+    fn refusal(bits: u32) -> String {
+        match reject_unsupported_features(bits) {
+            Err(Error::UnsupportedFeature(m)) => m,
+            other => panic!("incompat {bits:#x} gave {other:?}"),
+        }
+    }
+
+    /// The bit values themselves, against `fs/xfs/libxfs/xfs_format.h`
+    /// (torvalds/linux master): not a transcription from memory, which is
+    /// how `METADIR` came to be `ro_compat` bit 4 (#126).
+    #[test]
+    fn the_incompat_bits_are_upstreams() {
+        assert_eq!(incompat::NEEDSREPAIR, 1 << 4);
+        assert_eq!(incompat::EXCHRANGE, 1 << 6);
+        assert_eq!(incompat::PARENT, 1 << 7);
+        assert_eq!(incompat::METADIR, 1 << 8);
+        assert_eq!(
+            incompat::SUPPORTED
+                & (incompat::NEEDSREPAIR
+                    | incompat::EXCHRANGE
+                    | incompat::PARENT
+                    | incompat::METADIR),
+            0,
+            "a named bit must not be mounted as though its layout were understood"
+        );
+    }
+
+    /// A volume that needs `xfs_repair` is told so, and not that it uses
+    /// an unimplemented feature (#99) -- even beside another bit.
+    #[test]
+    fn a_volume_needing_repair_is_told_to_run_xfs_repair() {
+        for bits in [
+            incompat::NEEDSREPAIR,
+            incompat::NEEDSREPAIR | incompat::PARENT,
+        ] {
+            let m = refusal(bits);
+            assert!(m.contains("xfs_repair"), "{bits:#x}: {m}");
+            assert!(!m.contains("not implemented"), "{bits:#x}: {m}");
+        }
+    }
+
+    /// The known-but-unread bits are named; anything else is still shown
+    /// as a hex mask, never dropped.
+    #[test]
+    fn a_refusal_names_the_features_it_knows_and_shows_the_rest() {
+        assert!(refusal(incompat::METADIR).contains("metadata directory tree"));
+        assert!(refusal(incompat::PARENT).contains("parent pointers"));
+        assert!(refusal(incompat::EXCHRANGE).contains("exchange-range"));
+        let m = refusal(incompat::FTYPE | incompat::METADIR | (1 << 20));
+        assert!(m.contains("metadir") && m.contains("0x00100000"), "{m}");
+        assert!(
+            !m.contains("0x00100100"),
+            "a named bit is left in the mask: {m}"
+        );
+        reject_unsupported_features(incompat::SUPPORTED).expect("every supported bit mounts");
+    }
 }
 
 #[cfg(test)]
