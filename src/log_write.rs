@@ -218,9 +218,11 @@ pub struct Placement {
 ///
 /// If `payload` pads to more than [`XLOG_CYCLE_DATA_ENTRIES`] basic
 /// blocks, which is more than the one header block this writes can
-/// describe (#131). The panic is kept in release on purpose: a record
-/// past that limit would be laid down with blocks that recovery replays
-/// as garbage, and every build of this crate is `--release`.
+/// describe (#131). It is an `assert!`, not a `debug_assert!`, on
+/// purpose: a record past that limit would be laid down with blocks that
+/// recovery replays as garbage, and the artifacts this crate ships are
+/// release builds, where a `debug_assert!` would compile to nothing. The
+/// debug-profile test run in CI and local builds see the same panic.
 ///
 /// It is a precondition a caller can check first: [`max_payload`] gives
 /// the largest payload a record of `placement.iclog_size` bytes may
