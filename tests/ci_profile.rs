@@ -344,6 +344,34 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
     wf.triggers.iter().any(|t| t == "pull_request")
 }
 
+/// Why `workflow` gates no pull request at all, or `None` if it does.
+///
+/// The real-file assertions below ask this FIRST. Without it, a
+/// workflow whose `on:` block moved reported "no debug `cargo test`
+/// gates a pull request", which sends the reader to a step that is
+/// fine (#153). This names the triggers that were found instead, and
+/// says why `pull_request_target` alone does not count.
+fn not_a_pull_request_gate(workflow: &str) -> Option<String> {
+    let wf = parse_workflow(workflow);
+    if runs_on_pull_request(&wf) {
+        return None;
+    }
+    let mut why = format!(
+        "the workflow does not trigger on `pull_request` at all (its triggers: {:?}), so \
+         none of its steps gates a pull request however they are written. The steps are \
+         not the problem; the `on:` block is.",
+        wf.triggers
+    );
+    if wf.triggers.iter().any(|t| t == "pull_request_target") {
+        why.push_str(
+            " `pull_request_target` alone is refused on purpose: it runs against the base \
+             repository and may never build the contributor's code. See \
+             `runs_on_pull_request`; carry `pull_request:` beside it.",
+        );
+    }
+    Some(why)
+}
+
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
@@ -399,6 +427,9 @@ fn the_gate_still_tests_in_a_profile_that_can_see_an_overflow() {
         .join("ci.yml");
     let workflow = read_or_panic(&path);
 
+    if let Some(why) = not_a_pull_request_gate(&workflow) {
+        panic!("{}: {why}", path.display());
+    }
     let debug_runs = gating_runs_with_overflow_checks(&workflow);
     assert!(
         !debug_runs.is_empty(),
@@ -485,6 +516,9 @@ fn the_debug_run_asks_the_build_to_prove_it_traps_overflows() {
         .join("ci.yml");
     let workflow = read_or_panic(&path);
 
+    if let Some(why) = not_a_pull_request_gate(&workflow) {
+        panic!("{}: {why}", path.display());
+    }
     let proving = gating_runs_that_prove_the_build_traps(&workflow);
     assert!(
         !proving.is_empty(),
@@ -693,6 +727,34 @@ jobs:
             1,
             "the control must be counted, or every test below passes for the wrong reason"
         );
+    }
+
+    /// THE MESSAGE NAMES THE CAUSE (#153). A workflow that stopped
+    /// triggering on pull requests is reported as that, with the
+    /// triggers it has, and not as a missing debug step. The control is
+    /// the gating shape, which has nothing to explain.
+    #[test]
+    fn a_workflow_off_pull_requests_is_reported_by_its_trigger() {
+        assert_eq!(super::not_a_pull_request_gate(GATING), None, "control");
+        for (trigger, names_target) in [
+            ("pull_request_target", true),
+            ("pull_request_review", false),
+            ("push", false),
+        ] {
+            let yaml = GATING.replace("  pull_request:\n", &format!("  {trigger}:\n"));
+            assert_ne!(yaml, GATING, "the mutation must actually apply");
+            let why = super::not_a_pull_request_gate(&yaml)
+                .unwrap_or_else(|| panic!("{trigger}: no reason given"));
+            assert!(
+                why.contains(&format!("{trigger:?}")) && why.contains("`on:` block"),
+                "{trigger}: the message must name the trigger found and the on: block: {why}"
+            );
+            assert_eq!(
+                why.contains("refused on purpose"),
+                names_target,
+                "{trigger}: only pull_request_target gets the refusal explained: {why}"
+            );
+        }
     }
 
     #[test]
@@ -1081,6 +1143,9 @@ jobs:
                 .join("workflows")
                 .join("ci.yml"),
         );
+        if let Some(why) = super::not_a_pull_request_gate(&workflow) {
+            panic!("the real ci.yml: {why}");
+        }
         assert!(
             !gating(&workflow).is_empty(),
             "the real ci.yml must parse into at least one gating step, or the guard is \
