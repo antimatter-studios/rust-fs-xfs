@@ -85,7 +85,7 @@ use crate::superblock::Superblock;
 /// Measured both ways. On an ordinary filesystem the kernel hashes
 /// `Mixed` to 0xdd3e32e0; on a case-insensitive one, 0xdd3e32e2 — and
 /// `hashname` of the lowercased name is exactly that.
-fn hash_for(sb: &Superblock, name: &[u8]) -> u32 {
+pub(crate) fn hash_for(sb: &Superblock, name: &[u8]) -> u32 {
     if sb.has_case_insensitive_dirs() {
         let folded: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
         hashname(&folded)

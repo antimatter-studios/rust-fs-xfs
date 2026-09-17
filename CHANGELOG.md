@@ -8,6 +8,15 @@ never does.
 
 ### Changed
 
+- **A lookup goes through the directory's hash index.** `Filesystem::lookup`
+  listed the whole directory to find one name, reading every data block of
+  it for every path component. Block-, leaf- and node-form directories are
+  now searched by name hash (the block's tail index, the leaf block, or the
+  node B-tree down to a leaf), and only the data blocks the matching
+  records point at are read: one lookup in a 20,000-name directory makes 6
+  device reads where the listing made 122. Short-form directories, which
+  live in the inode, are scanned as before.
+
 - **BREAKING (C ABI).** `fs_xfs_set_attributes` and `fs_xfs_truncate`
   take a new sentinel for timestamps: `FS_XFS_LEAVE_TIME`
   (`INT64_MIN`), not `FS_XFS_LEAVE` (`-1`). A caller that passed `-1`

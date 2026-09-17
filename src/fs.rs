@@ -883,13 +883,169 @@ impl Filesystem {
     }
 
     /// Look up a single name within a directory.
+    ///
+    /// # Why this is not `read_dir().find(..)`
+    ///
+    /// Every directory past short form carries a hash index: at the tail of
+    /// a block-form directory's one block, in the single leaf block of a
+    /// leaf-form one, and as a B-tree of leaves under nodes in a node-form
+    /// one. Each record gives a name hash and the address of the entry. So a
+    /// lookup hashes the name, finds the records with that hash, and reads
+    /// only the data blocks they point at. Listing the directory to find one
+    /// name read every data block it has, for every path component (#95).
+    ///
+    /// A short-form directory lives inside its inode and is scanned.
     pub fn lookup(&self, dir_inode: &Inode, raw: &[u8], name: &[u8]) -> Result<Inode> {
-        let entries = self.read_dir(dir_inode, raw)?;
-        let hit = entries
-            .iter()
-            .find(|e| e.name == name)
+        if !dir_inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        // `read_dir` never lists them, in any format, so neither does this.
+        if name == b"." || name == b".." {
+            return Err(Error::NotFound);
+        }
+        if dir_inode.format == Format::Local {
+            let hit = self
+                .read_dir(dir_inode, raw)?
+                .into_iter()
+                .find(|e| e.name == name)
+                .ok_or(Error::NotFound)?;
+            return self.read_inode(hit.ino);
+        }
+        let ino = self
+            .lookup_by_hash(dir_inode, raw, name)?
             .ok_or(Error::NotFound)?;
-        self.read_inode(hit.ino)
+        self.read_inode(ino)
+    }
+
+    /// The inode number `name` resolves to in a block-, leaf- or node-form
+    /// directory, found through its hash index, or `None`.
+    fn lookup_by_hash(&self, dir_inode: &Inode, raw: &[u8], name: &[u8]) -> Result<Option<u64>> {
+        use crate::format::dir::{
+            XFS_DA3_NODE_MAGIC, XFS_DA_NODE_MAGIC, XFS_DIR2_LEAFN_MAGIC, XFS_DIR3_LEAFN_MAGIC,
+        };
+        let hash = crate::dir_block::hash_for(&self.sb, name);
+        let extents = self.data_extents(dir_inode, raw)?;
+        let dir_block_size = u64::from(self.sb.dirblocksize());
+        let Some(first) = self.read_dir_block(&extents, 0)? else {
+            return Ok(None);
+        };
+
+        // A record's address is in 8-byte units from the start of the
+        // directory's data space: its block, and its offset within it.
+        let entry_at = |address: u32| {
+            let byte = u64::from(address) * 8;
+            (byte / dir_block_size, (byte % dir_block_size) as u32)
+        };
+
+        if dir::is_block_form(be32(&first, crate::format::dir::offsets::dir3_blk::MAGIC)) {
+            let block = dir::parse_block_form(&first, &self.sb)?;
+            let found = block
+                .index
+                .iter()
+                .filter(|r| !r.is_stale() && r.hashval == hash)
+                .find_map(|r| {
+                    let (_, offset) = entry_at(r.address);
+                    block
+                        .entries
+                        .iter()
+                        .find(|e| e.offset == offset && e.name == name)
+                        .map(|e| e.ino)
+                });
+            return Ok(found);
+        }
+
+        // Leaf or node form: the index starts at the leaf offset.
+        let leaf_start = DIR_LEAF_FILE_OFFSET / dir_block_size;
+        let mut at = leaf_start;
+        let mut block = self.read_dir_block(&extents, at)?.ok_or_else(|| {
+            Error::BadSuperblock(format!(
+                "directory inode {} has data blocks and no hash index",
+                dir_inode.ino
+            ))
+        })?;
+        // Down the node B-tree to the leaf covering the hash. A node sits
+        // more than MAX_SUPPORTED_NODE_LEVEL above the leaves is refused by
+        // parse_node, so this is bounded.
+        loop {
+            let magic = crate::endian::be16(&block, crate::format::dir::offsets::da_blk::MAGIC);
+            if magic != XFS_DA3_NODE_MAGIC && magic != XFS_DA_NODE_MAGIC {
+                break;
+            }
+            let Some(child) = dir::parse_node(&block, &self.sb)?.child_for_hash(hash) else {
+                return Ok(None);
+            };
+            at = u64::from(child);
+            block = self.read_dir_block(&extents, at)?.ok_or_else(|| {
+                Error::BadSuperblock(format!(
+                    "directory inode {}: node names block {at}, which is a hole",
+                    dir_inode.ino
+                ))
+            })?;
+        }
+
+        // Every record with the hash, following the leaf chain while the
+        // run of equal hashes continues into the next leaf.
+        let mut addresses = Vec::new();
+        loop {
+            let leaf = dir::parse_leaf(&block, &self.sb)?;
+            addresses.extend(
+                leaf.entries
+                    .iter()
+                    .filter(|r| !r.is_stale() && r.hashval == hash)
+                    .map(|r| r.address),
+            );
+            let continues = leaf.entries.last().is_some_and(|r| r.hashval == hash)
+                && (leaf.magic == XFS_DIR3_LEAFN_MAGIC || leaf.magic == XFS_DIR2_LEAFN_MAGIC)
+                && leaf.forw != 0;
+            if !continues {
+                break;
+            }
+            at = u64::from(leaf.forw);
+            block = match self.read_dir_block(&extents, at)? {
+                Some(b) => b,
+                None => break,
+            };
+        }
+
+        for address in addresses {
+            let (db, offset) = entry_at(address);
+            let Some(data) = self.read_dir_block(&extents, db)? else {
+                continue;
+            };
+            if let Some(e) = dir::parse_data_block(&data, &self.sb)?
+                .into_iter()
+                .find(|e| e.offset == offset && e.name == name)
+            {
+                return Ok(Some(e.ino));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Directory block `dir_block` (in the directory's own block numbers),
+    /// read whole through the extent list, or `None` where any of it is a
+    /// hole or unwritten.
+    fn read_dir_block(&self, extents: &[Extent], dir_block: u64) -> Result<Option<Vec<u8>>> {
+        let block_size = u64::from(self.sb.blocksize);
+        let dir_block_size = self.sb.dirblocksize() as usize;
+        let per = dir_block_size as u64 / block_size;
+        let mut out = vec![0u8; dir_block_size];
+        for i in 0..per {
+            let file_block = dir_block * per + i;
+            let Some(e) = extent::lookup(extents, file_block) else {
+                return Ok(None);
+            };
+            if e.is_unwritten() {
+                return Ok(None);
+            }
+            let phys = e.map(file_block).expect("block inside its own extent");
+            let at = (i * block_size) as usize;
+            self.device.read_at(
+                self.block_offset(phys),
+                &mut out[at..at + block_size as usize],
+            )?;
+        }
+        Ok(Some(out))
     }
 
     /// Resolve an absolute path to its inode.
