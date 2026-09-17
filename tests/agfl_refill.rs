@@ -25,12 +25,28 @@ use fs_xfs::Filesystem;
 use std::sync::Arc;
 
 /// Removes the image however the test ends: every suite reads each `.img`
-/// in the share as a fixture.
-struct Scratch(std::path::PathBuf);
+/// in the share as a fixture. And the share itself when this test made it,
+/// because a suite that finds an empty share fails where a missing one
+/// skips (`log_oracle` in the fixture-less test jobs).
+struct Scratch {
+    image: std::path::PathBuf,
+    made_share: bool,
+}
+
+impl Scratch {
+    fn new(image: std::path::PathBuf) -> Self {
+        let made_share = !share().exists();
+        std::fs::create_dir_all(share()).unwrap();
+        Scratch { image, made_share }
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.image);
+        if self.made_share {
+            let _ = std::fs::remove_dir(share());
+        }
     }
 }
 
@@ -39,13 +55,12 @@ const PER_DIR: usize = 100;
 
 #[test]
 fn writes_on_rmapbt_keep_going_past_the_free_list() {
-    std::fs::create_dir_all(share()).unwrap();
     let name = format!("agfl-refill-{}.img", std::process::id());
     let image = share().join(&name);
+    let _scratch = Scratch::new(image.clone());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(320 * 1024 * 1024))
         .unwrap();
-    let _scratch = Scratch(image.clone());
 
     let Some(built) = kernel_run(&format!(
         r#"
