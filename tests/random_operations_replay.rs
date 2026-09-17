@@ -26,7 +26,6 @@ use common::{kernel_run, share};
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::write::AttrChange;
 use fs_xfs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 const STEPS: u64 = 40;
@@ -160,16 +159,17 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(320 * 1024 * 1024))
             .unwrap();
-        let mkfs = Command::new("mkfs.xfs")
-            .args(["-q", "-f"])
-            .arg(&image)
-            .output()
-            .expect("mkfs.xfs");
-        assert!(
-            mkfs.status.success(),
-            "{}",
-            String::from_utf8_lossy(&mkfs.stderr)
-        );
+        // Formatted where the kernel runs, so a host without xfsprogs, such
+        // as the macOS runner, skips with the kernel rather than failing
+        // here.
+        let Some(mkfs) = kernel_run(&format!(
+            "mkfs.xfs -q -f /share/{name} && echo MKFS_OK || echo MKFS_FAILED; echo DONE"
+        )) else {
+            let _ = std::fs::remove_file(&image);
+            eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
+            return;
+        };
+        assert!(mkfs.contains("MKFS_OK"), "mkfs.xfs failed:\n{mkfs}");
         let image_path = image.to_str().unwrap().to_string();
 
         // Mount to replay, then judge. The mount and unmount are what apply
