@@ -79,7 +79,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           # Checked even when the run failed: a truncated run is worth
           # naming too, and `rc` still decides the step's fate.
-          ./scripts/ci-test.sh --floor-check 480 "$RUNNER_TEMP/release-tests.log" "the release run in test-ubuntu-latest" || rc=1
+          ./scripts/ci-test.sh --floor-check 99999 "$RUNNER_TEMP/release-tests.log" "the release run in test-ubuntu-latest" || rc=1
           exit "$rc"
 
       # AND ONCE WITHOUT `--release`, WHICH IS NOT THE SAME RUN.
