@@ -139,7 +139,9 @@ jobs:
   # and need xfsprogs or a VM, so they stay on the Linux jobs.
   darwin:
     name: test-darwin
-    runs-on: macos-latest
+    # arm64 by label, not by whatever macos-latest resolves to: the tests
+    # built for aarch64-apple-darwin have to run on the host.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Clone sibling rust-fs-core
