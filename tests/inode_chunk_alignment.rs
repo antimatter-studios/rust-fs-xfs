@@ -73,12 +73,28 @@ fn inodes(fs: &Filesystem) -> u32 {
 }
 
 /// Removes the image however the test ends: every suite reads each `.img`
-/// in the share as a fixture.
-struct Scratch(std::path::PathBuf);
+/// in the share as a fixture. And the share itself when this test made it,
+/// because a suite that finds an empty share fails where a missing one
+/// skips (`log_oracle` in the fixture-less test jobs).
+struct Scratch {
+    image: std::path::PathBuf,
+    made_share: bool,
+}
+
+impl Scratch {
+    fn new(image: std::path::PathBuf) -> Self {
+        let made_share = !share().exists();
+        std::fs::create_dir_all(share()).unwrap();
+        Scratch { image, made_share }
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.image);
+        if self.made_share {
+            let _ = std::fs::remove_dir(share());
+        }
     }
 }
 
@@ -86,11 +102,10 @@ impl Drop for Scratch {
 fn a_new_inode_chunk_on_one_kib_blocks_replays() {
     let name = format!("inode-align-{}.img", std::process::id());
     let image = share().join(&name);
-    std::fs::create_dir_all(share()).unwrap();
+    let _scratch = Scratch::new(image.clone());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(320 * 1024 * 1024))
         .unwrap();
-    let _scratch = Scratch(image.clone());
     let Some(mkfs) = kernel_run(&format!(
         "mkfs.xfs -q -f -b size=1024 -d agcount=2 /share/{name} 2>&1 && echo MKFS_OK; echo DONE"
     )) else {
