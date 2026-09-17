@@ -299,6 +299,19 @@ check_eq "$(holder_field 4)" "gen-SECOND" "while the live accessor sees the repl
 # for as long as it takes to put it back, and restoring is a `mkdir` a
 # waiter can win -- so moving a lock this process can already see is not
 # its own is a risk taken for nothing.
+#
+# NO RESIDUE IS NOT THE SAME AS NO MOVE. A delete that moves the lock,
+# finds the token is not its own and restores it leaves exactly what a
+# delete that never moved it leaves, so the residue check below held
+# with the pre-move comparison deleted (#158). Every `mv` the sourced
+# functions make is recorded, which is the one thing that tells the two
+# apart.
+moves="$sandbox/mv.log"
+mv() {
+    printf '%s\n' "$*" >> "$moves"
+    command mv "$@"
+}
+: > "$moves"
 set_lock "$OTHER" "gen-LIVE"
 delete_generation "gen-STALE" breaking
 rc=$?
@@ -310,7 +323,16 @@ check_eq "$rc" 1 "and reports that it deleted nothing"
 residue="$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 \
     \( -name 'slot.lock.breaking.*' -o -name 'slot.lock.releasing.*' \
        -o -name 'slot.lock.orphan.*' \) | wc -l | tr -d ' ')"
-check_eq "$residue" 0 "and left nothing staged: it never moved it at all"
+check_eq "$residue" 0 "and left nothing staged"
+check_eq "$(wc -l < "$moves" | tr -d ' ')" 0 "and never moved it at all, not even to put it back"
+# The control: the recorder sees the move an authorised delete makes, so
+# the zero above is the refusal and not a recorder that sees nothing.
+: > "$moves"
+set_lock "$OTHER" "gen-LIVE"
+delete_generation "gen-LIVE" breaking
+check removed "an authorised break deletes the lock"
+check_eq "$(wc -l < "$moves" | tr -d ' ')" 1 "and the recorder saw its one move"
+unset -f mv
 
 # --- a restore that loses the race keeps the record --------------------
 
