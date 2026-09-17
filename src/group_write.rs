@@ -474,23 +474,48 @@ impl<'a> GroupAlloc<'a> {
     ///
     /// [`Error::UnsupportedFeature`] when no single run is long enough.
     pub(crate) fn take(&mut self, want: u32, owner: i64, offset: u64) -> Result<u32> {
+        self.take_aligned(want, 1, owner, offset)
+    }
+
+    /// [`GroupAlloc::take`], starting on a multiple of `align` blocks.
+    ///
+    /// An inode chunk needs this. The kernel finds an inode's cluster by
+    /// masking its block down to `sb_inoalignmt`, so a chunk that starts
+    /// anywhere else has its inodes read from blocks it does not own.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when no run holds `want` blocks from an
+    /// aligned start.
+    pub(crate) fn take_aligned(
+        &mut self,
+        want: u32,
+        align: u32,
+        owner: i64,
+        offset: u64,
+    ) -> Result<u32> {
         use crate::alloc_btree::{alloc_extent, longest};
 
         let agno = self.agno;
-        let chosen = self
+        let align = u64::from(align.max(1));
+        let start = self
             .by_block
             .iter()
-            .find(|run| run.blockcount >= want)
-            .copied()
+            .find_map(|run| {
+                let start = u64::from(run.startblock).div_ceil(align) * align;
+                let end = u64::from(run.startblock) + u64::from(run.blockcount);
+                (start + u64::from(want) <= end).then_some(start as u32)
+            })
             .ok_or_else(|| {
                 Error::UnsupportedFeature(format!(
-                    "allocation group {agno} has no single free run of {want} blocks — its \
-                     longest is {}, and splitting across extents is not implemented",
+                    "allocation group {agno} has no single free run of {want} blocks \
+                     starting on a multiple of {align} — its longest run is {}, and \
+                     splitting across extents is not implemented",
                     longest(&self.by_block)
                 ))
             })?;
         let taking = FreeExtent {
-            startblock: chosen.startblock,
+            startblock: start,
             blockcount: want,
         };
         alloc_extent(&mut self.by_block, taking)?;
