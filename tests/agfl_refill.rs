@@ -122,10 +122,30 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
                     .unwrap_or_else(|e| panic!("write {file}, after {written} writes: {e:?}"));
             }
             let out = kernel_run(&replay).expect("kernel");
-            assert!(
-                out.contains("MOUNTED") && out.contains("REPAIR_RC=0"),
-                "after writing {file}, the kernel or xfs_repair rejected the volume:\n{out}"
-            );
+            if !(out.contains("MOUNTED") && out.contains("REPAIR_RC=0")) {
+                let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
+                let mut state = format!(
+                    "sb_fdblocks {} after {written} writes\n",
+                    fs.superblock().fdblocks
+                );
+                for ag in 0..fs.superblock().agcount {
+                    let agf = fs.read_agf(ag).unwrap();
+                    state.push_str(&format!(
+                        "AG {ag}: freeblks {} flcount {} btreeblks {} rmap_blocks {} \
+                         levels {:?} longest {}\n",
+                        agf.freeblks,
+                        agf.flcount,
+                        agf.btreeblks,
+                        agf.rmap_blocks,
+                        agf.levels,
+                        agf.longest
+                    ));
+                }
+                panic!(
+                    "after writing {file}, the kernel or xfs_repair rejected the volume:\n\
+                     {out}\n{state}"
+                );
+            }
             written += 1;
             let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
             for ag in 0..fs.superblock().agcount {
