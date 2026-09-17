@@ -6,6 +6,15 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Extended attributes can be read.** `Filesystem::list_xattrs` and
+  `get_xattr` read an inode's attribute fork in every shape: short form
+  inline in the inode, a single leaf block, a node B-tree over chained
+  leaves, and remote values over several blocks (each block's v5 header
+  stripped). Names come back with their `user.`, `trusted.` or `security.`
+  prefix; entries still marked incomplete are not returned.
+
 ### Changed
 
 - **A lookup goes through the directory's hash index.** `Filesystem::lookup`
