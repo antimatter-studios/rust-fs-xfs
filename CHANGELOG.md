@@ -6,22 +6,6 @@ never does.
 
 ## [Unreleased]
 
-### Fixed
-
-- **A created file no longer inherits the flags of the file its inode last
-  held.** `unlink_file` left `di_flags`, `di_flags2` and the attribute fork
-  in the inode it freed, and `create_file` read them back, so a new file
-  could come out immutable, append-only, real-time or reflinked. A freed
-  inode is now reset the way the kernel's `xfs_ifree` resets it, and a
-  created one starts with no flags beyond `BIGTIME` and `NREXT64` (#189).
-- **In-place writes are refused once a mount has logged a change.** A
-  logged operation writes only its record, so the disk is out of date until
-  replay. `write_at`, `set_attributes` and `truncate` read that stale disk:
-  a write after `truncate_to_zero` reported success into blocks replay then
-  frees, and an attribute change was put back by replay. They now refuse
-  after the mount's checkpoint, as a second logged operation already did
-  (#186).
-
 ### Added
 
 - **Extended attributes can be read.** `Filesystem::list_xattrs` and
@@ -41,7 +25,6 @@ never does.
   records point at are read: one lookup in a 20,000-name directory makes 6
   device reads where the listing made 122. Short-form directories, which
   live in the inode, are scanned as before.
-
 - **BREAKING (C ABI).** `fs_xfs_set_attributes` and `fs_xfs_truncate`
   take a new sentinel for timestamps: `FS_XFS_LEAVE_TIME`
   (`INT64_MIN`), not `FS_XFS_LEAVE` (`-1`). A caller that passed `-1`
@@ -53,12 +36,32 @@ never does.
   call returned 0 and the field did not move. `mode`, `uid` and `gid`
   keep `FS_XFS_LEAVE`, which is the `chown(2)` convention and correct
   for them.
-
   Callers should replace `FS_XFS_LEAVE` with `FS_XFS_LEAVE_TIME` in the
   `atime_sec` and `mtime_sec` positions, and in `fs_xfs_truncate`'s
   `mtime_sec`. Dates earlier than 1901-12-13 are accepted by the ABI
   and clamped by the on-disk encoding, which is unchanged.
 
+### Fixed
+
+- **A created file no longer inherits the flags of the file its inode last
+  held.** `unlink_file` left `di_flags`, `di_flags2` and the attribute fork
+  in the inode it freed, and `create_file` read them back, so a new file
+  could come out immutable, append-only, real-time or reflinked. A freed
+  inode is now reset the way the kernel's `xfs_ifree` resets it, and a
+  created one starts with no flags beyond `BIGTIME` and `NREXT64` (#189).
+- **In-place writes are refused once a mount has logged a change.** A
+  logged operation writes only its record, so the disk is out of date until
+  replay. `write_at`, `set_attributes` and `truncate` read that stale disk:
+  a write after `truncate_to_zero` reported success into blocks replay then
+  frees, and an attribute change was put back by replay. They now refuse
+  after the mount's checkpoint, as a second logged operation already did
+  (#186).
+- **A rename or create refuses a name no directory entry can hold.**
+  `rename_in_directory` checked only the new name's length, and logged
+  names containing `/` or NUL, and `.` and `..`. `create_file` let NUL
+  through, and a name longer than the one-byte length it is stored in.
+  Both now apply the kernel's `xfs_dir2_namecheck` rule, before claiming
+  the mount's checkpoint (#192).
 
 ## [0.7.0] — 2026-09-06
 

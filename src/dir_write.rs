@@ -92,9 +92,15 @@ impl Filesystem {
                 "renaming writes v5 metadata; a v4 filesystem is not supported".into(),
             ));
         }
-        if to.is_empty() || to.len() > u8::MAX as usize {
+        // THE NAME AS WELL AS ITS LENGTH. A `/` or NUL is what
+        // `xfs_dir2_namecheck` refuses and `xfs_repair` reports as an
+        // illegal character, and `.` or `..` would shadow the entries every
+        // directory answers for itself. Only the length was checked, and
+        // anything else went into the record.
+        if !dir::entry_name_is_valid(to) {
             return Err(Error::UnsupportedFeature(format!(
-                "a name of {} bytes cannot be stored; the length is one byte",
+                "{:?} ({} bytes) is not a name a directory entry can hold",
+                String::from_utf8_lossy(to),
                 to.len()
             )));
         }
