@@ -14,23 +14,29 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fails=0
-check() {
-    if eval "$1"; then
-        printf 'ok    %s\n' "$2"
-    else
-        printf 'FAIL  %s\n' "$2"
-        fails=$((fails + 1))
-    fi
-}
+ok() { printf 'ok    %s\n' "$1"; }
+fail() { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 
 for builder in build-fixtures-native.sh vm-build-fixtures.sh; do
     f="$REPO/scripts/$builder"
-    check "grep -q 'source \"\$REPO/scripts/fixture-geometries.sh\"' '$f'" \
-        "$builder sources the shared geometry list"
-    check "! grep -qE '^[[:space:]]*[A-Z_]*GEOMETRIES=\\(' '$f'" \
-        "$builder declares no geometry list of its own"
-    check "grep -q '\"\${XFS_GEOMETRIES\[@\]}\"' '$f'" \
-        "$builder builds from that list"
+    if grep -qF 'source "$REPO/scripts/fixture-geometries.sh"' "$f"; then
+        ok "$builder sources the shared geometry list"
+    else
+        fail "$builder sources the shared geometry list"
+    fi
+    # Any assignment to a geometry array: a declaration, an append with
+    # `+=`, or one element replaced by index. Each would make this builder's
+    # set differ from the shared one again.
+    if grep -qE '^[[:space:]]*[A-Za-z_]*GEOMETRIES(\[[^]]*\])?\+?=' "$f"; then
+        fail "$builder declares or changes no geometry list of its own"
+    else
+        ok "$builder declares or changes no geometry list of its own"
+    fi
+    if grep -qF '"${XFS_GEOMETRIES[@]}"' "$f"; then
+        ok "$builder builds from that list"
+    else
+        fail "$builder builds from that list"
+    fi
 done
 
 # shellcheck source=/dev/null
@@ -40,8 +46,20 @@ has() {
     for g in "${XFS_GEOMETRIES[@]}"; do [ "$g" = "$1" ] && return 0; done
     return 1
 }
-check 'has "default:-m rmapbt=0"' "default is pinned to rmapbt=0"
-check 'has "nosparse:-m crc=1 -i sparse=0"' "nosparse is in the list CI builds"
+if has "default:-m rmapbt=0"; then ok "default is pinned to rmapbt=0"; else fail "default is pinned to rmapbt=0"; fi
+if has "nosparse:-m crc=1 -i sparse=0"; then ok "nosparse is in the list CI builds"; else fail "nosparse is in the list CI builds"; fi
+
+# The mutation check itself, against the shapes it must catch.
+probe="$(mktemp)"
+trap 'rm -f "$probe"' EXIT
+for shape in 'GEOMETRIES=(' 'XFS_GEOMETRIES+=("extra:-b size=512")' 'XFS_GEOMETRIES[0]="default:"'; do
+    printf '%s\n' "  $shape" > "$probe"
+    if grep -qE '^[[:space:]]*[A-Za-z_]*GEOMETRIES(\[[^]]*\])?\+?=' "$probe"; then
+        ok "the check catches: $shape"
+    else
+        fail "the check catches: $shape"
+    fi
+done
 
 if [ "$fails" -eq 0 ]; then
     echo "PASS  fixture geometries have one copy"
