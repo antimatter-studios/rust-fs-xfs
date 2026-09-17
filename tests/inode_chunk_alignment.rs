@@ -1,0 +1,150 @@
+//! A new inode chunk starts on the inode alignment, so the kernel finds
+//! the inodes where the driver put them.
+//!
+//! With the align bit set and `sb_inoalignmt` at least a cluster, the
+//! kernel maps an inode to its cluster buffer by masking its block down to
+//! that alignment (`m_inoalign_mask` in `xfs_imap`), and `xfs_ialloc_ag_alloc`
+//! allocates chunks only there. On 4 KiB blocks the alignment is 8 blocks;
+//! on 1 KiB blocks it is 32.
+//!
+//! The driver took a new chunk's blocks from the first free run long enough,
+//! wherever that run started. On 1 KiB blocks, after a few one-block
+//! writes, free space started at block 91, so the chunk went there. The
+//! kernel then replayed the record against the cluster at block 80, which
+//! held file data, and refused the log: "metadata I/O error in
+//! xlog_recover_items_pass2 … error 117".
+//!
+//! This fills the first chunk with files that each get one block of data,
+//! which leaves free space starting off the alignment, then creates past
+//! it. Every step is replayed by the kernel and checked by `xfs_repair -n`.
+//! It skips when no kernel is reachable (see `common::transport`), and
+//! ci-test.sh turns that skip into a failure in CI.
+
+mod common;
+
+use common::{kernel_run, share};
+use fs_core::{BlockDevice, FileDevice};
+use fs_xfs::Filesystem;
+use std::sync::Arc;
+
+/// Mount, apply `f`, unmount; then have the kernel replay the record and
+/// `xfs_repair -n` judge the result.
+fn step(
+    image: &str,
+    name: &str,
+    what: &str,
+    f: impl FnOnce(&Filesystem) -> Result<(), fs_xfs::Error>,
+) -> Option<()> {
+    {
+        let dev = Arc::new(FileDevice::open_rw(image).unwrap());
+        let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>)
+            .unwrap_or_else(|e| panic!("{what}: mount_rw after a replay: {e:?}"));
+        f(&fs).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+    }
+    let out = kernel_run(&format!(
+        r#"
+        m=$(mktemp -d)
+        if mount -o loop,nouuid /share/{name} "$m"; then
+            umount "$m"
+            echo MOUNTED
+        else
+            echo MOUNT_FAILED
+            dmesg | tail -8
+        fi
+        rmdir "$m"
+        out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
+        echo "REPAIR_RC=$rc"
+        [ "$rc" = 0 ] || echo "$out" | tail -20
+        echo DONE
+        "#
+    ))?;
+    assert!(
+        out.contains("MOUNTED") && out.contains("REPAIR_RC=0"),
+        "after {what}, the kernel or xfs_repair rejected the volume:\n{out}"
+    );
+    Some(())
+}
+
+/// Inodes allocated across every group.
+fn inodes(fs: &Filesystem) -> u32 {
+    (0..fs.superblock().agcount)
+        .map(|ag| fs.read_agi(ag).unwrap().count)
+        .sum()
+}
+
+/// Removes the image however the test ends: every suite reads each `.img`
+/// in the share as a fixture.
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn a_new_inode_chunk_on_one_kib_blocks_replays() {
+    let name = format!("inode-align-{}.img", std::process::id());
+    let image = share().join(&name);
+    std::fs::create_dir_all(share()).unwrap();
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(320 * 1024 * 1024))
+        .unwrap();
+    let _scratch = Scratch(image.clone());
+    let Some(mkfs) = kernel_run(&format!(
+        "mkfs.xfs -q -f -b size=1024 -d agcount=2 /share/{name} 2>&1 && echo MKFS_OK; echo DONE"
+    )) else {
+        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
+        return;
+    };
+    assert!(mkfs.contains("MKFS_OK"), "mkfs.xfs failed:\n{mkfs}");
+    let path = image.to_str().unwrap().to_string();
+
+    let (inodes_before, align) = {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
+        (inodes(&fs), fs.superblock().inoalignmt)
+    };
+    assert_eq!(
+        align, 32,
+        "mkfs.xfs gave 1 KiB blocks a different alignment"
+    );
+
+    // Short-form directories hold a handful of entries each, so the
+    // files are spread over directories until the first chunk is full.
+    let mut made = 0u32;
+    'fill: for d in 0.. {
+        let dir = format!("d{d}");
+        step(&path, &name, &format!("mkdir /{dir}"), |fs| {
+            let root = fs.lookup_path("/").unwrap().ino;
+            fs.create_directory(root, dir.as_bytes(), 0o40755)
+                .map(|_| ())
+        })
+        .expect("kernel");
+        for f in 0..6 {
+            let file = format!("/{dir}/f{f}");
+            step(&path, &name, &format!("create {file}"), |fs| {
+                let parent = fs.lookup_path(&format!("/{dir}")).unwrap().ino;
+                fs.create_file(parent, format!("f{f}").as_bytes(), 0o100644)
+                    .map(|_| ())
+            })
+            .expect("kernel");
+            step(&path, &name, &format!("write {file}"), |fs| {
+                let ino = fs.lookup_path(&file).unwrap().ino;
+                fs.write_into_empty_file(ino, &[7u8; 1024]).map(|_| ())
+            })
+            .expect("kernel");
+            made += 1;
+            let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
+            if inodes(&fs) > inodes_before {
+                break 'fill;
+            }
+            assert!(made < 200, "no new inode chunk after {made} files");
+        }
+    }
+
+    let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
+    assert!(
+        inodes(&fs) > inodes_before,
+        "the test never needed a second chunk, so it checked nothing"
+    );
+}
