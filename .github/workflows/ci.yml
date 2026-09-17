@@ -319,7 +319,7 @@ jobs:
                        log_encode_oracle log_dinode_oracle \
                        file_handle_oracle read_path_cost \
                        capi fs_refusals alloc_btree_oracle inode_alloc_oracle \
-                       deeptree_oracle; do
+                       deeptree_oracle random_operations_replay; do
             ./scripts/ci-test.sh --test "$suite"
           done
 

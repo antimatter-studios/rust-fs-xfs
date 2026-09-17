@@ -169,8 +169,23 @@ pub fn kernel_run(script: &str) -> Option<String> {
                 c.arg("-c");
                 c
             } else {
+                // SUDO RESETS PATH to its secure_path, so a tool installed for
+                // this user (xfs_repair under ~/.local/bin, say) is not found
+                // as root, and every script that runs it reports "command not
+                // found" as though the filesystem were broken. Carry PATH and
+                // HOME through: wrappers that locate their binaries under
+                // $HOME need the second.
                 let mut c = Command::new("sudo");
-                c.args(["-n", "bash", "-c"]);
+                c.args(["-n", "env"])
+                    .arg(format!(
+                        "PATH={}",
+                        std::env::var("PATH").unwrap_or_default()
+                    ))
+                    .arg(format!(
+                        "HOME={}",
+                        std::env::var("HOME").unwrap_or_default()
+                    ))
+                    .args(["bash", "-c"]);
                 c
             };
             cmd.arg(localised).output().ok()?
