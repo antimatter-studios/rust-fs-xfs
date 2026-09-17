@@ -202,7 +202,28 @@ fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
     core[core_at::AFORMAT] = AFORMAT_EXTENTS;
     core[core_at::FORKOFF] = 0;
     core[core_at::ANEXTENTS..core_at::ANEXTENTS + 2].copy_from_slice(&0u16.to_be_bytes());
+
+    // NOTHING OF THE FILE BEFORE IT (#189). An inode this driver removed
+    // kept its flags, so a file created in it came out immutable,
+    // append-only, real-time or reflinked because the last one was. The
+    // kernel sets both words afresh (`xfs_init_new_inode`). Of `di_flags2`,
+    // only BIGTIME and NREXT64 describe the filesystem rather than the file,
+    // and the timestamps and extent counts are encoded by them.
+    reset_flags(&mut core);
     core
+}
+
+/// `di_flags` cleared, and `di_flags2` down to the bits that describe the
+/// filesystem's encoding: what the kernel's `xfs_ifree` leaves in a free
+/// inode and `xfs_init_new_inode` starts a new one from.
+pub(crate) fn reset_flags(core: &mut [u8]) {
+    use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
+    const FLAGS: usize = 90;
+    const FLAGS2: usize = 120;
+    core[FLAGS..FLAGS + 2].copy_from_slice(&0u16.to_be_bytes());
+    let flags2 = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"));
+    core[FLAGS2..FLAGS2 + 8]
+        .copy_from_slice(&(flags2 & (DI_FLAGS2_BIGTIME | DI_FLAGS2_NREXT64)).to_be_bytes());
 }
 
 /// What converting a directory to block form produced.

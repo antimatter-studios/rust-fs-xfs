@@ -69,6 +69,11 @@ mod core_at {
     pub const SIZE: usize = 56;
     pub const GEN: usize = 92;
     pub const CHANGECOUNT: usize = 104;
+    /// `di_nextents`, then `di_anextents`: the extent counts. Under
+    /// NREXT64 the four bytes at 76 hold the attribute fork's count.
+    pub const NEXTENTS: usize = 76;
+    pub const FORKOFF: usize = 82;
+    pub const AFORMAT: usize = 83;
 }
 
 /// The inode core of a file that has just been removed.
@@ -94,8 +99,22 @@ fn emptied_core(raw: &[u8]) -> Vec<u8> {
     let at = core_at::CHANGECOUNT;
     let now = u64::from_be_bytes(core[at..at + 8].try_into().expect("8 bytes"));
     core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+
+    // AS `xfs_ifree` LEAVES IT (#189): no flags, and no attribute fork.
+    // A local fork holds no blocks, so a file with attributes passes the
+    // "holds no blocks" refusal, and its fork stayed in the free inode.
+    // The attribute extent count is the u16 at 80, or, under NREXT64, the
+    // u32 at 76; the data fork's count at 76 is already zero, because a
+    // file with extents is refused.
+    crate::create::reset_flags(&mut core);
+    core[core_at::FORKOFF] = 0;
+    core[core_at::AFORMAT] = AFORMAT_EXTENTS;
+    core[core_at::NEXTENTS..core_at::FORKOFF].fill(0);
     core
 }
+
+/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
+const AFORMAT_EXTENTS: u8 = 2;
 
 impl Filesystem {
     /// Remove `name` from `parent`, freeing the inode it names.

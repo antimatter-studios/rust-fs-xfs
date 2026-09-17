@@ -8,6 +8,12 @@ never does.
 
 ### Fixed
 
+- **A created file no longer inherits the flags of the file its inode last
+  held.** `unlink_file` left `di_flags`, `di_flags2` and the attribute fork
+  in the inode it freed, and `create_file` read them back, so a new file
+  could come out immutable, append-only, real-time or reflinked. A freed
+  inode is now reset the way the kernel's `xfs_ifree` resets it, and a
+  created one starts with no flags beyond `BIGTIME` and `NREXT64` (#189).
 - **In-place writes are refused once a mount has logged a change.** A
   logged operation writes only its record, so the disk is out of date until
   replay. `write_at`, `set_attributes` and `truncate` read that stale disk:
