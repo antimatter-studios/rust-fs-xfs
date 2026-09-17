@@ -1,0 +1,58 @@
+# .github-guard — declarations github-guard reads (see the github-guard skill:
+# https://github.com/antimatter-studios/agent-skills/blob/main/.claude/skills/github-guard/README.md).
+# git-config format: check with `git config -f .github-guard --list`, and
+# double-quote any value containing # or ;.
+
+# Required status checks for main. A declaration beats discovery exactly.
+#
+# Discovery requires checks BY JOB NAME, which is a guess at the PR gate and
+# drifts silently: a renamed job, an added workflow, or any future check
+# reporting under the github-actions app changes what is required without
+# anyone deciding to. Pinning it costs nothing and makes the intent reviewable.
+#
+# WHAT THIS FILE FIXES TODAY (#201). The settings page required two of the
+# three checks ci.yml produces:
+#
+#     ["test-ubuntu-latest","validate against xfs_db + in-kernel XFS driver"]
+#
+# `test-darwin` ran on every pull request, reported, and could not block one.
+# Nothing noticed, because nothing in the repository had an opinion about the
+# list: a job was added, its check was never added to a settings page nobody
+# re-reads, and the difference between "this job runs" and "this job gates"
+# was invisible from the workflow. It is written down here now, so adding a
+# job and forgetting to require it is a reviewable diff rather than a silence.
+#
+# WHY test-darwin GATES rather than advising. It builds the staticlib that
+# DiskJockey's XFS extension links against, for aarch64-apple-darwin, and runs
+# the suite on that target on an arm64 host. It is the only macOS/aarch64
+# coverage in this repository, and the failures it exists to catch are exactly
+# the ones no Linux job can see: the one target-conditional value in the C ABI
+# (ENOTSUP is 45 on Darwin and 95 on Linux, so tests/capi.rs's ENOTSUP asserts
+# were never compiled against their Darwin branch until this job existed),
+# `c_char` signedness at the C ABI boundary, and pointer-width and alignment
+# assumptions that x86_64 Linux happens to satisfy. A break there ships to the
+# consumer that links the artifact, and `test-ubuntu-latest` stays green
+# through all of it. A check that cannot block the merge it disagrees with is
+# a check that reports rather than gates.
+#
+# Only these three: they are the only checks that run on `pull_request`.
+# release.yml is `on: push: tags: ['v*']` and stress.yml is workflow_dispatch
+# plus a weekly cron, so neither reports on a pull request at all, and a
+# required check that never reports is a permanent block on every merge —
+# GitHub reads "required and absent" as pending, with enforce_admins on and
+# no failure to point at.
+#
+# No aggregate `ci-ok`-style job exists here yet, so the three real job names
+# are declared instead. An always-run job that `needs:` all three and fails on
+# failure/cancelled/skipped would be the better end state — it survives a
+# rename, a matrix split or a path filter without stranding a merge — but
+# adding one belongs in its own change, where the skipped/cancelled semantics
+# can be reviewed on their own.
+#
+# Names must match the check-run names GitHub reports, which here are the
+# `name:` of each job rather than its key: `test-${{ matrix.os }}` renders as
+# `test-ubuntu-latest`, and the kernel gate's name is a sentence with spaces.
+[checks]
+	required = test-ubuntu-latest
+	required = test-darwin
+	required = validate against xfs_db + in-kernel XFS driver
