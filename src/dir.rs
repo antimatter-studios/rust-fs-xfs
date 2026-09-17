@@ -738,7 +738,7 @@ fn data_hdr_size(magic: u32, sb: &Superblock) -> Result<usize> {
 }
 
 /// Whether a data block magic is the single-block (block form) variant.
-fn is_block_form(magic: u32) -> bool {
+pub(crate) fn is_block_form(magic: u32) -> bool {
     magic == XFS_DIR3_BLOCK_MAGIC || magic == XFS_DIR2_BLOCK_MAGIC
 }
 
