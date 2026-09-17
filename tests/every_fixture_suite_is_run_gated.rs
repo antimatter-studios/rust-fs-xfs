@@ -19,10 +19,7 @@ use std::path::{Path, PathBuf};
 /// yet, each with the issue that tracks it. An entry here that is run,
 /// or no longer reads `.vm-share`, fails the test, so the list cannot
 /// outlive its reason.
-const NOT_YET_RUN: &[(&str, &str)] = &[(
-    "deeptree_oracle",
-    "#107: no workflow builds the xfsdeep-* fixtures",
-)];
+const NOT_YET_RUN: &[(&str, &str)] = &[];
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
