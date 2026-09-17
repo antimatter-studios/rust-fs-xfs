@@ -56,6 +56,17 @@ pub use crate::format::dir::{
     XFS_DIR3_LEAF1_MAGIC, XFS_DIR3_LEAFN_MAGIC, XFS_DIR3_LEAF_HDR_SIZE,
 };
 
+/// Whether a directory entry can hold `name`: one to 255 bytes, no `/`
+/// and no NUL (the kernel's `xfs_dir2_namecheck`), and not `.` or `..`,
+/// which every directory already answers for itself.
+pub(crate) fn entry_name_is_valid(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= usize::from(u8::MAX)
+        && !name.iter().any(|&b| b == b'/' || b == 0)
+        && name != b"."
+        && name != b".."
+}
+
 /// An index entry whose address is this has been removed but not yet
 /// compacted away (`XFS_DIR2_NULL_DATAPTR`).
 const NULL_DATAPTR: u32 = 0;

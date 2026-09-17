@@ -461,7 +461,7 @@ impl Filesystem {
                 "creating writes v5 metadata; a v4 filesystem is not supported".into(),
             ));
         }
-        if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
+        if !dir::entry_name_is_valid(name) {
             return Err(Error::UnsupportedFeature(format!(
                 "{:?} is not a name a directory entry can hold",
                 String::from_utf8_lossy(name)
