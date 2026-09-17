@@ -6,6 +6,16 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **In-place writes are refused once a mount has logged a change.** A
+  logged operation writes only its record, so the disk is out of date until
+  replay. `write_at`, `set_attributes` and `truncate` read that stale disk:
+  a write after `truncate_to_zero` reported success into blocks replay then
+  frees, and an attribute change was put back by replay. They now refuse
+  after the mount's checkpoint, as a second logged operation already did
+  (#186).
+
 ### Added
 
 - **Extended attributes can be read.** `Filesystem::list_xattrs` and

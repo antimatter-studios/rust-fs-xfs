@@ -71,6 +71,7 @@ impl Filesystem {
         if data.is_empty() {
             return Ok(0);
         }
+        self.refuse_after_checkpoint()?;
 
         // A symlink is excluded as well as the obvious non-files: a short
         // one lives inline in the inode, and a long one's target length
@@ -458,6 +459,7 @@ impl Filesystem {
         let Some(device) = self.writable.as_ref() else {
             return Err(Error::ReadOnly);
         };
+        self.refuse_after_checkpoint()?;
         let at = self.inode_offset(ino)?;
         let mut raw = vec![0u8; usize::from(self.sb.inodesize)];
         device.read_at(at, &mut raw)?;

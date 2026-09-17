@@ -77,6 +77,33 @@ pub struct Filesystem {
 const DEFAULT_CACHE_BLOCKS: usize = 512;
 
 impl Filesystem {
+    /// Refuse an in-place write once this mount has written a checkpoint.
+    ///
+    /// An in-place write reads the disk and edits it. After a checkpoint
+    /// the disk no longer shows everything that has happened: the change is
+    /// in the record, and nothing has replayed it. A write built on that
+    /// view is lost at replay, which frees the blocks it filled or puts back
+    /// the inode core it edited. The in-place LSN is unchanged, so replay
+    /// takes the record's copy. Unlike [`Self::begin_checkpoint`], this
+    /// claims nothing: an in-place write before any checkpoint is exactly
+    /// as safe as it was.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] if a checkpoint has already been
+    /// written by this mount.
+    pub(crate) fn refuse_after_checkpoint(&self) -> Result<()> {
+        if self.checkpointed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::UnsupportedFeature(
+                "this mount has written a checkpoint that nothing has replayed, so the \
+                 disk an in-place write would read is out of date; mount again after the \
+                 log has been replayed"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Claim the right to write one checkpoint, or refuse.
     ///
     /// # Why a mount writes at most one
