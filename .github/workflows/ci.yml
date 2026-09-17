@@ -75,6 +75,11 @@ jobs:
       - name: The suite, and proof it was a suite rather than nothing
         run: |
           set -uo pipefail
+          # ERREXIT OFF ON PURPOSE. The runner's default shell is
+          # `bash -e -o pipefail`, so a failing run would end the step
+          # before the count below ever printed — and a truncated run is
+          # exactly the one worth naming. `rc` still decides the step.
+          set +e
           cargo test --locked --release 2>&1 | tee "$RUNNER_TEMP/release-tests.log"
           rc=${PIPESTATUS[0]}
           # Checked even when the run failed: a truncated run is worth
@@ -142,6 +147,11 @@ jobs:
       - name: The debug run, and proof it was a run rather than nothing
         run: |
           set -uo pipefail
+          # ERREXIT OFF ON PURPOSE. The runner's default shell is
+          # `bash -e -o pipefail`, so a failing run would end the step
+          # before the count below ever printed — and a truncated run is
+          # exactly the one worth naming. `rc` still decides the step.
+          set +e
           EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 | tee "$RUNNER_TEMP/lib-tests.log"
           rc=${PIPESTATUS[0]}
           ./scripts/ci-test.sh --floor-check 290 "$RUNNER_TEMP/lib-tests.log" "the debug --lib run in test-ubuntu-latest" || rc=1
@@ -200,6 +210,11 @@ jobs:
       - name: The suite on the target it ships to, and proof it ran
         run: |
           set -uo pipefail
+          # ERREXIT OFF ON PURPOSE. The runner's default shell is
+          # `bash -e -o pipefail`, so a failing run would end the step
+          # before the count below ever printed — and a truncated run is
+          # exactly the one worth naming. `rc` still decides the step.
+          set +e
           cargo test --locked --release --target aarch64-apple-darwin 2>&1 | tee "$RUNNER_TEMP/darwin-tests.log"
           rc=${PIPESTATUS[0]}
           ./scripts/ci-test.sh --floor-check 480 "$RUNNER_TEMP/darwin-tests.log" "the aarch64-apple-darwin run" || rc=1
@@ -352,6 +367,11 @@ jobs:
       - name: Replay against the kernel every oracle that can reach one
         run: |
           set -uo pipefail
+          # ERREXIT OFF ON PURPOSE. The runner's default shell is
+          # `bash -e -o pipefail`, so a failing run would end the step
+          # before the count below ever printed — and a truncated run is
+          # exactly the one worth naming. `rc` still decides the step.
+          set +e
           log="$RUNNER_TEMP/kernel-oracles.log"
           : > "$log"
           rc=0
@@ -457,6 +477,11 @@ jobs:
       - name: Run the xfsprogs-gated oracle tests
         run: |
           set -uo pipefail
+          # ERREXIT OFF ON PURPOSE. The runner's default shell is
+          # `bash -e -o pipefail`, so a failing run would end the step
+          # before the count below ever printed — and a truncated run is
+          # exactly the one worth naming. `rc` still decides the step.
+          set +e
           cargo test --locked --release -- --ignored 2>&1 | tee "$RUNNER_TEMP/ignored-tests.log"
           rc=${PIPESTATUS[0]}
           ./scripts/ci-test.sh --floor-check 12 "$RUNNER_TEMP/ignored-tests.log" "the xfsprogs-gated --ignored run" || rc=1
