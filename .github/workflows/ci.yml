@@ -344,6 +344,21 @@ jobs:
       # rather than reading .vm-share. It is ignored by default so a
       # checkout without xfsprogs stays green; xfsprogs is installed here,
       # so opt it in.
+      #
+      # Parent pointers and exchange-range need xfsprogs 6.10 or newer, and
+      # this runner's is older, so tests/parent_exchrange_oracle.rs gets a
+      # pinned build of its own through XFSPROGS_PARENT_BIN (#99).
+      - name: Cache the pinned xfsprogs build
+        uses: actions/cache@v4
+        with:
+          path: ~/xfsprogs-pinned
+          key: ${{ runner.os }}-xfsprogs-${{ hashFiles('scripts/build-xfsprogs.sh') }}
+      - name: Build the pinned xfsprogs
+        run: |
+          sudo apt-get install -y -qq liburcu-dev libinih-dev uuid-dev libblkid-dev \
+            libdevmapper-dev autoconf automake libtool gettext pkg-config
+          ./scripts/build-xfsprogs.sh ~/xfsprogs-pinned
+          echo "XFSPROGS_PARENT_BIN=$HOME/xfsprogs-pinned/sbin" >> "$GITHUB_ENV"
       - name: Run the xfsprogs-gated oracle tests
         run: cargo test --locked --release -- --ignored
 

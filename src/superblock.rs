@@ -207,10 +207,13 @@ pub mod incompat {
     pub const NEEDSREPAIR: u32 = 1 << 4;
     /// 64-bit per-inode extent counters.
     pub const NREXT64: u32 = 1 << 5;
-    /// Atomic file extent exchange (`exchrange`). Named, not read (#99).
+    /// Atomic file extent exchange (`exchrange`). Adds log items and no
+    /// structure a read walks, so it is read; writing is refused (#99).
     pub const EXCHRANGE: u32 = 1 << 6;
-    /// Parent pointers (`parent`): each inode records its parent
-    /// directory in an extended attribute. Named, not read (#99).
+    /// Parent pointers (`parent`): each link has an extended attribute in
+    /// its own namespace naming its directory, which the attribute reader
+    /// leaves out. Read; writing is refused, because every create, rename
+    /// and unlink must maintain them (#99).
     pub const PARENT: u32 = 1 << 7;
     /// The metadata directory tree (`metadir`): quota and realtime
     /// metadata reached through a hidden directory rather than by
@@ -227,7 +230,12 @@ pub mod incompat {
     /// NOT the named bits above that are absent from it: naming a bit is
     /// what lets a refusal say what stopped the mount, and adding one here
     /// would mount a volume whose layout this driver does not understand.
-    pub const SUPPORTED: u32 = FTYPE | SPINODES | META_UUID | BIGTIME | NREXT64;
+    pub const SUPPORTED: u32 =
+        FTYPE | SPINODES | META_UUID | BIGTIME | NREXT64 | EXCHRANGE | PARENT;
+
+    /// The readable bits a write does not maintain. A read-write mount
+    /// refuses them; see `Filesystem::mount_rw`.
+    pub const READ_ONLY: u32 = EXCHRANGE | PARENT;
 }
 
 /// `sb_features2` bits. Only meaningful when `MOREBITSBIT` is set in
@@ -977,11 +985,7 @@ fn reject_unsupported_features(features_incompat: u32) -> Result<()> {
         return Ok(());
     }
     let mut named = Vec::new();
-    for (bit, name) in [
-        (incompat::EXCHRANGE, "exchange-range (exchrange)"),
-        (incompat::PARENT, "parent pointers (parent)"),
-        (incompat::METADIR, "the metadata directory tree (metadir)"),
-    ] {
+    for (bit, name) in [(incompat::METADIR, "the metadata directory tree (metadir)")] {
         if unknown & bit != 0 {
             named.push(name.to_string());
             unknown &= !bit;
@@ -1026,13 +1030,14 @@ mod incompat_naming_tests {
         assert_eq!(incompat::PARENT, 1 << 7);
         assert_eq!(incompat::METADIR, 1 << 8);
         assert_eq!(
-            incompat::SUPPORTED
-                & (incompat::NEEDSREPAIR
-                    | incompat::EXCHRANGE
-                    | incompat::PARENT
-                    | incompat::METADIR),
+            incompat::SUPPORTED & (incompat::NEEDSREPAIR | incompat::METADIR),
             0,
             "a named bit must not be mounted as though its layout were understood"
+        );
+        assert_eq!(
+            incompat::SUPPORTED & incompat::READ_ONLY,
+            incompat::READ_ONLY,
+            "a bit refused for writing must still be readable"
         );
     }
 
@@ -1055,8 +1060,13 @@ mod incompat_naming_tests {
     #[test]
     fn a_refusal_names_the_features_it_knows_and_shows_the_rest() {
         assert!(refusal(incompat::METADIR).contains("metadata directory tree"));
-        assert!(refusal(incompat::PARENT).contains("parent pointers"));
-        assert!(refusal(incompat::EXCHRANGE).contains("exchange-range"));
+        for bits in [
+            incompat::PARENT,
+            incompat::EXCHRANGE,
+            incompat::PARENT | incompat::EXCHRANGE,
+        ] {
+            assert!(reject_unsupported_features(bits).is_ok(), "{bits:#x}");
+        }
         let m = refusal(incompat::FTYPE | incompat::METADIR | (1 << 20));
         assert!(m.contains("metadir") && m.contains("0x00100000"), "{m}");
         assert!(
