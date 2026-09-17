@@ -411,6 +411,37 @@ jobs:
           ./scripts/ci-test.sh --floor-check 105 "$log" "the kernel-reachable oracle suites" || rc=1
           exit "$rc"
 
+      # THE FAILURE THAT COST TWO RED `main` RUNS LEFT NOTHING BEHIND.
+      # This step keeps no artefact, so the only record of a kernel
+      # rejecting a volume is whatever the suite printed, and #199 was
+      # read from twenty lines of `xfs_repair` with the interesting part
+      # cut off. `agfl_refill` now keeps its volume when it fails (and
+      # only then); this puts it where the next reader can fetch it.
+      #
+      # `if: failure()` runs after ANY failing step above, which is why
+      # it says so when there is nothing to collect rather than failing
+      # a job that is already failing for another reason.
+      - name: Keep the volume a kernel replay was judged on
+        if: failure()
+        run: |
+          shopt -s nullglob
+          kept=(.vm-share/agfl-refill-*.img)
+          if [ ${#kept[@]} -eq 0 ]; then
+            echo "no volume kept — this failure was not agfl_refill's"
+            exit 0
+          fi
+          # --sparse because the volumes are 320 MiB holding a few of
+          # them, and the artefact upload would otherwise carry the holes.
+          tar --sparse -cJf "$RUNNER_TEMP/agfl-refill-volumes.tar.xz" "${kept[@]}"
+          ls -l "$RUNNER_TEMP/agfl-refill-volumes.tar.xz"
+      - name: Upload the kept volume
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agfl-refill-volumes
+          path: ${{ runner.temp }}/agfl-refill-volumes.tar.xz
+          if-no-files-found: ignore
+
       # The strongest check in the suite: build a block-form directory
       # from the short-form one, and require it to equal the block the
       # kernel built for the same entries, byte for byte apart from the
