@@ -174,9 +174,14 @@ fn what_a_read_costs_in_calls_to_the_device() {
     // this driver reads file data on demand, and `docs/read-path-cost.md`
     // records the uncached read at 522 calls and 754 KB. (btrfs loads its
     // tree at mount and legitimately records zero for one fixture.)
+    //
+    // ONLY WHEN THE FILES HAD BYTES TO RETURN. A freshly formatted fixture
+    // (`xfs-4ags.img`, the fallback) holds no regular files, so a correct
+    // driver reads nothing there (Greptile on #177).
     assert!(
-        uncached.read.bytes > 0,
-        "the read pass fetched no bytes from the device"
+        uncached.read_returned == 0 || uncached.read.bytes > 0,
+        "the read pass returned {} bytes and fetched none from the device",
+        uncached.read_returned
     );
     for (what, un, ca) in [
         ("walk", &uncached.walk, &cached.walk),
@@ -203,6 +208,8 @@ struct Pass {
     walk: Cost,
     stat: Cost,
     read: Cost,
+    /// Bytes the read pass's `read_file` calls returned.
+    read_returned: u64,
 }
 
 fn measure_one(img: &Path, blocks: usize) -> Pass {
@@ -291,5 +298,10 @@ fn measure_one(img: &Path, blocks: usize) -> Pass {
         "the reads returned {returned} bytes where the files declare {declared}"
     );
 
-    Pass { walk, stat, read }
+    Pass {
+        walk,
+        stat,
+        read,
+        read_returned: returned,
+    }
 }
