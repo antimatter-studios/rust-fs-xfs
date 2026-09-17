@@ -29,7 +29,7 @@ corrupt.
 | Directories | short form, block, leaf and node; rename within short form |
 | Extents / bmbt | inline extent lists and the block-map B+tree |
 | Symlinks | inline and remote (`XSLM`), across multiple extents |
-| Extended attributes | on-disk shapes documented; reading not yet |
+| Extended attributes | read (`list_xattrs`, `get_xattr`): short form, leaf, node and remote values; not written, not in the C ABI |
 | Log replay | not yet — a dirty volume is refused, not silently misread |
 | Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir, directory conversion |
 | Write path | overwrite in place, plus the journalled operations above |

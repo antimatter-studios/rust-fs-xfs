@@ -6,11 +6,9 @@
 //! the inode record. [`crate::inode::Inode::attr_fork_range`] already
 //! computes that span; `di_aformat` says how to read what is inside it.
 //!
-//! There is no attribute parser in this crate yet. This module is the
-//! groundwork for one: every structure the format defines, named field
-//! by field, so that the parser can be written against something already
-//! checked against the specification and against real filesystems rather
-//! than rediscovered a field at a time.
+//! Every structure the format defines, named field by field and checked
+//! against the specification and against real filesystems. The reader built
+//! on it is [`crate::attr`].
 //!
 //! # Which shape, and how to tell
 //!
