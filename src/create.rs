@@ -542,11 +542,24 @@ impl Filesystem {
                 // The inodes own the blocks, which is what the reverse
                 // map records: XFS_RMAP_OWN_INODES, the -7 that appears
                 // beside the group's own headers and trees.
-                let agblock = allocations.group(&self.sb, self.device(), agno)?.take(
-                    blocks,
-                    crate::rmap::OWN_INODES,
-                    0,
-                )?;
+                // On the inode alignment, where the kernel looks for the
+                // chunk's clusters (`xfs_ialloc_cluster_alignment`): when
+                // the align bit is set and the alignment is at least a
+                // cluster. Taken from the first free run long enough, the
+                // chunk started wherever that run did. On 1 KiB blocks, where
+                // the alignment is 32, the kernel then replayed its inodes
+                // over the file data at the aligned block below.
+                let cluster_blocks = self.sb.inode_cluster_bytes() / self.sb.blocksize;
+                let align = if self.sb.versionnum & crate::superblock::version_flags::ALIGNBIT != 0
+                    && self.sb.inoalignmt >= cluster_blocks
+                {
+                    self.sb.inoalignmt
+                } else {
+                    1
+                };
+                let agblock = allocations
+                    .group(&self.sb, self.device(), agno)?
+                    .take_aligned(blocks, align, crate::rmap::OWN_INODES, 0)?;
                 let startino = agblock * inopblock;
 
                 if chunks.iter().any(|c| c.startino == startino) {

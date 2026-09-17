@@ -52,6 +52,17 @@ never does.
 
 ### Fixed
 
+- **A new inode chunk starts on the inode alignment.** A create that needed
+  a new chunk took its blocks from the first free run long enough, wherever
+  that run started. The kernel finds a chunk's inodes by masking their block
+  down to `sb_inoalignmt`, so on 1 KiB blocks, where that is 32, a chunk at
+  block 91 had its inodes replayed over the file data at block 80. The
+  kernel refused the log (`xlog_recover_items_pass2`, error 117), and the
+  volume would not mount. Chunks are now taken from an aligned start, by the
+  kernel's rule in `xfs_ialloc_cluster_alignment`. On 4 KiB blocks the
+  alignment is 8, and the chunk the tests used happened to start on it.
+  `tests/inode_chunk_alignment.rs` runs creates on 1 KiB blocks, with the
+  kernel replaying every step, until a second chunk is needed.
 - **A created file no longer inherits the flags of the file its inode last
   held.** `unlink_file` left `di_flags`, `di_flags2` and the attribute fork
   in the inode it freed, and `create_file` read them back, so a new file
