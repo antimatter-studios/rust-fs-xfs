@@ -12,6 +12,28 @@ Each pass is one entry, newest first. An entry names:
 - each finding with its issue;
 - what it didn't reach, so the next pass knows where to start.
 
+## 2026-09-17, second pass: inode reuse, allocation, directory conversion
+
+Read at `e8d3f4b` (#92), taking the modules the first pass listed as not reached.
+
+| Module | Result |
+|---|---|
+| `src/unlink.rs`: the freed inode core | #189 |
+| `src/create.rs`: the created inode core | #189 |
+| `src/group_write.rs`: `GroupAlloc::open`, `take`, `give_back`, `release_shared`, `into_items` | none found |
+| `src/unlink.rs`: free-inode tree membership (`give_back`, counts) | none found |
+| `src/create.rs`: `convert_to_block_form` | none found |
+
+**Finding:**
+- **#189, fixed in #190.** A freed inode kept `di_flags`, `di_flags2` and its attribute fork, and a create read the flags back. So a file created in an inode this driver had removed inherited `IMMUTABLE`, `APPEND`, `REALTIME` or `REFLINK`. The kernel's `xfs_ifree` resets all of them. Pinned by unit tests against that rule.
+
+**Looked at and not a finding:**
+- `take` allocates one whole free run, records the rmap with its owner, and refuses a split. Tree growth goes through the AGFL.
+- `convert_to_block_form` logs only the chunks of the new block that differ from zeros, so replay leaves a recycled block's old bytes in the unused regions. The v5 write verifier recomputes the CRC over the replayed buffer, so the block stays valid. Those bytes are slack, not structure.
+- Per-AG reservations aren't honoured by `take`. Filling them can make the kernel warn at mount that the reservation failed; it doesn't corrupt anything.
+
+**Still not reached:** `src/dir_write.rs` (rename), `src/super_write.rs`, and the B+tree `relay` layout in `src/ag_btree.rs`.
+
 ## 2026-09-17: write ordering and fencing (partial)
 
 Read at `2d3d0f1` (#92). This pass covers how the write paths are ordered and fenced against each other, not every tree edit in depth.
