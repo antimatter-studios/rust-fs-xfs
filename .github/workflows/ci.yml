@@ -259,12 +259,28 @@ jobs:
       # zero-length file looks the same however its blocks were returned.
       # The before/after pair is the only oracle, so these run where the
       # pair can actually be built.
+      #
+      # Every suite whose fixtures this job builds is in the list, not
+      # only the replay ones. A fixture-gated suite left out runs only in
+      # the test job, which has no .vm-share, and skips there: capi (#104),
+      # dir_oracle (#105), rmap_oracle and refcount_oracle (#106), the
+      # nine in #108, and fs_refusals, alloc_btree_oracle and
+      # inode_alloc_oracle all passed that way without reading an image.
+      # ci-test.sh fails the job if any of them skips here, and
+      # tests/every_fixture_suite_is_run_gated.rs fails if a suite that
+      # reads .vm-share is added without being listed somewhere like this.
       - name: Replay against the kernel every oracle that can reach one
         run: |
           for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
                        create_replay_oracle log_replay_oracle file_write_replay_oracle \
                        rename_oracle write_oracle endtoend_oracle log_oracle \
-                       feature_matrix_oracle crossag_oracle; do
+                       feature_matrix_oracle crossag_oracle \
+                       dir_oracle rmap_oracle refcount_oracle \
+                       super_write_oracle inode_btree_oracle \
+                       buf_item_oracle inode_buffer_oracle log_checksum_oracle \
+                       log_encode_oracle log_dinode_oracle \
+                       file_handle_oracle read_path_cost \
+                       capi fs_refusals alloc_btree_oracle inode_alloc_oracle; do
             ./scripts/ci-test.sh --test "$suite"
           done
 
