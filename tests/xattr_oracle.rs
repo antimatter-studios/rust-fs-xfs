@@ -36,13 +36,12 @@ fn xfs_db(image: &str, args: &[String]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// `(namespace flag, on-disk name, value length)`, and what each file's
-/// attribute fork should become.
-fn plan() -> Vec<(
-    &'static str,
-    &'static str,
-    Vec<(&'static str, String, usize)>,
-)> {
+/// `(namespace flag, on-disk name, value length)`.
+type Attr = (&'static str, String, usize);
+
+/// Each file, the shape `xfs_db` must report for its attribute fork, and
+/// the attributes it is given.
+fn plan() -> Vec<(&'static str, &'static str, Vec<Attr>)> {
     let many = |n: usize, len: usize| {
         (0..n)
             .map(|i| {
