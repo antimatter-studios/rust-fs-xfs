@@ -69,6 +69,11 @@ mod core_at {
     pub const SIZE: usize = 56;
     pub const GEN: usize = 92;
     pub const CHANGECOUNT: usize = 104;
+    /// `di_nextents`, then `di_anextents`: the extent counts. Under
+    /// NREXT64 the four bytes at 76 hold the attribute fork's count.
+    pub const NEXTENTS: usize = 76;
+    pub const FORKOFF: usize = 82;
+    pub const AFORMAT: usize = 83;
 }
 
 /// The inode core of a file that has just been removed.
@@ -94,8 +99,22 @@ fn emptied_core(raw: &[u8]) -> Vec<u8> {
     let at = core_at::CHANGECOUNT;
     let now = u64::from_be_bytes(core[at..at + 8].try_into().expect("8 bytes"));
     core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+
+    // AS `xfs_ifree` LEAVES IT (#189): no flags, and no attribute fork.
+    // A local fork holds no blocks, so a file with attributes passes the
+    // "holds no blocks" refusal, and its fork stayed in the free inode.
+    // The attribute extent count is the u16 at 80, or, under NREXT64, the
+    // u32 at 76; the data fork's count at 76 is already zero, because a
+    // file with extents is refused.
+    crate::create::reset_flags(&mut core);
+    core[core_at::FORKOFF] = 0;
+    core[core_at::AFORMAT] = AFORMAT_EXTENTS;
+    core[core_at::NEXTENTS..core_at::FORKOFF].fill(0);
     core
 }
+
+/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
+const AFORMAT_EXTENTS: u8 = 2;
 
 impl Filesystem {
     /// Remove `name` from `parent`, freeing the inode it names.
@@ -282,6 +301,46 @@ impl Filesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A removed inode is reset the way the kernel's `xfs_ifree` resets it
+    /// (#189): no flags, `di_flags2` back to the filesystem's defaults, and
+    /// no attribute fork. Otherwise a later create that reads the free
+    /// inode back hands its flags and attributes to an unrelated file.
+    #[test]
+    fn an_emptied_core_carries_no_flags_and_no_attribute_fork() {
+        use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
+        const FLAGS: usize = 90;
+        const FLAGS2: usize = 120;
+        const ANEXTENTS: usize = 80;
+        const FORKOFF: usize = 82;
+        const AFORMAT: usize = 83;
+        let mut raw = vec![0u8; 176];
+        raw[FLAGS..FLAGS + 2].copy_from_slice(&0x0018u16.to_be_bytes());
+        raw[FLAGS2..FLAGS2 + 8].copy_from_slice(&(0x2 | DI_FLAGS2_BIGTIME).to_be_bytes());
+        raw[FORKOFF] = 15;
+        raw[AFORMAT] = 1; // local
+        raw[ANEXTENTS..ANEXTENTS + 2].copy_from_slice(&3u16.to_be_bytes());
+
+        let core = emptied_core(&raw);
+        assert_eq!(
+            u16::from_be_bytes(core[FLAGS..FLAGS + 2].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().unwrap()),
+            DI_FLAGS2_BIGTIME
+        );
+        assert_eq!(core[FORKOFF], 0, "di_forkoff");
+        assert_eq!(
+            core[AFORMAT], 2,
+            "di_aformat is EXTENTS, as an empty fork is"
+        );
+        assert_eq!(
+            u16::from_be_bytes(core[ANEXTENTS..ANEXTENTS + 2].try_into().unwrap()),
+            0
+        );
+        let _ = DI_FLAGS2_NREXT64;
+    }
 
     /// A removed file has no mode, no links and no size, and its
     /// generation has moved on.

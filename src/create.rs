@@ -202,7 +202,28 @@ fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
     core[core_at::AFORMAT] = AFORMAT_EXTENTS;
     core[core_at::FORKOFF] = 0;
     core[core_at::ANEXTENTS..core_at::ANEXTENTS + 2].copy_from_slice(&0u16.to_be_bytes());
+
+    // NOTHING OF THE FILE BEFORE IT (#189). An inode this driver removed
+    // kept its flags, so a file created in it came out immutable,
+    // append-only, real-time or reflinked because the last one was. The
+    // kernel sets both words afresh (`xfs_init_new_inode`). Of `di_flags2`,
+    // only BIGTIME and NREXT64 describe the filesystem rather than the file,
+    // and the timestamps and extent counts are encoded by them.
+    reset_flags(&mut core);
     core
+}
+
+/// `di_flags` cleared, and `di_flags2` down to the bits that describe the
+/// filesystem's encoding: what the kernel's `xfs_ifree` leaves in a free
+/// inode and `xfs_init_new_inode` starts a new one from.
+pub(crate) fn reset_flags(core: &mut [u8]) {
+    use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
+    const FLAGS: usize = 90;
+    const FLAGS2: usize = 120;
+    core[FLAGS..FLAGS + 2].copy_from_slice(&0u16.to_be_bytes());
+    let flags2 = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"));
+    core[FLAGS2..FLAGS2 + 8]
+        .copy_from_slice(&(flags2 & (DI_FLAGS2_BIGTIME | DI_FLAGS2_NREXT64)).to_be_bytes());
 }
 
 /// What converting a directory to block form produced.
@@ -844,6 +865,39 @@ fn empty_short_form_dir(parent: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A created file inherits none of its free inode's flags (#189).
+    ///
+    /// The kernel's `xfs_ifree` zeroes `di_flags` and resets `di_flags2` to
+    /// the filesystem's defaults, but an inode this driver removed still
+    /// carried them. A create read them back: the new file came out
+    /// immutable, append-only, real-time or reflinked because the file
+    /// before it was. Only `BIGTIME` and `NREXT64` describe the filesystem
+    /// rather than the file.
+    #[test]
+    fn a_created_core_carries_none_of_the_free_inodes_flags() {
+        use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
+        const FLAGS: usize = 90;
+        const FLAGS2: usize = 120;
+        const REFLINK: u64 = 0x2;
+        let mut raw = vec![0u8; 176];
+        // IMMUTABLE | APPEND | REALTIME.
+        raw[FLAGS..FLAGS + 2].copy_from_slice(&(0x0008u16 | 0x0010 | 0x0001).to_be_bytes());
+        raw[FLAGS2..FLAGS2 + 8]
+            .copy_from_slice(&(REFLINK | DI_FLAGS2_BIGTIME | DI_FLAGS2_NREXT64).to_be_bytes());
+
+        let core = created_core(&raw, 0o100644, Kind::File, 0);
+        assert_eq!(
+            u16::from_be_bytes(core[FLAGS..FLAGS + 2].try_into().unwrap()),
+            0,
+            "di_flags"
+        );
+        assert_eq!(
+            u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().unwrap()),
+            DI_FLAGS2_BIGTIME | DI_FLAGS2_NREXT64,
+            "di_flags2 keeps only what describes the filesystem"
+        );
+    }
 
     /// A created file is a regular file with one link and no contents,
     /// and its generation has moved on from whatever the free inode
