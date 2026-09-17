@@ -129,6 +129,40 @@ jobs:
             echo "::endgroup::"
           done
 
+  # The platform the artifact ships to (#115). chores.yml builds
+  # libfs_xfs.a for aarch64-apple-darwin and Swift links it, but every
+  # other job here runs on Linux, so the one target-conditional value in
+  # the C ABI -- ENOTSUP, 45 on Darwin and 95 on Linux -- was never
+  # compiled with its Darwin branch, and tests/capi.rs's ENOTSUP asserts
+  # never ran against it. This builds the shipped staticlib for that
+  # triple and runs the suite there. The oracle suites are #[ignore]-gated
+  # and need xfsprogs or a VM, so they stay on the Linux jobs.
+  darwin:
+    name: test-darwin
+    # arm64 by label, not by whatever macos-latest resolves to: the tests
+    # built for aarch64-apple-darwin have to run on the host.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone sibling rust-fs-core
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-darwin-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build the shipped staticlib for aarch64-apple-darwin
+        run: cargo build --locked --release --lib --target aarch64-apple-darwin
+      - run: cargo test --locked --release --target aarch64-apple-darwin
+
   # ---------------------------------------------------------------------
   # Real-kernel cross-validation gate. This job BLOCKS — it is not
   # advisory, and it is not continue-on-error.
