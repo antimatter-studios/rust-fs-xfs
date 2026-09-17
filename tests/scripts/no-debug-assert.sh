@@ -30,9 +30,10 @@ set -euo pipefail
 # The exemption is implemented, not just stated (#136): a line inside an
 # item carrying `#[cfg(test)]` -- a `mod tests { ... }`, a test-only
 # helper `fn` -- is not a hit. The item is found by brace depth from the
-# first `{` after the attribute, with `//` comments stripped first. That
-# is a scanner, not a parser: a `{` or `}` inside a string literal in a
-# test module would miscount. `self_test` below pins the shapes it does
+# first `{` after the attribute, with string and char literals, one-line
+# block comments and `//` comments stripped first. That is a scanner, not
+# a parser: a raw string, or a string or block comment spanning lines,
+# with an unmatched brace in it would still miscount. `self_test` below pins the shapes it does
 # handle, and runs before the real scan so a broken scanner cannot pass.
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,10 +48,16 @@ cd "$REPO"
 # had been deleted, because it matched the word in a comment above it.
 scan() {
     local dir="$1"
-    find "$dir" -name '*.rs' -type f -print0 | sort -z | xargs -0 -r awk '
+    find "$dir" -name '*.rs' -type f -print0 | sort -z | xargs -0 -r awk -v charlit="'([^'\\\\\\\\]|\\\\\\\\.)'" '
         FNR == 1 { pending = 0; depth = 0 }
         {
             code = $0
+            # Literals and comments first, so a brace inside one is not
+            # counted: a string, a char literal, a one-line block
+            # comment, then a line comment.
+            gsub(/"([^"\\]|\\.)*"/, "\"\"", code)
+            gsub(charlit, "\"\"", code)
+            gsub(/\/\*([^*]|\*+[^*\/])*\*+\//, "", code)
             sub(/\/\/.*/, "", code)
             opens = gsub(/\{/, "{", code)
             closes = gsub(/\}/, "}", code)
@@ -112,6 +119,19 @@ fn test_only_helper() {
 }
 
 #[cfg(test)] mod inline { fn f() { debug_assert!(true); } }
+
+// A close brace in a literal must not end the module early, or the
+// assertion after it is reported.
+#[cfg(test)]
+mod close_braces_in_literals {
+    fn f() {
+        let _ = "} an unmatched brace in a string";
+        let _ = '}';
+        /* } in a block comment */
+        let _ = "an escaped quote \" then }";
+        debug_assert!(true);
+    }
+}
 RS
     cat > "$t/after.rs" <<'RS'
 #[cfg(test)]
@@ -130,11 +150,27 @@ use std::fmt;
 fn shipped_after_a_test_only_use() {
     debug_assert!(false);
 }
+
+// An open brace in a literal must not keep the module open past its end,
+// or the shipped function after it is exempted.
+#[cfg(test)]
+mod open_braces_in_literals {
+    fn f() {
+        let _ = "{";
+        let _ = '{';
+        /* { */
+    }
+}
+
+fn shipped_after_open_braces_in_literals() {
+    debug_assert!(false);
+}
 RS
     local got want
     got="$(scan "$t" | sed "s#^$t/##" | cut -d: -f1,2)"
     want="after.rs:8
 after.rs:15
+after.rs:30
 shipped.rs:2"
     if [ "$got" != "$want" ]; then
         echo "FAIL  the scanner's self-test: expected"
