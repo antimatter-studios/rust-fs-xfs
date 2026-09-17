@@ -316,7 +316,11 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
         last_errno_erange()
     );
     assert!(
-        buf.iter().all(|&c| c as u8 == 0x7F),
+        // `i32::from`, not `c as u8`: `c_char` is SIGNED on x86_64 and
+        // UNSIGNED on aarch64, so a cast that is necessary on one is a
+        // clippy error on the other and the pre-commit guard cannot pass
+        // on both. Widening is defined for either sign and needs no cast.
+        buf.iter().all(|&c| i32::from(c) == 0x7F),
         "a refused readlink must not have written into the buffer"
     );
     unsafe { fs_xfs_umount(fs) };
