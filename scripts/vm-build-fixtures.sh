@@ -18,28 +18,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/vm-session.sh"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$REPO/scripts/vm.sh" up
 
-GEOMETRIES=(
-    "default:"
-    "1k:-b size=1024"
-    "2k:-b size=2048"
-    "i512:-i size=512"
-    "i1k:-i size=1024"
-    "4ags:-d agcount=4"
-    "8ags:-d agcount=8"
-    "reflink:-m reflink=1,rmapbt=1"
-    "bigtime:-m bigtime=1"
-    "nocrc:-m crc=0"
-    # A v5 filesystem with sparse inodes turned off. The inode B+tree
-    # record packs a hole mask and a chunk count into the four bytes a v4
-    # record spends on a single free count, and without an image that has
-    # v5 metadata and no sparse inodes there is no way to tell whether
-    # that packing follows the format version or the feature.
-    "nosparse:-m crc=1 -i sparse=0"
-)
+# shellcheck source=scripts/fixture-geometries.sh
+source "$REPO/scripts/fixture-geometries.sh"
 
 # The loop is driven from the host so the geometry list stays in one
 # place and shell quoting stays sane.
-for geom in "${GEOMETRIES[@]}"; do
+for geom in "${XFS_GEOMETRIES[@]}"; do
     name="${geom%%:*}"
     args="${geom#*:}"
     "$REPO/scripts/vm.sh" run "
