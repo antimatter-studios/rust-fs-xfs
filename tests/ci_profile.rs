@@ -125,15 +125,37 @@ fn runs_with_overflow_checks(script: &str) -> Vec<String> {
 fn selects_release_by_short_flag(command: &str) -> bool {
     shell_commands(command).iter().any(|command| {
         let words: Vec<&str> = command.iter().map(String::as_str).collect();
-        (0..words.len()).any(|at| {
-            // `cargo` by name or by path, then any `+toolchain`, then `test`.
-            let is_cargo = words[at] == "cargo" || words[at].ends_with("/cargo");
-            let mut next = at + 1;
-            while is_cargo && words.get(next).is_some_and(|w| w.starts_with('+')) {
-                next += 1;
-            }
-            is_cargo && words.get(next) == Some(&"test") && release_in(&words[next + 1..])
-        })
+        // THE COMMAND WORD, NOT ANY WORD (Greptile on #181). In
+        // `echo cargo test -r` the program is `echo`, and a scan that took
+        // `cargo` wherever it appeared discarded a debug run beside it. The
+        // program is the first word after any `NAME=value` assignments.
+        let at = words
+            .iter()
+            .position(|w| !is_assignment(w))
+            .unwrap_or(words.len());
+        let Some(&program) = words.get(at) else {
+            return false;
+        };
+        // `cargo` by name or by path, then any `+toolchain`, then `test`.
+        if program != "cargo" && !program.ends_with("/cargo") {
+            return false;
+        }
+        let mut next = at + 1;
+        while words.get(next).is_some_and(|w| w.starts_with('+')) {
+            next += 1;
+        }
+        words.get(next) == Some(&"test") && release_in(&words[next + 1..])
+    })
+}
+
+/// Whether `word` is a `NAME=value` assignment, which the shell applies to
+/// the command that follows rather than running.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     })
 }
 
@@ -1366,6 +1388,7 @@ jobs:
             "cargo test --locked '-r'",
             "cargo test --locked \"-qr\"",
             "cargo test --locked \\-r",
+            "RUSTFLAGS=-Dwarnings cargo test --locked -r",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line),
@@ -1386,6 +1409,8 @@ jobs:
             "cargo test --locked --lib|tee -r",
             "cargo test --locked -- '-r'",
             "cargo test --locked --lib && echo 'cargo test -r'",
+            "cargo test --locked --lib && echo cargo test -r",
+            "echo cargo test -r; cargo test --locked --lib",
         ] {
             assert_eq!(
                 runs_with_overflow_checks(line).len(),
