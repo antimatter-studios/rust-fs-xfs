@@ -40,7 +40,13 @@ passed in **0.00 seconds** for want of one image.
 
 That is the thing to distrust in this repository, and `scripts/ci-test.sh`
 exists to make it loud: it fails a job when a suite skips in a job that
-built its fixtures.
+built its fixtures, and — since #201 — when a run executes fewer tests
+than the floor it was given. A skip is the loud way for a suite to prove
+nothing. Executing nothing at all is the quiet one: the harness exits 0
+on `0 passed; 0 failed` and prints no skip line for the gate to find, so
+only a count of what ran can tell that apart from a full run. Every test
+run in `ci.yml` now carries a floor measured from a real CI log, with the
+count, the date and the run id beside it.
 
 ## What the corpus caught once it ran
 

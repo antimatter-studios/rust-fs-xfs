@@ -59,7 +59,28 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       # The oracle tests are #[ignore]-gated so this stays green without
       # xfsprogs installed; the validate-kernel-xfs job below opts them in.
-      - run: cargo test --locked --release
+      #
+      # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE (#201). The
+      # harness exits 0 on "0 passed; 0 failed", so a selection that
+      # matched nothing, a build that produced no test binaries, and a
+      # suite list that came out empty all report the same green as a
+      # full run. Nothing in this job could tell those apart, and the
+      # #[ignore] gating above means "fewer tests than expected" is the
+      # normal-looking state here rather than an obvious one.
+      #
+      # 518 executed on 2026-09-17 in run 35256241155 (job 105320487901,
+      # main at 19f6acbf). The floor is 480 — the measured count less
+      # about 7%, room for a suite to be reorganised without a red job.
+      # It moves up with the suite and never down.
+      - name: The suite, and proof it was a suite rather than nothing
+        run: |
+          set -uo pipefail
+          cargo test --locked --release 2>&1 | tee "$RUNNER_TEMP/release-tests.log"
+          rc=${PIPESTATUS[0]}
+          # Checked even when the run failed: a truncated run is worth
+          # naming too, and `rc` still decides the step's fate.
+          ./scripts/ci-test.sh --floor-check 480 "$RUNNER_TEMP/release-tests.log" "the release run in test-ubuntu-latest" || rc=1
+          exit "$rc"
 
       # AND ONCE WITHOUT `--release`, WHICH IS NOT THE SAME RUN.
       #
@@ -113,7 +134,18 @@ jobs:
       # Do not remove this as a duplicate of the line above it, and do not
       # drop the variable from it. tests/ci_profile.rs asserts that a
       # cargo test here runs without --release AND sets this, and says why.
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+      #
+      # The floor for this selection is its own: --lib is a different
+      # selection from the release run above, and either can empty
+      # without the other noticing. 312 executed on 2026-09-17 in run
+      # 35256241155 (job 105320487901); floor 290.
+      - name: The debug run, and proof it was a run rather than nothing
+        run: |
+          set -uo pipefail
+          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 | tee "$RUNNER_TEMP/lib-tests.log"
+          rc=${PIPESTATUS[0]}
+          ./scripts/ci-test.sh --floor-check 290 "$RUNNER_TEMP/lib-tests.log" "the debug --lib run in test-ubuntu-latest" || rc=1
+          exit "$rc"
 
       # The VM-teardown guards, which decide whether a machine is left
       # running. They stub pgrep and vagrant, so they need neither.
@@ -161,7 +193,17 @@ jobs:
           key: ${{ runner.os }}-cargo-darwin-${{ hashFiles('**/Cargo.lock') }}
       - name: Build the shipped staticlib for aarch64-apple-darwin
         run: cargo build --locked --release --lib --target aarch64-apple-darwin
-      - run: cargo test --locked --release --target aarch64-apple-darwin
+      # Its own floor, because this is its own selection on its own
+      # host: the Linux jobs going green says nothing about whether the
+      # aarch64-apple-darwin binaries were built and run. 518 executed on
+      # 2026-09-17 in run 35256241155 (job 105320488018); floor 480.
+      - name: The suite on the target it ships to, and proof it ran
+        run: |
+          set -uo pipefail
+          cargo test --locked --release --target aarch64-apple-darwin 2>&1 | tee "$RUNNER_TEMP/darwin-tests.log"
+          rc=${PIPESTATUS[0]}
+          ./scripts/ci-test.sh --floor-check 480 "$RUNNER_TEMP/darwin-tests.log" "the aarch64-apple-darwin run" || rc=1
+          exit "$rc"
 
   # ---------------------------------------------------------------------
   # Real-kernel cross-validation gate. This job BLOCKS — it is not
@@ -309,6 +351,10 @@ jobs:
       # reads .vm-share is added without being listed somewhere like this.
       - name: Replay against the kernel every oracle that can reach one
         run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/kernel-oracles.log"
+          : > "$log"
+          rc=0
           for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
                        create_replay_oracle log_replay_oracle file_write_replay_oracle \
                        rename_oracle write_oracle endtoend_oracle log_oracle \
@@ -321,15 +367,45 @@ jobs:
                        capi fs_refusals alloc_btree_oracle inode_alloc_oracle \
                        deeptree_oracle random_operations_replay \
                        inode_chunk_alignment agfl_refill; do
-            ./scripts/ci-test.sh --test "$suite"
+            ./scripts/ci-test.sh --test "$suite" 2>&1 | tee -a "$log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$suite failed; the floor below is checked against what did run"
+              break
+            fi
           done
+          # THE TOTAL, ON TOP OF THE PER-SUITE FLOOR ci-test.sh APPLIES
+          # (#201). The script refuses any single suite that executed
+          # nothing; this refuses the step as a whole shrinking. The two
+          # answer different questions: one suite emptying is caught by
+          # the script, and the list above losing entries -- an edit that
+          # drops names from the `for` line, a `break` that fires early,
+          # a rename that leaves a suite unbuilt -- is only visible in the
+          # total.
+          #
+          # 117 executed on 2026-09-17 in run 35256241155 (job
+          # 105320488253, main at 19f6acbf), across the 31 suites listed
+          # there; agfl_refill has been added since, so the real figure
+          # today is higher. Floor 105, the measured count less about
+          # 10%. Raise it, never lower it.
+          ./scripts/ci-test.sh --floor-check 105 "$log" "the kernel-reachable oracle suites" || rc=1
+          exit "$rc"
 
       # The strongest check in the suite: build a block-form directory
       # from the short-form one, and require it to equal the block the
       # kernel built for the same entries, byte for byte apart from the
       # checksum and sequence number it stamps after logging.
       - name: Compare our block-form directory against the kernel's
-        run: ./scripts/ci-test.sh --test dir_block_oracle
+        #
+        # CI_TEST_FLOOR, not an argument: an option between the script
+        # and `--test` would make tests/every_fixture_suite_is_run_gated.rs
+        # read this suite as unrun. 3 executed on 2026-09-17 in run
+        # 35256241155 (job 105320488253), and the floor is 3 rather than
+        # the measured count less a margin: a margin under a three-test
+        # oracle is a floor of 2, which is one silently dropped
+        # comparison away from meaning nothing. Dropping a case here is
+        # meant to be a deliberate edit to this line.
+        run: CI_TEST_FLOOR=3 ./scripts/ci-test.sh --test dir_block_oracle
 
       # The comparison itself: parse each image with this driver and
       # require every field to equal what xfs_db reported for it. This
@@ -338,7 +414,14 @@ jobs:
       # which would leave the images disagreeing with the dumps that were
       # taken straight out of mkfs.
       - name: Cross-validate every superblock field against xfs_db
-        run: ./scripts/ci-test.sh --test oracle_vm_fixtures
+        #
+        # 5 executed on 2026-09-17 in run 35256241155 (job 105320488253)
+        # — one per fixture geometry — and the floor is that count for
+        # the same reason as dir_block_oracle above: this is the suite
+        # whose whole purpose is comparing against xfs_db, and a
+        # geometry quietly disappearing from .vm-share takes its
+        # comparison with it while the rest still reports ok.
+        run: CI_TEST_FLOOR=5 ./scripts/ci-test.sh --test oracle_vm_fixtures
 
       # The #[ignore]-gated oracle suite in tests/oracle_mkfs.rs does the
       # same field-by-field comparison, but builds its own images inline
@@ -360,8 +443,24 @@ jobs:
             libdevmapper-dev autoconf automake libtool gettext pkg-config
           ./scripts/build-xfsprogs.sh ~/xfsprogs-pinned
           echo "XFSPROGS_PARENT_BIN=$HOME/xfsprogs-pinned/sbin" >> "$GITHUB_ENV"
+      #
+      # THIS ONE DOES NOT GO THROUGH ci-test.sh, so it gets its floor
+      # inline. That bypass is #200's subject — the skip gate cannot see
+      # this run, and tests/oracle_mkfs.rs prints a skip note per field
+      # it cannot compare — and it is deliberately not fixed here. The
+      # floor is the half that does not need the rerouting: `--ignored`
+      # selects a disjoint set from every other run in this file, so it
+      # can empty on its own, and an #[ignore] attribute added or a
+      # filter that stops matching would leave "0 passed" and a green
+      # step. 14 executed on 2026-09-17 in run 35256241155 (job
+      # 105320488253); floor 12.
       - name: Run the xfsprogs-gated oracle tests
-        run: cargo test --locked --release -- --ignored
+        run: |
+          set -uo pipefail
+          cargo test --locked --release -- --ignored 2>&1 | tee "$RUNNER_TEMP/ignored-tests.log"
+          rc=${PIPESTATUS[0]}
+          ./scripts/ci-test.sh --floor-check 12 "$RUNNER_TEMP/ignored-tests.log" "the xfsprogs-gated --ignored run" || rc=1
+          exit "$rc"
 
       # Mounting is the end of the argument. xfs_db agreeing with us
       # proves we read the metadata correctly; the kernel mounting the
