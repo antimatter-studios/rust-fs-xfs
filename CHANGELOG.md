@@ -8,6 +8,15 @@ never does.
 
 ### Added
 
+- **Volumes with parent pointers or exchange-range can be read.** Both
+  incompat bits are accepted by a read-only mount. `mkfs.xfs -n parent=1`
+  sets both, and `-i exchange=1` sets exchange-range alone. Parent pointers
+  are attributes in their own namespace, which `list_xattrs` already leaves
+  out. `mount_rw` refuses either bit, saying the volume can be read but not
+  written, because no write here maintains parent pointers.
+  `tests/parent_exchrange_oracle.rs` builds both kinds of volume with a
+  pinned xfsprogs 6.13 (`scripts/build-xfsprogs.sh`), which CI builds and
+  caches (#99).
 - **Extended attributes can be read.** `Filesystem::list_xattrs` and
   `get_xattr` read an inode's attribute fork in every shape: short form
   inline in the inode, a single leaf block, a node B-tree over chained
