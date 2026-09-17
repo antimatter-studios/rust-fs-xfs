@@ -93,8 +93,10 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
     let replay = format!(
         r#"
         m=$(mktemp -d)
+        mounted=no
         if mount -o loop,nouuid /share/{name} "$m"; then
             umount "$m"
+            mounted=yes
             echo MOUNTED
         else
             echo MOUNT_FAILED
@@ -103,7 +105,17 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
         rmdir "$m"
         out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
         echo "REPAIR_RC=$rc"
-        [ "$rc" = 0 ] || echo "$out" | tail -20
+        if [ "$rc" != 0 ] || [ "$mounted" != yes ]; then
+            echo "$out" | tail -20
+            xfs_db -r -c 'sb 0' -c 'print fdblocks icount ifree' /share/{name} 2>&1
+            for ag in 0 1; do
+                echo "== agf $ag"
+                xfs_db -r -c "agf $ag" \
+                    -c 'print freeblks flcount flfirst fllast btreeblks rmapblocks levels longest' \
+                    /share/{name} 2>&1
+            done
+            xfs_logprint -t /share/{name} 2>&1 | tail -20
+        fi
         echo DONE
         "#
     );
@@ -122,30 +134,11 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
                     .unwrap_or_else(|e| panic!("write {file}, after {written} writes: {e:?}"));
             }
             let out = kernel_run(&replay).expect("kernel");
-            if !(out.contains("MOUNTED") && out.contains("REPAIR_RC=0")) {
-                let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
-                let mut state = format!(
-                    "sb_fdblocks {} after {written} writes\n",
-                    fs.superblock().fdblocks
-                );
-                for ag in 0..fs.superblock().agcount {
-                    let agf = fs.read_agf(ag).unwrap();
-                    state.push_str(&format!(
-                        "AG {ag}: freeblks {} flcount {} btreeblks {} rmap_blocks {} \
-                         levels {:?} longest {}\n",
-                        agf.freeblks,
-                        agf.flcount,
-                        agf.btreeblks,
-                        agf.rmap_blocks,
-                        agf.levels,
-                        agf.longest
-                    ));
-                }
-                panic!(
-                    "after writing {file}, the kernel or xfs_repair rejected the volume:\n\
-                     {out}\n{state}"
-                );
-            }
+            assert!(
+                out.contains("MOUNTED") && out.contains("REPAIR_RC=0"),
+                "after writing {file} (write {written}), the kernel or xfs_repair \
+                 rejected the volume:\n{out}"
+            );
             written += 1;
             let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
             for ag in 0..fs.superblock().agcount {
