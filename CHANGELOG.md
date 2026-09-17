@@ -63,6 +63,17 @@ never does.
   alignment is 8, and the chunk the tests used happened to start on it.
   `tests/inode_chunk_alignment.rs` runs creates on 1 KiB blocks, with the
   kernel replaying every step, until a second chunk is needed.
+- **A group's free list is refilled.** Every block a group's B+trees grow
+  into comes off its free list (AGFL), and the driver only ever took from
+  it. On rmapbt, where a 1 KiB leaf holds 40 records, a few splits emptied
+  the list, and from then on every write that needed a tree block was
+  refused with `…free list is empty, and refilling it is not implemented`.
+  Before a group's trees are laid out again, the list is now topped up out
+  of free space to the kernel's `xfs_alloc_min_freelist`: twice the height
+  of each free-space tree and of the reverse map. Refill blocks are recorded
+  in the reverse map as `OWN_AG`. `tests/agfl_refill.rs` has the driver write
+  500 one-block files on rmapbt, with the kernel replaying each; before the
+  fix, write 432 was refused (#197).
 - **A created file no longer inherits the flags of the file its inode last
   held.** `unlink_file` left `di_flags`, `di_flags2` and the attribute fork
   in the inode it freed, and `create_file` read them back, so a new file

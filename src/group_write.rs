@@ -593,6 +593,64 @@ impl<'a> GroupAlloc<'a> {
         Ok(ranges)
     }
 
+    /// Top the free list up to what the kernel keeps in it, out of free
+    /// space, before any tree is laid out again (#197).
+    ///
+    /// Every block a tree grows into comes off this list. The kernel refills
+    /// it before each allocation (`xfs_alloc_fix_freelist`) to
+    /// `xfs_alloc_min_freelist`: for each free-space tree, and for the
+    /// reverse map where there is one, `(height + 1) * 2 - 2`, enough for a
+    /// split at every level and a new root, then the splits the refill's
+    /// own insert may cause. Taking without refilling drained the list after
+    /// a few reverse-map leaf splits, and every later allocation that grew a
+    /// tree was refused.
+    ///
+    /// A block moved onto the list stays in use by the group: the reverse
+    /// map records it as `OWN_AG`, like the trees' own blocks, and the
+    /// filesystem's free-block count does not change, as the kernel's
+    /// `XFS_AG_RESV_AGFL` allocations leave it.
+    fn refill_free_list(&mut self) -> Result<()> {
+        use crate::ag::agf_btree::{BNO, CNT, RMAP};
+        use crate::ag::offsets::agf;
+
+        let level = |tree: usize| {
+            let at = agf::LEVELS + 4 * tree;
+            u32::from_be_bytes(self.agf_raw[at..at + 4].try_into().expect("4 bytes"))
+        };
+        let mut need = 2 * level(BNO) + 2 * level(CNT);
+        if self.rmap.is_some() {
+            need += 2 * level(RMAP);
+        }
+        let need = need.min(crate::agfl::capacity(self.sb) as u32);
+
+        while self.agfl.count() < need {
+            let Some(run) = self.by_block.first().copied() else {
+                return Err(Error::UnsupportedFeature(format!(
+                    "allocation group {} has no free space left to refill its free list",
+                    self.agno
+                )));
+            };
+            let block = FreeExtent {
+                startblock: run.startblock,
+                blockcount: 1,
+            };
+            crate::alloc_btree::alloc_extent(&mut self.by_block, block)?;
+            self.agfl.put(self.sb, self.agno, block.startblock)?;
+            if let Some((records, _)) = self.rmap.as_mut() {
+                crate::rmap::insert(
+                    records,
+                    crate::rmap::Rmap {
+                        startblock: block.startblock,
+                        blockcount: 1,
+                        owner: crate::rmap::OWN_AG,
+                        offset: 0,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Lay one tree out again, through the shared layout.
     fn relay<T, E, K>(
         &mut self,
@@ -643,6 +701,8 @@ impl<'a> GroupAlloc<'a> {
         let agno = self.agno;
         let sector = u64::from(self.sb.sectsize);
         let mut items = Vec::new();
+
+        self.refill_free_list()?;
 
         let by_block = std::mem::take(&mut self.by_block);
         let mut by_count = by_block.clone();
@@ -1129,10 +1189,12 @@ mod tests {
             alloc.take(1, 131, 0).expect("second take");
             let items = alloc.into_items().expect("items");
 
+            // The fixture's free list is empty, so the refill fills it
+            // (#197) and it is logged too.
             assert_eq!(
                 items.len(),
-                3,
-                "the group header and its two free-space trees, once each"
+                4,
+                "the group header, its two free-space trees and its free list, once each"
             );
         }
 
