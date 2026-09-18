@@ -35,6 +35,27 @@ OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-sha
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
+# SUDO FOR A TOOL THAT IS NOT IN ROOT'S PATH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user -- under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME -- is simply not there when the command runs as root, and
+# the failure reads as "command not found". Carrying PATH and HOME through
+# is what the test harness does for the same reason (see
+# `tests/common/mod.rs`).
+#
+# This mattered here: the forced shutdown below ran through plain `sudo`,
+# could not find `xfs_io`, failed, and had its failure swallowed by
+# `|| true` -- so the snapshot was taken of a filesystem that had never
+# been shut down, and the fixture came out with a clean log (#211).
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
+
 for tool in mkfs.xfs xfs_db xfs_io python3; do
     command -v "$tool" >/dev/null || { echo "$tool not found (xfsprogs, python3)" >&2; exit 1; }
 done
@@ -178,7 +199,16 @@ $SUDO chmod 0600 "$mnt/d/renamed-1"
 # record and leaves a clean log however the filesystem was shut down --
 # which is what the first attempt at this fixture did, and why it has to
 # be a snapshot rather than a copy afterwards.
-$SUDO xfs_io -x -c 'shutdown -f' "$mnt" || true
+# NOT `|| true`. A shutdown that did not happen leaves a filesystem that
+# unmounts cleanly, and the fixture is then a healthy volume pretending to
+# be a crashed one -- which every suite downstream reads as a pass (#211).
+if ! as_root xfs_io -x -c 'shutdown -f' "$mnt"; then
+    $SUDO umount -l "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+    echo "xfs_io could not shut the filesystem down, so there is no dirty log to \
+capture; install xfsprogs where root can run it" >&2
+    exit 1
+fi
 $SUDO cp --sparse=always "$work" "$img"
 $SUDO umount -l "$mnt" 2>/dev/null || $SUDO umount "$mnt" 2>/dev/null || true
 rmdir "$mnt" 2>/dev/null || true
@@ -201,6 +231,15 @@ else
     echo CLEAN > xfsdirty.verdict
 fi
 echo "BUILT xfsdirty (xfs_repair says $(cat xfsdirty.verdict))"
+
+# A CLEAN VERDICT IS A FAILED BUILD, not a fixture with a note on it. The
+# suite that reads this fixture fails on it, correctly, but by then the
+# build has reported success and the reason is a hundred lines up (#211).
+if [ "$(cat xfsdirty.verdict)" != DIRTY ]; then
+    echo "xfsdirty came out with a clean log, so it is not a dirty-log fixture:" >&2
+    sed 's/^/  /' xfsdirty.repair >&2
+    exit 1
+fi
 
 echo
 echo "Data fixtures in $OUT:"
