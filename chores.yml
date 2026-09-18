@@ -32,6 +32,8 @@ chore_min_version: 0.10.0
 #                      the harness VM (vm:*)
 #   chore test:unit    tests that need no tool, no fixture and no VM
 #   chore test:images  tests that read a fixture but need no VM
+#   chore test:stress  the fsstress/fsx corpus, which `chore fixtures`
+#                      does not build by default (stress.yml runs it)
 #   chore test:oracle  the driver writes, xfsprogs reads back (xfs_repair -n
 #                      for consistency, xfs_db for content and metadata)
 #   chore test:kernel  the driver writes, THE REAL KERNEL reads back: our
@@ -268,6 +270,27 @@ tasks:
     # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
     cmds:
       - 'scripts/tier.sh test:images images 1450 82000 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
+
+  test:stress:
+    desc: 'The fsstress/fsx corpus read back — the one fixture set `chore fixtures` does not build by default'
+    # NOT PART OF `chore test`, and that is the whole reason it is a tier
+    # of its own. The corpus is three 500 MB filesystems generated from a
+    # fixed seed on top of an fstests build: tens of minutes for a result
+    # that is identical every run unless the seed, mkfs.xfs, the kernel
+    # or fstests moves. .github/workflows/stress.yml builds it weekly and
+    # on demand and runs this against it, so a change in any of those
+    # shows up as a failure there rather than the next time somebody
+    # rebuilds fixtures by hand.
+    #
+    # Before this tier existed the suite sat in `images`, where it
+    # skipped for want of the corpus on every ordinary run. A skip is not
+    # a pass, so it now fails there instead — which is what made the tier
+    # necessary rather than tidy.
+    #
+    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    cmds:
+      - 'scripts/build-fixtures.sh --check stress'
+      - 'scripts/tier.sh test:stress stress 400 24000 -- scripts/ci-test.sh $(scripts/test-targets.sh stress)'
 
   test:oracle:
     desc: 'The driver writes, xfsprogs reads back — every tool call made inside the harness VM'

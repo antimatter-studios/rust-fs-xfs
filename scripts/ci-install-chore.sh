@@ -40,6 +40,9 @@ curl -fsSL -o "$dir/checksums.txt" "$base/checksums.txt"
 tar -xzf "$dir/$tarball" -C "$dir"
 bin="$(find "$dir" -type f -name chore -perm -u+x | head -1)"
 [ -n "$bin" ] || { echo "ci-install-chore: no chore binary in $tarball" >&2; exit 1; }
-install -D -m 0755 "$bin" "$HOME/.local/bin/chore"
+# mkdir THEN install, because BSD install has no -D: on macOS
+# `install -D` is an unknown option, not a request to make the parent.
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "$bin" "$HOME/.local/bin/chore"
 [ -z "${GITHUB_PATH:-}" ] || echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 "$HOME/.local/bin/chore" --version | head -1

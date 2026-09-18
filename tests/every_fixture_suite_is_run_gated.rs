@@ -43,7 +43,7 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-const TIERS: [&str; 4] = ["unit", "images", "oracle", "kernel"];
+const TIERS: [&str; 5] = ["unit", "images", "stress", "oracle", "kernel"];
 
 /// The suites `scripts/test-targets.sh` puts in `tier`.
 fn tier_members(tier: &str) -> BTreeSet<String> {
@@ -184,6 +184,39 @@ fn no_suite_that_needs_the_guest_or_a_fixture_is_in_the_unit_tier() {
     );
 }
 
+/// Every suite `scripts/test-targets.sh` names in STRESS_SUITES really
+/// does read the fsstress/fsx corpus.
+///
+/// That list is the one place in the classifier that is a list rather
+/// than a rule, because the corpus is the one fixture set `chore
+/// fixtures` does not build and "needs it" cannot be told from "reads it
+/// when it is there" by grepping for a name: tests/stress_oracle.rs
+/// cannot run without it, tests/buf_item_oracle.rs walks whatever images
+/// exist and names the same files among them. A list can grow a suite
+/// that has nothing to do with the corpus, and that suite would then sit
+/// in a tier `chore test` never runs — coverage lost with nothing saying
+/// so. This is what stops that.
+#[test]
+fn the_stress_tier_only_holds_suites_that_read_the_corpus() {
+    let members = tier_members("stress");
+    assert!(
+        !members.is_empty(),
+        "scripts/test-targets.sh puts nothing in the stress tier, so \
+         .github/workflows/stress.yml runs nothing against the corpus it \
+         spends tens of minutes building"
+    );
+    for suite in &members {
+        let path = manifest_dir().join("tests").join(format!("{suite}.rs"));
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            source.contains("xfsstress-"),
+            "{suite} is in STRESS_SUITES but names no xfsstress- image, so `chore \
+             test` does not run it and the weekly stress workflow has no reason to"
+        );
+    }
+}
+
 #[test]
 fn every_tier_runs_through_the_skip_and_floor_gate() {
     let chores = std::fs::read_to_string(manifest_dir().join("chores.yml")).expect("read chores");
@@ -191,7 +224,7 @@ fn every_tier_runs_through_the_skip_and_floor_gate() {
     // going through scripts/ci-test.sh would take its whole set of
     // suites out of the skip gate at once.
     let mut ungated = Vec::new();
-    for tier in ["images", "oracle", "kernel"] {
+    for tier in ["images", "stress", "oracle", "kernel"] {
         let marker = format!("$(scripts/test-targets.sh {tier})");
         let line = chores
             .lines()

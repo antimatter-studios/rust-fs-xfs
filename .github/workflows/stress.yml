@@ -95,11 +95,14 @@ jobs:
       # log_dinode_oracle only, and not endtoend_oracle, which wants the
       # xfsdata-* fixtures this workflow has no reason to build.
       - name: Read the corpus back
-        run: |
-          set -euo pipefail
-          ../fs-linux-test-harness/scripts/vm.sh up
-          ./scripts/ci-test.sh --test stress_oracle
-          ./scripts/ci-test.sh --test log_dinode_oracle
+        run: chore test:stress
+      # The corpus reaches parts of the reader the hand-built fixtures do
+      # not, so a suite that walks every image is worth running against
+      # it too. This is where the bmbt addressing bug showed up: a real
+      # file lands in a later allocation group and a hand-written one
+      # does not.
+      - name: Reproduce every logged inode core from the corpus
+        run: ./scripts/ci-test.sh --test log_dinode_oracle
 
       - name: chore vm:status (the VM is down again)
         if: always()
