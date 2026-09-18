@@ -32,6 +32,14 @@ use std::sync::Arc;
 /// their metadata may or may not be.
 const SETTLED: u32 = 20;
 
+/// Directories made and then removed, so their blocks are freed and
+/// handed out again inside the range being replayed.
+const CHURN: u32 = 200;
+
+/// Files written into the churn's blocks and fsynced, so what those
+/// blocks hold afterwards is file data the log does not describe.
+const REUSED: u32 = 40;
+
 /// Files created afterwards, with nothing flushed behind them. These
 /// exist in the log and nowhere else, so a driver that does not replay
 /// cannot see one of them.
@@ -52,13 +60,17 @@ impl Drop for Scratch {
 
 /// One line per name, in the shape the guest prints: `D <path>`,
 /// `F <path> <size> <md5>`, `L <path> <target>`.
+///
+/// Ordered by path, which is what `find | sort` gives the guest — a
+/// directory immediately before what is inside it, rather than every
+/// directory first.
 fn walk(fs: &Filesystem) -> Vec<String> {
     let mut out = Vec::new();
     let root = fs.root_inode().expect("the root inode");
     let raw = fs.read_inode_raw(root.ino).expect("the root inode raw").1;
     descend(fs, &root, &raw, ".", &mut out);
-    out.sort();
-    out
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.into_iter().map(|(_, line)| line).collect()
 }
 
 fn descend(
@@ -66,7 +78,7 @@ fn descend(
     dir: &fs_xfs::inode::Inode,
     raw: &[u8],
     at: &str,
-    out: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
 ) {
     for entry in fs.read_dir(dir, raw).expect("reading a directory") {
         let name = String::from_utf8_lossy(&entry.name).to_string();
@@ -78,14 +90,20 @@ fn descend(
             .read_inode_raw(entry.ino)
             .unwrap_or_else(|e| panic!("the inode behind {path}: {e}"));
         if inode.is_dir() {
-            out.push(format!("D {path}"));
+            out.push((path.clone(), format!("D {path}")));
             descend(fs, &inode, &raw, &path, out);
         } else if inode.is_symlink() {
             let target = fs.read_link(&inode, &raw).expect("a symlink target");
-            out.push(format!("L {path} {}", String::from_utf8_lossy(&target)));
+            out.push((
+                path.clone(),
+                format!("L {path} {}", String::from_utf8_lossy(&target)),
+            ));
         } else {
             let body = fs.read_file(&inode, &raw).expect("a file's contents");
-            out.push(format!("F {path} {} {:x}", body.len(), md5(&body)));
+            out.push((
+                path.clone(),
+                format!("F {path} {} {:x}", body.len(), md5(&body)),
+            ));
         }
     }
 }
@@ -205,7 +223,38 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         ln -s ../settled/settled_0001 "$m/unflushed/link"
         mkdir "$m/unflushed/deeper"
         : > "$m/unflushed/deeper/leaf"
+        # BLOCKS FREED AND HANDED OUT AGAIN, inside the range about to be
+        # replayed: a directory grown past its inode and then emptied
+        # gives its blocks back, and what is made next takes them. Every
+        # item logged for such a block before it changed hands describes
+        # something it no longer is, and a replay that applied one would
+        # write a directory block over an inode chunk.
+        mkdir "$m/churn"
+        for i in $(seq 0 {churn_last}); do
+            mkdir "$m/churn/gone_$(printf %04d $i)"
+        done
+        rm -rf "$m/churn"
+        # And what takes those blocks back is FILE DATA, which the log
+        # does not carry: the blocks go to a file, the file is fsynced so
+        # its bytes are on disk, and nothing later re-logs them. A replay
+        # that applied the directory items from before the hand-over
+        # would write a directory block over a file's contents, and the
+        # file would read back as something else entirely.
+        mkdir "$m/reused"
+        for i in $(seq 0 {reused_last}); do
+            xfs_io -f -c 'pwrite -S 0x5a 0 262144' -c fsync \
+                "$m/reused/reused_$(printf %04d $i)" >/dev/null
+        done
+        # AN INODE UNLINKED WHILE IT IS STILL OPEN goes on the allocation
+        # group's unlinked list, which the kernel maintains through the
+        # inode *buffer* rather than the inode item beside it. It is in
+        # no directory, so neither side lists it — what it is here for is
+        # the buffer items it puts in the range.
+        : > "$m/orphan"
+        exec 9< "$m/orphan"
+        rm "$m/orphan"
         xfs_io -x -c 'shutdown -f' "$m" && echo SHUTDOWN_OK
+        exec 9<&-
         umount "$m" || umount -l "$m"
         rmdir "$m"
         cp /share/{dirty} /share/{replayed}
@@ -233,6 +282,8 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         "#,
         settled_last = SETTLED - 1,
         unflushed_last = UNFLUSHED - 1,
+        churn_last = CHURN - 1,
+        reused_last = REUSED - 1,
     )) else {
         eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
         return;
