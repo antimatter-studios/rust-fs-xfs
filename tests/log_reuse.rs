@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -173,18 +173,19 @@ fn a_mount_writes_past_the_end_of_the_log() {
             dmesg | grep -i xfs | tail -25
         fi
         rmdir "$m"
-        out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
-        echo "REPAIR_RC=$rc"
-        [ "$rc" = 0 ] || echo "$out" | tail -20
+        echo "REPAIR_BEGIN"
+        xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
         echo DONE
         "#
     ))
     .expect("kernel");
 
     assert!(
-        out.contains("MOUNTED") && out.contains("REPAIR_RC=0"),
-        "after {operations} operations the kernel or xfs_repair rejected the volume:\n{out}"
+        out.contains("MOUNTED"),
+        "after {operations} operations the kernel refused the volume:\n{out}"
     );
+    repair::assert_agreed(&out, &format!("after {operations} operations"));
     let field = |key: &str| -> String {
         out.lines()
             .find_map(|l| l.strip_prefix(&format!("{key} ")))

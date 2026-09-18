@@ -338,6 +338,25 @@ pub mod repair {
         report(out).contains(IGNORED_THE_LOG)
     }
 
+    /// Run `xfs_repair -n` here rather than in a guest, and read its
+    /// answer the same way.
+    ///
+    /// `program` because one oracle runs a build of xfsprogs newer than
+    /// the host's and has to name it.
+    pub fn assert_agreed_running(program: &str, img: &str, what: &str) {
+        let out = std::process::Command::new(program)
+            .args(["-n", img])
+            .output()
+            .unwrap_or_else(|e| panic!("{what}: {program} would not run: {e}"));
+        let said = format!(
+            "REPAIR_BEGIN\n{}{}\nREPAIR_RC={}\nREPAIR_END",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            out.status.code().unwrap_or(-1)
+        );
+        assert_agreed(&said, what);
+    }
+
     /// Read the report in `out` as a verdict on the volume, and fail
     /// unless it is one (#124).
     ///

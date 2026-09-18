@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 
 /// A directory small enough to live inside its inode, built by the
 /// fixture script with two equal-length names.
@@ -168,16 +168,7 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         "the new name should resolve to the inode the old name did\n{out}"
     );
 
-    let report: String = out
-        .lines()
-        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
-        .take_while(|l| !l.starts_with("REPAIR_END"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        report.contains("REPAIR_RC=0"),
-        "the checker rejected the filesystem after the rename:\n{report}"
-    );
+    repair::assert_agreed(&out, "the filesystem after the rename");
 }
 
 /// Renaming onto a name that is taken must be refused, and must leave

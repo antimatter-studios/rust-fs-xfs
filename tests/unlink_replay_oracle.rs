@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope.
@@ -166,16 +166,7 @@ fn unlink_and_replay(case: &str) -> Option<()> {
         );
     }
 
-    let repair: String = out
-        .lines()
-        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
-        .take_while(|l| !l.starts_with("REPAIR_END"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        repair.contains("REPAIR_RC=0"),
-        "{case}: xfs_repair found something wrong after the replay:\n{repair}"
-    );
+    repair::assert_agreed(&out, &format!("{case}, after the replay"));
 
     Some(())
 }

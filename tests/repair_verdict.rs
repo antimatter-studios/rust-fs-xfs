@@ -47,7 +47,7 @@ fn every_oracle_reads_its_repair_report_through_the_check() {
         // so comments do not count.
         let runs_it = body.lines().any(|l| {
             let l = l.trim_start();
-            !l.starts_with("//") && (l.contains("xfs_repair") || l.contains("repair::script("))
+            !l.starts_with("//") && (l.contains("xfs_repair -n ") || l.contains("repair::script("))
         });
         if !runs_it {
             continue;

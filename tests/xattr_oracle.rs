@@ -9,6 +9,13 @@
 //! tool. `xfs_repair -n` must accept the image first. Skips when xfsprogs is
 //! not installed.
 
+// Only the repair check is wanted here — this oracle runs the tools on
+// this machine rather than through a guest — and a module included whole
+// is a module whose other helpers are unused in this binary.
+#[allow(dead_code)]
+mod common;
+
+use common::repair;
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::collections::BTreeMap;
@@ -127,15 +134,7 @@ fn attributes_read_back_as_xfs_db_wrote_them() {
         }
         xfs_db(&image, &args);
     }
-    let repair = Command::new("xfs_repair")
-        .args(["-n", &image])
-        .output()
-        .unwrap();
-    assert!(
-        repair.status.success(),
-        "{}",
-        String::from_utf8_lossy(&repair.stdout)
-    );
+    repair::assert_agreed_running("xfs_repair", &image, "the fixture this oracle reads");
 
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
     for (file, shape, attrs) in &plan {
