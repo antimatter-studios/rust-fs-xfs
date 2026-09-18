@@ -170,14 +170,24 @@ impl Filesystem {
                  allocation groups to free into"
             )));
         }
-        if file.format == crate::inode::Format::Btree {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} keeps its extents in a B+tree, whose own blocks would have \
-                 to be freed alongside the file's; only an inline extent list is supported"
-            )));
-        }
-
-        let extents = self.data_extents(&file, &raw)?;
+        // A B+TREE FORK'S OWN BLOCKS GO BACK WITH THE DATA (#222). They
+        // belong to the inode — counted in di_nblocks, and mapped to it in
+        // the reverse map with OFF_BMBT_BLOCK — so a truncate that freed
+        // only the data would leave them allocated and owned by an inode
+        // that maps nothing, which is the leak the refusal here avoided.
+        let (extents, map_blocks) = match file.format {
+            crate::inode::Format::Btree => {
+                let (start, end) = file.data_fork_range(usize::from(self.sb.inodesize));
+                crate::bmbt::walk_with_blocks(
+                    &raw[start..end],
+                    file.nextents,
+                    &self.sb,
+                    ino,
+                    |fsblock| self.read_fsblock(fsblock),
+                )?
+            }
+            _ => (self.data_extents(&file, &raw)?, Vec::new()),
+        };
         if extents.is_empty() {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} has no extents to free"
@@ -200,6 +210,24 @@ impl Filesystem {
             u32,
             (Vec<FreeExtent>, Vec<crate::extent::Extent>),
         > = std::collections::BTreeMap::new();
+        // The map's blocks are freed like the data's, but their reverse-map
+        // records carry OFF_BMBT_BLOCK rather than a file offset: that is
+        // what says the block held part of the map rather than part of the
+        // file.
+        for fsblock in &map_blocks {
+            let (owner, agblock) = split_fsblock(&self.sb, *fsblock);
+            let entry = by_group.entry(owner).or_default();
+            entry.0.push(FreeExtent {
+                startblock: agblock,
+                blockcount: 1,
+            });
+            entry.1.push(crate::extent::Extent {
+                startoff: crate::rmap::OFF_BMBT_BLOCK,
+                startblock: *fsblock,
+                blockcount: 1,
+                unwritten: false,
+            });
+        }
         for extent in &extents {
             let (owner, agblock) = split_fsblock(&self.sb, extent.startblock);
             let entry = by_group.entry(owner).or_default();
@@ -220,7 +248,12 @@ impl Filesystem {
             group_items.extend(self.free_in_group(ino, *agno, freeing_here, extents_here)?);
         }
 
-        let core = emptied_core(&raw, true);
+        let mut core = emptied_core(&raw, true);
+        // THE FORK IS AN EMPTY EXTENT LIST NOW, not a tree: the tree's
+        // blocks have just been freed, so a format that still says B+tree
+        // points the reader at blocks that belong to nobody.
+        core[crate::format::log_items::log_dinode::offsets::FORMAT] =
+            crate::inode::Format::Extents as u8;
         let logged = log_dinode_from_disk(&core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
         let buffer =

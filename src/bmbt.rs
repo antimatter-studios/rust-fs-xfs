@@ -312,8 +312,36 @@ pub fn walk<F>(
     nextents: u64,
     sb: &Superblock,
     ino: u64,
-    mut read_fsblock: F,
+    read_fsblock: F,
 ) -> Result<Vec<Extent>>
+where
+    F: FnMut(u64) -> Result<Vec<u8>>,
+{
+    Ok(walk_with_blocks(fork, nextents, sb, ino, read_fsblock)?.0)
+}
+
+/// [`walk`], and the blocks the tree itself occupies.
+///
+/// A truncate needs both. The tree's blocks belong to the inode as much as
+/// the data does — they are counted in `di_nblocks` and mapped to it in the
+/// reverse map, with `OFF_BMBT_BLOCK` set — so freeing the file without
+/// freeing them leaves them allocated and owned by an inode that no longer
+/// maps anything (#222).
+///
+/// The blocks come back in the order they were visited, deepest-first
+/// within each subtree, which is the order a free wants: nothing here reads
+/// one after it has been given back.
+///
+/// # Errors
+///
+/// As [`walk`].
+pub fn walk_with_blocks<F>(
+    fork: &[u8],
+    nextents: u64,
+    sb: &Superblock,
+    ino: u64,
+    mut read_fsblock: F,
+) -> Result<(Vec<Extent>, Vec<u64>)>
 where
     F: FnMut(u64) -> Result<Vec<u8>>,
 {
@@ -325,6 +353,7 @@ where
     // overflowed `isize` into "capacity overflow". The vector grows to
     // what the tree really holds.
     let mut extents = Vec::with_capacity((nextents as usize).min(4096));
+    let mut blocks: Vec<u64> = Vec::new();
 
     // Depth-first, left to right, so records arrive in file order and
     // the check below is a plain comparison rather than a sort.
@@ -354,6 +383,7 @@ where
 
         let buf = read_fsblock(fsblock)?;
         let node = parse_block(&buf, sb, ino, fsblock, expect_level)?;
+        blocks.push(fsblock);
 
         if node.level == 0 {
             extents.extend(records(&buf, &node, ino, fsblock)?);
@@ -369,7 +399,7 @@ where
             extents.len()
         )));
     }
-    Ok(extents)
+    Ok((extents, blocks))
 }
 
 #[cfg(test)]

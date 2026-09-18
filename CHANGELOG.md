@@ -87,6 +87,14 @@ never does.
 
 ### Fixed
 
+- **A file whose extents live in a B+tree can be truncated.** Once a file has
+  more extents than its inode holds, its map moves into a B+tree, and
+  freeing such a file was refused: the tree's own blocks belong to the inode
+  and would have been left allocated. `truncate_to_zero` now walks the fork
+  with `bmbt::walk_with_blocks`, frees the data and the tree's blocks
+  together — the latter recorded in the reverse map as `OFF_BMBT_BLOCK`, as
+  the kernel records them — and puts the fork back as an empty extent list
+  (#222).
 - **A new inode chunk starts on the inode alignment.** A create that needed
   a new chunk took its blocks from the first free run long enough, wherever
   that run started. The kernel finds a chunk's inodes by masking their block
