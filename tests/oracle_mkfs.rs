@@ -309,12 +309,37 @@ fn agrees_on_1k_inodes() {
 fn agrees_on_many_allocation_groups() {
     // Forces a small agblocks and a large agblklog, exercising the
     // inode-number splitting arithmetic at an unusual shift.
-    assert_agrees_with_oracle(600, &["-d", "agcount=16"], "16-ags");
+    //
+    // 1200 MiB, not 600: the internal log has to fit inside one
+    // allocation group with room to spare, and mkfs.xfs refuses a
+    // geometry whose log would come out under 64 MB —
+    // "Log size must be at least 64MB." At sixteen groups that puts the
+    // floor at roughly a gigabyte. The old size predates the tool this
+    // suite now runs against and was never noticed, because a refused
+    // geometry used to print a skip and pass.
+    assert_agrees_with_oracle(1200, &["-d", "agcount=16"], "16-ags");
 }
 
 #[test]
-fn agrees_on_single_allocation_group() {
-    assert_agrees_with_oracle(300, &["-d", "agcount=1"], "1-ag");
+fn agrees_on_the_fewest_allocation_groups_mkfs_will_make() {
+    // TWO, BECAUSE ONE CANNOT BE BUILT. `mkfs.xfs -d agcount=1` is
+    // refused outright — "Filesystem must have at least 2 superblocks
+    // for redundancy!" — at every size, and by every version this
+    // repository has to hand: the guest's 6.1, Ubuntu's 6.6 and the
+    // pinned 6.13 all say it. A single-allocation-group XFS is not a
+    // thing mkfs makes, so there was never an image for this to compare.
+    //
+    // It asked for one for its whole existence. `mkfs` returned None on
+    // a refusal, the test printed "rejected this geometry — skipping"
+    // and returned ok, and the only run that selected it was the
+    // `--ignored` step that went round scripts/ci-test.sh (#200) — so
+    // nothing was in a position to say that the case it claimed to cover
+    // had never been built once.
+    //
+    // Two is the smallest that exists, and it still does what the case
+    // was for: the fewest groups gives the largest agblocks and the
+    // widest shift in the inode-number split.
+    assert_agrees_with_oracle(300, &["-d", "agcount=2"], "2-ags");
 }
 
 #[test]
