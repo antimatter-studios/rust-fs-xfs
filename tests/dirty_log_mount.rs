@@ -23,7 +23,7 @@
 
 mod common;
 
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -275,9 +275,9 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
             dmesg | tail -10
         fi
         rmdir "$m2"
-        out=$(xfs_repair -n /share/{replayed} 2>&1) && rc=0 || rc=$?
-        echo "REPAIR_RC=$rc"
-        [ "$rc" = 0 ] || echo "$out" | tail -20
+        echo "REPAIR_BEGIN"
+        xfs_repair -n /share/{replayed} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
         echo DONE
         "#,
         settled_last = SETTLED - 1,
@@ -293,9 +293,10 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         "building the dirty volume failed:\n{built}"
     );
     assert!(
-        built.contains("REPLAY_MOUNT_OK") && built.contains("REPAIR_RC=0"),
+        built.contains("REPLAY_MOUNT_OK"),
         "the kernel would not replay the image, so there is nothing to compare against:\n{built}"
     );
+    repair::assert_agreed(&built, "the copy the kernel replayed");
     let oracle: Vec<String> = built
         .lines()
         .filter_map(|l| l.strip_prefix("ORACLE "))
