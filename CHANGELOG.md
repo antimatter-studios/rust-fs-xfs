@@ -8,6 +8,16 @@ never does.
 
 ### Added
 
+- **A directory takes entries after it has outgrown the inode.** A
+  short-form directory that would not hold one more name was moved into a
+  block of its own, and the next entry was then refused: "has outgrown the
+  inode, so adding an entry rewrites a directory block rather than the
+  inode's own fork". A directory therefore held about two dozen names and no
+  more. A create into a directory already in block form now lays that block
+  out again with the entry in it, through the same `dir_block::build` the
+  conversion uses, and logs the block. A 4 KiB block holds about 124 names
+  of 10 characters; past that the create is refused naming leaf form, which
+  is not implemented (#215).
 - **A mount keeps going, in bounded memory.** Every buffer a record carried
   was held for as long as the mount ran and the log was never reused, so the
   memory grew with the run and the 32,751st operation was refused with
