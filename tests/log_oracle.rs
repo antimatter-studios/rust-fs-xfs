@@ -9,11 +9,14 @@
 //! notice.
 //!
 //! So there are two fixtures and both matter. Every other image in
-//! `.vm-share` was unmounted cleanly and must mount — a check that
-//! always answered "dirty" would be useless. `xfsdirty.img` was shut
-//! down mid-flight with `xfs_io -c shutdown` and snapshotted while still
-//! mounted, so its log holds work that was never applied, and it must be
-//! refused.
+//! `.vm-share` was unmounted cleanly and must mount as it stands.
+//! `xfsdirty.img` was shut down mid-flight with `xfs_io -c shutdown` and
+//! snapshotted while still mounted, so its log holds work that was never
+//! applied — and since #90 that volume mounts too, by **replaying** the
+//! log into memory rather than reading past it. What must never happen
+//! is the third thing: the structures presented as they stand on disk,
+//! silently, with the log's records ignored. The mount says which of the
+//! two it did, and that is what this checks.
 //!
 //! The work in that fixture is deliberately renames, permission changes
 //! and fresh allocations, and deliberately leaves nothing unlinked. That
@@ -44,9 +47,10 @@ fn dirty_fixture() -> Option<(PathBuf, String)> {
     Some((img, v))
 }
 
-/// A filesystem whose log holds unapplied changes must be refused.
+/// A filesystem whose log holds unapplied changes is replayed, and says
+/// so (#90).
 #[test]
-fn a_dirty_log_is_refused() {
+fn a_dirty_log_is_replayed_rather_than_read_past() {
     let Some((img, verdict)) = dirty_fixture() else {
         eprintln!("no xfsdirty fixture in .vm-share — skipping");
         return;
@@ -65,14 +69,25 @@ fn a_dirty_log_is_refused() {
     );
 
     let dev = FileDevice::open(&img).expect("open the crashed image");
-    match Filesystem::mount(Arc::new(dev)) {
-        Err(fs_xfs::Error::DirtyLog) => {}
-        Ok(_) => panic!(
-            "a filesystem xfs_repair says has unreplayed log records mounted as clean — \
-             every structure it returns may be a version the log was about to replace"
-        ),
-        Err(other) => panic!("expected DirtyLog, got {other}"),
-    }
+    let fs = Filesystem::mount(Arc::new(dev))
+        .expect("a volume whose log holds records mounts, replaying them");
+    assert!(
+        fs.was_replayed(),
+        "xfs_repair says this volume's log holds unapplied records, and the mount says \
+         it replayed nothing — so every structure it returns may be a version the log \
+         was about to replace, and nothing would say so"
+    );
+    // And it reads: a replay that produced something unreadable would
+    // otherwise pass the line above.
+    let root = fs
+        .root_inode()
+        .expect("the root inode of the replayed volume");
+    let raw = fs
+        .read_inode_raw(root.ino)
+        .expect("the root inode's record")
+        .1;
+    fs.read_dir(&root, &raw)
+        .expect("the replayed volume's root directory lists");
 }
 
 /// And every cleanly unmounted fixture must still mount.
@@ -106,8 +121,8 @@ fn cleanly_unmounted_filesystems_still_mount() {
         match Filesystem::mount(Arc::new(dev)) {
             Ok(_) => mounted += 1,
             Err(fs_xfs::Error::DirtyLog) => panic!(
-                "{name} was unmounted cleanly but the log check calls it dirty — \
-                 the check is refusing filesystems it should accept"
+                "{name} was unmounted cleanly and a read-only mount still refused it \
+                 for a dirty log, which no longer refuses anything (#90)"
             ),
             // Geometries this driver declines for other reasons are not
             // this test's business.

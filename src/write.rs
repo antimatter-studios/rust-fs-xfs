@@ -577,6 +577,7 @@ mod tests {
         Filesystem {
             device: dev.clone(),
             writable: writable.then_some(dev as Arc<dyn BlockDevice>),
+            replayed: false,
             sb: superblock(),
             overlay: None,
             oldest_record: std::sync::Mutex::new(None),

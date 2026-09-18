@@ -106,15 +106,23 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         // the fixture's own list names.
     }
 
+    // NOTHING ON DISK HOLDS ANY OF THIS; the records do. A read-only
+    // mount replays them in memory (#90), so every name created above
+    // resolves here, to the inode the driver said — which is what the
+    // kernel is asked to agree with below.
     {
         let dev = FileDevice::open(img).expect("open read-only");
-        let err = Filesystem::mount(Arc::new(dev))
-            .err()
-            .expect("a log with an unreplayed record must not mount");
-        assert!(
-            matches!(err, fs_xfs::Error::DirtyLog),
-            "{case}: expected the log to read as dirty, got {err}"
-        );
+        let fs = Filesystem::mount(Arc::new(dev))
+            .expect("a volume whose log holds records mounts, replaying them");
+        for (name, ino) in &created {
+            let found = fs
+                .lookup_path(&format!("/{name}"))
+                .unwrap_or_else(|e| panic!("{case}: {name} is missing after the replay: {e}"));
+            assert_eq!(
+                found.ino, *ino,
+                "{case}: {name} resolves to a different inode than the record gave it"
+            );
+        }
     }
 
     let checks: String = names

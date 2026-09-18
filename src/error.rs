@@ -54,8 +54,12 @@ pub enum Error {
     CorruptLog(String),
 
     /// The volume's log is dirty — it holds committed transactions that
-    /// have not been applied to the metadata. Mounting without replaying
-    /// it would present a stale, internally inconsistent filesystem.
+    /// have not been applied to the metadata.
+    ///
+    /// A read-only mount replays it into memory instead of refusing
+    /// (#90), so this is what a **read-write** mount returns: writing
+    /// new records on top of a replay held in memory means taking the
+    /// volume over, and this driver does not.
     DirtyLog,
 
     /// A path component was not found.

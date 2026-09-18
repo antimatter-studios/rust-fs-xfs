@@ -82,14 +82,17 @@ fn unlink_and_replay(case: &str) -> Option<()> {
         ino
     };
 
+    // NOTHING ON DISK HAS CHANGED; the record is the whole of it. A
+    // read-only mount replays it in memory (#90), so the name should
+    // already be gone here — and if it is not, the kernel below is being
+    // asked about a record this driver itself cannot read.
     {
         let dev = FileDevice::open(img).expect("open read-only");
-        let err = Filesystem::mount(Arc::new(dev))
-            .err()
-            .expect("a log with an unreplayed record must not mount");
+        let fs = Filesystem::mount(Arc::new(dev))
+            .expect("a volume whose log holds a record mounts, replaying it");
         assert!(
-            matches!(err, fs_xfs::Error::DirtyLog),
-            "{case}: expected the log to read as dirty, got {err}"
+            fs.lookup_path("/victim").is_err(),
+            "{case}: the victim is still there after replaying the record that removed it"
         );
     }
 

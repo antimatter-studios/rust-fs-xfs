@@ -93,16 +93,17 @@ fn replay_case(case: &str) -> Option<()> {
         assert_ne!(lsn, 0, "a record must be given a sequence number");
     }
 
-    // Nothing but the log has changed, so our own reader refuses the
-    // volume rather than reading past an unapplied record.
+    // NOTHING BUT THE LOG HAS CHANGED, and a read-only mount replays it
+    // in memory (#90): the victim is already empty here, which is what
+    // the kernel is asked to agree with below.
     {
         let dev = FileDevice::open(img).expect("open read-only");
-        let err = Filesystem::mount(Arc::new(dev))
-            .err()
-            .expect("a log with an unreplayed record must not mount");
-        assert!(
-            matches!(err, fs_xfs::Error::DirtyLog),
-            "{case}: expected the log to read as dirty, got {err}"
+        let fs = Filesystem::mount(Arc::new(dev))
+            .expect("a volume whose log holds a record mounts, replaying it");
+        let (inode, _) = fs.read_inode_raw(victim).expect("the victim inode");
+        assert_eq!(
+            inode.size, 0,
+            "{case}: the victim still has a length after replaying the truncate"
         );
     }
 

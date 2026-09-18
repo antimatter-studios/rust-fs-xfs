@@ -553,13 +553,12 @@ fn root_directory_parses_on_real_images() {
 /// `..`, and entries that name inodes which actually read. What differs
 /// is only how the directory was reached.
 fn check_subdirectories(img: &Path, label: &str) -> usize {
-    // A fixture with work still in its log cannot be mounted, and that
-    // is the driver behaving correctly rather than a failure here. Any
-    // other error is real and is raised.
+    // A fixture with work still in its log is replayed as it is mounted
+    // (#90), so it is read like any other. Anything that still refuses
+    // is a real failure and is raised.
     let fs =
         match fs_xfs::Filesystem::mount(Arc::new(FileDevice::open(img).expect("open the image"))) {
             Ok(fs) => fs,
-            Err(fs_xfs::Error::DirtyLog) => return 0,
             Err(e) => panic!("{label}: {e}"),
         };
     let sb = fs.superblock().clone();

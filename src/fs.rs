@@ -3,15 +3,25 @@
 //! Ties the parsers together into the operations a consumer actually
 //! wants: open a device, resolve a path, list a directory, read a file.
 //!
+//! # A dirty log is replayed, in memory
+//!
+//! A volume that was not unmounted cleanly holds committed transactions
+//! the metadata has never been given, and reading its structures without
+//! replaying first presents a stale tree with nothing to show it is
+//! stale. So a read-only mount replays: the records are applied over the
+//! device into an overlay, the volume itself is untouched, and what the
+//! mount reads is what the kernel would read after recovering it. See
+//! [`crate::log_recover`].
+//!
+//! A read-write mount still refuses one. Replaying into memory and then
+//! writing new records on top of it means taking the volume over, which
+//! is a larger promise than this driver makes.
+//!
 //! # What is deliberately refused
 //!
 //! A driver that guesses is worse than one that declines, so this
-//! refuses rather than approximates in three cases:
+//! refuses rather than approximates in two cases:
 //!
-//! - **A dirty log.** The log holds committed transactions that have not
-//!   reached the metadata. Mounting without replaying it presents a
-//!   stale, internally inconsistent tree. Replay is not implemented yet,
-//!   so a dirty volume is an error rather than a best effort.
 //! - **Real-time inodes.** Their extents live on a separate device this
 //!   driver was never handed.
 //! - **B+tree-format forks.** Files fragmented past what the inode can
@@ -59,6 +69,16 @@ pub struct Filesystem {
     /// path cannot compile without going through this field.
     pub(crate) writable: Option<Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
+    /// Whether this mount is a **recovery**: the volume's log held records
+    /// nothing had applied, and this mount replayed them into memory to
+    /// read through (#90).
+    ///
+    /// Worth a caller knowing. What such a mount returns is not what the
+    /// device holds — it is what the device would hold after the kernel
+    /// recovered it — and somebody imaging a disk, or deciding whether to
+    /// trust what they are seeing, is entitled to be told which of the two
+    /// they have.
+    pub(crate) replayed: bool,
     /// What this mount has logged and nothing has replayed, which is what
     /// the mount reads through so each operation is built on the last
     /// (#89). `None` on a read-only mount, which logs nothing.
@@ -419,8 +439,29 @@ impl Filesystem {
             fs_core::CachingDevice::read_only(device, u64::from(sb.blocksize), blocks)
         };
 
+        // A DIRTY LOG IS REPLAYED RATHER THAN REFUSED (#90).
+        //
+        // What the log holds is what the filesystem *is*; the structures
+        // on disk are a version it was about to replace. So the records
+        // are applied — into memory, over the device, exactly as a mount
+        // that has logged its own records reads through what it wrote.
+        // The volume itself is not touched, which is what makes this
+        // safe to do to a disk one is recovering data from.
+        let replayed = matches!(
+            log::inspect(device.as_ref(), &sb)?,
+            log::LogState::NeedsReplay
+        );
+        let device: Arc<dyn BlockRead> = if replayed {
+            let into = crate::overlay::Overlay::new(device.clone());
+            crate::log_recover::replay(device.as_ref(), &sb, &into)?;
+            Arc::new(into)
+        } else {
+            device
+        };
+
         let fs = Filesystem {
             device,
+            replayed,
             writable: None,
             sb,
             overlay: None,
@@ -429,7 +470,16 @@ impl Filesystem {
             wraps: std::sync::atomic::AtomicUsize::new(0),
             logged_anything: std::sync::atomic::AtomicBool::new(false),
         };
-        fs.check_log_is_clean()?;
+        // THE UNLINKED LIST IS ONLY CHECKED ON A VOLUME NOTHING
+        // REPLAYED. An inode left on it is one that was open when it was
+        // deleted and open still when the machine stopped; the kernel
+        // frees those as it mounts, and this driver cannot, because
+        // freeing is a write. It changes nothing this mount reports —
+        // such an inode is in no directory, so no walk reaches it —
+        // beyond the space it holds still being counted.
+        if !replayed {
+            fs.check_log_is_clean()?;
+        }
         Ok(fs)
     }
 
@@ -440,10 +490,12 @@ impl Filesystem {
     /// because nothing stopped it. A caller that wants a read-only view
     /// of a writable device keeps [`Filesystem::mount`].
     ///
-    /// The log check applies here as it does to a read-only mount, and
-    /// matters more: a volume holding unapplied log records is one whose
-    /// metadata is already out of date, and writing to it would layer
-    /// new data on top of state the log was about to replace.
+    /// A DIRTY LOG IS STILL REFUSED HERE, where a read-only mount
+    /// replays it (#90). A replay held in memory is a reading of the
+    /// volume; writing new records on top of one means taking the volume
+    /// over — the records would describe metadata no reader of the disk
+    /// alone can see, and the first push would write a recovery this
+    /// driver performed rather than one the kernel agreed to.
     ///
     /// # Errors
     ///
@@ -465,6 +517,9 @@ impl Filesystem {
         ));
         let fs = Filesystem {
             device: overlay.clone(),
+            // A read-write mount refuses a volume whose log holds
+            // records, so one that gets this far never replayed.
+            replayed: false,
             writable: Some(device),
             sb,
             overlay: Some(overlay),
@@ -694,6 +749,15 @@ impl Filesystem {
     /// by attempting a write and being refused.
     pub fn is_writable(&self) -> bool {
         self.writable.is_some()
+    }
+
+    /// Whether this mount replayed the volume's log to read it (#90).
+    ///
+    /// `true` means the volume was not unmounted cleanly and what this
+    /// mount reads is the recovered state, held in memory over an
+    /// untouched device — not what the structures on disk say.
+    pub fn was_replayed(&self) -> bool {
+        self.replayed
     }
 
     /// Byte offset of a filesystem block.

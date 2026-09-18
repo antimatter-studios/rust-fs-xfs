@@ -49,6 +49,7 @@ pub mod group_write;
 pub mod inode;
 pub mod inode_btree;
 pub mod log;
+pub(crate) mod log_recover;
 pub mod log_write;
 pub(crate) mod overlay;
 pub mod refcount;
