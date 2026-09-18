@@ -386,7 +386,7 @@ jobs:
                        file_handle_oracle read_path_cost \
                        capi fs_refusals alloc_btree_oracle inode_alloc_oracle \
                        deeptree_oracle random_operations_replay many_ops_per_mount log_reuse \
-                       block_form_insert \
+                       block_form_insert truncate_btree_fork \
                        inode_chunk_alignment agfl_refill; do
             ./scripts/ci-test.sh --test "$suite" 2>&1 | tee -a "$log"
             rc=${PIPESTATUS[0]}
