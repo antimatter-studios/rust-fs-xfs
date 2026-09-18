@@ -51,7 +51,8 @@ should not be used for anything else.
 cargo clippy --all-targets -- -D warnings    # what the pre-commit hook runs
 ```
 
-Install hooks once per clone: `./scripts/install-hooks.sh`.
+Install hooks once per clone with github-guard's installer, which puts them in
+`.git/hooks`: `~/.claude/skills/github-guard/install.sh .`
 
 ## The oracle VM
 
