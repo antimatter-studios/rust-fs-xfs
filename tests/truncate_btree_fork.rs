@@ -55,7 +55,7 @@ fn a_file_with_a_btree_fork_is_truncated() {
     // file existed is what the truncate has to give back.
     let Some(built) = kernel_run(&format!(
         r#"
-        mkfs.xfs -q -f /share/{name} 2>&1 && echo MKFS_OK
+        mkfs.xfs -q -f -m rmapbt=1 /share/{name} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
         mount -o loop /share/{name} "$m" && echo MOUNT_OK
         echo "FREE_BEFORE $(df --output=avail -k "$m" | tail -1)"

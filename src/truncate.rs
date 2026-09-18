@@ -123,11 +123,22 @@ impl Filesystem {
         // top of that.
         for extent in extents_here {
             let (_, agblock) = crate::group_write::split_fsblock(&self.sb, extent.startblock);
+            // AN UNWRITTEN EXTENT IS FLAGGED IN ITS RECORD. The kernel
+            // keeps `OFF_UNWRITTEN` in `rm_offset`, and a record is
+            // matched on its flags, so an extent the file never wrote --
+            // which is most of what speculative preallocation leaves
+            // behind -- would not be found without it.
+            let offset = extent.startoff
+                | if extent.unwritten {
+                    crate::rmap::OFF_UNWRITTEN
+                } else {
+                    0
+                };
             group.forget_rmap(crate::rmap::Rmap {
                 startblock: agblock,
                 blockcount: extent.blockcount as u32,
                 owner: ino as i64,
-                offset: extent.startoff,
+                offset,
             })?;
         }
 
@@ -214,19 +225,45 @@ impl Filesystem {
         // records carry OFF_BMBT_BLOCK rather than a file offset: that is
         // what says the block held part of the map rather than part of the
         // file.
+        //
+        // AND THEY GO BACK IN THE RUNS THE REVERSE MAP HOLDS, not one block
+        // at a time. Two map blocks that happen to adjoin are a single
+        // record there: a map block has no file offset to keep the two
+        // apart, so the kernel merges them, and the tree of a 6000-extent
+        // file has several such pairs. Freeing each block on its own then
+        // finds no record starting at the second of a pair and the whole
+        // truncate is refused -- on every volume with a reverse-mapping
+        // tree, which is every volume `mkfs.xfs` makes today.
+        let mut map_by_group: std::collections::BTreeMap<u32, Vec<u32>> =
+            std::collections::BTreeMap::new();
         for fsblock in &map_blocks {
-            let (owner, agblock) = split_fsblock(&self.sb, *fsblock);
-            let entry = by_group.entry(owner).or_default();
-            entry.0.push(FreeExtent {
-                startblock: agblock,
-                blockcount: 1,
-            });
-            entry.1.push(crate::extent::Extent {
-                startoff: crate::rmap::OFF_BMBT_BLOCK,
-                startblock: *fsblock,
-                blockcount: 1,
-                unwritten: false,
-            });
+            let (agno, agblock) = split_fsblock(&self.sb, *fsblock);
+            map_by_group.entry(agno).or_default().push(agblock);
+        }
+        for (agno, mut blocks) in map_by_group {
+            blocks.sort_unstable();
+            blocks.dedup();
+            let entry = by_group.entry(agno).or_default();
+            let mut at = 0;
+            while at < blocks.len() {
+                let startblock = blocks[at];
+                let mut blockcount = 1u32;
+                while at + 1 < blocks.len() && blocks[at + 1] == startblock + blockcount {
+                    blockcount += 1;
+                    at += 1;
+                }
+                at += 1;
+                entry.0.push(FreeExtent {
+                    startblock,
+                    blockcount,
+                });
+                entry.1.push(crate::extent::Extent {
+                    startoff: crate::rmap::OFF_BMBT_BLOCK,
+                    startblock: (u64::from(agno) << self.sb.agblklog) | u64::from(startblock),
+                    blockcount: u64::from(blockcount),
+                    unwritten: false,
+                });
+            }
         }
         for extent in &extents {
             let (owner, agblock) = split_fsblock(&self.sb, extent.startblock);
