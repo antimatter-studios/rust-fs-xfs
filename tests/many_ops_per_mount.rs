@@ -30,9 +30,14 @@ struct Scratch {
 }
 
 impl Scratch {
+    /// IN A DIRECTORY OF ITS OWN, not beside the fixtures. Cargo runs test
+    /// binaries at the same time, and the suites that scan the share take
+    /// every `.img` in it for a fixture — so a scratch image sitting there
+    /// while this test writes to it fails them with a dirty log. A
+    /// subdirectory is not an `.img`, so their scans pass it by.
     fn new(image: std::path::PathBuf) -> Self {
         let made_share = !share().exists();
-        std::fs::create_dir_all(share()).unwrap();
+        std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
         Scratch { image, made_share }
     }
 }
@@ -40,6 +45,9 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.image);
+        if let Some(dir) = self.image.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
         if self.made_share {
             let _ = std::fs::remove_dir(share());
         }
@@ -48,7 +56,7 @@ impl Drop for Scratch {
 
 #[test]
 fn a_mount_writes_several_journalled_operations() {
-    let name = format!("many-ops-{}.img", std::process::id());
+    let name = format!("many-ops/many-ops-{}.img", std::process::id());
     let image = share().join(&name);
     let _scratch = Scratch::new(image.clone());
     std::fs::File::create(&image)

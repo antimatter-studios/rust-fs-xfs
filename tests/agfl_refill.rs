@@ -58,9 +58,14 @@ struct Scratch {
 }
 
 impl Scratch {
+    /// IN A DIRECTORY OF ITS OWN, not beside the fixtures. Cargo runs test
+    /// binaries at the same time, and the suites that scan the share take
+    /// every `.img` in it for a fixture — so a scratch image sitting there
+    /// while this test writes to it fails them with a dirty log. A
+    /// subdirectory is not an `.img`, so their scans pass it by.
     fn new(image: std::path::PathBuf) -> Self {
         let made_share = !share().exists();
-        std::fs::create_dir_all(share()).unwrap();
+        std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
         Scratch { image, made_share }
     }
 }
@@ -91,7 +96,7 @@ const PER_DIR: usize = 100;
 
 #[test]
 fn writes_on_rmapbt_keep_going_past_the_free_list() {
-    let name = format!("agfl-refill-{}.img", std::process::id());
+    let name = format!("agfl-refill/agfl-refill-{}.img", std::process::id());
     let image = share().join(&name);
     let _scratch = Scratch::new(image.clone());
     std::fs::File::create(&image)
