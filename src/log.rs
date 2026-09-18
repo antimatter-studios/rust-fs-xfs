@@ -9,10 +9,10 @@
 //! Presenting that as though it were current is the worst thing a
 //! read-only driver can do, because there is no symptom: directories
 //! parse, checksums verify, files read. The data is simply old, and the
-//! caller has no way to tell. So the question this module answers is not
-//! "can we replay the log" — this driver cannot write and does not try —
-//! but "is there anything to replay", which decides whether the volume
-//! may be mounted at all.
+//! caller has no way to tell. So the question this module answers is "is
+//! there anything to replay", which decides what a mount does next:
+//! nothing, or the replay in [`crate::log_recover`], which applies the
+//! records into memory rather than to the volume.
 //!
 //! # How a clean log is recognised
 //!
@@ -179,21 +179,21 @@ pub enum LogState {
 }
 
 /// One record header found in the ring.
-struct Record {
+pub(crate) struct Record {
     /// Basic-block offset from the start of the log.
-    bb: u64,
+    pub(crate) bb: u64,
     /// `h_lsn`, which orders records: cycle in the high half, block in
     /// the low. Comparing it as one `u64` therefore orders by cycle
     /// first, which is exactly the intended ordering.
-    lsn: u64,
-    num_logops: u32,
+    pub(crate) lsn: u64,
+    pub(crate) num_logops: u32,
     /// `h_len` — payload bytes following the header blocks.
-    len: u32,
+    pub(crate) len: u32,
     /// Basic blocks this record's header occupies before its data.
-    header_blocks: u64,
+    pub(crate) header_blocks: u64,
     /// The record's header block, kept so its format field can be
     /// checked once the newest record is known.
-    header: Vec<u8>,
+    pub(crate) header: Vec<u8>,
 }
 
 /// Read the log and report whether anything in it is outstanding.
@@ -270,7 +270,7 @@ pub fn inspect(device: &dyn BlockRead, sb: &Superblock) -> Result<LogState> {
 /// [`Error::UnsupportedFeature`] for an external log, whose blocks this
 /// driver has no handle for, and [`Error::BadSuperblock`] for a length
 /// of zero, which no filesystem has.
-fn extent(sb: &Superblock) -> Result<(u64, u64)> {
+pub(crate) fn extent(sb: &Superblock) -> Result<(u64, u64)> {
     if !sb.has_internal_log() {
         return Err(Error::UnsupportedFeature(
             "the log is on a separate device, so this driver cannot address it".into(),
@@ -492,7 +492,7 @@ pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
 
 /// Walk the ring and return the record with the greatest sequence
 /// number, or `None` if it holds no records at all.
-fn scan_for_newest_record(
+pub(crate) fn scan_for_newest_record(
     device: &dyn BlockRead,
     sb: &Superblock,
     log_start: u64,

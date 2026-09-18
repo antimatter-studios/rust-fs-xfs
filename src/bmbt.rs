@@ -69,7 +69,7 @@ const KEY_LEN: usize = 8;
 const PTR_LEN: usize = 8;
 
 /// Byte offsets within an on-disk node header.
-mod offsets {
+pub(crate) mod offsets {
     pub const MAGIC: usize = 0;
     pub const LEVEL: usize = 4;
     pub const NUMRECS: usize = 6;
@@ -82,7 +82,7 @@ mod offsets {
     pub const BLKNO: usize = 24;
     pub const UUID: usize = 40;
     pub const OWNER: usize = 56;
-    pub const CRC: usize = 64;
+    pub(crate) const CRC: usize = 64;
 }
 
 /// Offsets within the in-inode root, which has no magic to precede them.

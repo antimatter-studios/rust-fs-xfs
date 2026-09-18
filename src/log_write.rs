@@ -377,6 +377,64 @@ pub fn log_dinode_from_disk(raw: &[u8]) -> std::result::Result<Vec<u8>, &'static
     Ok(out)
 }
 
+/// The inverse of [`log_dinode_from_disk`]: the core a record holds, as
+/// the disk would hold it (#90).
+///
+/// Recovery's half of the same conversion. The two forms are the same
+/// structure at the same offsets and differ only in byte order, so this
+/// is the same table of fields reversed the other way — which is why it
+/// lives beside the encoder rather than in the replayer, where the two
+/// could drift apart without anything noticing.
+///
+/// `di_crc` is left as the log holds it, which is zero: whatever writes
+/// the inode out computes it, because the value depends on every field
+/// this conversion has just changed.
+///
+/// # Errors
+///
+/// A core shorter than the version it declares, or a version this
+/// driver does not know — both of which are a record that cannot be
+/// applied rather than one to guess at.
+pub fn log_dinode_to_disk(logged: &[u8]) -> std::result::Result<Vec<u8>, &'static str> {
+    if logged.len() < V2_LOG_DINODE_SIZE {
+        return Err("logged core is shorter than a v2 core");
+    }
+    let version = logged[offsets::VERSION];
+    let size = match version {
+        1 | 2 => V2_LOG_DINODE_SIZE,
+        3 => LOG_DINODE_SIZE,
+        _ => return Err("unrecognised inode version"),
+    };
+    if logged.len() < size {
+        return Err("logged core is shorter than its version's core");
+    }
+
+    // READ FROM THE LOGGED FORM, which is native — the flags that say
+    // where the later fields are have not been swapped yet.
+    let flags2 = if version >= 3 {
+        u64::from_ne_bytes(
+            logged[offsets::FLAGS2..offsets::FLAGS2 + 8]
+                .try_into()
+                .expect("8 bytes"),
+        )
+    } else {
+        0
+    };
+    let bigtime = flags2 & DI_FLAGS2_BIGTIME != 0;
+    let nrext64 = flags2 & DI_FLAGS2_NREXT64 != 0;
+
+    let mut out = logged[..size].to_vec();
+    if cfg!(target_endian = "little") {
+        for &(at, width) in field_layout(version, bigtime, nrext64) {
+            if at + width > size {
+                continue;
+            }
+            out[at..at + width].reverse();
+        }
+    }
+    Ok(out)
+}
+
 /// Offsets within the inode core, shared by the on-disk and logged forms.
 mod offsets {
     pub const VERSION: usize = 4;

@@ -30,7 +30,7 @@ corrupt.
 | Extents / bmbt | inline extent lists and the block-map B+tree |
 | Symlinks | inline and remote (`XSLM`), across multiple extents |
 | Extended attributes | read (`list_xattrs`, `get_xattr`): short form, leaf, node and remote values; not written, not in the C ABI |
-| Log replay | not yet — a dirty volume is refused, not silently misread |
+| Log replay | read-only: a dirty volume is replayed into memory and reads as the kernel reads it; the device is not written |
 | Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir, directory conversion |
 | Write path | overwrite in place, plus the journalled operations above |
 
