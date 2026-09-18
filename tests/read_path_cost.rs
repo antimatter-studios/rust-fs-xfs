@@ -57,21 +57,26 @@ struct Cost {
     items: usize,
 }
 
+/// The fixtures worth measuring, widest first: the cost of a walk is the
+/// point, so what matters is how much tree the image holds.
+///
+/// EVERY ONE OF THESE IS POPULATED. A bare geometry image is not here, and
+/// that is the whole of this list's job: `xfs-4ags.img` used to be the last
+/// resort, and a run that fell through to it measured an empty filesystem
+/// and then failed with "the fixture had nothing to walk" — a true
+/// statement about the wrong thing, since what had gone wrong was that the
+/// populated fixtures were never built (#213).
+const POPULATED: [&str; 3] = [
+    "xfsfeat-everything.img",
+    "xfsdeep-inobt2.img",
+    "xfsdata-default.img",
+];
+
 fn fixture() -> Option<PathBuf> {
-    // The largest tree available, since the cost of a walk is the point:
-    // xfsstress corpora have the deepest, and the feature-matrix images
-    // the widest.
-    for name in [
-        "xfsfeat-everything.img",
-        "xfsdeep-inobt2.img",
-        "xfs-4ags.img",
-    ] {
-        let p = share().join(name);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    POPULATED
+        .iter()
+        .map(|name| share().join(name))
+        .find(|path| path.exists())
 }
 
 /// The counter sits BELOW the cache, so what it reports is what
@@ -146,7 +151,12 @@ fn report(what: &str, c: &Cost) {
 #[test]
 fn what_a_read_costs_in_calls_to_the_device() {
     let Some(img) = fixture() else {
-        eprintln!("no fixture to measure — skipping");
+        eprintln!(
+            "no populated fixtures ({}) — skipping. Build them with \
+             ./scripts/build-feature-matrix-fixtures.sh, ./scripts/build-deeptree-fixtures.sh \
+             or ./scripts/build-data-fixtures.sh",
+            POPULATED.join(", ")
+        );
         return;
     };
     eprintln!("measuring {}", img.display());
@@ -164,7 +174,8 @@ fn what_a_read_costs_in_calls_to_the_device() {
     // so asserting on it would be asserting that the cache failed.
     assert!(
         uncached.walk.items > 0,
-        "the fixture had nothing to walk — the measurement is of nothing"
+        "{} is populated and yet the walk found nothing, so the walk is not walking",
+        img.display()
     );
     assert!(
         uncached.walk.reads > 0 && uncached.stat.reads > 0,
