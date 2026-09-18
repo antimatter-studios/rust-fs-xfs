@@ -89,17 +89,21 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         created.push((name, ino));
 
-        // A second create on the same mount would be built from a disk
-        // that does not yet reflect the first, and would hand out the
-        // same inode again. It is refused, and this is what says so —
-        // without it the limit is a comment rather than a behaviour.
-        let err = fs
+        // A SECOND CREATE ON THE SAME MOUNT (#89). It is built from what
+        // the first logged rather than from the disk, which still shows
+        // neither — so the thing to check is that it does not hand out the
+        // inode the first one took.
+        let (second, _) = fs
             .create_file(root, b"second", 0o100644)
-            .expect_err("a second checkpoint on one mount must be refused");
-        assert!(
-            err.to_string().contains("already written a checkpoint"),
-            "{case}: the refusal should say why: {err}"
+            .unwrap_or_else(|e| panic!("{case}: a second create must be accepted: {e}"));
+        assert_ne!(
+            second, ino,
+            "{case}: the second create handed out the first's inode, so it read a disk \
+             that does not reflect the first"
         );
+        // Not added to `created`: what this case is about is the inode
+        // number, and the guest's checks below are written for the names
+        // the fixture's own list names.
     }
 
     {

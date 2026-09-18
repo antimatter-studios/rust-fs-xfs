@@ -91,6 +91,51 @@ pub struct BufferItem {
 }
 
 impl BufferItem {
+    /// Where this buffer lives, in 512-byte basic blocks.
+    pub fn blkno(&self) -> u64 {
+        self.blkno
+    }
+
+    /// The buffer as this item leaves it, which is what recovery writes
+    /// and what the mount's overlay holds until it does (#89).
+    pub fn image(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The buffer's type, which says where its checksum lives.
+    pub fn buf_type(&self) -> u16 {
+        self.buf_type
+    }
+
+    /// The buffer as it will read on disk once recovery has written it:
+    /// the logged bytes, with the checksum recovery computes (#89).
+    ///
+    /// A logged buffer carries a stale checksum on purpose — the kernel
+    /// computes one when the buffer is written, and recovery does the same
+    /// after it applies the item — so an overlay holding the logged bytes
+    /// alone is refused by this driver's own readers.
+    ///
+    /// A type whose checksum this does not know is returned unchanged,
+    /// which is what a reader that does not verify it expects anyway.
+    pub fn image_as_written(&self) -> Vec<u8> {
+        use crate::format::log_items::buf_log_format::buf_type::*;
+        let at = match self.buf_type {
+            BLFT_AGF => crate::ag::offsets::agf::CRC,
+            BLFT_AGI => crate::ag::offsets::agi::CRC,
+            BLFT_AGFL => crate::agfl::offsets::CRC,
+            BLFT_BTREE => crate::ag_btree::offsets::CRC,
+            BLFT_DIR_BLOCK => crate::format::dir::offsets::dir3_blk::CRC,
+            _ => return self.data.clone(),
+        };
+        let mut out = self.data.clone();
+        if out.len() < at + 4 {
+            return out;
+        }
+        let crc = crate::superblock::crc32c_with_zeroed_crc(&out, at);
+        out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
     /// Start an item for the block at `blkno` holding `data`.
     ///
     /// Nothing is dirty yet. `data` is the block as it currently reads;

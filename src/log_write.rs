@@ -556,11 +556,12 @@ pub fn max_payload(iclog_size: u32) -> Result<usize> {
 /// that wrong replays a record that was never committed. A log with
 /// room only past the wrap therefore reports full.
 ///
-/// It also does not move the tail. `h_tail_lsn` is set to the record's
-/// own sequence number, which is correct precisely while this is the
-/// only outstanding checkpoint — the case a driver that commits one
-/// operation at a time is always in, and a claim that stops being true
-/// the moment it commits two without an intervening replay.
+/// It also does not move the tail: `h_tail_lsn` is whatever the caller
+/// names. [`append_at`] names the record itself, which is correct while it
+/// is the only outstanding checkpoint; a mount writing several passes the
+/// first of them through [`append_at_with_tail`], because a tail past a
+/// record recovery still needs is how a filesystem loses a transaction it
+/// was told had committed (#89).
 ///
 /// # Errors
 ///
@@ -573,6 +574,29 @@ pub fn append_at(
     head: &Head,
     tid: u32,
     ops: &[Op],
+) -> Result<u64> {
+    append_at_with_tail(device, sb, head, tid, ops, lsn_of(head))
+}
+
+/// The sequence number a record written at `head` is given: its cycle and
+/// its block, which is what orders it against everything already there.
+pub fn lsn_of(head: &Head) -> u64 {
+    (u64::from(head.cycle) << 32) | u64::from(head.block)
+}
+
+/// [`append_at`], naming `tail_lsn` as the oldest record recovery still
+/// needs rather than assuming it is this one.
+///
+/// # Errors
+///
+/// As [`append_at`].
+pub fn append_at_with_tail(
+    device: &dyn fs_core::BlockDevice,
+    sb: &Superblock,
+    head: &Head,
+    tid: u32,
+    ops: &[Op],
+    tail_lsn: u64,
 ) -> Result<u64> {
     let payload = payload(tid, ops);
 
@@ -605,12 +629,12 @@ pub fn append_at(
     let mut payload = payload;
     payload.resize(padded, 0);
 
-    let lsn = (u64::from(head.cycle) << 32) | u64::from(head.block);
+    let lsn = lsn_of(head);
     let placement = Placement {
         block: head.block,
         cycle: head.cycle,
         prev_block: head.prev_block,
-        tail_lsn: lsn,
+        tail_lsn,
         uuid: sb.uuid,
         iclog_size: head.iclog_size,
     };
@@ -647,7 +671,7 @@ where
 /// both properties without a counter to keep. The high bit is set so it
 /// can never come out zero, which the kernel treats as no transaction at
 /// all.
-fn transaction_id(head: &Head) -> u32 {
+pub fn transaction_id(head: &Head) -> u32 {
     0x8000_0000 | (head.cycle.rotate_left(16) ^ head.block) & 0x7fff_ffff
 }
 
@@ -669,9 +693,9 @@ impl Filesystem {
     /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
     /// and as [`append`] otherwise.
     pub fn log_inode_core(&self, ino: u64, disk_core: &[u8]) -> Result<u64> {
-        let Some(device) = self.writable.as_ref() else {
+        if self.writable.is_none() {
             return Err(Error::ReadOnly);
-        };
+        }
         let core = log_dinode_from_disk(disk_core).map_err(|why| {
             Error::UnsupportedFeature(format!("inode {ino} cannot be logged: {why}"))
         })?;
@@ -679,11 +703,8 @@ impl Filesystem {
             InodeBuffer::containing(self.inode_offset(ino)?, self.sb.inode_cluster_bytes());
 
         // Every refusal this operation has is behind us and the next
-        // statement writes, so the mount's one checkpoint is claimed
-        // here rather than on the way in: a refusal must not spend it.
-        // See `Filesystem::begin_checkpoint`.
-        self.begin_checkpoint()?;
-        append(device.as_ref(), &self.sb, |tid| {
+        // statement writes. See `Filesystem::commit_record`.
+        let lsn = self.commit_record(|tid| {
             vec![
                 Op {
                     flags: XLOG_START_TRANS,
@@ -706,7 +727,12 @@ impl Filesystem {
                     data: Vec::new(),
                 },
             ]
-        })
+        })?;
+
+        // What the record says is now what this mount reads (#89).
+        self.logged_inode(ino, disk_core, &[])?;
+
+        Ok(lsn)
     }
 }
 

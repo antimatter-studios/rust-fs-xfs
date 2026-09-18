@@ -436,17 +436,17 @@ fn a_refused_write_leaves_the_checkpoint_for_a_real_one() {
     assert_ne!(ino, 0, "a created file must be given an inode");
     assert_ne!(lsn, 0, "a record must be given a sequence number");
 
-    // And the other direction: the token is spent by the write that was
-    // performed, so the limit still holds. A fix that simply stopped
-    // taking it would pass everything above and lose the property the
-    // whole mechanism exists for.
-    let err = fs
-        .create_file(root, b"one-too-many", 0o100644)
-        .map(|_| ())
-        .expect_err("a second checkpoint on one mount must be refused");
-    assert!(
-        err.to_string().contains("already written a checkpoint"),
-        "the second write should be refused as a second checkpoint, not as {err}"
+    // And the other direction: a second write on the same mount goes
+    // through, built on what the first logged (#89), and takes an inode of
+    // its own.
+    let (again, lsn) = fs
+        .create_file(root, b"one-more", 0o100644)
+        .expect("a second write on one mount is built on the first, not refused");
+    assert_ne!(lsn, 0, "the second record must be given a sequence number");
+    assert_ne!(
+        again, ino,
+        "the second create handed out the first's inode, so it read a disk that does \
+         not reflect the first"
     );
 }
 

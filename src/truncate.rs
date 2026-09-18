@@ -50,7 +50,7 @@ use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::group_write::{emptied_core, split_fsblock};
 use crate::log_write::{
-    append, inode_log_format, log_dinode_from_disk, trans_header, InodeBuffer, Op, XFS_ILOG_CORE,
+    inode_log_format, log_dinode_from_disk, trans_header, InodeBuffer, Op, XFS_ILOG_CORE,
     XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
@@ -151,9 +151,9 @@ impl Filesystem {
     }
 
     pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
-        let Some(device) = self.writable.as_ref() else {
+        if self.writable.is_none() {
             return Err(Error::ReadOnly);
-        };
+        }
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "truncating writes v5 metadata; a v4 filesystem is not supported".into(),
@@ -232,12 +232,7 @@ impl Filesystem {
         // went.
         let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 2;
 
-        // Every refusal this operation has is behind us and the next
-        // statement writes, so the mount's one checkpoint is claimed
-        // here rather than on the way in: a refusal must not spend it.
-        // See `Filesystem::begin_checkpoint`.
-        self.begin_checkpoint()?;
-        append(device.as_ref(), &self.sb, |tid| {
+        let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
                     flags: XLOG_START_TRANS,
@@ -264,6 +259,12 @@ impl Filesystem {
                 data: Vec::new(),
             });
             ops
-        })
+        })?;
+
+        // What the record says is now what this mount reads (#89).
+        self.logged_buffers(&group_items);
+        self.logged_inode(ino, &core, &[])?;
+
+        Ok(lsn)
     }
 }

@@ -42,8 +42,8 @@ use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
 use crate::fs::Filesystem;
 use crate::inode::Format;
 use crate::log_write::{
-    append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
-    InodeBuffer, Op, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
+    Op, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// Log operations round up to this; the data they carry does not.
@@ -159,12 +159,9 @@ impl Filesystem {
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
         // Every refusal this operation has is behind us and the next
-        // statement writes, so the mount's one checkpoint is claimed
-        // here rather than on the way in: a refusal must not spend it.
-        // See `Filesystem::begin_checkpoint`.
-        self.begin_checkpoint()?;
-        let device = self.writable.as_ref().expect("checked above");
-        append(device.as_ref(), &self.sb, |tid| {
+        // statement writes. See `Filesystem::commit_record`.
+        let logged_fork = fork_op[..dsize].to_vec();
+        let lsn = self.commit_record(|tid| {
             vec![
                 Op {
                     flags: XLOG_START_TRANS,
@@ -206,7 +203,13 @@ impl Filesystem {
                     data: Vec::new(),
                 },
             ]
-        })
+        })?;
+
+        // What the record says is now what this mount reads (#89).
+        self.logged_inode(dir_ino, &dir_core, &logged_fork)?;
+        self.logged_inode(moved_ino, &moved_core, &[])?;
+
+        Ok(lsn)
     }
 
     /// The directory's fork with `from` removed and `to` appended.

@@ -578,7 +578,8 @@ mod tests {
             device: dev.clone(),
             writable: writable.then_some(dev as Arc<dyn BlockDevice>),
             sb: superblock(),
-            checkpointed: std::sync::atomic::AtomicBool::new(false),
+            overlay: None,
+            oldest_record: std::sync::Mutex::new(None),
         }
     }
 

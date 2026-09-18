@@ -66,8 +66,8 @@ use crate::fs::Filesystem;
 use crate::inode::Format;
 use crate::inode_btree::{choose_free_inode, InodeChunk, Taken};
 use crate::log_write::{
-    append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
-    InodeBuffer, Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
+    Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// An operation's payload is padded to four bytes; a fork's own length
@@ -453,9 +453,9 @@ impl Filesystem {
     }
 
     fn create(&self, parent: u64, name: &[u8], mode: u16, kind: Kind) -> Result<(u64, u64)> {
-        let Some(device) = self.writable.as_ref() else {
+        if self.writable.is_none() {
             return Err(Error::ReadOnly);
-        };
+        }
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "creating writes v5 metadata; a v4 filesystem is not supported".into(),
@@ -524,6 +524,9 @@ impl Filesystem {
         // run. See `group_write::GroupAlloc`.
         let mut allocations = crate::group_write::Allocations::new();
         let mut icreate: Option<Vec<u8>> = None;
+        // The chunk a new icreate makes, so the overlay can hold the inodes
+        // recovery will write into it (#89).
+        let mut new_chunk: Option<(u32, u32)> = None;
         let mut added_inodes = 0u32;
 
         let (index, slot) = match choose_free_inode(&chunks) {
@@ -569,6 +572,7 @@ impl Filesystem {
                     )));
                 }
 
+                new_chunk = Some((agno, startino));
                 icreate = Some(crate::format::log_items::icreate_log_format::build(
                     agno,
                     agblock,
@@ -766,9 +770,11 @@ impl Filesystem {
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
         // here rather than on the way in: a refusal must not spend it.
-        // See `Filesystem::begin_checkpoint`.
-        self.begin_checkpoint()?;
-        let lsn = append(device.as_ref(), &self.sb, |tid| {
+        // Kept for the overlay, which needs the same bytes the record
+        // carries (#89).
+        let logged_fork = fork_op[..dsize].to_vec();
+        let logged_new_fork = new_fork_op[..new_dsize].to_vec();
+        let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
                     flags: XLOG_START_TRANS,
@@ -850,6 +856,25 @@ impl Filesystem {
             });
             ops
         })?;
+
+        // WHAT THE RECORD SAYS IS NOW WHAT THIS MOUNT READS (#89). Nothing
+        // is on disk, so the next operation would otherwise be built on the
+        // state this one started from.
+        self.logged_buffers(&allocation_items);
+        self.logged_buffers(&inode_tree_items);
+        self.logged_buffers(&extra);
+        if let Some((agno, startino)) = new_chunk {
+            // Recovery initialises every inode of a chunk an icreate item
+            // names, not only the one being created, and the next create
+            // takes its free slot from the same chunk.
+            for slot in 0..u32::from(crate::inode_btree::INODES_PER_CHUNK) {
+                let chunk_ino = self.sb.join_ino(agno, startino + slot);
+                let fresh = self.freshly_initialised_inode(chunk_ino);
+                self.logged_inode(chunk_ino, &fresh, &[])?;
+            }
+        }
+        self.logged_inode(parent, &dir_core, &logged_fork)?;
+        self.logged_inode(ino, &new_core, &logged_new_fork)?;
 
         Ok((ino, lsn))
     }

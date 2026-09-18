@@ -17,7 +17,7 @@
 //! `mkfs.xfs -p` makes a file with 64 KiB of data in one extent. Skips when
 //! xfsprogs is not installed.
 
-use fs_core::{BlockDevice, FileDevice};
+use fs_core::{BlockDevice, BlockRead, FileDevice};
 use fs_xfs::write::AttrChange;
 use fs_xfs::Filesystem;
 use std::process::Command;
@@ -72,12 +72,30 @@ fn in_place_writes_are_refused_once_the_mount_has_logged_a_change() {
 
     fs.truncate_to_zero(ino).expect("the logged truncate");
 
-    // The disk still shows the file as it was.
-    let (inode, raw) = fs.read_inode_raw(ino).unwrap();
+    // THE DISK still shows the file as it was: a record is written and
+    // nothing is applied in place. Read straight off the device, because
+    // the mount itself now reads through what it has logged (#89).
+    let mut on_disk = vec![0u8; usize::from(fs.superblock().inodesize)];
+    let at = fs.inode_offset(ino).expect("where the inode lives");
+    let disk = FileDevice::open(image.to_str().unwrap()).expect("the image itself");
+    disk.read_at(at, &mut on_disk).expect("read the disk");
+    let disk_size = u64::from_be_bytes(
+        on_disk[fs_xfs::inode::offsets::SIZE..fs_xfs::inode::offsets::SIZE + 8]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(
-        inode.size,
+        disk_size,
         body.len() as u64,
         "the record was applied in place"
+    );
+
+    // THE MOUNT reads the truncate it logged, which is what lets a second
+    // journalled operation be built on it (#89).
+    let (inode, raw) = fs.read_inode_raw(ino).unwrap();
+    assert_eq!(
+        inode.size, 0,
+        "the mount should read the size its own record logged"
     );
 
     let wrote = fs.write_at(&inode, &raw, 0, b"after");
