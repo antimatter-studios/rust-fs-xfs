@@ -380,11 +380,14 @@ tasks:
     # skipped. That is exactly how ci-test.sh's own --self-test went
     # unrun from the day it was written (#200) until it was moved here.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    # MEASURED, 2026-09-18, on this arm64 host: 20 lines / 1,062 bytes
+    # across five shell tests. The budget is double that — a shell test
+    # prints about four lines, so it is room for five more before anybody
+    # has to think about it.
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 60 4000 -- bash -c '
+        scripts/tier.sh test:scripts scripts 40 2500 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
