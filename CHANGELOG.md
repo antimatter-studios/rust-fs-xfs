@@ -8,6 +8,18 @@ never does.
 
 ### Added
 
+- **A mount writes as many journalled operations as it likes.** A record
+  changes nothing on disk, so the second operation of a mount read the state
+  the first started from — two creates handed out one inode — and the mount
+  refused it rather than write it. Every buffer a record carries now goes
+  into an overlay that a writable mount reads through, so each operation is
+  built on what its predecessors logged, which is what a replay arrives at.
+  What goes in is what recovery writes: buffer images with the checksum
+  recovery computes, inode cores with their fork and CRC, and every inode of
+  a chunk an `icreate` names. `h_tail_lsn` names the mount's first
+  outstanding record rather than the record itself, because a tail past a
+  record recovery still needs loses a committed transaction. In-place writes
+  are still refused once anything has been logged (#89).
 - **Volumes with parent pointers or exchange-range can be read.** Both
   incompat bits are accepted by a read-only mount. `mkfs.xfs -n parent=1`
   sets both, and `-i exchange=1` sets exchange-range alone. Parent pointers

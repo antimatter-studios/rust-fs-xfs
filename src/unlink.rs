@@ -54,8 +54,8 @@ use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
 use crate::inode::Format;
 use crate::log_write::{
-    append, inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header,
-    InodeBuffer, Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
+    Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// An operation's payload is padded to four bytes; a fork's own length
@@ -131,9 +131,9 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn unlink_file(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
-        let Some(device) = self.writable.as_ref() else {
+        if self.writable.is_none() {
             return Err(Error::ReadOnly);
-        };
+        }
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "removing writes v5 metadata; a v4 filesystem is not supported".into(),
@@ -246,9 +246,10 @@ impl Filesystem {
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
         // here rather than on the way in: a refusal must not spend it.
-        // See `Filesystem::begin_checkpoint`.
-        self.begin_checkpoint()?;
-        let lsn = append(device.as_ref(), &self.sb, |tid| {
+        // Kept for the overlay, which needs the same bytes the record
+        // carries (#89).
+        let logged_fork = fork_op[..dsize].to_vec();
+        let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
                     flags: XLOG_START_TRANS,
@@ -293,6 +294,11 @@ impl Filesystem {
             });
             ops
         })?;
+
+        // What the record says is now what this mount reads (#89).
+        self.logged_buffers(&group_items);
+        self.logged_inode(parent, &dir_core, &logged_fork)?;
+        self.logged_inode(ino, &victim_core, &[])?;
 
         Ok((ino, lsn))
     }

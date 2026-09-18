@@ -35,7 +35,7 @@ use crate::inode::{Format, Inode};
 use crate::log;
 use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 use fs_core::{BlockDevice, BlockRead};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// File byte offset at which a directory's leaf blocks begin.
 ///
@@ -59,11 +59,13 @@ pub struct Filesystem {
     /// path cannot compile without going through this field.
     pub(crate) writable: Option<Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
-    /// Whether this mount has already written a checkpoint into the log.
-    ///
-    /// See [`Filesystem::begin_checkpoint`] for why a second one is
-    /// refused rather than written.
-    pub(crate) checkpointed: std::sync::atomic::AtomicBool,
+    /// What this mount has logged and nothing has replayed, which is what
+    /// the mount reads through so each operation is built on the last
+    /// (#89). `None` on a read-only mount, which logs nothing.
+    pub(crate) overlay: Option<Arc<crate::overlay::Overlay>>,
+    /// The sequence number of this mount's first outstanding record, which
+    /// is the tail every later record has to name.
+    pub(crate) oldest_record: Mutex<Option<u64>>,
 }
 
 /// How many filesystem blocks a mount caches by default.
@@ -93,7 +95,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] if a checkpoint has already been
     /// written by this mount.
     pub(crate) fn refuse_after_checkpoint(&self) -> Result<()> {
-        if self.checkpointed.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.overlay.as_ref().is_some_and(|o| !o.is_empty()) {
             return Err(Error::UnsupportedFeature(
                 "this mount has written a checkpoint that nothing has replayed, so the \
                  disk an in-place write would read is out of date; mount again after the \
@@ -104,71 +106,118 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Claim the right to write one checkpoint, or refuse.
+    /// Write one record, and make this mount read as though it had been
+    /// replayed (#89).
     ///
-    /// # Why a mount writes at most one
+    /// # Why a mount can write more than one
     ///
-    /// A journalled operation here writes a record and **touches nothing
-    /// on disk**. That is what makes each one checkable — a filesystem
-    /// that came out different is one something replayed — but it means
-    /// a second operation would read the same disk the first one read,
-    /// as though the first had never happened. Two creates in a row hand
-    /// out the same inode; a truncate followed by an allocation hands
-    /// out blocks that are still recorded as in use.
+    /// A journalled operation writes a record and touches nothing on disk,
+    /// so a second operation would read the disk the first one read: two
+    /// creates would hand out one inode, and a truncate followed by an
+    /// allocation would hand out blocks the record had only promised to
+    /// free. A mount used to refuse the second outright for exactly that
+    /// reason.
     ///
-    /// It is not only the reads. `h_tail_lsn` is written as the record's
-    /// own sequence number, which is true precisely while there is one
-    /// outstanding checkpoint and false the moment there are two, and a
-    /// tail that points past a record recovery still needs is how a
-    /// filesystem loses a transaction it was told had committed.
+    /// What makes it safe is that the buffers a record carries are kept in
+    /// [`crate::overlay::Overlay`], which every read on a writable mount
+    /// goes through, so each operation is built on the state its
+    /// predecessors logged rather than on the disk they left alone.
     ///
-    /// Supporting more means keeping the changed metadata in memory and
-    /// building each transaction on the last — a real dirty-block
-    /// overlay, which this does not have. Until it does, the second
-    /// attempt is refused, because a wrong answer here is one nothing
-    /// downstream would catch.
+    /// # The tail
+    ///
+    /// `h_tail_lsn` names the oldest record recovery still needs. With one
+    /// outstanding record that is the record itself, which is what
+    /// [`crate::log_write::append_at`] assumed. With several it is the
+    /// first of them, and naming anything later tells recovery it may skip
+    /// records that have not been applied — which is how a filesystem
+    /// loses a transaction it was told had committed. This mount's first
+    /// record is remembered for that reason, and nothing here ever moves
+    /// the tail past it: nothing has replayed, so nothing can be dropped.
     ///
     /// # Where to call this
     ///
-    /// At the last point before the operation writes its first byte,
-    /// **not** as the first statement of the entry point. The token is a
-    /// budget for checkpoints that were written. An operation refused
-    /// for a name that already exists, an inode of a shape this cannot
-    /// rewrite, or a tree too deep to change has left the disk exactly
-    /// as it found it, so there is nothing for the next operation to be
-    /// built on top of and so nothing to spend.
-    ///
-    /// Spending it on a refusal costs the caller the whole mount. The
-    /// next write — a legitimate one, on a handle that has written
-    /// nothing — comes back saying a checkpoint has already been
-    /// written, which is both untrue and unactionable: the error tells
-    /// the caller to mount again after a replay, and there is nothing to
-    /// replay. Nothing resets the flag, so the handle is finished.
-    ///
-    /// Claiming it late is safe because everything an entry point does
-    /// beforehand is reads and arithmetic. The cost is that a second
-    /// caller does that work before being refused, which is work it was
-    /// going to waste anyway.
-    ///
-    /// It is deliberately not given back when the write itself fails.
-    /// Once the first byte is out, a failure may have left part of a
-    /// record on disk, and carrying on from there is precisely what the
-    /// limit exists to prevent.
+    /// At the last point before the operation writes its first byte, as
+    /// the only writer of records. `build` receives the transaction id,
+    /// which is derived from where the record lands.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] if a checkpoint has already been
-    /// written by this mount.
-    pub(crate) fn begin_checkpoint(&self) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        if self.checkpointed.swap(true, Ordering::SeqCst) {
-            return Err(Error::UnsupportedFeature(
-                "this mount has already written a checkpoint, and a second would be built \
-                 from a disk that does not yet reflect the first — mount again after the \
-                 log has been replayed"
-                    .into(),
-            ));
+    /// [`Error::ReadOnly`] on a mount that cannot write, and whatever
+    /// finding the head and appending the record return.
+    pub(crate) fn commit_record<F>(&self, build: F) -> Result<u64>
+    where
+        F: FnOnce(u32) -> Vec<crate::log_write::Op>,
+    {
+        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?.clone();
+        let head = crate::log::head(device.as_ref(), &self.sb)?;
+        let tid = crate::log_write::transaction_id(&head);
+        let mut oldest = self.oldest_record.lock().expect("oldest record poisoned");
+        let tail = oldest.unwrap_or_else(|| crate::log_write::lsn_of(&head));
+        let lsn = crate::log_write::append_at_with_tail(
+            device.as_ref(),
+            &self.sb,
+            &head,
+            tid,
+            &build(tid),
+            tail,
+        )?;
+        oldest.get_or_insert(lsn);
+        Ok(lsn)
+    }
+
+    /// Put every buffer a record carried into the overlay, so the next
+    /// operation reads them rather than the disk (#89).
+    pub(crate) fn logged_buffers(&self, items: &[crate::buf_write::BufferItem]) {
+        for item in items {
+            self.logged_buffer(item.blkno() * 512, &item.image_as_written());
         }
+    }
+
+    /// Put a buffer this mount has just logged into the overlay, so the
+    /// next operation reads it rather than the disk (#89).
+    pub(crate) fn logged_buffer(&self, offset: u64, bytes: &[u8]) {
+        if let Some(overlay) = &self.overlay {
+            overlay.wrote(offset, bytes);
+        }
+    }
+
+    /// The same for an inode a record has just rewritten: its core, and
+    /// its data fork in the literal area behind it.
+    pub(crate) fn logged_inode(&self, ino: u64, core: &[u8], fork: &[u8]) -> Result<()> {
+        let Some(overlay) = &self.overlay else {
+            return Ok(());
+        };
+        let mut image = core.to_vec();
+        let at = if image.len() > crate::inode::offsets::VERSION
+            && image[crate::inode::offsets::VERSION] == 3
+        {
+            crate::inode::XFS_DINODE_V3_SIZE
+        } else {
+            crate::inode::XFS_DINODE_V2_SIZE
+        };
+        if !fork.is_empty() {
+            if image.len() < at + fork.len() {
+                image.resize(at + fork.len(), 0);
+            }
+            image[at..at + fork.len()].copy_from_slice(fork);
+        }
+        // THE CHECKSUM IS RECOVERY'S, so the overlay has to stamp it too.
+        // A logged inode carries no CRC — the kernel computes one when it
+        // writes the inode out — and an image without it is refused by this
+        // driver's own reader the moment the next operation looks at it.
+        let size = usize::from(self.sb.inodesize);
+        if image.len() < size {
+            image.resize(size, 0);
+        }
+        if image.get(crate::inode::offsets::VERSION) == Some(&3) {
+            let crc = crate::superblock::crc32c_with_zeroed_crc(
+                &image[..size],
+                crate::inode::offsets::CRC,
+            );
+            image[crate::inode::offsets::CRC..crate::inode::offsets::CRC + 4]
+                .copy_from_slice(&crc.to_le_bytes());
+        }
+        overlay.wrote(self.inode_offset(ino)?, &image);
         Ok(())
     }
 
@@ -224,7 +273,8 @@ impl Filesystem {
             device,
             writable: None,
             sb,
-            checkpointed: std::sync::atomic::AtomicBool::new(false),
+            overlay: None,
+            oldest_record: Mutex::new(None),
         };
         fs.check_log_is_clean()?;
         Ok(fs)
@@ -254,11 +304,18 @@ impl Filesystem {
         device.read_at(0, &mut buf)?;
         let sb = Superblock::parse(&buf)?;
 
+        // EVERY READ GOES THROUGH WHAT THIS MOUNT HAS LOGGED (#89). A
+        // record changes nothing on disk, so without this the second
+        // operation would read the state the first one started from.
+        let overlay = Arc::new(crate::overlay::Overlay::new(
+            device.clone() as Arc<dyn BlockRead>
+        ));
         let fs = Filesystem {
-            device: device.clone(),
+            device: overlay.clone(),
             writable: Some(device),
             sb,
-            checkpointed: std::sync::atomic::AtomicBool::new(false),
+            overlay: Some(overlay),
+            oldest_record: Mutex::new(None),
         };
         fs.refuse_unmaintained_features()?;
         fs.check_log_is_clean()?;

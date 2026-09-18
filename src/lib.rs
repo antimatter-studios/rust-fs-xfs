@@ -50,6 +50,7 @@ pub mod inode;
 pub mod inode_btree;
 pub mod log;
 pub mod log_write;
+pub(crate) mod overlay;
 pub mod refcount;
 pub mod rmap;
 pub mod super_write;

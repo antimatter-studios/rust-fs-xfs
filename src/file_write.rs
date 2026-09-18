@@ -69,8 +69,8 @@ use crate::extent::Extent;
 use crate::fs::Filesystem;
 use crate::inode::Format;
 use crate::log_write::{
-    append, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer, Op,
-    XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer, Op, XFS_ILOG_CORE,
+    XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 use crate::format::log_items::inode_log_format::XFS_ILOG_DEXT;
@@ -196,10 +196,9 @@ impl Filesystem {
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
         // here rather than on the way in: a refusal must not spend it.
-        // See `Filesystem::begin_checkpoint`. This is the one entry
+        // See `Filesystem::commit_record`. This is the one entry
         // point where the claim comes before the file's own bytes rather
         // than before the record, because the bytes go out first.
-        self.begin_checkpoint()?;
 
         // The file's own bytes, straight to their blocks, before the
         // record that claims them. A machine that dies between the two
@@ -235,7 +234,10 @@ impl Filesystem {
         // extent list — where a truncate logs two.
         let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 3;
 
-        append(device.as_ref(), &self.sb, |tid| {
+        // Kept for the overlay, which needs the same bytes the record
+        // carries (#89).
+        let logged_fork = fork_op[..dsize].to_vec();
+        let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
                     flags: XLOG_START_TRANS,
@@ -271,7 +273,13 @@ impl Filesystem {
                 data: Vec::new(),
             });
             ops
-        })
+        })?;
+
+        // What the record says is now what this mount reads (#89).
+        self.logged_buffers(&group_items);
+        self.logged_inode(ino, &core, &logged_fork)?;
+
+        Ok(lsn)
     }
 }
 
