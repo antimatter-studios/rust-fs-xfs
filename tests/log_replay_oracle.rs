@@ -144,12 +144,18 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
     // that is worth failing on before asking the kernel.
     {
         let dev = FileDevice::open(img).expect("open read-only");
-        let err = Filesystem::mount(Arc::new(dev))
-            .err()
-            .expect("a log with an unreplayed record must not mount");
+        let fs = Filesystem::mount(Arc::new(dev))
+            .expect("a volume whose log holds a record mounts, replaying it (#90)");
         assert!(
-            matches!(err, fs_xfs::Error::DirtyLog),
-            "expected the log to read as dirty, got {err}"
+            fs.was_replayed(),
+            "the record is in the log and nowhere else, so this mount has to be a replay"
+        );
+        let root = fs.superblock().rootino;
+        let inode = fs.read_inode(root).expect("the inode the record names");
+        assert_eq!(
+            inode.mode & PERM_BITS,
+            NEW_MODE,
+            "replaying the record in memory did not give the mode the record asks for"
         );
     }
 

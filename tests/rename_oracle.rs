@@ -94,16 +94,23 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         assert_ne!(lsn, 0, "a record must be given a sequence number");
     }
 
-    // Nothing but the log has changed. Our own reader still sees the old
-    // name, and refuses the volume because the log has work in it.
+    // NOTHING BUT THE LOG HAS CHANGED, and a read-only mount replays it
+    // in memory (#90): the new name is there and the old one is not,
+    // before the kernel has seen any of it.
     {
         let dev = FileDevice::open(img).expect("open read-only");
-        let err = Filesystem::mount(Arc::new(dev))
-            .err()
-            .expect("a log with an unreplayed record must not mount");
+        let fs = Filesystem::mount(Arc::new(dev))
+            .expect("a volume whose log holds a record mounts, replaying it");
+        let (dir, raw) = fs.read_inode_raw(dir_ino).expect("the directory");
+        let names: Vec<String> = fs
+            .read_dir(&dir, &raw)
+            .expect("the directory's entries")
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.name).to_string())
+            .collect();
         assert!(
-            matches!(err, fs_xfs::Error::DirtyLog),
-            "expected the log to read as dirty, got {err}"
+            names.iter().any(|n| n == "cccc") && !names.iter().any(|n| n == "aaaa"),
+            "replaying the rename in memory left {names:?}"
         );
     }
 

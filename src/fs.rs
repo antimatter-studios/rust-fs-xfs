@@ -69,6 +69,16 @@ pub struct Filesystem {
     /// path cannot compile without going through this field.
     pub(crate) writable: Option<Arc<dyn BlockDevice>>,
     pub(crate) sb: Superblock,
+    /// Whether this mount is a **recovery**: the volume's log held records
+    /// nothing had applied, and this mount replayed them into memory to
+    /// read through (#90).
+    ///
+    /// Worth a caller knowing. What such a mount returns is not what the
+    /// device holds — it is what the device would hold after the kernel
+    /// recovered it — and somebody imaging a disk, or deciding whether to
+    /// trust what they are seeing, is entitled to be told which of the two
+    /// they have.
+    pub(crate) replayed: bool,
     /// What this mount has logged and nothing has replayed, which is what
     /// the mount reads through so each operation is built on the last
     /// (#89). `None` on a read-only mount, which logs nothing.
@@ -451,6 +461,7 @@ impl Filesystem {
 
         let fs = Filesystem {
             device,
+            replayed,
             writable: None,
             sb,
             overlay: None,
@@ -506,6 +517,9 @@ impl Filesystem {
         ));
         let fs = Filesystem {
             device: overlay.clone(),
+            // A read-write mount refuses a volume whose log holds
+            // records, so one that gets this far never replayed.
+            replayed: false,
             writable: Some(device),
             sb,
             overlay: Some(overlay),
@@ -735,6 +749,15 @@ impl Filesystem {
     /// by attempting a write and being refused.
     pub fn is_writable(&self) -> bool {
         self.writable.is_some()
+    }
+
+    /// Whether this mount replayed the volume's log to read it (#90).
+    ///
+    /// `true` means the volume was not unmounted cleanly and what this
+    /// mount reads is the recovered state, held in memory over an
+    /// untouched device — not what the structures on disk say.
+    pub fn was_replayed(&self) -> bool {
+        self.replayed
     }
 
     /// Byte offset of a filesystem block.

@@ -109,16 +109,25 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
         assert_ne!(lsn, 0, "a record must be given a sequence number");
     }
 
-    // The data blocks are on disk, but the inode still says the file is
-    // empty — nothing but the log claims them yet.
+    // THE INODE ON DISK STILL SAYS THE FILE IS EMPTY, and the record
+    // says otherwise. A read-only mount replays it in memory (#90), so
+    // what this reads is what the kernel will produce below — and if the
+    // two disagree, they disagree here, before the kernel is asked.
     {
         let dev = FileDevice::open(img).expect("open read-only");
-        let err = Filesystem::mount(Arc::new(dev))
-            .err()
-            .expect("a log with an unreplayed record must not mount");
+        let fs = Filesystem::mount(Arc::new(dev))
+            .expect("a volume whose log holds a record mounts, replaying it");
+        let (inode, raw) = fs.read_inode_raw(victim).expect("the victim inode");
+        assert_eq!(
+            inode.size,
+            data.len() as u64,
+            "{case}: the replayed inode should be as long as what was written"
+        );
+        let read = fs.read_file(&inode, &raw).expect("the victim's contents");
         assert!(
-            matches!(err, fs_xfs::Error::DirtyLog),
-            "{case}: expected the log to read as dirty, got {err}"
+            read == data,
+            "{case}: replaying the record in memory gives different bytes than were \
+             written, so the record and the data on disk do not agree"
         );
     }
 
