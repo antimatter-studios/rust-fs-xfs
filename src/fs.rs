@@ -820,7 +820,7 @@ impl Filesystem {
     }
 
     /// Read one whole filesystem block by its packed (AG, block) number.
-    fn read_fsblock(&self, fsblock: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read_fsblock(&self, fsblock: u64) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; self.sb.blocksize as usize];
         self.device.read_at(self.block_offset(fsblock), &mut buf)?;
         Ok(buf)
