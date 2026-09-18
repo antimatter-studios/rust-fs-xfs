@@ -108,7 +108,7 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
             echo "FIRST $(stat -c %i "$m/d/entry_0000")"
             echo "LAST $(stat -c %i "$m/d/$(ls "$m/d" | sort | tail -1)")"
             echo "NAMES $(ls "$m/d" | sort | tr '\n' ' ')"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
             echo MOUNTED
         else
             echo MOUNT_FAILED

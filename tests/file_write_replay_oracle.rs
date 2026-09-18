@@ -131,7 +131,7 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
                 [ "$(stat -c %s "$m/$f")" = "1048576" ] || ok=no
             done
             echo "NEIGHBOURS $ok"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12

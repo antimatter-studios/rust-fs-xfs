@@ -170,7 +170,7 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
         mnt=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$mnt"; then
             echo "MODE $(stat -c %a "$mnt")"
-            umount "$mnt"
+            umount "$mnt" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -8

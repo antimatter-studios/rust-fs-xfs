@@ -65,7 +65,7 @@ fn a_mount_writes_past_the_end_of_the_log() {
         m=$(mktemp -d)
         mount -o loop {name} "$m" && echo MOUNT_OK
         for d in $(seq 0 {last}); do mkdir "$m/d$d"; done
-        umount "$m"
+        umount "$m" || echo UMOUNT_FAILED
         rmdir "$m"
         echo DONE
         "#,
@@ -147,7 +147,7 @@ fn a_mount_writes_past_the_end_of_the_log() {
         if mount -o loop,nouuid {name} "$m"; then
             echo "KEPT $(find "$m" -name 'kept*' | wc -l)"
             echo "LEFTOVER $(find "$m" -name 'f0*' | wc -l)"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
             echo MOUNTED
         else
             echo MOUNT_FAILED

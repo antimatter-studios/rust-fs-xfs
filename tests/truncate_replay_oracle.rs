@@ -113,7 +113,7 @@ fn replay_case(case: &str) -> Option<()> {
             done
             echo "NEIGHBOURS $ok"
             echo "DF $(df --output=avail -k "$m" | tail -1)"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12

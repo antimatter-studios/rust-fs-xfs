@@ -306,7 +306,7 @@ fn exercise(img: &Path, op: &str) -> Outcome {
         mounted=0
         for attempt in 1 2 3; do
             if mount -o loop,nouuid "$img" "$m"; then
-                umount "$m"
+                umount "$m" || echo UMOUNT_FAILED
                 mounted=$((mounted + 1))
             fi
             out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?

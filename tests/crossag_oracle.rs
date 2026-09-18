@@ -92,7 +92,7 @@ fn case(name: &str) -> bool {
                 [ "$(stat -c%s "$m/spanning")" = 0 ] && echo "EMPTIED" || echo "NOT_EMPTIED"
                 # The file that was inside one group has to be untouched.
                 [ "$(stat -c%s "$m/withingroup")" = 262144 ] && echo "NEIGHBOUR_OK" || echo "NEIGHBOUR_CHANGED"
-                umount "$m"
+                umount "$m" || echo UMOUNT_FAILED
                 mounted=$((mounted + 1))
             fi
             check=$(mktemp -u /tmp/repair-XXXXXX.img)

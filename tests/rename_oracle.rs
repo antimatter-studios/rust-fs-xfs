@@ -109,7 +109,7 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         if mount -o loop,nouuid "$img" "$m"; then
             echo "NAMES $(ls "$m/sf" | sort | tr '\n' ' ')"
             echo "INO $(stat -c %i "$m/sf/cccc" 2>/dev/null || echo none)"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -8

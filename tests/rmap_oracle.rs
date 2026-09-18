@@ -45,7 +45,8 @@ fn replay(img: &Path) -> bool {
     let script = format!(
         r#"
         m=$(mktemp -d)
-        mount -o loop,nouuid {image} "$m" && umount "$m" || echo MOUNT_FAILED
+        mount -o loop,nouuid {image} "$m" || echo MOUNT_FAILED
+        umount "$m" || echo UMOUNT_FAILED
         rmdir "$m" 2>/dev/null
         echo DONE
         "#

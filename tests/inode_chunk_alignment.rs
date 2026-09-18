@@ -50,7 +50,7 @@ fn step(
         r#"
         m=$(mktemp -d)
         if mount -o loop,nouuid {name} "$m"; then
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
             echo MOUNTED
         else
             echo MOUNT_FAILED

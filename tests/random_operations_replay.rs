@@ -178,7 +178,7 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
             r#"
             m=$(mktemp -d)
             if mount -o loop,nouuid /share/{name} "$m"; then
-                umount "$m"
+                umount "$m" || echo UMOUNT_FAILED
                 echo MOUNTED
             else
                 echo MOUNT_FAILED

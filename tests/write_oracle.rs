@@ -119,9 +119,23 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
         mnt=$(mktemp -d)
-        mount -o ro,loop "$img" "$mnt"
+        # REPORTED, NOT FATAL. Under `set -e` a mount the kernel refuses
+        # ends the script, the run comes back non-zero, and the suite
+        # reads that as no kernel being available and skips — so a volume
+        # this driver made unmountable passes as an unavailable VM (#206).
+        # NOUUID: these three scripts run at the same time, from copies
+        # of one fixture, and XFS refuses a second filesystem carrying a
+        # UUID it already has mounted. That refusal is what `set -e` used
+        # to turn into "no VM available" (#206).
+        if ! mount -o ro,loop,nouuid "$img" "$mnt"; then
+            echo MOUNT_FAILED
+            dmesg | tail -10
+            rmdir "$mnt"; rm -f "$img"
+            echo DONE
+            exit 0
+        fi
         echo "SHA $(sha256sum "$mnt{TARGET}" | cut -d' ' -f1)"
-        umount "$mnt"; rmdir "$mnt"; rm -f "$img"
+        umount "$mnt" || echo UMOUNT_FAILED; rmdir "$mnt"; rm -f "$img"
         echo DONE
         "#,
         source = scratch.guest(),
@@ -130,6 +144,11 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "the kernel refused the volume after this driver wrote to it, which is a \
+         failure here rather than a reason to skip:\n{out}"
+    );
 
     // The kernel's reading of the file we just wrote.
     let got = out
@@ -256,11 +275,24 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
         mnt=$(mktemp -d)
-        mount -o ro,loop "$img" "$mnt"
+        # REPORTED, NOT FATAL. See the first of these scripts: a mount
+        # the kernel refuses would otherwise end the script and read as
+        # an unavailable VM (#206).
+        # NOUUID: these three scripts run at the same time, from copies
+        # of one fixture, and XFS refuses a second filesystem carrying a
+        # UUID it already has mounted. That refusal is what `set -e` used
+        # to turn into "no VM available" (#206).
+        if ! mount -o ro,loop,nouuid "$img" "$mnt"; then
+            echo MOUNT_FAILED
+            dmesg | tail -10
+            rmdir "$mnt"; rm -f "$img"
+            echo DONE
+            exit 0
+        fi
         echo "MODE $(stat -c%a "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
         echo "MTIME_NS $(stat -c%y "$mnt{TARGET}")"
-        umount "$mnt"; rmdir "$mnt"; rm -f "$img"
+        umount "$mnt" || echo UMOUNT_FAILED; rmdir "$mnt"; rm -f "$img"
         echo DONE
         "#,
         source = scratch.guest(),
@@ -269,6 +301,11 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "the kernel refused the volume after this driver wrote to it, which is a \
+         failure here rather than a reason to skip:\n{out}"
+    );
 
     let field = |k: &str| {
         out.lines()
@@ -367,11 +404,24 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
         mnt=$(mktemp -d)
-        mount -o ro,loop "$img" "$mnt"
+        # REPORTED, NOT FATAL. See the first of these scripts: a mount
+        # the kernel refuses would otherwise end the script and read as
+        # an unavailable VM (#206).
+        # NOUUID: these three scripts run at the same time, from copies
+        # of one fixture, and XFS refuses a second filesystem carrying a
+        # UUID it already has mounted. That refusal is what `set -e` used
+        # to turn into "no VM available" (#206).
+        if ! mount -o ro,loop,nouuid "$img" "$mnt"; then
+            echo MOUNT_FAILED
+            dmesg | tail -10
+            rmdir "$mnt"; rm -f "$img"
+            echo DONE
+            exit 0
+        fi
         echo "SIZE $(stat -c%s "$mnt{TARGET}")"
         echo "BLOCKS $(stat -c%b "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
-        umount "$mnt"; rmdir "$mnt"; rm -f "$img"
+        umount "$mnt" || echo UMOUNT_FAILED; rmdir "$mnt"; rm -f "$img"
         echo DONE
         "#,
         source = scratch.guest(),
@@ -380,6 +430,11 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
+    assert!(
+        !out.contains("MOUNT_FAILED"),
+        "the kernel refused the volume after this driver wrote to it, which is a \
+         failure here rather than a reason to skip:\n{out}"
+    );
 
     let field = |k: &str| {
         out.lines()
