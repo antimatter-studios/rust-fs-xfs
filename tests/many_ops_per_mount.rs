@@ -94,7 +94,7 @@ fn a_mount_writes_several_journalled_operations() {
             echo "DIR $(ls "$m/d" 2>&1 | sort | tr '\n' ' ')"
             echo "SIZE $(stat -c %s "$m/d/renamed")"
             echo "INOS $(stat -c %i "$m/second" "$m/d" "$m/d/renamed" | sort -u | wc -l)"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
             echo MOUNTED
         else
             echo MOUNT_FAILED

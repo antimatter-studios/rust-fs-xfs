@@ -230,6 +230,26 @@ pub fn kernel_run(script: &str) -> Option<String> {
         "the script did not run to completion under {:?}:\n{stdout}",
         transport()
     );
+    // AN UNMOUNT THAT DID NOT HAPPEN IS NOT A RESULT (#206).
+    //
+    // The superblock's summary counters are lazy: they live in memory
+    // while a filesystem is mounted, the kernel writes them at unmount,
+    // and this driver never writes them. So a busy unmount or a silent
+    // read-only fallback leaves them as they were, and the `xfs_repair
+    // -n` that follows walks the trees, counts the real free blocks, and
+    // disagrees with a superblock the kernel had not finished with.
+    //
+    // What that prints is `sb_fdblocks N, counted N-1` and nothing else,
+    // which reads as a driver fault and was chased as one twice, in #199
+    // and #124. Every script says `umount ... || echo UMOUNT_FAILED`, and
+    // this is what reads it — here rather than in each suite, because it
+    // means the same thing in all of them.
+    assert!(
+        !stdout.contains("UMOUNT_FAILED"),
+        "the guest could not unmount the volume, so the kernel never wrote the summary \
+         counters and whatever graded it next was grading a filesystem still in \
+         flight:\n{stdout}"
+    );
     Some(stdout)
 }
 

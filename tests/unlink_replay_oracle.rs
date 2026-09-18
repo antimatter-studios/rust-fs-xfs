@@ -101,7 +101,7 @@ fn unlink_and_replay(case: &str) -> Option<()> {
             else
                 echo "REUSE_FAILED"
             fi
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12

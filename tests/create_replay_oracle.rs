@@ -143,7 +143,7 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
             if [ -d "$m/fill" ]; then
                 echo "FILL $(ls "$m/fill" | wc -l)"
             fi
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -161,7 +161,9 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
                 *"valuable metadata changes in a log"*) ;;
                 *) break ;;
             esac
-            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+            r=$(mktemp -d)
+            mount -o loop,nouuid "$img" "$r" && {{ umount "$r" || echo UMOUNT_FAILED; }}
+            rmdir "$r"
         done
         echo "REPAIR_BEGIN"
         echo "$out"
@@ -327,7 +329,7 @@ fn chunk_case(case: &str) -> bool {
             # out, and the ninth was the test's own.
             touch "$m/needsachunk" && echo "WRITABLE" || echo "NOT_WRITABLE"
             echo "STAT $(stat -c%i "$m/needsachunk")"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -349,7 +351,9 @@ fn chunk_case(case: &str) -> bool {
                 *"valuable metadata changes in a log"*) ;;
                 *) break ;;
             esac
-            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+            r=$(mktemp -d)
+            mount -o loop,nouuid "$img" "$r" && {{ umount "$r" || echo UMOUNT_FAILED; }}
+            rmdir "$r"
         done
         echo "REPAIR_BEGIN"
         echo "$out"
@@ -478,7 +482,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
             else
                 echo "USABLE failed"
             fi
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -496,7 +500,9 @@ fn the_kernel_uses_a_directory_this_driver_made() {
                 *"valuable metadata changes in a log"*) ;;
                 *) break ;;
             esac
-            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+            r=$(mktemp -d)
+            mount -o loop,nouuid "$img" "$r" && {{ umount "$r" || echo UMOUNT_FAILED; }}
+            rmdir "$r"
         done
         echo "REPAIR_BEGIN"
         echo "$out"
@@ -697,7 +703,7 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             # is maintained, not merely read.
             : > "$m/d/afterwards" 2>/dev/null && echo "ADD_OK" || echo "ADD_FAILED"
             rm -f "$m/d/{added}" 2>/dev/null && echo "REMOVE_OK" || echo "REMOVE_FAILED"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -715,7 +721,9 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
                 *"valuable metadata changes in a log"*) ;;
                 *) break ;;
             esac
-            r=$(mktemp -d); mount -o loop,nouuid "$img" "$r" && umount "$r"; rmdir "$r"
+            r=$(mktemp -d)
+            mount -o loop,nouuid "$img" "$r" && {{ umount "$r" || echo UMOUNT_FAILED; }}
+            rmdir "$r"
         done
         echo "REPAIR_BEGIN"
         echo "$out"
