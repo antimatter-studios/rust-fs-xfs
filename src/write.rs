@@ -580,6 +580,9 @@ mod tests {
             sb: superblock(),
             overlay: None,
             oldest_record: std::sync::Mutex::new(None),
+            next_head: std::sync::Mutex::new(None),
+            wraps: std::sync::atomic::AtomicUsize::new(0),
+            logged_anything: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

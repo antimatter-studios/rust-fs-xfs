@@ -54,14 +54,17 @@ use std::sync::Arc;
 /// skips (`log_oracle` in the fixture-less test jobs).
 struct Scratch {
     image: std::path::PathBuf,
-    made_share: bool,
 }
 
 impl Scratch {
+    /// IN A DIRECTORY OF ITS OWN, not beside the fixtures. Cargo runs test
+    /// binaries at the same time, and the suites that scan the share take
+    /// every `.img` in it for a fixture — so a scratch image sitting there
+    /// while this test writes to it fails them with a dirty log. A
+    /// subdirectory is not an `.img`, so their scans pass it by.
     fn new(image: std::path::PathBuf) -> Self {
-        let made_share = !share().exists();
-        std::fs::create_dir_all(share()).unwrap();
-        Scratch { image, made_share }
+        std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
+        Scratch { image }
     }
 }
 
@@ -80,8 +83,8 @@ impl Drop for Scratch {
             return;
         }
         let _ = std::fs::remove_file(&self.image);
-        if self.made_share {
-            let _ = std::fs::remove_dir(share());
+        if let Some(dir) = self.image.parent() {
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
@@ -91,7 +94,16 @@ const PER_DIR: usize = 100;
 
 #[test]
 fn writes_on_rmapbt_keep_going_past_the_free_list() {
-    let name = format!("agfl-refill-{}.img", std::process::id());
+    // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
+    // volume, but it builds it in the share, and a share that exists is
+    // what the suites scanning it take for a fixture set: creating one
+    // here makes them fail where they would have skipped. The job that
+    // runs this builds the fixtures first, so the directory is there.
+    if !share().exists() {
+        eprintln!("no .vm-share — skipped");
+        return;
+    }
+    let name = format!("agfl-refill/agfl-refill-{}.img", std::process::id());
     let image = share().join(&name);
     let _scratch = Scratch::new(image.clone());
     std::fs::File::create(&image)
