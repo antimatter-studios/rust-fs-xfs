@@ -1,234 +1,367 @@
-//! Running a script against a real Linux kernel, wherever one is.
+//! Running a script, and every oracle tool, against a real Linux kernel
+//! — IN THE fs-linux-test-harness GUEST, and nowhere else.
 //!
-//! The replay oracles all do the same thing: this driver writes a log
-//! record, then a kernel is asked to replay it and `xfs_repair` is asked
-//! whether the result is sound. Only a real kernel can settle that — our
-//! own reader agreeing with us proves nothing about whether the record
-//! was correct.
+//! # Why the guest is the only place
 //!
-//! # Why this is not just `vm.sh`
+//! The oracles all do the same thing: this driver writes something, then
+//! `mkfs.xfs`, `xfs_db`, `xfs_repair`, `xfs_logprint` or the in-kernel
+//! XFS driver is asked whether the result is sound. Only an independent
+//! implementation can settle that — our own reader agreeing with us
+//! proves nothing.
 //!
-//! Each oracle used to call `scripts/vm.sh run` directly, so a kernel
-//! meant *the VM's* kernel. On a developer Mac that is the only option.
-//! On a Linux CI runner it is the wrong one: the runner already has a
-//! kernel, xfsprogs, and passwordless sudo, and there is no VM to boot.
+//! An oracle whose answer depends on which machine asked is not an
+//! oracle. xfsprogs on a workstation is whatever that machine has:
+//! nothing at all on a Mac, 6.1 on Debian 12, 6.6 on Ubuntu 24.04, and
+//! 6.13 if someone built one under `~/.local`. The kernel is worse: this
+//! host runs 6.12 and the CI runner runs whatever Azure booted that
+//! week, and #211 and #212 are both "the fixture came out different on
+//! the kernel that built it".
 //!
-//! The tests skipped there. Silently — a skip prints a line and the test
-//! returns ok — so CI reported green on the write path while never
-//! replaying a single record. `truncate_replay_oracle` and
-//! `unlink_replay_oracle` had done that on every run since they were
-//! written.
+//! So this module chooses nothing. Every tool call and every mount goes
+//! to ONE Debian guest, provisioned by `scripts/vm-setup.sh` and booted
+//! by the harness, on a developer's machine and on a CI runner alike.
 //!
-//! So the transport is chosen from what the host can do, and the script
-//! is the same either way.
+//! This replaces the `Transport::{Native, Vm, None}` fork that used to
+//! live here, which ran the scripts under `sudo -n` when the host looked
+//! Linux enough and in the VM otherwise — two kernels, two xfsprogs, and
+//! a third case (`None`) whose only outcome was a test that skipped and
+//! reported ok.
+//!
+//! # Nothing skips
+//!
+//! [`kernel_run`] returns the script's output, not an `Option`. There is
+//! no "no kernel reachable" any more, because there is exactly one
+//! kernel and failing to reach it is a failure: a harness that is not
+//! checked out, a VM that will not boot, a tool the guest does not have
+//! — each panics naming the task that fixes it.
+//!
+//! THAT IS ALSO THE FIX FOR #206's second half. `kernel_run` used to
+//! return `None` both when no host could be found AND when the script's
+//! process failed, so `write_oracle` printed "oracle VM unavailable —
+//! skipping verification" for a mount the kernel had refused. The two
+//! are now different things: a script that runs is reported by its own
+//! output and its own exit status, and only the harness failing to reach
+//! the guest is a missing host.
+//!
+//! # One path means one thing on both sides
+//!
+//! The harness mounts this repository in the guest at `/repo`, and
+//! [`session`] symlinks the host's own absolute path to it, so
+//! `<repo>/.vm-share/xfs-default.img` is that same path in the guest and
+//! arguments cross unchanged. Scripts written against `/share` — which
+//! is what every fixture builder and every oracle script in this
+//! repository says — are localised to that path by [`kernel_run`], which
+//! is the same rewrite the old native transport did, now applied on
+//! every path instead of one of them.
+//!
+//! # Why it is not slow
+//!
+//! The VM is booted once for a tier (`chore test:oracle` brings it up
+//! and the reaper stops it) and every call rides one multiplexed SSH
+//! connection: about 30 ms of overhead per call against 700 ms for a
+//! fresh handshake. Nothing is copied.
 
+// EVERY TEST BINARY COMPILES THE WHOLE MODULE and uses part of it, so
+// an item only the oracle tiers call is dead code in the unit tier's
+// binaries. The alternative — a feature per helper, or one module per
+// caller — would fragment the single place the guest is spoken to, which
+// is the property this module exists to have.
+#![allow(dead_code)]
+
+use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// How long one call into the VM may take before it is given up on.
-const VM_CALL_TIMEOUT_SECONDS: u32 = 600;
+/// Where `scripts/vm-setup.sh` installs the xfsprogs build that knows
+/// parent pointers (6.10 and newer; Debian 12 ships 6.1).
+///
+/// THIS PATH AND scripts/vm-setup.sh MUST AGREE. That script greps this
+/// file for it, so the pair cannot drift silently.
+pub const PARENT_XFSPROGS_BIN: &str = "/usr/local/xfsprogs-parent/sbin";
 
-/// The shared fixture directory. Inside the VM it is mounted at
-/// `/share`; natively it is this path, and scripts written against
-/// `/share` are rewritten to match.
+/// The shared fixture directory: `<repo>/.vm-share` on the host, which
+/// the guest sees both as `/share` and — through the repository mount —
+/// at this same absolute path.
 pub fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
+    repo().join(".vm-share")
 }
 
 pub fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-/// How a script gets to a kernel on this host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    /// Run it here. Linux, with the tools and the privilege.
-    Native,
-    /// Ship it to the oracle VM. Anything else with a working `vm.sh`.
-    Vm,
-    /// Neither is possible, and the caller must skip and say so.
-    None,
-}
-
-/// Decide once. Probing sudo per call would prompt repeatedly and slow
-/// every case down.
-pub fn transport() -> Transport {
-    static CHOICE: OnceLock<Transport> = OnceLock::new();
-    *CHOICE.get_or_init(|| {
-        if cfg!(target_os = "linux") && have("mount") && have("xfs_repair") && can_elevate() {
-            Transport::Native
-        } else if repo().join("scripts/vm.sh").exists() {
-            Transport::Vm
-        } else {
-            Transport::None
-        }
+/// The harness's driver script, or a panic naming `chore siblings`.
+fn vm_script() -> &'static Path {
+    static VM: OnceLock<PathBuf> = OnceLock::new();
+    VM.get_or_init(|| {
+        let path = repo().join("../fs-linux-test-harness/scripts/vm.sh");
+        assert!(
+            path.is_file(),
+            "the fs-linux-test-harness sibling is not checked out at {}. \
+             `chore siblings` clones it at the ref chores.yml pins. The oracle \
+             tools and the kernel run in its VM and nowhere else, so there is \
+             nothing to fall back to and nothing to skip.",
+            path.display()
+        );
+        path
     })
 }
 
-fn have(tool: &str) -> bool {
-    // `command -v` rather than running the tool: xfs_repair with no
-    // argument exits non-zero, and mount with none prints the table.
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {tool}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// True when this process is itself running inside the harness guest
+/// (`chore test:vm`, which is how a Mac runs this suite at all).
+fn in_guest() -> bool {
+    std::env::var_os("FLTH_GUEST").is_some_and(|value| value == "1")
 }
 
-/// Root already, or sudo without a password. A sudo that would prompt is
-/// not usable from a test: it would block forever on a runner and steal
-/// the terminal on a workstation.
-fn can_elevate() -> bool {
-    if is_root() {
-        return true;
-    }
-    Command::new("sudo")
-        .args(["-n", "true"])
+/// Run a harness command from the repository root, where the harness
+/// finds `fs-linux-test-harness.toml`.
+fn vm(command: &str, argument: &str) -> io::Result<Output> {
+    Command::new(vm_script())
+        .arg(command)
+        .arg(argument)
+        .current_dir(repo())
+        .stdin(Stdio::null())
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
-fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
-}
-
-/// Run `script` against a kernel and return its stdout.
+/// Boot the VM once per test process, and make the host's own path for
+/// this repository mean the repository inside the guest too.
 ///
-/// `None` means no kernel was reachable — a reason to skip. It
-/// deliberately does **not** cover a script that ran and reported a
-/// problem: the scripts never exit non-zero, so a kernel refusing the
-/// filesystem arrives as output to assert on rather than as a missing
-/// host. Conflating the two is how a real failure got reported as a
-/// skip the first time these suites ran. (Carried here from the four
-/// copies of this function that it replaces, because it is the same
-/// mistake this whole module exists to stop.)
-///
-/// A script that runs but does not print `DONE` is a bug in the script
-/// rather than a missing host, so that is an assertion, not a skip.
-/// Stop dead if the process that started this test has gone.
-///
-/// # The mess this prevents
-///
-/// Killing `cargo test` does not kill the test BINARY it spawned. The
-/// binary keeps running, keeps calling `vm.sh`, and `vm.sh` boots the VM
-/// on demand — so every `vagrant halt` was followed by a fresh QEMU a
-/// few seconds later, and the machine sat at a load of 8 with nothing
-/// visibly running. `pkill -f "cargo test"` does not match
-/// `target/release/deps/feature_matrix_oracle-<hash>`, so the obvious
-/// way to stop a run does not stop it.
-///
-/// An orphaned test has nobody to report to and no reason to keep
-/// booting a virtual machine. It exits.
-///
-/// The parent is recorded on first use rather than compared against
-/// pid 1: a process reparented to `launchd` is the same situation, and
-/// on macOS it does not always land on 1.
-fn abort_if_orphaned() {
-    static PARENT: OnceLock<Option<u32>> = OnceLock::new();
-
-    let parent = *PARENT.get_or_init(|| {
-        Command::new("ps")
-            .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+/// `vm.sh up` is idempotent and costs milliseconds when the VM is
+/// already running, which is the normal case: the tier task brings it up
+/// for the whole run. A test process that finds it down boots it rather
+/// than failing, so a suite run by hand with a bare `cargo test` still
+/// works, and the chore reaper stops what it left behind.
+fn session() {
+    static SESSION: OnceLock<()> = OnceLock::new();
+    SESSION.get_or_init(|| {
+        if in_guest() {
+            return;
+        }
+        let out = vm("up", "")
+            .unwrap_or_else(|error| panic!("cannot run {}: {error}", vm_script().display()));
+        assert!(
+            out.status.success(),
+            "the fs-linux-test-harness VM would not start, so no oracle tool and no \
+             kernel can be reached.\n`chore vm:host:check` says what this host is \
+             missing; `chore vm:destroy` clears a broken machine.\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        mirror_repo_path();
     });
-    let Some(parent) = parent else { return };
+}
 
-    let alive = Command::new("kill")
-        .args(["-0", &parent.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(true);
-    if !alive {
-        eprintln!(
-            "the process that started this test ({parent}) is gone, so this one is \
-             orphaned and would go on booting the oracle VM with nobody watching. Stopping."
+/// MAKE ONE PATH MEAN ONE THING ON BOTH SIDES.
+///
+/// The harness mounts this repository in the guest at `/repo`. A test
+/// hands `xfs_repair` the path it used on the host — `<repo>/tmp/x.img`
+/// — so the guest is given that same absolute path as a symlink to the
+/// mount. Every argument then crosses unchanged: no rewriting of
+/// arguments, nothing copied in and out.
+///
+/// Idempotent, and it refuses to replace a real directory: in a guest
+/// that somehow has one at that path, silently shadowing it would be
+/// worse than stopping.
+fn mirror_repo_path() {
+    let repo = repo().to_string_lossy().into_owned();
+    let script = format!(
+        "set -eu\n\
+         repo={0}\n\
+         if [ -e \"$repo\" ] && [ ! -L \"$repo\" ]; then\n\
+             echo \"$repo exists in the guest and is not the repository mount\" >&2\n\
+             exit 1\n\
+         fi\n\
+         mkdir -p \"$(dirname \"$repo\")\"\n\
+         ln -sfn /repo \"$repo\"\n\
+         [ -f \"$repo/Cargo.toml\" ]",
+        guest_quote(&repo)
+    );
+    let out = vm("exec", &script)
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", vm_script().display()));
+    assert!(
+        out.status.success(),
+        "the guest cannot see this repository at {repo}, so no oracle tool can read \
+         the images a test writes. The harness mounts the consumer repository at /repo \
+         on every boot (`chore vm:destroy` then `chore vm:up` re-provisions it).\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Run a script in the guest, wherever this process is.
+///
+/// From the host that is `vm.sh exec` over the harness's one shared
+/// connection. Inside the guest it is the shell itself, as root.
+fn guest_shell(script: &str) -> io::Result<Output> {
+    if in_guest() {
+        return Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .current_dir(repo())
+            .stdin(Stdio::null())
+            .output();
+    }
+    vm("exec", script)
+}
+
+/// One argument, as the guest's shell will read it.
+pub fn guest_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', r"'\''"))
+}
+
+/// The three files one guest call leaves behind, named so that two calls
+/// — from two threads or two test binaries — never share one.
+struct Run {
+    dir: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    status: PathBuf,
+}
+
+impl Run {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = share().join("run");
+        let name = format!(
+            "{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        std::process::exit(1);
+        Self {
+            stdout: dir.join(format!("{name}.out")),
+            stderr: dir.join(format!("{name}.err")),
+            status: dir.join(format!("{name}.status")),
+            dir,
+        }
+    }
+
+    /// The script's own exit status, or `None` when the guest never ran
+    /// it — which is the harness failing, not the script.
+    fn code(&self) -> Option<i32> {
+        let text = std::fs::read_to_string(&self.status).ok()?;
+        let code = text.trim().parse().ok()?;
+        let _ = std::fs::remove_file(&self.status);
+        Some(code)
+    }
+
+    fn streams(&self) -> (String, String) {
+        let read = |path: &PathBuf| {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            let _ = std::fs::remove_file(path);
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        (read(&self.stdout), read(&self.stderr))
     }
 }
 
-pub fn kernel_run(script: &str) -> Option<String> {
-    abort_if_orphaned();
+/// What one guest call did: the script's own exit status and its two
+/// streams, kept apart from whether the harness reached the guest.
+///
+/// THAT SEPARATION IS THE POINT (#206). The harness answers 1 for "no
+/// VM"; `xfs_repair` answers 1 for "this filesystem has errors". If both
+/// arrive as the exit status of one process there is no way to tell a
+/// refused mount from an absent machine, and this suite spent a release
+/// reporting the first as the second.
+pub struct GuestOutput {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
 
-    let out = match transport() {
-        Transport::Native => {
-            // The scripts are written for the VM, where the fixtures are
-            // at /share. Point them at the real directory instead.
-            let localised = script.replace("/share/", &format!("{}/", share().display()));
-            let mut cmd = if is_root() {
-                let mut c = Command::new("bash");
-                c.arg("-c");
-                c
-            } else {
-                // SUDO RESETS PATH to its secure_path, so a tool installed for
-                // this user (xfs_repair under ~/.local/bin, say) is not found
-                // as root, and every script that runs it reports "command not
-                // found" as though the filesystem were broken. Carry PATH and
-                // HOME through: wrappers that locate their binaries under
-                // $HOME need the second.
-                let mut c = Command::new("sudo");
-                c.args(["-n", "env"])
-                    .arg(format!(
-                        "PATH={}",
-                        std::env::var("PATH").unwrap_or_default()
-                    ))
-                    .arg(format!(
-                        "HOME={}",
-                        std::env::var("HOME").unwrap_or_default()
-                    ))
-                    .args(["bash", "-c"]);
-                c
-            };
-            cmd.arg(localised).output().ok()?
-        }
-        Transport::Vm => {
-            // One caller at a time. Vagrant holds a lock per machine and
-            // FAILS rather than waits when it is taken, so two test
-            // binaries reaching for the VM at once turn into
-            // "Translation missing: en.vagrant.errors.machine_action_locked"
-            // and a skip -- which reads as a pass. Cargo runs each test
-            // binary's tests in parallel, so this is ordinary, and it is
-            // intermittent, which is worse: the suite loses a little
-            // coverage at random and says so only in a line nobody reads.
-            let _guard = VmLock::acquire();
-            // BOUNDED. A call that never returns is how a test run
-            // becomes a process nobody knows about: no output, no
-            // failure, and a virtual machine held open behind it. Ten
-            // minutes is far beyond the slowest legitimate call here — a
-            // cold boot plus a replay is about two.
-            Command::new("timeout")
-                .arg(VM_CALL_TIMEOUT_SECONDS.to_string())
-                .arg(repo().join("scripts/vm.sh"))
-                .arg("run")
-                .arg(script)
-                .output()
-                .ok()?
-        }
-        Transport::None => return None,
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() {
-        eprintln!(
-            "{:?} run failed: {}",
-            transport(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return None;
+impl GuestOutput {
+    pub fn ok(&self) -> bool {
+        self.status == 0
     }
+
+    /// What the tool said, in the shape [`repair::assert_agreed`] reads.
+    ///
+    /// The markers exist because a guest script's output is a whole
+    /// session and the report is a part of it. A tool run directly has
+    /// no session around it, so the markers are put back here and one
+    /// reader grades both (#124).
+    pub fn repair_report(&self) -> String {
+        format!(
+            "REPAIR_BEGIN\n{}{}\nREPAIR_RC={}\nREPAIR_END",
+            self.stdout, self.stderr, self.status
+        )
+    }
+}
+
+/// Run `script` in the guest under `bash -euo pipefail`, and return what
+/// it did.
+///
+/// Panics — never skips — when the harness cannot reach the guest at
+/// all. A script that ran and failed comes back in [`GuestOutput`].
+#[track_caller]
+pub fn guest_script(script: &str) -> GuestOutput {
+    session();
+    let run = Run::new();
+    let wrapped = format!(
+        "mkdir -p {dir} && cd {repo} && \
+         {{ bash -euo pipefail -c {script} > {stdout} 2> {stderr}; }}; \
+         printf %s $? > {status}",
+        dir = guest_quote(&run.dir.to_string_lossy()),
+        repo = guest_quote(&repo().to_string_lossy()),
+        script = guest_quote(script),
+        stdout = guest_quote(&run.stdout.to_string_lossy()),
+        stderr = guest_quote(&run.stderr.to_string_lossy()),
+        status = guest_quote(&run.status.to_string_lossy()),
+    );
+    let out = guest_shell(&wrapped)
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", vm_script().display()));
+    let Some(status) = run.code() else {
+        panic!(
+            "the script could not be run in the fs-linux-test-harness VM (the harness \
+             exited {:?}). This is the harness, not the script: `chore vm:status` shows \
+             the VM and `chore vm:up` boots it. Tests never skip on a missing VM.\n{}{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let (stdout, stderr) = run.streams();
+    GuestOutput {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// Run `script` against the kernel in the guest and return its stdout.
+///
+/// The scripts in this repository are written for the shared directory
+/// as the guest used to see it, `/share`; that is rewritten to the path
+/// both sides agree on, so one script text works whether this process is
+/// on the host or inside the guest.
+///
+/// A script that runs to completion prints `DONE`; one that does not is
+/// a bug in the script rather than a missing host, so that is an
+/// assertion. The scripts themselves never exit non-zero on a filesystem
+/// problem — a kernel refusing a mount arrives as output to assert on —
+/// so a non-zero status here is the script breaking, and it fails loudly
+/// with both streams rather than being reported as an absent VM (#206).
+#[track_caller]
+pub fn kernel_run(script: &str) -> String {
+    let localised = script.replace("/share/", &format!("{}/", share().display()));
+    let out = guest_script(&localised);
     assert!(
-        stdout.contains("DONE"),
-        "the script did not run to completion under {:?}:\n{stdout}",
-        transport()
+        out.ok(),
+        "the guest script exited {} — that is the script failing, not a missing \
+         kernel:\n--- stdout ---\n{}--- stderr ---\n{}",
+        out.status,
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("DONE"),
+        "the script did not run to completion in the guest:\n--- stdout ---\n{}\
+         --- stderr ---\n{}",
+        out.stdout,
+        out.stderr
     );
     // AN UNMOUNT THAT DID NOT HAPPEN IS NOT A RESULT (#206).
     //
@@ -245,62 +378,230 @@ pub fn kernel_run(script: &str) -> Option<String> {
     // this is what reads it — here rather than in each suite, because it
     // means the same thing in all of them.
     assert!(
-        !stdout.contains("UMOUNT_FAILED"),
+        !out.stdout.contains("UMOUNT_FAILED"),
         "the guest could not unmount the volume, so the kernel never wrote the summary \
          counters and whatever graded it next was grading a filesystem still in \
-         flight:\n{stdout}"
+         flight:\n{}",
+        out.stdout
     );
-    Some(stdout)
+    out.stdout
 }
 
-/// A lock held across one `vm.sh` invocation.
+/// A tool invocation, built and then run in the guest.
 ///
-/// A file rather than a mutex: the contention is between separate test
-/// BINARIES, which are separate processes, so nothing in this one's
-/// memory can serialise them.
+/// ```ignore
+/// let out = oracle("xfs_repair").args(["-n", &image]).output();
+/// assert_eq!(out.status, 0, "{}", out.stderr);
+/// ```
 ///
-/// Advisory and deliberately simple -- create the file exclusively, or
-/// wait and try again. A holder that dies without cleaning up would
-/// wedge every later caller, so the file is treated as stale after
-/// `STALE_AFTER` and taken; the longest legitimate hold is a VM boot
-/// plus a script, and the timeout is well past that.
-struct VmLock(PathBuf);
+/// THE ONLY WAY A TEST REACHES AN ORACLE TOOL. `tests/test_contract.rs`
+/// fails the suite if a test spawns one itself, which would run it on the
+/// host — a different version, a different platform, and free to be
+/// absent so that the test could skip.
+#[must_use]
+pub struct Oracle {
+    tool: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    stdin: Option<String>,
+}
 
-impl VmLock {
-    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+/// Start building a call to `tool` (`mkfs.xfs`, `xfs_db`, `xfs_repair`,
+/// `xfs_logprint`, `xfs_io`), which runs in the harness VM.
+pub fn oracle(tool: &str) -> Oracle {
+    Oracle {
+        tool: tool.to_string(),
+        args: Vec::new(),
+        env: Vec::new(),
+        stdin: None,
+    }
+}
 
-    fn acquire() -> Self {
-        let path = share().join(".kernel-run.lock");
-        let _ = std::fs::create_dir_all(share());
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Self(path),
-                Err(_) => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .map(|t| t.elapsed().unwrap_or_default() > Self::STALE_AFTER)
-                        .unwrap_or(true);
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-            }
+/// The same tool, from the pinned xfsprogs the guest builds for parent
+/// pointers and exchange-range (6.10 and newer). Debian's is 6.1, and a
+/// test that needs the newer one says so here rather than probing.
+pub fn parent_oracle(tool: &str) -> Oracle {
+    oracle(&format!("{PARENT_XFSPROGS_BIN}/{tool}"))
+}
+
+impl Oracle {
+    #[track_caller]
+    pub fn arg(mut self, argument: impl AsRef<OsStr>) -> Self {
+        self.args.push(text(argument.as_ref()));
+        self
+    }
+
+    #[track_caller]
+    pub fn args<I, S>(mut self, arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        for argument in arguments {
+            self.args.push(text(argument.as_ref()));
         }
+        self
+    }
+
+    /// An environment variable for the tool, in the guest.
+    pub fn env(mut self, name: &str, value: &str) -> Self {
+        self.env.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Text on the tool's standard input (an `xfs_db` command list).
+    pub fn stdin(mut self, text: impl Into<String>) -> Self {
+        self.stdin = Some(text.into());
+        self
+    }
+
+    /// Run it, and return what the tool did.
+    #[track_caller]
+    pub fn output(self) -> GuestOutput {
+        for argument in &self.args {
+            self.check_path(argument);
+        }
+        let mut line = String::new();
+        for (name, value) in &self.env {
+            line.push_str(&format!("{name}={} ", guest_quote(value)));
+        }
+        line.push_str(&guest_quote(&self.tool));
+        for argument in &self.args {
+            line.push(' ');
+            line.push_str(&guest_quote(argument));
+        }
+        let script = match &self.stdin {
+            Some(input) => format!("printf %s {} | {line}", guest_quote(input)),
+            None => line,
+        };
+        let out = guest_script(&script);
+        assert!(
+            out.status != 127,
+            "the oracle tool `{}` is not installed in the harness VM. It is \
+             provisioned by scripts/vm-setup.sh; `chore vm:provision` applies that \
+             script again. Tests never skip on a missing tool.\n{}",
+            self.tool,
+            out.stderr
+        );
+        // The evidence a green run carries: every tool call and its
+        // verdict, kept in the tier's log by --nocapture.
+        println!(
+            "[oracle vm] {} {} -> {}",
+            self.tool,
+            self.args.join(" "),
+            out.status
+        );
+        out
+    }
+
+    /// Everything a tool touches is inside this repository, because that
+    /// is the tree the guest has. Caught here, where the rule can be
+    /// explained, rather than in the guest as a missing file.
+    #[track_caller]
+    fn check_path(&self, argument: &str) {
+        if !argument.starts_with('/') || !Path::new(argument).exists() {
+            return;
+        }
+        let repo = repo();
+        assert!(
+            Path::new(argument).starts_with(&repo),
+            "`{}` was given {argument}, which is outside {}. The oracle tools run in \
+             the harness VM, which sees this repository and nothing else of the host, \
+             so a path outside it does not exist there. Put scratch files under the \
+             directory scripts/with-test-temp.sh selects, which is inside the \
+             repository for exactly this reason.",
+            self.tool,
+            repo.display()
+        );
     }
 }
 
-impl Drop for VmLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// An argument as text, which every path and flag this suite passes is.
+#[track_caller]
+fn text(argument: &OsStr) -> String {
+    argument
+        .to_str()
+        .unwrap_or_else(|| {
+            panic!("an oracle argument that is not UTF-8 cannot be passed to the guest")
+        })
+        .to_string()
 }
 
+/// `xfs_repair -n` on `image` must find nothing, or the test fails with
+/// the report. It runs in the harness VM, like every oracle tool.
+#[track_caller]
+pub fn assert_xfs_repair_clean(image: &str, tag: &str) {
+    let out = oracle("xfs_repair").args(["-n", image]).output();
+    // GRADED BY repair::assert_agreed, not by the exit status alone: a
+    // zero return code beside "valuable metadata changes in a log" is
+    // the tool declining to look at an image whose log it did not
+    // replay, and reading that as a pass is a suite checking nothing
+    // (#124).
+    repair::assert_agreed(&out.repair_report(), tag);
+}
+
+/// The path of a fixture under `.vm-share/`, or a panic that says how to
+/// build it.
+///
+/// THE ONLY WAY A TEST REACHES A FIXTURE. The images are gitignored and
+/// generated: the kernel populates them, inside the harness VM. A test
+/// that found its image absent used to print "skipping" and return, and
+/// a skipped test reads exactly like a passing one — so a checkout
+/// without fixtures ran most of this suite against nothing and reported
+/// green. `tests/truncate_oracle.rs` did that in CI for its whole
+/// existence, which is how truncate.rs came to sit at 5% line coverage
+/// with a passing oracle.
+///
+/// `chore fixtures` builds every set, `chore test` checks they are there
+/// before it runs a test that needs one, and `scripts/ci-test.sh` fails
+/// a run whose output says it skipped. This is the half that makes the
+/// test itself honest.
+#[track_caller]
+pub fn fixture(name: &str) -> PathBuf {
+    let path = share().join(name);
+    assert!(
+        path.is_file(),
+        ".vm-share/{name} is missing: the fixtures are gitignored and generated. \
+         Build them with `chore fixtures` (it boots the fs-linux-test-harness VM; \
+         `chore siblings` checks the harness out), then run the tests again. \
+         Tests never skip on a missing fixture.",
+    );
+    path
+}
+
+/// Every fixture in `.vm-share` whose name starts with `prefix` and ends
+/// with `suffix`, in sorted order, or a panic naming the task that
+/// builds them when there are none.
+///
+/// The same rule as [`fixture`] for the suites that walk a set rather
+/// than naming one image: a set that produced nothing is a fixture
+/// build that did not happen, not a test with nothing to do.
+#[track_caller]
+pub fn fixtures_matching(prefix: &str, suffix: &str) -> Vec<PathBuf> {
+    let dir = share();
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    assert!(
+        !found.is_empty(),
+        "no {prefix}*{suffix} fixture in {}: the fixtures are gitignored and \
+         generated. Build them with `chore fixtures`, then run the tests again. \
+         Tests never skip on a missing fixture.",
+        dir.display()
+    );
+    found
+}
 // ---------------------------------------------------------------------
 // Reading an xfs_repair report (#124)
 // ---------------------------------------------------------------------

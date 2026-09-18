@@ -9,32 +9,23 @@
 //! does not corrupt anything — it silently does nothing. Byte equality
 //! against a real record is the only cheap way to notice.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone.
+//! Fixtures are gitignored and generated. They are built on every run
+//! now — `chore fixtures` makes the whole set — so a clone with none of
+//! them fails here rather than passing having re-encoded nothing.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::log::{BBSIZE, XLOG_HEADER_MAGIC};
 use fs_xfs::log_write::{encode_record, Placement};
 use fs_xfs::superblock::Superblock;
-use std::path::{Path, PathBuf};
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
+mod common;
+use common::fixtures_matching;
 
 /// Re-encode every checksummed record and require byte equality.
 #[test]
 fn re_encoding_reproduces_records_byte_for_byte() {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        eprintln!("no .vm-share — skipping");
-        return;
-    };
-
     let mut checked = 0usize;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    for p in fixtures_matching("", ".img") {
         let Ok(dev) = FileDevice::open(&p) else {
             continue;
         };
@@ -119,9 +110,16 @@ fn re_encoding_reproduces_records_byte_for_byte() {
         }
     }
 
-    if checked == 0 {
-        eprintln!("no checksummed records in .vm-share — skipping");
-        return;
-    }
+    // THE FLOOR IS THE ONLY GUARD LEFT. Every assertion above is inside
+    // the loop, so a run that found no checksummed record anywhere would
+    // otherwise report a green test that compared nothing. The fixtures
+    // always carry records the kernel wrote, so none of them having one
+    // is a fixture build that went wrong, not a run with nothing to do.
+    assert!(
+        checked > 0,
+        "no checksummed log record in any .vm-share image: the fixtures are built \
+         by one mkfs.xfs in the harness guest and every one of them has records \
+         the kernel wrote. `chore fixtures` rebuilds them."
+    );
     eprintln!("{checked} records re-encoded byte-for-byte");
 }

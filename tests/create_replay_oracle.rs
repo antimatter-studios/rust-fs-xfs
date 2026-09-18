@@ -25,9 +25,11 @@
 //! - and `xfs_repair` is what catches the inode trees and the group
 //!   header disagreeing.
 //!
-//! Fixtures are gitignored and the VM is not always up, so this skips
-//! rather than fails when either is missing. Build them with
-//! `./scripts/vm-build-create-fixtures.sh`.
+//! The fixtures are gitignored and generated, and the guest that
+//! replays the records is the one the harness boots. `chore fixtures`
+//! builds every before-image, so one that is not there is a build that
+//! did not happen and this suite fails naming it; the VM not being up is
+//! `common`'s business, and it fails there for the same reason.
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
@@ -52,11 +54,8 @@ const SUITE: &str = "create_replay_oracle";
 /// disk that does not yet reflect the first — see
 /// `Filesystem::begin_checkpoint`. That limit is asserted below rather
 /// than merely worked around.
-fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
-    let source = share().join(format!("xfscreate-{case}-before.img"));
-    if !source.exists() {
-        return None;
-    }
+fn create_and_replay(case: &str, names: &[&str]) {
+    let source = common::fixture(&format!("xfscreate-{case}-before.img"));
     let name = format!("xfs-create-{case}-scratch.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, &name);
     let image = scratch.guest();
@@ -178,11 +177,21 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         "#
     );
 
-    let out = kernel_run(&script)?;
+    // The replay always happens: the script runs in the harness guest,
+    // and a guest that cannot be reached is a failure rather than a
+    // fixture that went unjudged.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "{case}: the kernel refused the filesystem after the create was logged:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "{case}: the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
 
     for (n, ino) in &created {
@@ -217,8 +226,6 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         repair.contains("REPAIR_RC=0"),
         "{case}: xfs_repair found something wrong after the replay:\n{repair}"
     );
-
-    Some(())
 }
 
 /// A file created by this driver, used by the kernel.
@@ -226,23 +233,14 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
 fn the_kernel_uses_a_file_this_driver_created() {
     let mut ran = Vec::new();
 
-    if create_and_replay("spare", &["alpha"]).is_some() {
-        ran.push("spare");
-    }
+    create_and_replay("spare", &["alpha"]);
+    ran.push("spare");
     // `last` has exactly one inode free, so this create takes it and the
     // chunk has to leave the free-inode tree. That is the case where the
     // record changes a tree's membership rather than only its contents.
-    if create_and_replay("last", &["only"]).is_some() {
-        ran.push("last");
-    }
+    create_and_replay("last", &["only"]);
+    ran.push("last");
 
-    if ran.is_empty() {
-        eprintln!(
-            "no create fixtures or no VM; build them with \
-             ./scripts/vm-build-create-fixtures.sh"
-        );
-        return;
-    }
     eprintln!("the kernel used files this driver created for: {ran:?}");
 }
 
@@ -263,34 +261,20 @@ fn a_group_with_no_free_inode_gets_a_new_chunk() {
     // one: the blocks a chunk gets sit next to the chunk before them and
     // are owned by the same -7, so the record has to MERGE with its
     // neighbour rather than be added beside it.
+    // BOTH CASES RUN, ALWAYS. This used to return early when neither
+    // fixture was there, on the reasoning that a fresh checkout has
+    // none; the fixtures are built by one pinned mkfs.xfs in one guest
+    // now, so an absent before-image is a fact about that build and has
+    // to be seen. `chore fixtures` is what a fresh checkout runs.
     for case in ["newchunk", "newchunk-rmap"] {
-        if chunk_case(case) {
-            ran.push(case);
-        }
-    }
-    // NO FIXTURE IS A FRESH CHECKOUT, not a failure — the same contract
-    // every suite here keeps, and the job that builds the fixtures runs
-    // through scripts/ci-test.sh, which fails on a skip. Asserting here
-    // instead broke the no-fixture job, which has none on purpose.
-    //
-    // Second time I have written that assertion and had CI correct it.
-    if ran.is_empty() {
-        eprintln!(
-            "no newchunk fixtures — skipping. Build them with \
-             `sudo ./scripts/build-create-fixtures.sh` (needs xfsprogs, so Linux)."
-        );
-        return;
+        chunk_case(case);
+        ran.push(case);
     }
     eprintln!("a chunk was allocated and replayed for: {ran:?}");
 }
 
-/// Returns false when the fixture is missing, so the caller can say so.
-fn chunk_case(case: &str) -> bool {
-    let source = share().join(format!("xfscreate-{case}-before.img"));
-    if !source.exists() {
-        eprintln!("no {case} fixture — skipping");
-        return false;
-    }
+fn chunk_case(case: &str) {
+    let source = common::fixture(&format!("xfscreate-{case}-before.img"));
     let name = format!("xfs-create-{case}-scratch.img");
     let name = name.as_str();
     let scratch = scratch::Volume::copy_of(SUITE, &source, name);
@@ -372,14 +356,20 @@ fn chunk_case(case: &str) -> bool {
         "#
     );
 
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return false;
-    };
+    // The replay always happens in the harness guest, so the chunk this
+    // driver allocated is always judged.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "{case}: the kernel refused a filesystem whose inode chunk this driver allocated:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "{case}: the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
     assert!(
         out.contains("PRESENT"),
@@ -431,7 +421,6 @@ fn chunk_case(case: &str) -> bool {
         before - after
     );
     eprintln!("{case}: the chunk cost {expected} blocks, and inode {ino} came out of it");
-    true
 }
 
 /// A directory made by this driver, used by the kernel.
@@ -448,11 +437,7 @@ fn chunk_case(case: &str) -> bool {
 /// believes something still links to it.
 #[test]
 fn the_kernel_uses_a_directory_this_driver_made() {
-    let source = share().join("xfscreate-spare-before.img");
-    if !source.exists() {
-        eprintln!("no create fixture — skipping");
-        return;
-    }
+    let source = common::fixture("xfscreate-spare-before.img");
     let name = "xfs-mkdir-scratch.img";
     let scratch = scratch::Volume::copy_of(SUITE, &source, name);
     let image = scratch.guest();
@@ -525,14 +510,20 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         "#
     );
 
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The replay always happens in the harness guest, so the mkdir is
+    // always judged.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "the kernel refused the filesystem after the mkdir was logged:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
     assert!(out.contains("IS_DIR"), "newdir is not a directory\n{out}");
     assert!(
@@ -623,11 +614,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
 /// index rather than through a linear walk.
 #[test]
 fn the_kernel_uses_a_directory_this_driver_converted() {
-    let source = share().join("xfsdirconv-exact-before.img");
-    if !source.exists() {
-        eprintln!("no conversion fixture — skipping");
-        return;
-    }
+    let source = common::fixture("xfsdirconv-exact-before.img");
     let name = "xfs-dirconv-scratch.img";
     let scratch = scratch::Volume::copy_of(SUITE, &source, name);
     let image = scratch.guest();
@@ -750,14 +737,20 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
         "#
     );
 
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The replay always happens in the harness guest, so the converted
+    // directory is always judged.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "the kernel refused the filesystem after the conversion:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
     assert!(
         !out.contains("LOST "),

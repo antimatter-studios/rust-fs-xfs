@@ -17,8 +17,9 @@
 //! This fills the first chunk with files that each get one block of data,
 //! which leaves free space starting off the alignment, then creates past
 //! it. Every step is replayed by the kernel and checked by `xfs_repair -n`.
-//! It skips when no kernel is reachable (see `common::transport`), and
-//! ci-test.sh turns that skip into a failure in CI.
+//! Every step runs in the fs-linux-test-harness guest, so there is no
+//! reachable-kernel question to skip on: a guest that cannot be reached
+//! fails the run.
 
 mod common;
 
@@ -39,7 +40,7 @@ fn step(
     name: &str,
     what: &str,
     f: impl FnOnce(&Filesystem) -> Result<(), fs_xfs::Error>,
-) -> Option<()> {
+) {
     {
         let dev = Arc::new(FileDevice::open_rw(image).unwrap());
         let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>)
@@ -66,13 +67,20 @@ fn step(
         echo "REPAIR_END"
         echo DONE
         "#
-    ))?;
+    ));
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "after {what}, the volume could not be unmounted, so the summary counters \
+         were never written back to it. `xfs_repair` reports \
+         `sb_fdblocks N, counted N-1` for exactly that -- the free-block count it \
+         disagrees about is the one the unmount never wrote, not one this driver got \
+         wrong:\n{out}"
+    );
     assert!(
         out.contains("MOUNTED"),
         "after {what}, the kernel refused the volume:\n{out}"
     );
     repair::assert_agreed(&out, &format!("after {what}"));
-    Some(())
 }
 
 /// Inodes allocated across every group.
@@ -88,15 +96,21 @@ fn inodes(fs: &Filesystem) -> u32 {
 /// skips (`log_oracle` in the fixture-less test jobs).
 #[test]
 fn a_new_inode_chunk_on_one_kib_blocks_replays() {
-    // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
-    // volume, but it builds it in the share, and a share that exists is
-    // what the suites scanning it take for a fixture set: creating one
-    // here makes them fail where they would have skipped. The job that
-    // runs this builds the fixtures first, so the directory is there.
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. This builds its own volume,
+    // but it builds it in the share, and `chore fixtures` makes that
+    // directory before anything else runs. The old reasoning for
+    // returning early here was that creating the directory would leave
+    // the suites which scan it looking at a set holding nothing but this
+    // scratch image; those suites fail on an empty set themselves now,
+    // so an absent share is simply the fixture build not having
+    // happened, and that has to be seen.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let scratch = scratch::Volume::empty(
         SUITE,
         &format!("{}.img", std::process::id()),
@@ -104,12 +118,9 @@ fn a_new_inode_chunk_on_one_kib_blocks_replays() {
     );
     let image = scratch.path().to_path_buf();
     let name = scratch.guest();
-    let Some(mkfs) = kernel_run(&format!(
+    let mkfs = kernel_run(&format!(
         "mkfs.xfs -q -f -b size=1024 -d agcount=2 {name} 2>&1 && echo MKFS_OK; echo DONE"
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(mkfs.contains("MKFS_OK"), "mkfs.xfs failed:\n{mkfs}");
     let path = image.to_str().unwrap().to_string();
 
@@ -131,21 +142,18 @@ fn a_new_inode_chunk_on_one_kib_blocks_replays() {
             let root = fs.lookup_path("/").unwrap().ino;
             fs.create_directory(root, dir.as_bytes(), 0o40755)
                 .map(|_| ())
-        })
-        .expect("kernel");
+        });
         for f in 0..6 {
             let file = format!("/{dir}/f{f}");
             step(&path, &name, &format!("create {file}"), |fs| {
                 let parent = fs.lookup_path(&format!("/{dir}")).unwrap().ino;
                 fs.create_file(parent, format!("f{f}").as_bytes(), 0o100644)
                     .map(|_| ())
-            })
-            .expect("kernel");
+            });
             step(&path, &name, &format!("write {file}"), |fs| {
                 let ino = fs.lookup_path(&file).unwrap().ino;
                 fs.write_into_empty_file(ino, &[7u8; 1024]).map(|_| ())
-            })
-            .expect("kernel");
+            });
             made += 1;
             let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
             if inodes(&fs) > inodes_before {

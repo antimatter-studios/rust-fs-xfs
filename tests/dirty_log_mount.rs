@@ -176,10 +176,17 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
 
 #[test]
 fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. `chore fixtures` makes it
+    // before anything else runs, and this test writes its scratch volume
+    // beside the fixtures. An absent share is that build not having
+    // happened, which has to be seen rather than skipped.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let pid = std::process::id();
     let crashed = scratch::Volume::empty(SUITE, &format!("dirty-{pid}.img"), 400 * 1024 * 1024);
     let copy = scratch::Volume::empty(SUITE, &format!("replayed-{pid}.img"), 400 * 1024 * 1024);
@@ -190,7 +197,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
     // THE CRASH IS `shutdown -f`: the log is flushed and the filesystem
     // is stopped before anything checkpoints it, which is the state a
     // power cut leaves and the one every structure below is read in.
-    let Some(built) = kernel_run(&format!(
+    let built = kernel_run(&format!(
         r#"
         export LC_ALL=C
         mkfs.xfs -q -f {dirty} 2>&1 && echo MKFS_OK
@@ -275,10 +282,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         unflushed_last = UNFLUSHED - 1,
         churn_last = CHURN - 1,
         reused_last = REUSED - 1,
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(
         built.contains("MKFS_OK") && built.contains("MOUNT_OK") && built.contains("SHUTDOWN_OK"),
         "building the dirty volume failed:\n{built}"

@@ -10,31 +10,34 @@
 //! refusal below is a place where returning plausible bytes would be
 //! worse than failing.
 //!
-//! Fixtures are gitignored; these skip cleanly without them.
+//! The fixture is gitignored and generated, and `chore fixtures` always
+//! builds it. An absent image is that build not having happened, so
+//! these fail and name the task instead of returning early.
+
+mod common;
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::{Error, Filesystem};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn any_fixture() -> Option<PathBuf> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let p = share.join("xfsdata-default.img");
-    p.exists().then_some(p)
+/// The image every test here reads. `common::fixture` resolves it and
+/// fails, naming the task that builds it, when it is not there.
+const IMAGE: &str = "xfsdata-default.img";
+
+fn any_fixture() -> PathBuf {
+    common::fixture(IMAGE)
 }
 
-fn mount() -> Option<Filesystem> {
-    let img = any_fixture()?;
-    let dev = FileDevice::open(&img).expect("open image");
-    Some(Filesystem::mount(Arc::new(dev)).expect("mount"))
+fn mount() -> Filesystem {
+    let img = any_fixture();
+    let dev = FileDevice::open(&img).expect("open .vm-share/xfsdata-default.img");
+    Filesystem::mount(Arc::new(dev)).expect("mount")
 }
 
 #[test]
 fn listing_a_regular_file_is_refused() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let found = fs.lookup_path("/small.txt").expect("small.txt exists");
     let (inode, raw) = fs.read_inode_raw(found.ino).expect("inode");
     assert!(
@@ -45,10 +48,7 @@ fn listing_a_regular_file_is_refused() {
 
 #[test]
 fn reading_a_directory_as_a_file_is_refused() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let found = fs.lookup_path("/sub").expect("sub exists");
     let (inode, raw) = fs.read_inode_raw(found.ino).expect("inode");
     assert!(
@@ -59,10 +59,7 @@ fn reading_a_directory_as_a_file_is_refused() {
 
 #[test]
 fn readlink_on_a_regular_file_is_refused() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let found = fs.lookup_path("/small.txt").expect("small.txt exists");
     let (inode, raw) = fs.read_inode_raw(found.ino).expect("inode");
     assert!(matches!(fs.read_link(&inode, &raw), Err(Error::NotAFile)));
@@ -70,10 +67,7 @@ fn readlink_on_a_regular_file_is_refused() {
 
 #[test]
 fn a_missing_name_is_not_found() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     assert!(matches!(
         fs.lookup_path("/definitely-not-here.txt"),
         Err(Error::NotFound)
@@ -86,10 +80,7 @@ fn a_missing_name_is_not_found() {
 
 #[test]
 fn descending_through_a_file_is_refused() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     // `small.txt` is a file, so it cannot have children. Returning
     // NotFound here would be misleading — the path is malformed, not
     // merely absent.
@@ -103,10 +94,7 @@ fn descending_through_a_file_is_refused() {
 /// cannot accidentally escape the subtree it thinks it is walking.
 #[test]
 fn parent_references_are_refused_rather_than_resolved() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     assert!(matches!(
         fs.lookup_path("/sub/../small.txt"),
         Err(Error::UnsupportedFeature(_))
@@ -116,10 +104,7 @@ fn parent_references_are_refused_rather_than_resolved() {
 /// Redundant separators and `.` components are ordinary, not errors.
 #[test]
 fn redundant_path_components_are_tolerated() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let direct = fs.lookup_path("/sub/nested/file.txt").expect("direct");
     for messy in [
         "//sub//nested//file.txt",
@@ -139,10 +124,7 @@ fn redundant_path_components_are_tolerated() {
 /// The root path in its various spellings is the root directory.
 #[test]
 fn root_resolves_in_every_spelling() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let expected = fs.superblock().rootino;
     for spelling in ["/", "", ".", "/./"] {
         let got = fs.lookup_path(spelling).expect("root resolves");
@@ -155,10 +137,7 @@ fn root_resolves_in_every_spelling() {
 
 #[test]
 fn an_inode_number_outside_the_filesystem_is_refused() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     // An inode number whose allocation group index exceeds agcount.
     let sb = fs.superblock();
     let bogus = u64::from(sb.agcount + 5) << (sb.inopblog + sb.agblklog);
@@ -170,10 +149,7 @@ fn an_inode_number_outside_the_filesystem_is_refused() {
 
 #[test]
 fn reading_past_end_of_file_returns_nothing() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let found = fs.lookup_path("/small.txt").expect("small.txt");
     let (inode, raw) = fs.read_inode_raw(found.ino).expect("inode");
     let mut buf = [0u8; 64];
@@ -187,10 +163,7 @@ fn reading_past_end_of_file_returns_nothing() {
 /// short, not an error.
 #[test]
 fn reads_are_clamped_to_the_end_of_the_file() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let found = fs.lookup_path("/small.txt").expect("small.txt");
     let (inode, raw) = fs.read_inode_raw(found.ino).expect("inode");
     let mut buf = vec![0u8; inode.size as usize * 4];
@@ -206,10 +179,7 @@ fn reads_are_clamped_to_the_end_of_the_file() {
 /// This is the accessor path `endtoend_oracle` never touches.
 #[test]
 fn every_allocation_group_header_is_readable() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let agcount = fs.superblock().agcount;
     for ag in 0..agcount {
         let agf = fs.read_agf(ag).unwrap_or_else(|e| panic!("AGF {ag}: {e}"));
@@ -345,10 +315,10 @@ impl fs_core::BlockDevice for ScratchOverlay {
     }
 }
 
-/// A writable view of the data fixture, or `None` if it is not built.
-fn mount_rw() -> Option<Filesystem> {
-    let img = any_fixture()?;
-    Some(Filesystem::mount_rw(Arc::new(ScratchOverlay::over(&img))).expect("mount read-write"))
+/// A writable view of the data fixture.
+fn mount_rw() -> Filesystem {
+    let img = any_fixture();
+    Filesystem::mount_rw(Arc::new(ScratchOverlay::over(&img))).expect("mount read-write")
 }
 
 /// A refused write must leave the mount's one checkpoint unspent.
@@ -374,10 +344,7 @@ fn mount_rw() -> Option<Filesystem> {
 /// that is the other half of it — the limit must still be a limit.
 #[test]
 fn a_refused_write_leaves_the_checkpoint_for_a_real_one() {
-    let Some(fs) = mount_rw() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount_rw();
     let root = fs.superblock().rootino;
     // A core no version recognises: `log_inode_core`'s own refusal, and
     // the only one it has that comes before the record is written.
@@ -467,13 +434,7 @@ fn a_refused_write_leaves_the_checkpoint_for_a_real_one() {
 /// operation against this feature and has `xfs_repair` judge the result.
 #[test]
 fn a_reverse_mapping_filesystem_is_writable_and_stays_consistent() {
-    let img = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("xfs-reflink.img");
-    if !img.exists() {
-        eprintln!("no rmapbt fixture (xfs-reflink.img) — skipping");
-        return;
-    }
+    let img = common::fixture("xfs-reflink.img");
 
     let ro = fs_core::FileDevice::open(&img).expect("open read-only");
     let fs = fs_xfs::Filesystem::mount(
@@ -571,12 +532,12 @@ impl fs_core::BlockDevice for MemDev {
 /// A copy of a fixture with `bits` added to `sb_features_ro_compat` and
 /// the superblock's checksum restored, so the volume is well-formed and
 /// differs only in the feature mask.
-fn fixture_with_ro_compat(bits: u32) -> Option<Arc<MemDev>> {
+fn fixture_with_ro_compat(bits: u32) -> Arc<MemDev> {
     // `sb_features_ro_compat` is at offset 212, and the superblock is
     // the first sector.
     const FEATURES_RO_COMPAT: usize = 212;
 
-    let img = any_fixture()?;
+    let img = any_fixture();
     let mut bytes = std::fs::read(&img).expect("read the fixture");
     let sectsize = u16::from_be_bytes([bytes[102], bytes[103]]) as usize;
 
@@ -588,7 +549,7 @@ fn fixture_with_ro_compat(bits: u32) -> Option<Arc<MemDev>> {
     bytes[FEATURES_RO_COMPAT..FEATURES_RO_COMPAT + 4]
         .copy_from_slice(&(existing | bits).to_be_bytes());
     fs_xfs::super_write::stamp_crc(&mut bytes[..sectsize]);
-    Some(MemDev::arc(bytes))
+    MemDev::arc(bytes)
 }
 
 /// A volume carrying a feature this driver does not maintain can be
@@ -604,10 +565,7 @@ fn an_unmaintained_ro_compat_bit_still_mounts_for_reading() {
     // looks like from here. Bit 4 is not the metadata directory tree:
     // that is incompat bit 8 (#126).
     for bits in [1u32 << 4, 1 << 20] {
-        let Some(dev) = fixture_with_ro_compat(bits) else {
-            eprintln!("no fixture — skipping");
-            return;
-        };
+        let dev = fixture_with_ro_compat(bits);
         Filesystem::mount(dev).unwrap_or_else(|e| {
             panic!("ro_compat {bits:#x} must still be readable, got {e:?}");
         });
@@ -623,10 +581,7 @@ fn an_unmaintained_ro_compat_bit_still_mounts_for_reading() {
 #[test]
 fn an_unmaintained_ro_compat_bit_refuses_a_writable_mount() {
     for bits in [1u32 << 4, 1 << 20] {
-        let Some(dev) = fixture_with_ro_compat(bits) else {
-            eprintln!("no fixture — skipping");
-            return;
-        };
+        let dev = fixture_with_ro_compat(bits);
         match Filesystem::mount_rw(dev) {
             Err(Error::UnsupportedFeature(msg)) => {
                 assert!(
@@ -648,10 +603,7 @@ fn an_unmaintained_ro_compat_bit_refuses_a_writable_mount() {
 /// likely to go wrong.
 #[test]
 fn a_default_volume_still_mounts_for_writing() {
-    let Some(img) = any_fixture() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let img = any_fixture();
     let bytes = std::fs::read(&img).expect("read the fixture");
     let dev = MemDev::arc(bytes);
     match Filesystem::mount_rw(dev) {

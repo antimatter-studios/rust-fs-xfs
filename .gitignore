@@ -11,20 +11,22 @@ Cargo.lock.bak
 .idea/
 *.swp
 
-# Test artifacts
-test-disks/*.img
-test-disks/[0-9]*/
-test-disks/test-run/
-!test-disks/.gitkeep
-
 # VM harness scratch (per-VM Vagrant state, cached boot assets).
-# Produced by scripts/vm.sh. Re-runnable, never in source control.
+# The harness keeps its machine directory outside the repository; what is
+# left here is whatever an older checkout produced. Re-runnable, never in
+# source control.
 .qemu/
 **/.vagrant/
-test-disks/.vm-cache/
 .claude/
-# VM harness shared dir (images exchanged with the oracle VM)
+# VM harness shared dir (the fixtures, and the files one guest call
+# leaves behind). Built by `chore fixtures`, large, and regenerable.
 .vm-share/
+
+# Test scratch and the tier logs. scripts/with-test-temp.sh puts every
+# test's scratch directory in here rather than in /tmp, because the
+# oracle tools run in the harness guest, which sees this repository and
+# nothing else of the host; scripts/tier.sh writes tmp/logs/<tier>.log.
+tmp/
 
 # chore fingerprint cache (sources:/generates: checksums). Derived data.
 .chore/
@@ -32,5 +34,6 @@ test-disks/.vm-cache/
 # Build output. `chore staticlib` writes the archive and headers here for a
 # consumer to copy out of (`chore artifact` prints this directory).
 /dist/
-.vm-share/.kernel-run.lock
-.vm-share/scratch/
+
+# Scratch logs from a run somebody watched.
+/tmp-*.log

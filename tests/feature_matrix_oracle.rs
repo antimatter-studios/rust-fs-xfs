@@ -30,9 +30,9 @@
 //! reasoning about the format.
 
 mod common;
-use common::{kernel_run, scratch, share};
+use common::{fixture, kernel_run, scratch};
 
-/// Where this suite's scratch volumes live, under
+/// Where this suite'''s scratch volumes live, under
 /// `.vm-share/scratch/`, out of reach of the suites that scan the
 /// fixtures beside them (#223).
 const SUITE: &str = "feature_matrix_oracle";
@@ -329,7 +329,9 @@ fn exercise(img: &Path, op: &str) -> Outcome {
         echo DONE
         "#
     );
-    let repair = kernel_run(&script).unwrap_or_default();
+    // The replay and the checker always run: they run in the harness
+    // guest, so every pair this reaches is judged.
+    let repair = kernel_run(&script);
     Outcome::Wrote { repair }
 }
 
@@ -348,11 +350,12 @@ fn every_feature_combination_is_written_correctly_or_refused() {
     let ops = selected("XFS_MATRIX_OPS", OPS);
 
     for combo in &combos {
-        let source = share().join(format!("xfsfeat-{combo}.img"));
-        if !source.exists() {
-            eprintln!("no xfsfeat-{combo} fixture — skipping");
-            continue;
-        }
+        // EVERY ROW IS BUILT, EVERY RUN. `chore fixtures -- feature-matrix`
+        // makes one image per name in COMBOS with one pinned mkfs.xfs, so
+        // a row whose image is not there is that build having gone wrong
+        // -- and a row left out is a combination nobody checked, which
+        // is the whole thing this matrix exists to prevent.
+        let source = fixture(&format!("xfsfeat-{combo}.img"));
 
         for op in &ops {
             // A fresh copy per operation: the previous one may have
@@ -382,11 +385,6 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                     }
                 }
                 Outcome::Wrote { repair } => {
-                    if repair.is_empty() {
-                        unjudged += 1;
-                        eprintln!("{combo:22} {op:22} wrote, no kernel to judge it");
-                        continue;
-                    }
                     // A KERNEL THAT REFUSED THE IMAGE IS A FAILURE, and
                     // it has to be tested for FIRST. A refused mount
                     // leaves the log unreplayed, so the check below
@@ -399,6 +397,15 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                         broken.push(format!("{combo} / {op}: the kernel refused to mount it"));
                         continue;
                     }
+
+                    assert!(
+                        !repair.contains("UMOUNT_FAILED"),
+                        "{combo} / {op}: the volume could not be unmounted, so the \
+                         summary counters were never written back to it. `xfs_repair` \
+                         reports `sb_fdblocks N, counted N-1` for exactly that -- the \
+                         free-block count it disagrees about is the one the unmount \
+                         never wrote, not one this driver got wrong:\n{repair}"
+                    );
 
                     // The checker disqualifies its own answer when the
                     // log was not replayed, and says so. Counting that
@@ -446,20 +453,18 @@ fn every_feature_combination_is_written_correctly_or_refused() {
         }
     }
 
-    // NO FIXTURE AT ALL IS A FRESH CHECKOUT, not a failure. That is the
-    // contract every suite here keeps, and the job that builds the
-    // fixtures runs through scripts/ci-test.sh, which fails on a skip --
-    // so this cannot go quiet where it matters.
-    //
-    // An assertion here instead of a skip is what broke the no-fixture
-    // job: it has no fixtures on purpose.
-    if checked == 0 {
-        eprintln!(
-            "no feature-matrix fixtures — skipping. Build them with \
-             `sudo ./scripts/build-feature-matrix-fixtures.sh` (needs xfsprogs, so Linux)."
-        );
-        return;
-    }
+    // THE FLOOR IS THE ONLY GUARD ON THE SELECTION. A missing image now
+    // fails inside `fixture`, so zero pairs can only mean the selection
+    // itself was empty: `XFS_MATRIX_COMBOS=` or `XFS_MATRIX_OPS=` naming
+    // nothing keeps every name out and would otherwise report a green run
+    // that exercised no combination at all.
+    assert!(
+        checked > 0,
+        "no combination/operation pair was exercised. XFS_MATRIX_COMBOS and \
+         XFS_MATRIX_OPS narrow the matrix and an empty one selects nothing; unset \
+         them for the whole matrix, which is what CI runs. The images come from \
+         `chore fixtures -- feature-matrix`."
+    );
     eprintln!(
         "\n{checked} combination/operation pairs: {sound} written and sound, \
          {refused} refused by name, {not_applicable} not applicable, {unjudged} unjudged"

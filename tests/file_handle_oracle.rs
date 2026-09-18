@@ -13,21 +13,21 @@
 //! in a counter and the two routes are compared. A claim about I/O that
 //! nothing counts is a guess.
 //!
-//! Fixtures come from a real `mkfs.xfs` — the CI job installs xfsprogs
-//! and builds them, and `scripts/vm-build-fixtures.sh` does it locally.
-//! They are gitignored, so this skips rather than fails on a fresh
-//! clone.
+//! Fixtures come from a real `mkfs.xfs`, run by one pinned xfsprogs in
+//! the harness guest. `chore fixtures` builds the set everywhere, so a
+//! checkout without it is a build that did not happen and this suite
+//! fails naming that task: an image is never a reason to return early
+//! and report ok.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use common::share;
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
 
 /// A fixture that actually CONTAINS SOMETHING.
 ///
@@ -36,15 +36,15 @@ fn share() -> PathBuf {
 /// finds nothing to compare passes while proving nothing. That is the
 /// failure this function exists to prevent, so it mounts candidates and
 /// returns the first whose root has a real entry.
-fn fixture_with_content() -> Option<PathBuf> {
-    let mut images: Vec<PathBuf> = std::fs::read_dir(share())
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "img"))
-        .collect();
-    images.sort();
-    images.into_iter().find(|img| {
+///
+/// It fails rather than returning nothing. `common::fixtures_matching`
+/// already fails when the set is empty, and a set that is there but
+/// holds no image with something in it is the same fact about the
+/// fixture build: every geometry came out bare, which this suite cannot
+/// test against and must not pass over.
+fn fixture_with_content() -> PathBuf {
+    let images = common::fixtures_matching("xfs", ".img");
+    let chosen = images.iter().find(|img| {
         let Ok(file) = FileDevice::open(img) else {
             return false;
         };
@@ -134,6 +134,17 @@ fn fixture_with_content() -> Option<PathBuf> {
         entries.iter().any(|e| e.name != b"." && e.name != b"..")
             && has_a_readable_file(&fs, "/", 4)
             && has_a_directory(&fs, "/", 4)
+    });
+    chosen.cloned().unwrap_or_else(|| {
+        panic!(
+            "none of the {} images in {} holds both a non-empty regular file and a \
+             directory, so there is nothing here for the handle to be compared \
+             against. The fixture builder writes a tree into each geometry; a set \
+             that is entirely bare is that step having failed, so rebuild it with \
+             `chore fixtures`.",
+            images.len(),
+            share().display()
+        )
     })
 }
 
@@ -228,10 +239,7 @@ fn walk(fs: &Filesystem, path: &str, out: &mut Vec<(String, bool)>) {
 
 #[test]
 fn open_agrees_with_the_low_level_calls_it_wraps() {
-    let Some(img) = fixture_with_content() else {
-        eprintln!("no fixture with content in .vm-share — skipping");
-        return;
-    };
+    let img = fixture_with_content();
     let (fs, _c) = mount_counting(&img);
 
     let mut found = Vec::new();
@@ -286,10 +294,7 @@ fn open_agrees_with_the_low_level_calls_it_wraps() {
 /// the last byte, and a request that runs past the end.
 #[test]
 fn ranged_reads_agree_with_the_whole_file() {
-    let Some(img) = fixture_with_content() else {
-        eprintln!("no fixture with content in .vm-share — skipping");
-        return;
-    };
+    let img = fixture_with_content();
     let (fs, _c) = mount_counting(&img);
 
     let mut found = Vec::new();
@@ -371,10 +376,7 @@ fn ranged_reads_agree_with_the_whole_file() {
 /// question the test asks is the one in its title again.
 #[test]
 fn the_handle_does_strictly_less_io_than_the_low_level_route() {
-    let Some(img) = fixture_with_content() else {
-        eprintln!("no fixture with content in .vm-share — skipping");
-        return;
-    };
+    let img = fixture_with_content();
     let (fs, counter) = mount_counting_uncached(&img);
 
     let mut found = Vec::new();
@@ -455,10 +457,7 @@ fn the_handle_does_strictly_less_io_than_the_low_level_route() {
 /// the deeper the path is.
 #[test]
 fn open_child_agrees_with_a_full_path_open() {
-    let Some(img) = fixture_with_content() else {
-        eprintln!("no fixture with content in .vm-share — skipping");
-        return;
-    };
+    let img = fixture_with_content();
     let (fs, _c) = mount_counting(&img);
 
     let root = fs.root().expect("root");
@@ -489,10 +488,7 @@ fn open_child_agrees_with_a_full_path_open() {
 /// for the wrong one is refused rather than answered with nonsense.
 #[test]
 fn the_handle_refuses_the_wrong_kind() {
-    let Some(img) = fixture_with_content() else {
-        eprintln!("no fixture with content in .vm-share — skipping");
-        return;
-    };
+    let img = fixture_with_content();
     let (fs, _c) = mount_counting(&img);
 
     let root = fs.root().expect("root");

@@ -44,31 +44,91 @@ should not be used for anything else.
 
 ## Running tests
 
-```sh
-./scripts/test.sh                                   # unit + host-side oracle tests
-./scripts/test.sh --test oracle_vm_fixtures -- --nocapture   # just the cross-validation
-./scripts/test.sh -- --ignored                      # tests that shell out to xfsprogs (Linux)
-cargo clippy --all-targets -- -D warnings    # what the pre-commit hook runs
-```
-
-Install hooks once per clone: `./scripts/install-hooks.sh`.
-
-## The oracle VM
-
-`mkfs.xfs` / `xfs_db` are Linux-only, so on macOS they live in a Debian arm64 VM
-(QEMU + HVF, hardware-accelerated).
+Every tier is a chore task, and every job in `.github/workflows/ci.yml` runs those same
+tasks, so a green `chore test` here is the same evidence as a green run there.
 
 ```sh
-./scripts/vm.sh up               # boot; idempotent
-./scripts/vm-build-fixtures.sh   # regenerate .vm-share/ fixture matrix
-./scripts/vm.sh run <cmd>        # run a command in the guest
-./scripts/vm.sh down             # halt (next `up` is fast)
+chore siblings        # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
+chore tools           # what the HOST needs: ripgrep, and the VM. NOT xfsprogs
+chore fixtures        # the .vm-share images, built by the kernel in the guest
+chore test:unit       # no tool, no fixture, no VM — debug profile, overflow checks on
+chore test:images     # reads a fixture, needs no VM
+chore test:oracle     # the driver writes, xfsprogs reads back
+chore test:kernel     # the driver writes, the real kernel reads back
+chore test:vm         # the whole suite compiled and run inside the guest
+chore test:scripts    # the shell tests, tests/scripts/*.sh, by glob
+chore test            # all of it, exactly as CI runs it
+chore lint            # cargo fmt --check and clippy -D warnings, as CI runs them
 ```
 
-Fixtures land in `.vm-share/` as `xfs-<name>.img` + `xfs-<name>.sbdump`. They are
-gitignored; the tests skip cleanly when absent.
+A tier prints a verdict and writes everything it saw to `tmp/logs/<tier>.log`; add
+`-- --verbose` to stream the run instead. Running one suite by hand still works:
 
-### Two VM traps, both already paid for
+```sh
+./scripts/test.sh --test oracle_vm_fixtures -- --nocapture
+```
+
+**Nothing skips.** A missing tool, fixture or VM fails the test that needed it and
+names the task that provides it, and `scripts/ci-test.sh` fails any run whose output
+matches a skip or that executed fewer tests than its floor.
+
+There is no hooks installer in this repository. `./scripts/install-hooks.sh` was
+removed by #165, when the guards moved outside the working tree so that no branch
+checkout could rewrite the hook about to run; this file went on naming it for far
+longer. The hooks come from the github-guard skill's own installer, once per clone —
+`~/.claude/skills/github-guard/install.sh .`, as README `## Building` says.
+
+## The oracle VM, and why everything Linux happens inside it
+
+`mkfs.xfs`, `xfs_db`, `xfs_repair`, `xfs_logprint` and `xfs_io` — and the loop mounts
+the kernel oracles need — run in one Debian guest, on every machine. Not "on a Mac,
+where they are missing": always. xfsprogs on a workstation is whatever that machine
+happens to have — nothing at all on a Mac, 6.1 on Debian 12, 6.6 on Ubuntu 24.04, 6.13
+if somebody built one under `~/.local` — and an oracle whose answer depends on which
+machine asked is not an oracle. CI used to install xfsprogs on the runner and loop-mount
+there with `sudo` while a developer got a VM, so the branch gate and a local run were
+graded by two different `mkfs.xfs` and two different kernels, which is what #211 and
+#212 are. There is one guest now, and `tests/test_contract.rs` fails the suite if a
+test reaches a tool any other way.
+
+The VM belongs to
+[fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness),
+a sibling checkout at `../fs-linux-test-harness` that `chore siblings` moves to the tag
+pinned in `chores.yml`. Thirteen VM scripts of this repository's own — `vm.sh`,
+`vm-slot.sh`, `vm-session.sh` and ten `vm-build-*-fixtures.sh` wrappers — went with it;
+its slot lock is the reconciliation of ours with two others. This repository configures
+it in `fs-linux-test-harness.toml` and drives it through the tasks the harness supplies,
+included here as `vm`:
+
+```sh
+chore vm:up            # boot, provision, and hold it up
+chore vm:run -- <cmd>  # run a command as root in the guest, booting if needed
+chore vm:exec -- <cmd> # the same in a VM already up — never boots one
+chore vm:status        # exit 0 when it is running
+chore vm:down          # halt, confirm it stopped (the next `up` is fast)
+chore vm:destroy       # delete it and its disk; the next boot provisions from scratch
+chore vm:provision     # re-run scripts/vm-setup.sh, changed or not
+chore vm:host:check    # what this host is missing, with the command that installs it
+```
+
+`scripts/vm-setup.sh` is what the guest is provisioned with, and it is the only place
+an oracle tool is installed: xfsprogs, `attr`/`acl`, a pinned xfsprogs 6.13 in its own
+prefix (parent pointers arrived in 6.10 and Debian 12 ships 6.1, and everything else
+keeps the distribution's `mkfs.xfs`, whose defaults the fixtures were built with), and
+the Rust toolchain `chore test:vm` compiles the suite with.
+
+Fixtures land in `.vm-share/` as `xfs-<name>.img` + `xfs-<name>.sbdump`, built by
+`chore fixtures` — name sets to build only those, `chore fixtures -- log truncate`.
+They are gitignored, and a missing one **fails** the test that wanted it naming that
+task. It used to print a skip line and return `ok`, which is how `truncate.rs` came to
+sit at 5% line coverage underneath a green oracle suite.
+
+### Three VM traps, all paid for here
+
+They belong to `../fs-linux-test-harness/vagrant/Vagrantfile` now — this repository's own
+`tests/vagrant/debian/Vagrantfile` is gone — and
+`../fs-linux-test-harness/tests/vagrantfile.sh` asserts every one of them, which is the
+reason they moved rather than being re-learned by the next repository:
 
 1. **Never set `config.notify_forwarder.enable = false`.** The plugin's `up` hook
    truncates the QEMU boot chain — the VM imports successfully and then never boots,
@@ -76,9 +136,8 @@ gitignored; the tests skip cleanly when absent.
 2. **`qe.virtiofs_guest_uid`/`gid` must match the box's `vagrant` user** (1001 on this
    box, not the plugin's 1000 default), or the shared folder is read-only to the guest
    and every fixture build fails with a bare permission error.
-
-Also: `generic/debian12` is deliberately not used — it was rebuilt upstream without its
-UEFI bootloader and no longer boots on a fresh clone.
+3. **`generic/debian12` is deliberately not used** — it was rebuilt upstream without its
+   UEFI bootloader and no longer boots on a fresh clone. The box is `cloud-image/debian-12`.
 
 ## Adding a parsed structure
 
@@ -90,9 +149,14 @@ UEFI bootloader and no longer boots on a fresh clone.
 3. On v5, verify both the CRC **and** the self-describing identity fields (UUID and
    owning AG). The checksum catches corrupted bits; the identity fields catch an
    intact block that came from the wrong place.
-4. Add a cross-validation case to `tests/oracle_vm_fixtures.rs`, and a geometry to
-   `scripts/vm-build-fixtures.sh` if the structure only appears under a particular
-   mkfs option.
+4. Add a cross-validation case to `tests/oracle_vm_fixtures.rs`, and — if the structure
+   only appears under a particular mkfs option — a geometry to
+   `scripts/fixture-geometries.sh`. That file is the single list: the builder
+   (`scripts/guest-build-fixtures.sh`, in the guest) sources it, and
+   `tests/scripts/fixture-geometries-single-copy.sh` fails if any builder grows a list
+   of its own again. Two copies drifted once already (#110) — one list gained
+   `nosparse` the other never built, and CI and a local run stopped meaning the same
+   thing.
 
 ## Project rules
 

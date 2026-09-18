@@ -21,8 +21,11 @@
 //! compared exactly, and the test asserts that those two are the *only*
 //! differences rather than masking a range and hoping.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-dirconv-fixtures.sh`.
+//! The fixtures are gitignored and generated: `chore fixtures` builds
+//! the dirconv set in the harness guest, one pinned `mkfs.xfs` and one
+//! kernel. A before- or after-image that is not there is that build
+//! having failed, so it fails here and names the task — a comparison
+//! that was never made must not read like one that matched.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::dir;
@@ -30,15 +33,13 @@ use fs_xfs::dir_block::{self, Entry};
 use fs_xfs::format::attr::hashname;
 use fs_xfs::format::dir::{offsets, XFS_DIR2_BLOCK_TAIL_SIZE, XFS_DIR2_LEAF_ENTRY_SIZE};
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
+
+mod common;
 
 /// The directory each fixture converts.
 const DIR: &str = "/d";
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
 
 /// Every name in a directory, with its inode and type byte.
 fn listing(img: &Path) -> Vec<Entry> {
@@ -57,12 +58,13 @@ fn listing(img: &Path) -> Vec<Entry> {
 }
 
 /// Build the block for `case` and compare it against the kernel's.
-fn compare(case: &str) -> Option<()> {
-    let before_path = share().join(format!("xfsdirconv-{case}-before.img"));
-    let after_path = share().join(format!("xfsdirconv-{case}-after.img"));
-    if !before_path.exists() || !after_path.exists() {
-        return None;
-    }
+///
+/// Both images come out of the same guest run, so either one missing is
+/// the fixture build having stopped halfway rather than a case this
+/// machine cannot make.
+fn compare(case: &str) {
+    let before_path = common::fixture(&format!("xfsdirconv-{case}-before.img"));
+    let after_path = common::fixture(&format!("xfsdirconv-{case}-after.img"));
 
     // What the directory held before, and in what order.
     let before_dev = Arc::new(FileDevice::open(&before_path).expect("open before"));
@@ -153,27 +155,23 @@ fn compare(case: &str) -> Option<()> {
         entries.len(),
         differing.len()
     );
-    Some(())
 }
 
 /// Every conversion fixture, compared against the kernel's own block.
 #[test]
 fn the_block_matches_what_the_kernel_built() {
+    // BOTH CASES ARE COMPARED, ALWAYS. `compare` fails on a missing
+    // image rather than reporting the case as one it passed over, so the
+    // count below is the number of conversions actually checked.
     let mut ran = Vec::new();
     for case in ["exact", "spill"] {
-        match compare(case) {
-            Some(()) => ran.push(case),
-            None => eprintln!("{case}: fixture missing — skipped"),
-        }
+        compare(case);
+        ran.push(case);
     }
-    if ran.is_empty() {
-        eprintln!(
-            "no conversion fixtures; build them with \
-             ./scripts/vm-build-dirconv-fixtures.sh"
-        );
-        return;
-    }
-    eprintln!("{} conversion(s) match the kernel byte for byte", ran.len());
+    eprintln!(
+        "{} conversion(s) in .vm-share match the kernel byte for byte",
+        ran.len()
+    );
 }
 
 /// This driver's own reader must accept the block this driver built.
@@ -184,11 +182,7 @@ fn the_block_matches_what_the_kernel_built() {
 /// would be caught here with a message about which.
 #[test]
 fn our_reader_accepts_our_own_block() {
-    let before_path = share().join("xfsdirconv-exact-before.img");
-    if !before_path.exists() {
-        eprintln!("no conversion fixture — skipping");
-        return;
-    }
+    let before_path = common::fixture("xfsdirconv-exact-before.img");
 
     let dev = Arc::new(FileDevice::open(&before_path).expect("open"));
     let fs = Filesystem::mount(dev).expect("mount");
@@ -234,11 +228,7 @@ fn our_reader_accepts_our_own_block() {
 /// correctly, passes every structural check, and cannot be searched.
 #[test]
 fn our_hash_agrees_with_the_kernels_index() {
-    let path = share().join("xfsdirconv-exact-after.img");
-    if !path.exists() {
-        eprintln!("no conversion fixture — skipping");
-        return;
-    }
+    let path = common::fixture("xfsdirconv-exact-after.img");
 
     let dev = Arc::new(FileDevice::open(&path).expect("open"));
     let fs = Filesystem::mount(dev.clone()).expect("mount");

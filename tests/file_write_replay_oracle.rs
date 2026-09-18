@@ -28,7 +28,7 @@
 //!
 //! Fixtures are gitignored and the VM is not always up, so this skips
 //! rather than fails when either is missing. Build them with
-//! `./scripts/vm-build-truncate-fixtures.sh`.
+//! `chore fixtures -- truncate`.
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
@@ -150,11 +150,21 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
         source = scratch.guest(),
     );
 
-    let out = kernel_run(&script)?;
+    // The replay always happens: the script runs in the harness guest,
+    // and a guest that cannot be reached is a failure rather than a
+    // fixture that went unjudged.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "{case}: the kernel refused the filesystem after the write was logged:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "{case}: the volume could not be unmounted, so the summary counters were \
+         never written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` \
+         for exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
 
     let field = |key: &str| -> String {
@@ -273,13 +283,13 @@ fn the_kernel_reads_back_a_file_this_driver_wrote() {
     ] {
         match write_and_replay(case, bytes) {
             Some(()) => ran.push((case, bytes)),
-            None => eprintln!("{case}: fixture or VM unavailable — skipped"),
+            None => eprintln!("{case}: no fixture for this case"),
         }
     }
     if ran.is_empty() {
         eprintln!(
-            "no truncate fixtures or no VM; build them with \
-             ./scripts/vm-build-truncate-fixtures.sh"
+            "no truncate fixtures; build them with \
+             chore fixtures -- truncate"
         );
         return;
     }

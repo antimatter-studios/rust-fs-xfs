@@ -30,7 +30,7 @@
 //! | `between` | free space on both sides | two records become one |
 //!
 //! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-truncate-fixtures.sh`.
+//! `chore fixtures -- truncate`.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::ag::Agf;
@@ -228,7 +228,7 @@ fn freeing_an_extent_reproduces_what_the_kernel_did() {
     if ran == 0 {
         eprintln!(
             "no truncate fixtures in {}; build them with \
-             ./scripts/vm-build-truncate-fixtures.sh",
+             chore fixtures -- truncate",
             share().display()
         );
         return;

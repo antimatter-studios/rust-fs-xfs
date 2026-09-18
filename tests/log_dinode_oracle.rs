@@ -11,17 +11,17 @@
 //! kernel logged an inode, convert that inode's on-disk bytes ourselves,
 //! and require the result to match what the kernel wrote.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone.
+//! The fixtures are gitignored and generated; `chore fixtures` builds
+//! them in the harness guest. A checkout without them is that build not
+//! having happened, so this fails and names the task rather than
+//! reporting a conversion it never made as one that matched.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::log::{BBSIZE, XLOG_HEADER_MAGIC};
 use fs_xfs::log_write::{log_dinode_from_disk, LOG_DINODE_SIZE, XFS_LI_INODE};
 use fs_xfs::superblock::Superblock;
-use std::path::{Path, PathBuf};
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
+mod common;
 
 /// Every logged inode core we can find must be reproducible from the
 /// inode on disk.
@@ -31,18 +31,9 @@ fn share() -> PathBuf {
 /// So the cores are collected by inode number and the newest kept.
 #[test]
 fn logged_cores_match_the_inodes_on_disk() {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        eprintln!("no .vm-share — skipping");
-        return;
-    };
-
     let mut compared = 0usize;
-    let mut skipped_stale = 0usize;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    let mut stale_records = 0usize;
+    for p in common::fixtures_matching("xfs", ".img") {
         let Ok(dev) = FileDevice::open(&p) else {
             continue;
         };
@@ -262,23 +253,32 @@ fn logged_cores_match_the_inodes_on_disk() {
                  {drifted} with a timestamp the disk moved on from"
             );
             compared += here;
-            skipped_stale += stale;
+            stale_records += stale;
         }
     }
 
-    if compared == 0 {
-        eprintln!("no comparable logged inodes — skipping");
-        return;
-    }
-    eprintln!("{compared} inode cores reproduced from disk, {skipped_stale} skipped as stale");
+    // THE FLOOR IS WHAT IS LEFT. The image set can no longer be empty —
+    // `common::fixtures_matching` fails first — but every filter above
+    // is a `continue`, so a corpus whose logs held no inode at all would
+    // leave the conversion unexercised and report green.
+    assert!(
+        compared > 0,
+        "no logged inode core in any .vm-share image could be compared against the \
+         inode on disk, so the conversion was never run. `chore fixtures` rebuilds \
+         the set."
+    );
+    eprintln!(
+        "{compared} inode cores reproduced from disk, {stale_records} records older \
+         than the disk and so not comparable"
+    );
 
     // A conversion fault that happened to shift `di_changecount` would
     // otherwise be filed as staleness and disappear. Requiring most
     // comparisons to actually happen keeps that from going quiet.
     assert!(
-        compared > skipped_stale,
-        "{skipped_stale} of {} logged inodes were skipped as older than the disk, \
-         which is too many for the rest to mean much",
-        compared + skipped_stale
+        compared > stale_records,
+        "{stale_records} of {} logged inodes were older than the disk and could not \
+         be compared, which is too many for the rest to mean much",
+        compared + stale_records
     );
 }

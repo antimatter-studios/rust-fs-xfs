@@ -34,17 +34,17 @@
 //! record therefore fails this test rather than damaging the fixture,
 //! and the fixture is a throwaway copy in any case.
 //!
-//! Fixtures are gitignored and the VM is not always up, so this skips
-//! rather than fails when either is missing. Generate fixtures with
-//! `./scripts/vm-build-fixtures.sh`.
+//! Fixtures are gitignored and generated, and they are built on every
+//! run now, so a missing one is a failure rather than a reason to stand
+//! down: `chore fixtures -- geometry` builds the image this asks for.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, repair, scratch, share};
+use common::{fixture, kernel_run, repair, scratch};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -63,15 +63,6 @@ const NEW_MODE: u16 = 0o0751;
 /// Just the permission bits, which is what `stat` reports.
 const PERM_BITS: u16 = 0o7777;
 
-/// A working image in the shared folder, removed when it goes out of
-/// scope — including on a panic. Every other suite here treats each
-/// `.img` in that directory as a fixture to check, so one left behind
-/// fails unrelated tests.
-fn fixture(name: &str) -> Option<PathBuf> {
-    let p = share().join(name);
-    p.exists().then_some(p)
-}
-
 /// The mode byte pair as it sits on the device, read without mounting.
 ///
 /// Mounting is not available once a record has been written: this
@@ -88,10 +79,7 @@ fn mode_at(img: &Path, offset: u64) -> u16 {
 
 #[test]
 fn the_kernel_replays_a_record_this_driver_wrote() {
-    let Some(source) = fixture("xfs-default.img") else {
-        eprintln!("no xfs-default fixture — skipping");
-        return;
-    };
+    let source = fixture("xfs-default.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-log-replay.img");
     let img = scratch.path();
 
@@ -185,19 +173,24 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
         echo "REPAIR_END"
         rm -f "$img"
         echo "DONE"
-        echo DONE
         "#,
         source = scratch.guest(),
     );
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The replay always happens in the harness guest, so the record is
+    // always put to the kernel.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "the kernel refused the filesystem after the record was written — the record \
          was found and trusted far enough to try, and then could not be applied:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
     let mode = out
         .lines()
@@ -217,10 +210,7 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
 /// A read-only mount must refuse to write a record at all.
 #[test]
 fn a_read_only_mount_refuses_to_log() {
-    let Some(source) = fixture("xfs-default.img") else {
-        eprintln!("no xfs-default fixture — skipping");
-        return;
-    };
+    let source = fixture("xfs-default.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-log-replay-ro.img");
     let img = scratch.path();
 

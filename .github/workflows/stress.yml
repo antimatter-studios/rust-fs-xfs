@@ -11,50 +11,61 @@ name: stress corpus
 # It runs on demand, and weekly so a change in mkfs.xfs, the kernel or
 # fstests shows up as a failure here rather than the next time somebody
 # rebuilds the fixtures by hand.
+#
+# IT BUILDS THEM WHERE EVERY OTHER FIXTURE IS BUILT: in the
+# fs-linux-test-harness VM, through `chore fixtures -- stress`. This
+# workflow used to install xfsprogs on the runner and build fsstress and
+# fsx there, which meant the weekly corpus was made by one kernel and
+# read back by the tests under another — the drift #211 and #212 are
+# both instances of. The guest builds the generators from source
+# (scripts/guest-stress-tools.sh) the first time this set is asked for.
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 4 * * 1"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  FS_CORE_REF: v0.2.10
   CARGO_INCREMENTAL: 0
+  CHORE_VERSION: "0.11.0"
 
 jobs:
   stress:
     name: read back what fsstress and fsx wrote
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+
+      - name: chore siblings
+        run: chore siblings
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
 
-      # xfsprogs makes and checks the filesystems; e2fsprogs supplies
-      # filefrag, which is where the extent counts in each fixture's
-      # .provenance come from.
-      - name: Install xfsprogs and e2fsprogs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xfsprogs e2fsprogs
-          mkfs.xfs -V
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
 
-      # The same script the oracle VM provisions with -- plain apt and
-      # make, so a runner takes it unchanged. fstests is GPL-2.0 and its
-      # binaries are executed, nothing from it is copied into this
-      # repository; see the note in build-stress-fixtures.sh.
-      - name: Build fsstress and fsx
-        run: sudo bash tests/vagrant/debian/provision-stress-tools.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
 
-      - name: Build the corpus
-        run: ./scripts/build-stress-fixtures.sh
+      # The stress corpus itself, plus the geometry and log sets the
+      # suites below also read. `stress` is not part of `chore fixtures`
+      # with no arguments, for the reason at the top of this file.
+      - name: Build the corpus in the harness VM
+        run: chore fixtures -- geometry log stress
 
       # Every fixture records what xfs_repair made of it. A generator can
       # trip over a kernel bug and leave a genuinely broken filesystem,
@@ -62,17 +73,19 @@ jobs:
       - name: Refuse a corpus the checker calls broken
         run: |
           set -euo pipefail
-          for v in .vm-share/xfsstress-*.verdict; do
+          shopt -s nullglob
+          verdicts=(.vm-share/xfsstress-*.verdict)
+          [ "${#verdicts[@]}" -gt 0 ] || { echo "::error::the corpus produced no verdicts"; exit 1; }
+          for v in "${verdicts[@]}"; do
             printf '%-40s %s\n' "$(basename "$v")" "$(cat "$v")"
             [ "$(cat "$v")" = SOUND ] || { echo "::error::$(basename "$v") is not SOUND"; exit 1; }
           done
 
-      # ci-test.sh fails the job on a skip, which matters most here: the
-      # whole point of this workflow is that these fixtures exist, so a
-      # test that cannot find one has nothing to say and must not pass.
-      - name: Read the corpus back
-        run: ./scripts/ci-test.sh --test stress_oracle
-
+      # ci-test.sh fails the job on a skip and on a run that executed
+      # fewer tests than its floor, which matters most here: the whole
+      # point of this workflow is that these fixtures exist, so a test
+      # that cannot find one has nothing to say and must not pass.
+      #
       # The corpus reaches parts of the reader the hand-built fixtures do
       # not, so a suite that walks every image is worth running against
       # it too. This is where the bmbt addressing bug showed up: a real
@@ -80,7 +93,14 @@ jobs:
       # does not.
       #
       # log_dinode_oracle only, and not endtoend_oracle, which wants the
-      # xfsdata-* fixtures this workflow has no reason to build. Adding
-      # it was my own over-reach and the skip check caught it.
-      - name: Reproduce every logged inode core from the corpus
-        run: ./scripts/ci-test.sh --test log_dinode_oracle
+      # xfsdata-* fixtures this workflow has no reason to build.
+      - name: Read the corpus back
+        run: |
+          set -euo pipefail
+          ../fs-linux-test-harness/scripts/vm.sh up
+          ./scripts/ci-test.sh --test stress_oracle
+          ./scripts/ci-test.sh --test log_dinode_oracle
+
+      - name: chore vm:status (the VM is down again)
+        if: always()
+        run: chore vm:reap && ! chore vm:status

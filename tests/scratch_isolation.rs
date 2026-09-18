@@ -57,10 +57,17 @@ fn no_suite_writes_its_own_scratch_guard() {
 /// And what the shared one makes is out of a scanner's reach.
 #[test]
 fn a_scratch_volume_is_invisible_to_a_suite_that_scans_the_fixtures() {
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. `chore fixtures` makes it
+    // before anything else runs, and this test writes its scratch volume
+    // beside the fixtures. An absent share is that build not having
+    // happened, which has to be seen rather than skipped.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let suite = format!("scratch-isolation-{}", std::process::id());
     let volume = scratch::Volume::empty(&suite, "probe.img", 4096);
     assert!(

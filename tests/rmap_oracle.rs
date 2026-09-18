@@ -20,7 +20,7 @@
 //! replayed what this driver logged, is the record there or not?
 
 mod common;
-use common::{kernel_run, scratch, share};
+use common::{fixture, kernel_run, scratch};
 
 /// Where this suite's scratch volumes live, under
 /// `.vm-share/scratch/`, out of the way of the suites that scan the
@@ -29,14 +29,8 @@ const SUITE: &str = "rmap_oracle";
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-
-/// A filesystem with a reverse-mapping tree and something in it.
-fn fixture() -> Option<PathBuf> {
-    let p = share().join("xfsfeat-rmapbt.img");
-    p.exists().then_some(p)
-}
 
 /// Have the kernel replay the log, so the image reflects what was
 /// logged rather than what was on disk before it.
@@ -45,20 +39,36 @@ fn replay(img: &Path) -> bool {
     let script = format!(
         r#"
         m=$(mktemp -d)
-        mount -o loop,nouuid {image} "$m" || echo MOUNT_FAILED
-        # RETRIED ONCE. A busy unmount under a loaded runner is
-        # ordinary and clears in a moment; one that does not is the
-        # failure worth reporting, because the kernel writes the
-        # summary counters at unmount and nothing else does.
-        if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
+        if mount -o loop,nouuid {image} "$m"; then
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            #
+            # REPORTED APART FROM THE MOUNT: the two were one `||`
+            # before, so a failed unmount was announced as a mount the
+            # kernel had refused, and an unmount of a mount that never
+            # happened was announced as a failed unmount.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
+        else
+            echo MOUNT_FAILED
+        fi
         rmdir "$m" 2>/dev/null
         echo DONE
         "#
     );
-    match kernel_run(&script) {
-        Some(out) => !out.contains("MOUNT_FAILED"),
-        None => false,
-    }
+    let out = kernel_run(&script);
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
+    );
+    // False means one thing now: the kernel refused the mount, so the
+    // log was not replayed. The replay itself always happens, in the
+    // harness guest.
+    !out.contains("MOUNT_FAILED")
 }
 
 fn records_owned_by(img: &Path, owner: i64) -> Vec<fs_xfs::rmap::Rmap> {
@@ -79,10 +89,7 @@ fn records_owned_by(img: &Path, owner: i64) -> Vec<fs_xfs::rmap::Rmap> {
 /// repository would still pass.
 #[test]
 fn freeing_a_file_removes_its_reverse_mapping_records() {
-    let Some(source) = fixture() else {
-        eprintln!("no xfsfeat-rmapbt fixture — skipping");
-        return;
-    };
+    let source = fixture("xfsfeat-rmapbt.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "rmap-free-scratch.img");
     let img = scratch.path();
 
@@ -105,10 +112,11 @@ fn freeing_a_file_removes_its_reverse_mapping_records() {
         fs.truncate_to_zero(ino).expect("truncate");
     }
 
-    if !replay(img) {
-        eprintln!("no kernel to replay the record — skipping the check");
-        return;
-    }
+    assert!(
+        replay(img),
+        "the kernel refused to mount the volume, so what this driver logged was \
+         never replayed"
+    );
 
     let after = records_owned_by(img, ino as i64);
     assert!(
@@ -122,10 +130,7 @@ fn freeing_a_file_removes_its_reverse_mapping_records() {
 /// owns them and where in the file they sit.
 #[test]
 fn writing_a_file_adds_a_reverse_mapping_record_for_it() {
-    let Some(source) = fixture() else {
-        eprintln!("no xfsfeat-rmapbt fixture — skipping");
-        return;
-    };
+    let source = fixture("xfsfeat-rmapbt.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "rmap-alloc-scratch.img");
     let img = scratch.path();
 
@@ -146,10 +151,11 @@ fn writing_a_file_adds_a_reverse_mapping_record_for_it() {
         fs.write_into_empty_file(ino, &data).expect("write");
     }
 
-    if !replay(img) {
-        eprintln!("no kernel to replay the record — skipping the check");
-        return;
-    }
+    assert!(
+        replay(img),
+        "the kernel refused to mount the volume, so what this driver logged was \
+         never replayed"
+    );
 
     let after = records_owned_by(img, ino as i64);
     assert_eq!(

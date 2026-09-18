@@ -3,12 +3,21 @@
 # ci-test.sh — run a test suite, treat a skip as a failure, and refuse a
 # run that executed nothing.
 #
-# WHY. Every fixture-gated test in this repository prints a skip line and
-# returns ok when it cannot find its fixture. That is right for a fresh
-# checkout and wrong in a job that just built the fixtures: the suite
-# goes green having proved nothing. tests/truncate_oracle.rs skipped in
-# CI for its whole existence that way, which is how truncate.rs came to
-# sit at 5% line coverage with a passing oracle.
+# WHY. Every fixture-gated test in this repository used to print a skip
+# line and return ok when it could not find its fixture. That reads
+# exactly like a pass: the suite went green having proved nothing.
+# tests/truncate_oracle.rs skipped in CI for its whole existence that
+# way, which is how truncate.rs came to sit at 5% line coverage with a
+# passing oracle.
+#
+# THE TESTS THEMSELVES NO LONGER SKIP — `common::fixture` and
+# `common::kernel_run` fail, naming the task that provides what is
+# missing, and tests/test_contract.rs refuses a source that announces a
+# skip at all. This script is the second half of that guarantee and not
+# a substitute for it: a skip can be reintroduced in a shell test, in a
+# builder's output, or in a message nobody thought of as a skip, and the
+# only thing that notices is a gate that reads what the run printed.
+# Every tier goes through it.
 #
 # WHY A COUNT AS WELL AS THE SKIP PATTERN (#201). A skip is the loud way
 # for a suite to prove nothing; executing no tests at all is the quiet
@@ -26,19 +35,30 @@
 # test that is not idempotent fail the second time, and it doubled the
 # job. Checking each suite as it runs is one execution and one place.
 #
-# Usage:  scripts/ci-test.sh --test truncate_oracle [more cargo args]
+# Usage:  scripts/ci-test.sh [cargo test args...]
+#         scripts/ci-test.sh --test truncate_oracle [more cargo args]
 #         CI_TEST_FLOOR=5 scripts/ci-test.sh --test oracle_vm_fixtures
-#         CI_TEST_FLOOR=12 scripts/ci-test.sh --ignored
+#         scripts/ci-test.sh --gate <floor> <logfile> <label>
 #         scripts/ci-test.sh --floor-check <floor> <logfile> <label>
 #         scripts/ci-test.sh --self-test
 #
+# `--gate` is both halves applied to a log a tier has already written,
+# for the one tier that cannot use the run mode: `chore test:unit` builds
+# in the DEBUG profile, where an arithmetic overflow traps, and the run
+# mode pins `--release`.
+#
 # THE FLOOR IS PASSED IN THE ENVIRONMENT, NOT AS AN ARGUMENT, and that is
-# not a style choice. tests/every_fixture_suite_is_run_gated.rs reads the
-# workflows for the literal shape `ci-test.sh --test <suite>` to decide
-# which fixture-gated suites are run where a skip fails; an option
-# between the script and `--test` makes every suite in that step read as
-# unrun, and that guard goes red for a reason with nothing to do with
-# fixtures. An environment prefix leaves the shape intact.
+# not a style choice. An option between the script and `--test` makes the
+# invocation read differently to anything scanning for the shape
+# `ci-test.sh --test <suite>` — which is how the fixture-gated suites
+# were tracked before the tiers replaced the list, and is still how a
+# reader finds every single-suite run in a workflow. An environment
+# prefix leaves the shape intact.
+#
+# `--self-test` holds the pattern and the counter to the outputs they
+# have to read. It never ran: no workflow and no task invoked it from the
+# day it was written until tests/scripts/ci-test-self-test.sh, which
+# `chore test:scripts` picks up by glob (#200).
 set -euo pipefail
 
 # The exact wordings the suites use to say they skipped.
@@ -74,9 +94,9 @@ executed_tests() {
 
 # Refuse a run that executed fewer than `floor` tests, reading the output
 # on stdin. `label` names the run selection in the error, because the
-# floors are per selection -- a `--ignored` run and the default run
-# select disjoint sets, and either can empty without the other moving --
-# and a reader needs to know which one emptied.
+# floors are per selection -- each tier selects a disjoint set of suites,
+# and any one of them can empty without the others moving -- and a reader
+# needs to know which one emptied.
 enforce_floor() {
     local floor=$1 label=$2 count
     count=$(executed_tests)
@@ -87,13 +107,34 @@ enforce_floor() {
     fi
 }
 
-# The counting half on its own, for the workflow steps that do not go
-# through this script's run mode: the plain suite runs in the test and
-# darwin jobs, and the `--ignored` run whose bypass is #200. They tee
-# their output to a log and hand it here, so the arithmetic, the wording
-# and the self-test below are shared rather than copied four times.
+# The counting half on its own, for a caller that already has a log and
+# wants the floor without the skip pattern. The arithmetic, the wording
+# and the self-test below are shared rather than copied per caller.
 if [ "${1:-}" = "--floor-check" ]; then
     enforce_floor "$2" "${4:-$3}" < "$3"
+    exit $?
+fi
+
+# BOTH HALVES, ON A LOG A TIER ALREADY WROTE. The run mode below pins
+# `--release`, which the debug tier cannot use — the whole point of that
+# tier is a profile where an arithmetic overflow traps — so it runs cargo
+# itself and hands the log here. scripts/tier.sh writes every tier's
+# output to tmp/logs/<tier>.log in full, so there is a log to hand over
+# and no second run to pay for.
+#
+# It is deliberately the same skip pattern and the same counter, rather
+# than a second implementation for the one tier that cannot use the
+# first: two gates that are meant to agree and are written twice are two
+# gates that will not.
+if [ "${1:-}" = "--gate" ]; then
+    floor="$2"; log="$3"; label="${4:-$3}"
+    [ -f "$log" ] || { echo "::error::$log does not exist, so $label produced no output to gate"; exit 1; }
+    if grep -qE "$SKIP_PATTERN" "$log"; then
+        grep -E "$SKIP_PATTERN" "$log"
+        echo "::error::a test skipped in $label — a skip is not a pass"
+        exit 1
+    fi
+    enforce_floor "$floor" "$label" < "$log"
     exit $?
 fi
 
@@ -104,7 +145,7 @@ if [ "${1:-}" = "--self-test" ]; then
         "spare: fixture or VM unavailable — skipped"
         "xfsstress-fsx: no fixture — skipping"
         "oracle VM unavailable — skipping verification"
-        "no create fixtures or no VM; build them with ./scripts/vm-build-create-fixtures.sh"
+        "no create fixtures or no VM; build them with chore fixtures -- create"
         # Hyphenated and numbered names: the pattern had [a-z]+ and
         # missed both, which would have let a real skip through.
         "no feature-matrix fixtures — skipping. Build them with sudo ./scripts/build-feature-matrix-fixtures.sh"
@@ -115,7 +156,7 @@ if [ "${1:-}" = "--self-test" ]; then
         # body with nothing asserted, and the pattern saw none of them:
         # the class was lowercase-only and the `skipping` clause ended at
         # the word.
-        "no XFS fixtures found; build them with ./scripts/vm-build-log-fixtures.sh"
+        "no XFS fixtures found; build them with chore fixtures -- log"
         "no kernel to replay the record — skipping the check"
         "note: xfs_db did not report \`sb_icount\`, skipping that comparison"
     )
@@ -172,25 +213,15 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     exit "$fail"
 fi
 
-# HARNESS ARGUMENTS THE CALLER ASKED FOR, which today is `--ignored`
-# and only that (#200).
-#
-# The xfsprogs-gated run selects the `#[ignore]`d suites, and it used to
-# run `cargo test -- --ignored` directly — outside this script, and so
-# outside the skip gate, which is the one thing here that stops a skip
-# reading as a pass. Those suites are exactly the kind it exists for:
-# `oracle_mkfs` prints a note per field it could not compare, and that
-# note is in the `--self-test` corpus above as a skip this must catch.
-#
-# It goes after the `--`, where the harness reads it, rather than into
-# `"$@"`, where cargo would.
-harness=()
-if [ "${1:-}" = "--ignored" ]; then
-    harness+=(--ignored)
-    shift
-fi
-
-out=$(cargo test --locked --release "$@" -- --nocapture "${harness[@]}" 2>&1) && status=0 || status=$?
+# THROUGH with-test-temp.sh, always. The oracle tools run inside the
+# fs-linux-test-harness VM, which sees this repository and nothing else
+# of the host, so a scratch directory under /tmp or $RUNNER_TEMP is a
+# path the tool asked to read an image cannot open. That wrapper is what
+# puts TMPDIR inside the checkout, and this used to call cargo directly —
+# which worked only for as long as the tools ran on the host.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+out=$("$REPO/scripts/with-test-temp.sh" cargo test --locked --release "$@" -- --nocapture 2>&1) &&
+    status=0 || status=$?
 echo "$out"
 
 if [ "$status" -ne 0 ]; then
@@ -208,6 +239,6 @@ fi
 # repository hands to the script executes at least one test, and a
 # selection that executed none proved nothing whatever it reported. A
 # caller that knows how many its selection should execute raises it with
-# CI_TEST_FLOOR — see ci.yml, where the two single-suite oracle steps
-# carry the count their suite produced on 2026-09-17.
+# CI_TEST_FLOOR — see chores.yml, where each tier carries the count its
+# selection produced, measured and dated.
 echo "$out" | enforce_floor "${CI_TEST_FLOOR:-1}" "${*:-the default selection}"

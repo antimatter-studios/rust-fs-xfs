@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 #
-# fixture-geometries-single-copy.sh — both fixture builders read the one
+# fixture-geometries-single-copy.sh — the fixture builder reads the one
 # geometry list (#110).
 #
-# The native (CI) and VM (developer) builders each carried a GEOMETRIES
-# array, and they drifted: CI never built `nosparse`, and the VM left
-# `default` unpinned. Now both source scripts/fixture-geometries.sh. This
-# fails if either grows its own list again or stops sourcing the shared
+# There were two builders, one for a CI runner and one for the VM, and
+# each carried a GEOMETRIES array of its own. They drifted: CI never
+# built `nosparse`, and the VM left `default` unpinned, so CI and a
+# developer's local run stopped meaning the same thing. There is one
+# builder now — scripts/guest-build-fixtures.sh, in the harness guest, on
+# every machine — and it sources scripts/fixture-geometries.sh. This
+# fails if it grows a list of its own again or stops sourcing the shared
 # one, and pins the two entries whose drift was the defect.
+#
+# THE CHECK OUTLIVES ITS SECOND BUILDER ON PURPOSE. The defect was a list
+# copied, not a list copied twice, and the next builder to want these
+# geometries will be written by somebody who has not read #110.
 #
 #   bash tests/scripts/fixture-geometries-single-copy.sh
 set -uo pipefail
@@ -17,7 +24,7 @@ fails=0
 ok() { printf 'ok    %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 
-for builder in build-fixtures-native.sh vm-build-fixtures.sh; do
+for builder in guest-build-fixtures.sh; do
     f="$REPO/scripts/$builder"
     if grep -qF 'source "$REPO/scripts/fixture-geometries.sh"' "$f"; then
         ok "$builder sources the shared geometry list"

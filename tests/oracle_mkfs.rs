@@ -13,41 +13,32 @@
 //! reference debugger reports for the same field. Disagreement on any
 //! one field fails the test and names the field.
 //!
-//! Requires Linux with `xfsprogs` installed, so every test here is
-//! `#[ignore]`-gated and a fresh checkout stays green:
-//!
-//! ```sh
-//! cargo test -- --ignored
-//! ```
-//!
-//! On macOS run them inside the oracle VM: `./scripts/vm.sh up`.
+//! `mkfs.xfs` and `xfs_db` run in the fs-linux-test-harness guest, which
+//! has them on every host this suite runs on, so nothing here is
+//! `#[ignore]`-gated and nothing here skips. A tool that cannot be
+//! reached, a geometry the pinned xfsprogs refuses, or a field the
+//! debugger did not print in the quantity this test requires is a
+//! failure that names what to do about it — a gate that quietly reports
+//! ok is worth less than no gate at all, because it is trusted.
 
 use fs_xfs::superblock::Superblock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Whether the reference tooling is available on this host.
-fn tooling_available() -> bool {
-    Command::new("mkfs.xfs")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        && Command::new("xfs_db")
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-}
+mod common;
+use common::oracle;
 
 /// Create a sparse image file and format it with `mkfs.xfs $args`.
-fn mkfs(size_mib: u64, args: &[&str]) -> Option<PathBuf> {
-    if !tooling_available() {
-        eprintln!("xfsprogs not available — skipping");
-        return None;
-    }
+///
+/// The image is made on the host and formatted in the guest, which is one
+/// file either way: the harness gives the guest this repository at the
+/// path the host knows it by, so the argument crosses unchanged. That is
+/// also why the scratch directory comes from `std::env::temp_dir()` —
+/// `scripts/with-test-temp.sh` points TMPDIR at a directory inside the
+/// repository precisely so that a path a test invents is a path the
+/// oracle tools can open.
+fn mkfs(size_mib: u64, args: &[&str]) -> PathBuf {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "fs-xfs-oracle-{}-{}",
@@ -61,47 +52,39 @@ fn mkfs(size_mib: u64, args: &[&str]) -> Option<PathBuf> {
     f.set_len(size_mib * 1024 * 1024).unwrap();
     drop(f);
 
-    let out = Command::new("mkfs.xfs")
-        .args(args)
-        .arg("-f")
-        .arg(&img)
-        .output()
-        .expect("run mkfs.xfs");
-    if !out.status.success() {
-        // Not every geometry is accepted on every xfsprogs version; skip
-        // rather than fail so the suite stays portable.
-        eprintln!(
-            "mkfs.xfs {:?} rejected this geometry — skipping: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        std::fs::remove_dir_all(&dir).ok();
-        return None;
-    }
-    Some(img)
+    let out = oracle("mkfs.xfs").args(args).arg("-f").arg(&img).output();
+    // A REFUSED GEOMETRY IS A FAILURE, not a case to step around. It was
+    // once a skip because the tool came from whichever xfsprogs the
+    // machine happened to have, so "this version will not build that" was
+    // a fact about the developer's laptop. One pinned xfsprogs in the
+    // guest ends that: a geometry it refuses is a geometry this suite no
+    // longer covers, and which of the two moves — the case or the pin —
+    // is a decision to take in the open rather than discover in a green
+    // run that stopped testing anything.
+    assert!(
+        out.ok(),
+        "mkfs.xfs {args:?} refused this geometry, so the comparison it feeds \
+         covers nothing. The guest's xfsprogs is pinned by scripts/vm-setup.sh: \
+         either the pin moved under a geometry this driver must still read, or \
+         the case belongs to a format that is genuinely gone and should be \
+         deleted here deliberately.\n{}{}",
+        out.stdout,
+        out.stderr
+    );
+    img
 }
 
 /// Ask the reference debugger to dump superblock 0 and return the fields
 /// as a map. Values are normalised to decimal strings.
 fn xfs_db_superblock(img: &Path) -> HashMap<String, String> {
-    let out = Command::new("xfs_db")
-        .arg("-r")
-        .arg("-c")
-        .arg("sb 0")
-        .arg("-c")
-        .arg("print")
+    let out = oracle("xfs_db")
+        .args(["-r", "-c", "sb 0", "-c", "print"])
         .arg(img)
-        .output()
-        .expect("run xfs_db");
-    assert!(
-        out.status.success(),
-        "xfs_db failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8_lossy(&out.stdout);
+        .output();
+    assert!(out.ok(), "xfs_db failed: {}{}", out.stdout, out.stderr);
 
     let mut map = HashMap::new();
-    for line in text.lines() {
+    for line in out.stdout.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
@@ -144,7 +127,7 @@ fn expect_field(oracle: &HashMap<String, String>, field: &str, ours: u64, label:
     let Some(theirs) = oracle.get(field) else {
         // Field absent from this xfsprogs version's output; nothing to
         // compare against, and silently passing would be dishonest.
-        eprintln!("note: xfs_db did not report `{field}`, skipping that comparison");
+        eprintln!("note: xfs_db did not report `{field}` — not compared");
         return false;
     };
     let theirs_n: u64 = theirs
@@ -166,9 +149,7 @@ fn parse_ours(img: &Path) -> Superblock {
 /// The core assertion: build a filesystem, then require this driver and
 /// the reference debugger to agree on every field we parse.
 fn assert_agrees_with_oracle(size_mib: u64, args: &[&str], label: &str) {
-    let Some(img) = mkfs(size_mib, args) else {
-        return;
-    };
+    let img = mkfs(size_mib, args);
     let ours = parse_ours(&img);
     let theirs = xfs_db_superblock(&img);
     let mut compared = 0usize;
@@ -292,11 +273,12 @@ fn assert_agrees_with_oracle(size_mib: u64, args: &[&str], label: &str) {
          above stopped matching its output."
     );
 
+    eprintln!("  {label}: {compared} fields agree with xfs_db");
+
     std::fs::remove_dir_all(img.parent().unwrap()).ok();
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_default_geometry() {
     // Whatever the installed mkfs.xfs considers default — the geometry
     // real users will actually have.
@@ -304,31 +286,26 @@ fn agrees_on_default_geometry() {
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_1k_blocks() {
     assert_agrees_with_oracle(300, &["-b", "size=1024"], "1k-blocks");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_2k_blocks() {
     assert_agrees_with_oracle(300, &["-b", "size=2048"], "2k-blocks");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_512_byte_inodes() {
     assert_agrees_with_oracle(300, &["-i", "size=512"], "512b-inodes");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_1k_inodes() {
     assert_agrees_with_oracle(300, &["-i", "size=1024"], "1k-inodes");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_many_allocation_groups() {
     // Forces a small agblocks and a large agblklog, exercising the
     // inode-number splitting arithmetic at an unusual shift.
@@ -336,28 +313,27 @@ fn agrees_on_many_allocation_groups() {
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_on_single_allocation_group() {
     assert_agrees_with_oracle(300, &["-d", "agcount=1"], "1-ag");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_with_reflink_and_rmapbt() {
     // Both are read-only-compatible features that change the AGF layout.
     assert_agrees_with_oracle(400, &["-m", "reflink=1,rmapbt=1"], "reflink+rmapbt");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_without_crc_v4_filesystem() {
-    // v4 has no CRC and no metadata UUID. Older xfsprogs can still make
-    // one; newer versions refuse, in which case mkfs() skips.
+    // v4 has no CRC and no metadata UUID, and it is the one format whose
+    // creation a future xfsprogs is expected to drop outright. When the
+    // pinned build does, this case fails rather than passing empty, and
+    // the answer is to retire the case — the driver still has to read v4
+    // volumes that already exist, which the .vm-share fixtures cover.
     assert_agrees_with_oracle(300, &["-m", "crc=0"], "v4");
 }
 
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agrees_with_bigtime_and_large_extent_counters() {
     assert_agrees_with_oracle(400, &["-m", "bigtime=1"], "bigtime");
 }
@@ -366,11 +342,8 @@ fn agrees_with_bigtime_and_large_extent_counters() {
 /// is set while mkfs is mid-write; a volume in that state is not safe to
 /// present to a user.
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn rejects_superblock_with_inprogress_set() {
-    let Some(img) = mkfs(300, &[]) else {
-        return;
-    };
+    let img = mkfs(300, &[]);
     let mut bytes = std::fs::read(&img).unwrap();
     bytes[126] = 1; // sb_inprogress
     assert!(
@@ -384,11 +357,8 @@ fn rejects_superblock_with_inprogress_set() {
 /// not merely what the superblock claims — the two are written by
 /// different parts of mkfs and a mismatch means we misread one of them.
 #[test]
-#[ignore = "requires xfsprogs on Linux"]
 fn agf_and_agi_parse_for_every_allocation_group() {
-    let Some(img) = mkfs(600, &["-d", "agcount=8"]) else {
-        return;
-    };
+    let img = mkfs(600, &["-d", "agcount=8"]);
     let bytes = std::fs::read(&img).unwrap();
     let sb = parse_ours(&img);
     let sector = usize::from(sb.sectsize);

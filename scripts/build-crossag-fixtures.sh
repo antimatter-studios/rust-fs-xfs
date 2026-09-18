@@ -26,7 +26,9 @@
 # # Where this runs
 #
 # Anywhere with xfsprogs and the privilege to loop-mount.
-# `vm-build-crossag-fixtures.sh` ships this into the VM.
+# It runs INSIDE the fs-linux-test-harness guest, started by
+# scripts/guest-build-fixtures.sh: one dispatcher for every set, rather
+# than one wrapper per set that shipped this file into the VM.
 #
 #   ./scripts/build-crossag-fixtures.sh
 set -euo pipefail

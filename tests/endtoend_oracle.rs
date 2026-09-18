@@ -18,14 +18,19 @@
 //! nested directories, and 400 entries in one directory — enough to push
 //! that directory out of short form into a block or leaf layout.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone. Generate
-//! them with `./scripts/vm-build-data-fixtures.sh`.
+//! The fixtures are gitignored and generated, and `chore fixtures`
+//! builds every one of them in the harness guest. A checkout without
+//! them is a build that did not happen: this suite fails and names that
+//! task rather than returning early, because a test that announced a
+//! skip read exactly like one that had compared every path.
+
+mod common;
 
 use fs_core::FileDevice;
 use fs_xfs::inode::FileType;
 use fs_xfs::Filesystem;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// What the kernel says one path is.
@@ -143,26 +148,34 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Every `xfsdata-*` image, with the manifest the kernel wrote beside
+/// it, in a stable order.
+///
+/// An empty set is a fixture build that did not happen, and
+/// `common::fixtures_matching` says so. An image whose manifest is
+/// missing is the same build stopped halfway — the two are written
+/// together in the guest — so that is an assertion rather than a reason
+/// to drop the image quietly from the set and compare one fewer tree.
 fn fixtures() -> Vec<(String, PathBuf, PathBuf)> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        let name = p.file_stem().map(|s| s.to_string_lossy().into_owned());
-        let Some(name) = name else { continue };
-        if !name.starts_with("xfsdata-") || p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
-        let manifest = p.with_extension("manifest");
-        if manifest.exists() {
-            out.push((name, p, manifest));
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    common::fixtures_matching("xfsdata-", ".img")
+        .into_iter()
+        .map(|img| {
+            let name = img
+                .file_stem()
+                .expect("an image path has a stem")
+                .to_string_lossy()
+                .into_owned();
+            let manifest = img.with_extension("manifest");
+            assert!(
+                manifest.is_file(),
+                "{}: the image is in .vm-share but its manifest is not. Both are \
+                 written by the same guest run, so rebuild the set with `chore \
+                 fixtures`.",
+                name
+            );
+            (name, img, manifest)
+        })
+        .collect()
 }
 
 /// Walk the whole tree with this driver and compare against the
@@ -170,10 +183,6 @@ fn fixtures() -> Vec<(String, PathBuf, PathBuf)> {
 #[test]
 fn reads_back_what_the_kernel_wrote() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no xfsdata-* fixtures in .vm-share — skipping");
-        return;
-    }
 
     for (label, img, manifest_path) in &fixtures {
         let expected = parse_manifest(&std::fs::read_to_string(manifest_path).unwrap());
@@ -271,10 +280,6 @@ fn walk(fs: &Filesystem, dir: &str, out: &mut BTreeMap<String, Entry>, label: &s
 #[test]
 fn sparse_regions_read_as_zeros() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     for (label, img, _) in &fixtures {
         let dev = FileDevice::open(img).expect("open");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -298,10 +303,6 @@ fn sparse_regions_read_as_zeros() {
 #[test]
 fn partial_reads_agree_with_whole_file_reads() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures — skipping");
-        return;
-    }
     for (label, img, _) in &fixtures {
         let dev = FileDevice::open(img).expect("open");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -346,16 +347,11 @@ fn partial_reads_agree_with_whole_file_reads() {
 #[test]
 fn the_fixture_still_contains_a_btree_fork() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no xfsdata-* fixtures in .vm-share — skipping");
-        return;
-    }
     for (label, img, _) in &fixtures {
         let forks = img.with_extension("bmbt");
         let Ok(text) = std::fs::read_to_string(&forks) else {
             panic!(
-                "{label}: no {} — regenerate the fixtures with \
-                 ./scripts/vm-build-data-fixtures.sh",
+                "{label}: no {} — regenerate the fixtures with `chore fixtures`",
                 forks.display()
             );
         };

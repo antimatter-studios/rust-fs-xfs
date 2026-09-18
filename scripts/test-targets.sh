@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+#
+# test-targets.sh unit|images|oracle|kernel — print the `cargo test`
+# target arguments for one tier of the suite.
+#
+#   unit    the library, the binaries, and every tests/*.rs that reaches
+#           neither a fixture nor the guest: no tool, no kernel, no VM
+#   images  the tests that read a fixture but need no guest — everything
+#           a host without KVM (GitHub's arm64 runners) can still run
+#   oracle  every tests/*.rs that runs an xfsprogs tool (in the guest)
+#   kernel  every tests/*.rs that asks the real kernel to mount, replay
+#           or write (in the guest)
+#
+# DERIVED FROM THE TESTS THEMSELVES, not from a list someone has to keep.
+# The old arrangement was that list: ci.yml named thirty-two suites in a
+# `for suite in ...` loop, and tests/every_fixture_suite_is_run_gated.rs
+# existed to notice when a new suite was left out of it. A suite is now
+# in a tier because of what it calls, so it cannot be left out.
+#
+# A test names a fixture through `common::share()` or by a `.vm-share`
+# path, reaches a tool only through `common::oracle` / `parent_oracle` /
+# `assert_xfs_repair_clean`, and the kernel only through
+# `common::kernel_run` / `guest_script` — the helpers that fail, never
+# skip, when the guest or the tool is missing. tests/test_contract.rs
+# fails the suite if a test reaches either any other way, so the
+# classification cannot drift.
+#
+# A file that does both is a KERNEL test: the tiers are disjoint so that
+# `chore test:oracle` and `chore test:kernel` together run each file
+# once.
+#
+# COMMENTS ARE STRIPPED BEFORE ANY MATCH, and string literals before a
+# CALL match. That is not tidiness. Two suites here are ABOUT these
+# patterns rather than users of them — tests/test_contract.rs, which
+# refuses every other way of reaching a tool, and
+# tests/every_fixture_suite_is_run_gated.rs, which checks this very
+# classification — and both name `kernel_run(` in prose and in string
+# constants. Matching those put the second in the `kernel` tier, where it
+# would have waited for a VM it never speaks to.
+#
+# A fixture path is the other way round: `.vm-share/xfs-default.img` is a
+# string literal and always will be, so that pattern is matched with the
+# literals intact. Over-classifying there is the safe direction — a suite
+# lands in a tier that has fixtures rather than in the one CI runs with
+# none.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# A FIXTURE is reached through common::fixture / fixtures_matching, or
+# named by a path. The CALLS are what matters and the path is the older
+# spelling, kept because a suite may still build its own name: a local
+# `fn share()`, or a literal `.vm-share/xfs-default.img`. Matched with
+# comments stripped and string literals intact, because a fixture name
+# IS a string literal.
+#
+# BOTH SPELLINGS, and that is not belt and braces. When the skips were
+# removed, three suites stopped naming `.vm-share` at all — the lookup
+# they had written by hand became one call to the shared helper — and
+# with only the path spelling here they dropped silently into the UNIT
+# tier, which CI runs on a runner with no fixtures at all.
+FIXTURE='fixture\(|fixtures_matching\(|\.vm-share|share\(\)'
+# A TOOL or THE KERNEL is reached by a CALL, so those are matched with
+# the literals emptied as well. `"kernel_run("` inside a constant is a
+# suite talking about the classifier, not one using it.
+TOOL='oracle\(|parent_oracle\(|assert_xfs_repair_clean\('
+KERNEL='kernel_run\(|guest_script\('
+
+tier="${1:-}"
+args=()
+# The file as the classifier reads it: comment lines dropped, and
+# double-quoted string literals emptied. A raw string (r#"..."#) is left
+# alone, which is right — that is how the guest scripts are written, and
+# the call around it is what is being read.
+uncommented() {
+    grep -vE '^[[:space:]]*//' "$1"
+}
+
+for f in "$REPO"/tests/*.rs; do
+    name="$(basename "$f" .rs)"
+    text="$(uncommented "$f")"
+    calls="$(printf '%s\n' "$text" | sed 's/"[^"]*"//g')"
+    case "$tier" in
+        unit)
+            if ! printf '%s\n' "$text" | grep -qE "$FIXTURE" &&
+               ! printf '%s\n' "$calls" | grep -qE "$TOOL|$KERNEL"; then
+                args+=(--test "$name")
+            fi
+            ;;
+        images)
+            if printf '%s\n' "$text" | grep -qE "$FIXTURE" &&
+               ! printf '%s\n' "$calls" | grep -qE "$TOOL|$KERNEL"; then
+                args+=(--test "$name")
+            fi
+            ;;
+        oracle)
+            if printf '%s\n' "$calls" | grep -qE "$TOOL" &&
+               ! printf '%s\n' "$calls" | grep -qE "$KERNEL"; then
+                args+=(--test "$name")
+            fi
+            ;;
+        kernel) printf '%s\n' "$calls" | grep -qE "$KERNEL" && args+=(--test "$name") ;;
+        *) echo "usage: test-targets.sh unit|images|oracle|kernel" >&2; exit 2 ;;
+    esac
+done
+case "$tier" in
+    unit) printf '%s\n' --lib --bins "${args[@]}" ;;
+    *) printf '%s\n' "${args[@]}" ;;
+esac

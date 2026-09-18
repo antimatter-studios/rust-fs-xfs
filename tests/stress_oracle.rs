@@ -24,8 +24,9 @@
 //! generator decided what went on the disk and the kernel said what is
 //! there; a disagreement is this driver's.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-stress-fixtures.sh`.
+//! Fixtures are gitignored and generated. Build them with
+//! `chore fixtures -- stress`; one that is absent fails the test that
+//! wants it, because a fixture nobody built is a fixture nobody read.
 
 use fs_core::FileDevice;
 use fs_xfs::format::symlink::buf_space;
@@ -33,8 +34,11 @@ use fs_xfs::inode::{FileType, Format, Inode};
 use fs_xfs::Filesystem;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
+
+mod common;
+use common::fixture;
 
 /// One entry as either side describes it.
 #[derive(Debug, PartialEq, Eq)]
@@ -46,10 +50,6 @@ struct Entry {
     size: u64,
     /// A symlink's target, a file's SHA-256, or `-`.
     detail: String,
-}
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
 }
 
 /// The manifest's word for what an inode is.
@@ -166,13 +166,13 @@ fn manifest(path: &Path) -> BTreeMap<String, Entry> {
 
 /// Compare one fixture against its manifest, reporting what differs
 /// rather than only that something does.
-fn check(name: &str) -> Option<usize> {
-    let img = share().join(format!("{name}.img"));
-    let man = share().join(format!("{name}.manifest"));
-    if !img.exists() || !man.exists() {
-        eprintln!("{name}: no fixture — skipping");
-        return None;
-    }
+fn check(name: &str) -> usize {
+    // Both halves are required: the image is what this driver reads and
+    // the manifest is the kernel's answer, and neither alone settles
+    // anything. `chore fixtures -- stress` builds the pair, so one that
+    // is missing fails here.
+    let img = fixture(&format!("{name}.img"));
+    let man = fixture(&format!("{name}.manifest"));
 
     let theirs = manifest(&man);
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).expect("open")))
@@ -211,15 +211,13 @@ fn check(name: &str) -> Option<usize> {
         wrong[..wrong.len().min(8)].join("\n")
     );
 
-    Some(theirs.len())
+    theirs.len()
 }
 
 /// A tree built by a long randomised sequence of filesystem operations.
 #[test]
 fn a_stress_generated_tree_reads_back_exactly() {
-    let Some(n) = check("xfsstress-ops") else {
-        return;
-    };
+    let n = check("xfsstress-ops");
     eprintln!("xfsstress-ops: {n} entries agree with the kernel");
     // The fixture's value is in what a hand-written tree never contains.
     // If it ever shrinks to a handful of entries, it has stopped being
@@ -238,13 +236,11 @@ fn a_stress_generated_tree_reads_back_exactly() {
 #[test]
 fn a_multi_block_symlink_target_reads_back_exactly() {
     let name = "xfsstress-ops1k";
-    let Some(n) = check(name) else {
-        return;
-    };
+    let n = check(name);
 
     // Not an aside: without a target that actually spans blocks, this
     // test is the previous one at a different block size.
-    let img = share().join(format!("{name}.img"));
+    let img = fixture(&format!("{name}.img"));
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).expect("open"))).expect("mount");
     // One block's worth. A target longer than this cannot be held by a
     // single-block extent, so it is the threshold that says whether the
@@ -276,11 +272,13 @@ fn a_multi_block_symlink_target_reads_back_exactly() {
     }
 
     eprintln!(
-        "{name}: {n} entries agree; {spanning} symlink targets span more than one          {per_block}-byte block, longest {longest}"
+        "{name}: {n} entries agree; {spanning} symlink targets span more than one \
+         {per_block}-byte block, longest {longest}"
     );
     assert!(
         spanning > 0,
-        "no target exceeds one block's {per_block} bytes (longest was {longest}), so the          multi-block path this fixture exists for was never taken"
+        "no target exceeds one block's {per_block} bytes (longest was {longest}), \
+         so the multi-block path this fixture exists for was never taken"
     );
 }
 
@@ -288,8 +286,6 @@ fn a_multi_block_symlink_target_reads_back_exactly() {
 /// hole punches and mmap operations.
 #[test]
 fn a_stress_hammered_file_reads_back_exactly() {
-    let Some(n) = check("xfsstress-fsx") else {
-        return;
-    };
+    let n = check("xfsstress-fsx");
     eprintln!("xfsstress-fsx: {n} entries agree with the kernel");
 }
