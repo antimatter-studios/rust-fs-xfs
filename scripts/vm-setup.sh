@@ -83,9 +83,13 @@ done
 # re-provision is a no-op; `vm:destroy` throws it away with the disk.
 if ! "$PARENT_PREFIX/sbin/mkfs.xfs" -V 2>/dev/null | grep -q "version $PARENT_VERSION\$"; then
     echo "vm-setup: building xfsprogs $PARENT_VERSION for parent pointers"
+    # g++ AS WELL AS gcc. xfsprogs' configure probes for a C++ compiler
+    # and a bare `gcc` package has no cc1plus, so the probe fails with
+    # "cannot execute 'cc1plus'" part way through the build rather than
+    # at the start, where a missing dependency is easy to read.
     apt-get install -y -qq \
         liburcu-dev libinih-dev uuid-dev libblkid-dev libdevmapper-dev \
-        autoconf automake libtool gettext make xz-utils >/dev/null
+        autoconf automake libtool gettext make xz-utils g++ >/dev/null
     work="$(mktemp -d /var/tmp/xfsprogs.XXXXXX)"
     curl -sSfL "https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-$PARENT_VERSION.tar.xz" |
         tar -xJ -C "$work"
