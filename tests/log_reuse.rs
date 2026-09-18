@@ -38,7 +38,6 @@ const MAX_DIRTY_BYTES: usize = 16 * 1024 * 1024;
 
 struct Scratch {
     image: std::path::PathBuf,
-    made_share: bool,
 }
 
 impl Scratch {
@@ -48,9 +47,8 @@ impl Scratch {
     /// while this test writes to it fails them with a dirty log. A
     /// subdirectory is not an `.img`, so their scans pass it by.
     fn new(image: std::path::PathBuf) -> Self {
-        let made_share = !share().exists();
         std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
-        Scratch { image, made_share }
+        Scratch { image }
     }
 }
 
@@ -60,14 +58,20 @@ impl Drop for Scratch {
         if let Some(dir) = self.image.parent() {
             let _ = std::fs::remove_dir(dir);
         }
-        if self.made_share {
-            let _ = std::fs::remove_dir(share());
-        }
     }
 }
 
 #[test]
 fn a_mount_writes_past_the_end_of_the_log() {
+    // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
+    // volume, but it builds it in the share, and a share that exists is
+    // what the suites scanning it take for a fixture set: creating one
+    // here makes them fail where they would have skipped. The job that
+    // runs this builds the fixtures first, so the directory is there.
+    if !share().exists() {
+        eprintln!("no .vm-share — skipped");
+        return;
+    }
     let name = format!("log-reuse/log-reuse-{}.img", std::process::id());
     let image = share().join(&name);
     let _scratch = Scratch::new(image.clone());
