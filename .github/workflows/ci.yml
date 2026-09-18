@@ -345,8 +345,12 @@ jobs:
       # to the consumer, and every Linux job stays green through it.
       - name: Build the shipped staticlib for aarch64-apple-darwin
         run: cargo build --locked --release --lib --target aarch64-apple-darwin
-      - name: chore lint
-        run: chore lint
+      # NO `chore lint` HERE. `cargo fmt --check` is the same answer on
+      # every platform and the two Linux jobs already ask it, and clippy
+      # has never run on Darwin in this repository — turning it on in the
+      # same change that moves every oracle into a VM would mix a lint
+      # sweep into a migration. What this job is for is the code paths
+      # only this target compiles, and the tiers below build all of them.
       - name: chore test:unit
         run: chore test:unit
       # The tiers a Mac can run, which is the same set as the arm64 Linux
