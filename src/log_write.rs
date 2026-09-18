@@ -578,6 +578,96 @@ pub fn append_at(
     append_at_with_tail(device, sb, head, tid, ops, lsn_of(head))
 }
 
+/// Fill the ring from `head` to its end with one record that does nothing.
+///
+/// A record may not straddle the wrap, so a writer that will not split one
+/// has to leave the blocks at the end of the ring unused — and a gap is not
+/// something a reader can cross. The kernel's log head search walks the
+/// cycle number stamped in every block and expects exactly one place where
+/// it changes; blocks never written carry cycle zero, and a reader that
+/// meets them reports `failed to locate log tail` and refuses the mount.
+///
+/// So the gap is filled rather than left: an empty transaction, padded out
+/// to the end of the ring, in the cycle the records before it belong to.
+/// Recovery reads it, finds a transaction with no items, and applies
+/// nothing (#89).
+///
+/// # Errors
+///
+/// As [`append_at`], and [`Error::UnsupportedFeature`] if the gap is larger
+/// than one record's payload can cover.
+pub fn append_pad(
+    device: &dyn fs_core::BlockDevice,
+    sb: &Superblock,
+    head: &Head,
+    tid: u32,
+    tail_lsn: u64,
+) -> Result<u64> {
+    let ops = vec![
+        Op {
+            flags: XLOG_START_TRANS,
+            data: Vec::new(),
+        },
+        Op {
+            flags: 0,
+            data: trans_header(tid, XFS_TRANS_CHECKPOINT, 0),
+        },
+        Op {
+            flags: XLOG_COMMIT_TRANS,
+            data: Vec::new(),
+        },
+    ];
+    let payload = payload(tid, &ops);
+    // The header block, then everything left of the ring.
+    let want = (head.free_blocks as usize - 1) * BBSIZE;
+    if payload.len() > want {
+        return Err(Error::UnsupportedFeature(format!(
+            "the gap at the end of the log is {want} bytes and an empty record needs {}",
+            payload.len()
+        )));
+    }
+    let mut padded = payload;
+    padded.resize(want, 0);
+    let lsn = lsn_of(head);
+    let placement = Placement {
+        block: head.block,
+        cycle: head.cycle,
+        prev_block: head.prev_block,
+        tail_lsn,
+        uuid: sb.uuid,
+        iclog_size: head.iclog_size,
+    };
+    let bytes = encode_record(&placement, ops.len() as u32, &padded);
+    let at = sb.fsblock_offset(sb.logstart) + u64::from(head.block) * BBSIZE as u64;
+    device.write_at(at, &bytes)?;
+    device.flush()?;
+    Ok(lsn)
+}
+
+/// How many basic blocks a record of `ops` occupies: its header block, and
+/// its payload rounded up.
+///
+/// A caller that has to decide whether the record fits in what is left of
+/// the ring needs this before it writes anything (#89).
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] when the payload exceeds what an in-core
+/// buffer of `iclog_size` can hold, which is the same refusal appending it
+/// would give.
+pub fn record_blocks(tid: u32, ops: &[Op], iclog_size: u32) -> Result<u32> {
+    let payload = payload(tid, ops);
+    let max_payload = max_payload(iclog_size)?;
+    if payload.len() > max_payload {
+        return Err(Error::UnsupportedFeature(format!(
+            "the checkpoint is {} bytes and the log's records hold at most {max_payload}; \
+             splitting one across records is not implemented",
+            payload.len()
+        )));
+    }
+    Ok(1 + payload.len().div_ceil(BBSIZE) as u32)
+}
+
 /// The sequence number a record written at `head` is given: its cycle and
 /// its block, which is what orders it against everything already there.
 pub fn lsn_of(head: &Head) -> u64 {

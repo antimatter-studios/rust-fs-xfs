@@ -64,8 +64,30 @@ pub struct Filesystem {
     /// (#89). `None` on a read-only mount, which logs nothing.
     pub(crate) overlay: Option<Arc<crate::overlay::Overlay>>,
     /// The sequence number of this mount's first outstanding record, which
-    /// is the tail every later record has to name.
+    /// is the tail every later record has to name. Cleared by a push, which
+    /// puts everything those records describe on disk.
     pub(crate) oldest_record: Mutex<Option<u64>>,
+    /// Where the next record goes, once this mount has written one.
+    ///
+    /// FINDING THE HEAD MEANS SCANNING THE RING. The scan is how a mount
+    /// starts, because only the log itself says where the last writer got
+    /// to — but a mount that wrote the last record knows where the next one
+    /// goes, and scanning again for every operation made each one cost the
+    /// size of the log: 52 ms an operation on a 320 MiB volume, which is
+    /// most of what a long run spent (#89).
+    pub(crate) next_head: Mutex<Option<crate::log::Head>>,
+    /// How many times this mount has started the log ring again from its
+    /// beginning. Exposed so a caller — a test, most of all — can tell that
+    /// a run really did reuse the log rather than merely fit inside it.
+    pub(crate) wraps: std::sync::atomic::AtomicUsize,
+    /// Whether this mount has written any record at all.
+    ///
+    /// NOT the same question as whether the overlay holds anything. A push
+    /// empties the overlay, but the records stay in the log until something
+    /// replays them, and replay writes their images again — over anything
+    /// an in-place write has since put there. So the in-place fence looks
+    /// at this, and nothing clears it.
+    pub(crate) logged_anything: std::sync::atomic::AtomicBool,
 }
 
 /// How many filesystem blocks a mount caches by default.
@@ -77,6 +99,14 @@ pub struct Filesystem {
 /// blocks evicting metadata is the way a cache this size makes things
 /// worse rather than better.
 const DEFAULT_CACHE_BLOCKS: usize = 512;
+
+/// How much logged metadata a mount holds in memory before it pushes.
+///
+/// Every buffer a record carried is kept until it has been written where it
+/// belongs, so this is the memory a long-running mount can occupy. 16 MiB
+/// is thousands of operations at any block size, so the push is rare, and
+/// it is small enough that a mount cannot grow without bound (#89).
+const MAX_DIRTY_BYTES: usize = 16 * 1024 * 1024;
 
 impl Filesystem {
     /// Refuse an in-place write once this mount has written a checkpoint.
@@ -95,7 +125,10 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] if a checkpoint has already been
     /// written by this mount.
     pub(crate) fn refuse_after_checkpoint(&self) -> Result<()> {
-        if self.overlay.as_ref().is_some_and(|o| !o.is_empty()) {
+        if self
+            .logged_anything
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(Error::UnsupportedFeature(
                 "this mount has written a checkpoint that nothing has replayed, so the \
                  disk an in-place write would read is out of date; mount again after the \
@@ -149,8 +182,56 @@ impl Filesystem {
         F: FnOnce(u32) -> Vec<crate::log_write::Op>,
     {
         let device = self.writable.as_ref().ok_or(Error::ReadOnly)?.clone();
-        let head = crate::log::head(device.as_ref(), &self.sb)?;
+        let mut head = match *self.next_head.lock().expect("next head poisoned") {
+            Some(known) => known,
+            None => crate::log::head(device.as_ref(), &self.sb)?,
+        };
         let tid = crate::log_write::transaction_id(&head);
+        let ops = build(tid);
+
+        // THE RING IS REUSED RATHER THAN EXHAUSTED. A record may not
+        // straddle the wrap, so one that will not fit in what is left
+        // starts again at the beginning — and may only do so once
+        // everything the records it would overwrite describe is on disk.
+        // That is the push, and it is what lets a mount keep going instead
+        // of filling the log and stopping (#89).
+        if crate::log_write::record_blocks(tid, &ops, head.iclog_size)? > head.free_blocks {
+            self.sync()?;
+            // THE GAP AT THE END IS FILLED, NOT LEFT. A reader walks the
+            // cycle number stamped in every block and expects one place
+            // where it changes; blocks nothing ever wrote carry cycle zero,
+            // and a reader that meets them gives up with "failed to locate
+            // log tail". One empty record covers the remainder.
+            let total = head.block + head.free_blocks;
+            let mut previous = head.prev_block;
+            if head.free_blocks > 0 {
+                let pad_lsn = crate::log_write::lsn_of(&head);
+                let tail = self
+                    .oldest_record
+                    .lock()
+                    .expect("oldest record poisoned")
+                    .unwrap_or(pad_lsn);
+                crate::log_write::append_pad(device.as_ref(), &self.sb, &head, tid, tail)?;
+                // The record after the wrap follows the pad, not whatever
+                // came before it.
+                previous = head.block;
+            }
+            head = crate::log::Head {
+                block: 0,
+                cycle: head.cycle.checked_add(1).ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "the log is in cycle {}, and wrapping would need one this log \
+                         cannot express",
+                        head.cycle
+                    ))
+                })?,
+                prev_block: previous,
+                free_blocks: total,
+                iclog_size: head.iclog_size,
+            };
+            self.wraps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
         let mut oldest = self.oldest_record.lock().expect("oldest record poisoned");
         let tail = oldest.unwrap_or_else(|| crate::log_write::lsn_of(&head));
         let lsn = crate::log_write::append_at_with_tail(
@@ -158,11 +239,80 @@ impl Filesystem {
             &self.sb,
             &head,
             tid,
-            &build(tid),
+            &ops,
             tail,
         )?;
         oldest.get_or_insert(lsn);
+        self.logged_anything
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(oldest);
+
+        // Where the next record goes, so it does not have to be found again.
+        let used = crate::log_write::record_blocks(tid, &ops, head.iclog_size)?;
+        *self.next_head.lock().expect("next head poisoned") = Some(crate::log::Head {
+            block: head.block + used,
+            cycle: head.cycle,
+            prev_block: head.block,
+            free_blocks: head.free_blocks - used,
+            iclog_size: head.iclog_size,
+        });
+
+        // AND THE MEMORY IS BOUNDED. Every buffer a record carried is held
+        // until something writes it where it belongs, so a mount that never
+        // pushed would grow for as long as it ran.
+        if self
+            .overlay
+            .as_ref()
+            .is_some_and(|o| o.bytes() >= MAX_DIRTY_BYTES)
+        {
+            self.sync()?;
+        }
         Ok(lsn)
+    }
+
+    /// How many times this mount has begun the log ring again. Zero until
+    /// the first record that would not fit in what was left of it.
+    pub fn log_wraps(&self) -> usize {
+        self.wraps.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How much logged metadata this mount is holding in memory, waiting
+    /// to be pushed. Zero right after a [`Filesystem::sync`], and never
+    /// more than the bound a commit pushes at.
+    pub fn dirty_bytes(&self) -> usize {
+        self.overlay.as_ref().map_or(0, |o| o.bytes())
+    }
+
+    /// Write everything this mount has logged to where it belongs, and let
+    /// the log be reused from here.
+    ///
+    /// This is the push an XFS mount makes through the AIL. Until it
+    /// happens the records are the only copy of the change, the log cannot
+    /// be reused, and the buffers cannot leave memory. Afterwards the disk
+    /// holds what the records described, so the next record may name itself
+    /// as the tail: recovery starts there and has nothing older to apply.
+    ///
+    /// The order matters and is the whole of the safety argument: the
+    /// records were written first, the buffers go out second, and the tail
+    /// moves last. A crash anywhere in that leaves recovery writing the
+    /// same bytes again.
+    ///
+    /// In-place writes stay refused afterwards, because the records are
+    /// still in the log and a replay would write their images over
+    /// anything put in their place.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] on a mount that cannot write, and whatever the
+    /// device returns. Nothing is dropped from memory unless its write
+    /// succeeded.
+    pub fn sync(&self) -> Result<()> {
+        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?.clone();
+        if let Some(overlay) = &self.overlay {
+            overlay.push(device.as_ref())?;
+        }
+        *self.oldest_record.lock().expect("oldest record poisoned") = None;
+        Ok(())
     }
 
     /// Put every buffer a record carried into the overlay, so the next
@@ -275,6 +425,9 @@ impl Filesystem {
             sb,
             overlay: None,
             oldest_record: Mutex::new(None),
+            next_head: Mutex::new(None),
+            wraps: std::sync::atomic::AtomicUsize::new(0),
+            logged_anything: std::sync::atomic::AtomicBool::new(false),
         };
         fs.check_log_is_clean()?;
         Ok(fs)
@@ -316,6 +469,9 @@ impl Filesystem {
             sb,
             overlay: Some(overlay),
             oldest_record: Mutex::new(None),
+            next_head: Mutex::new(None),
+            wraps: std::sync::atomic::AtomicUsize::new(0),
+            logged_anything: std::sync::atomic::AtomicBool::new(false),
         };
         fs.refuse_unmaintained_features()?;
         fs.check_log_is_clean()?;

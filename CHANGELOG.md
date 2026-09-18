@@ -8,6 +8,19 @@ never does.
 
 ### Added
 
+- **A mount keeps going, in bounded memory.** Every buffer a record carried
+  was held for as long as the mount ran and the log was never reused, so the
+  memory grew with the run and the 32,751st operation was refused with
+  "only 2 remain before the log wraps". `Filesystem::sync` now writes those
+  buffers where they belong, flushes and lets go of them — the push an XFS
+  mount makes through the AIL — and it runs when 16 MiB is held, when a
+  record will not fit in what is left of the ring, and whenever a caller
+  asks. The ring is then started again from its beginning in the next cycle,
+  with the blocks left at its end filled by an empty record, because a
+  reader walks the cycle number in every block and a gap reads as a corrupt
+  header. `log_wraps` and `dirty_bytes` report both. The head is remembered
+  between records rather than found by scanning the ring, which was 52 ms an
+  operation (#89).
 - **A mount writes as many journalled operations as it likes.** A record
   changes nothing on disk, so the second operation of a mount read the state
   the first started from — two creates handed out one inode — and the mount

@@ -66,9 +66,38 @@ impl Overlay {
         }
     }
 
-    /// Whether anything has been logged over the disk yet.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.logged.lock().expect("overlay poisoned").is_empty()
+    /// How much memory the buffers held here take.
+    pub(crate) fn bytes(&self) -> usize {
+        self.logged.lock().expect("overlay poisoned").len() * BBSIZE
+    }
+
+    /// Write every buffer held here to where it belongs, and let go of it.
+    ///
+    /// This is the push an XFS mount does through the AIL: the record said
+    /// what the metadata should be, and eventually the metadata itself has
+    /// to be written, or the log can never be reused and the buffers can
+    /// never be dropped.
+    ///
+    /// SAFE IN THIS ORDER BECAUSE THE RECORDS COME FIRST. Every buffer
+    /// written here is already described by a record in the log, so a crash
+    /// part-way through leaves recovery to write exactly the same bytes. It
+    /// is only once these writes are durable that the log's tail may move
+    /// past those records, which is why the caller flushes before it does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the device returns. Nothing is dropped from memory unless
+    /// its write succeeded, so a failed push can be retried.
+    pub(crate) fn push(&self, device: &dyn fs_core::BlockDevice) -> fs_core::Result<usize> {
+        let mut logged = self.logged.lock().expect("overlay poisoned");
+        let mut written = 0usize;
+        for (&at, block) in logged.iter() {
+            device.write_at(at, block)?;
+            written += 1;
+        }
+        device.flush()?;
+        logged.clear();
+        Ok(written)
     }
 }
 
@@ -130,7 +159,7 @@ mod tests {
         let mut buf = [0u8; 8];
         overlay.read_at(16, &mut buf).expect("read");
         assert_eq!(buf, [7u8; 8]);
-        assert!(overlay.is_empty());
+        assert_eq!(overlay.bytes(), 0);
     }
 
     /// What was logged is what comes back, and only where it was logged.
@@ -161,6 +190,63 @@ mod tests {
         overlay.read_at(1528, &mut tail).expect("read");
         assert!(tail[..8].iter().all(|&b| b == 3));
         assert!(tail[8..].iter().all(|&b| b == 7));
+    }
+
+    /// A push writes every held buffer where it belongs and lets go of it,
+    /// so the memory a mount holds is bounded by how often it pushes.
+    #[test]
+    fn a_push_writes_the_buffers_out_and_empties_the_overlay() {
+        use std::sync::Mutex as StdMutex;
+
+        /// A device that records what was written to it.
+        struct Writes {
+            bytes: StdMutex<Vec<u8>>,
+            flushed: StdMutex<bool>,
+        }
+
+        impl BlockRead for Writes {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+                let at = offset as usize;
+                buf.copy_from_slice(&self.bytes.lock().unwrap()[at..at + buf.len()]);
+                Ok(())
+            }
+
+            fn size_bytes(&self) -> u64 {
+                self.bytes.lock().unwrap().len() as u64
+            }
+        }
+
+        impl fs_core::BlockDevice for Writes {
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+                let at = offset as usize;
+                self.bytes.lock().unwrap()[at..at + buf.len()].copy_from_slice(buf);
+                Ok(())
+            }
+
+            fn flush(&self) -> Result<()> {
+                *self.flushed.lock().unwrap() = true;
+                Ok(())
+            }
+
+            fn is_writable(&self) -> bool {
+                true
+            }
+        }
+
+        let device = Arc::new(Writes {
+            bytes: StdMutex::new(vec![7u8; 4096]),
+            flushed: StdMutex::new(false),
+        });
+        let overlay = Overlay::new(device.clone() as Arc<dyn BlockRead>);
+        overlay.wrote(512, &[9u8; 1024]);
+        assert_eq!(overlay.bytes(), 1024, "two basic blocks held");
+
+        assert_eq!(overlay.push(device.as_ref()).expect("push"), 2);
+        assert_eq!(overlay.bytes(), 0, "nothing is held after a push");
+        assert!(*device.flushed.lock().unwrap(), "the push is flushed");
+        let written = device.bytes.lock().unwrap();
+        assert!(written[512..1536].iter().all(|&b| b == 9), "on the device");
+        assert!(written[..512].iter().all(|&b| b == 7), "and only there");
     }
 
     /// A later record over the same block wins, and a partial write keeps
