@@ -280,3 +280,96 @@ impl Drop for VmLock {
         let _ = std::fs::remove_file(&self.0);
     }
 }
+
+// ---------------------------------------------------------------------
+// Reading an xfs_repair report (#124)
+// ---------------------------------------------------------------------
+
+/// Asking `xfs_repair` about a volume, and reading the answer.
+///
+/// `allow(dead_code)`: this module is compiled into every test binary
+/// that says `mod common;`, including the ones that never run the tool,
+/// and unused here means unused *in that binary* rather than unused.
+#[allow(dead_code)]
+pub mod repair {
+    /// What `xfs_repair` said it was doing when it was asked about an
+    /// image whose log had not been replayed.
+    ///
+    /// The tool's own words, and the reason a report carrying them is
+    /// not a verdict: *"The filesystem has valuable metadata changes in
+    /// a log which is being ignored because the -n option was used.
+    /// Expect spurious inconsistencies which may be resolved by first
+    /// mounting the filesystem to replay the log."*
+    pub const IGNORED_THE_LOG: &str = "valuable metadata changes in a log";
+
+    /// The shell an oracle ends with: ask `xfs_repair` about `img`, and
+    /// print everything it said.
+    ///
+    /// Everything, rather than only on failure, because the report has
+    /// to be read whichever way it came out — a zero return code beside
+    /// [`IGNORED_THE_LOG`] is a suite reporting green while checking
+    /// nothing, and the return code alone cannot tell anyone that.
+    pub fn script(img: &str) -> String {
+        format!(
+            r#"
+        echo "REPAIR_BEGIN"
+        xfs_repair -n {img} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
+        "#
+        )
+    }
+
+    /// The report inside `out`, between the markers [`script`] prints,
+    /// or the whole of `out` when an oracle prints its report some other
+    /// way.
+    pub fn report(out: &str) -> String {
+        if !out.contains("REPAIR_BEGIN") {
+            return out.to_string();
+        }
+        out.lines()
+            .skip_while(|l| !l.trim().starts_with("REPAIR_BEGIN"))
+            .take_while(|l| !l.trim().starts_with("REPAIR_END"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether the report is one where the tool declined to look.
+    pub fn was_blind(out: &str) -> bool {
+        report(out).contains(IGNORED_THE_LOG)
+    }
+
+    /// Read the report in `out` as a verdict on the volume, and fail
+    /// unless it is one (#124).
+    ///
+    /// Three outcomes, of which only the first is a pass:
+    ///
+    /// - the tool walked the volume and found nothing wrong;
+    /// - it found something, which is the failure every oracle here is
+    ///   for;
+    /// - **it says it ignored the log**, which is neither. `-n` does not
+    ///   replay, so on an image whose log still holds records the tool
+    ///   is grading structures the log was about to replace. Read as a
+    ///   failure that is a driver blamed for a tool declining to look —
+    ///   `sb_fdblocks 84960, counted 84959` in #124 — and read as a pass
+    ///   it is a suite checking nothing. The image has to be replayed
+    ///   first, which for these oracles means mounting and unmounting it
+    ///   before it is graded.
+    pub fn assert_agreed(out: &str, what: &str) {
+        let report = report(out);
+        assert!(
+            report.contains("REPAIR_RC="),
+            "{what}: no xfs_repair report at all, so nothing graded the volume:\n{out}"
+        );
+        assert!(
+            !report.contains(IGNORED_THE_LOG),
+            "{what}: xfs_repair was asked about an image whose log it then ignored, so \
+             neither its silence nor its complaints say anything about this driver. The \
+             image has to be mounted and unmounted — replayed — before it is graded:\n\
+             {report}"
+        );
+        assert!(
+            report.contains("REPAIR_RC=0"),
+            "{what}: xfs_repair found something wrong with the volume:\n{report}"
+        );
+    }
+}
