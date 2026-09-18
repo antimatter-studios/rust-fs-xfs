@@ -227,6 +227,14 @@ pub(crate) fn reset_flags(core: &mut [u8]) {
 }
 
 /// What converting a directory to block form produced.
+/// A directory already in block form, with one more entry in it.
+struct BlockInsert {
+    /// The block as it now reads. The fork, the size and the block count
+    /// are unchanged: the entry went into a block the directory already
+    /// had.
+    items: Vec<crate::buf_write::BufferItem>,
+}
+
 struct Converted {
     /// The parent's new data fork: a single extent record naming the
     /// block the directory now lives in.
@@ -410,6 +418,90 @@ impl Filesystem {
         })
     }
 
+    /// Add `new` to a directory that is already in block form, by laying
+    /// the block out again with the entry in it.
+    ///
+    /// # Why the whole block is rebuilt
+    ///
+    /// The kernel finds a gap that fits and fills it, keeping the block's
+    /// free list and its hash index in step. Rebuilding produces the same
+    /// block from the same entries — `dir_block::build` is what the
+    /// conversion already uses, and `dir_block_oracle` compares its output
+    /// against the block the kernel builds for the same names — and it has
+    /// one behaviour rather than two. The cost is that a create logs the
+    /// whole block rather than the bytes that moved, which is what the
+    /// kernel would log for a block it rewrote anyway.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when the directory is more than one
+    /// block, or when the entry will not fit in the one it has: leaf and
+    /// node form are not implemented (#215).
+    fn add_to_block_form(
+        &self,
+        parent: u64,
+        dir_inode: &crate::inode::Inode,
+        dir_raw: &[u8],
+        new: dir_block::Entry,
+    ) -> Result<BlockInsert> {
+        use crate::format::log_items::buf_log_format::buf_type::BLFT_DIR_BLOCK;
+        use crate::group_write::changed_chunks;
+
+        let dirblocksize = (u64::from(self.sb.blocksize) << self.sb.dirblklog) as usize;
+        let extents = self.data_extents(dir_inode, dir_raw)?;
+        let blocks = u64::from(1u32 << self.sb.dirblklog);
+        // ONE BLOCK AT OFFSET ZERO is what block form is. Anything else is
+        // a directory that has grown a hash index of its own, or several
+        // blocks of entries, and rebuilding one block of it would leave the
+        // rest describing a directory that no longer exists.
+        let [only] = extents.as_slice() else {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {parent} holds its entries in {} extents, so it is past block form; \
+                 leaf and node directories are not implemented",
+                extents.len()
+            )));
+        };
+        if only.startoff != 0 || only.blockcount != blocks || only.unwritten {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {parent}'s directory data is {} blocks at offset {}, which is not \
+                 the single block at zero that block form is",
+                only.blockcount, only.startoff
+            )));
+        }
+
+        let at = self.sb.fsblock_offset(only.startblock);
+        let mut before = vec![0u8; dirblocksize];
+        self.device().read_at(at, &mut before)?;
+        let parsed = crate::dir::parse_block_form(&before, &self.sb)?;
+
+        let mut entries: Vec<dir_block::Entry> = parsed
+            .entries
+            .iter()
+            .map(|e| dir_block::Entry {
+                name: e.name.clone(),
+                ino: e.ino,
+                ftype: crate::dir::ftype_to_raw(e.ftype),
+            })
+            .collect();
+        if entries.iter().any(|e| e.name == new.name) {
+            return Err(Error::AlreadyExists);
+        }
+        entries.push(new);
+
+        if dir_block::space_needed(&entries) > dirblocksize {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {parent}'s directory block is full, and moving it into a leaf-form \
+                 directory of several blocks is not implemented"
+            )));
+        }
+
+        let block = dir_block::build(&self.sb, only.startblock, parent, &entries)?;
+        let blkno = crate::alloc_btree::blkno_of_fsbno(&self.sb, only.startblock);
+        Ok(BlockInsert {
+            items: vec![changed_chunks(blkno, &before, block, BLFT_DIR_BLOCK)],
+        })
+    }
+
     /// Create an empty regular file called `name` in `parent`.
     ///
     /// Returns the new file's inode number and the sequence number the
@@ -472,15 +564,29 @@ impl Filesystem {
         if !dir_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if dir_inode.format != Format::Local {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {parent} has outgrown the inode, so adding an entry rewrites a \
-                 directory block rather than the inode's own fork"
-            )));
-        }
+        // BLOCK FORM IS ADDED TO IN PLACE (#215); anything past it is not
+        // implemented and is refused below by `add_to_block_form`.
+        let in_block = match dir_inode.format {
+            Format::Local => false,
+            Format::Extents => true,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {parent} keeps its entries in {other:?} form, which adding an \
+                     entry here does not understand"
+                )))
+            }
+        };
 
         let (fork_start, fork_end) = dir_inode.data_fork_range(usize::from(self.sb.inodesize));
-        let parsed = dir::read_short_form(&dir_inode, &dir_raw[fork_start..fork_end], &self.sb)?;
+        let parsed = if in_block {
+            dir::ShortFormDir {
+                parent_ino: parent,
+                i8count: 0,
+                entries: Vec::new(),
+            }
+        } else {
+            dir::read_short_form(&dir_inode, &dir_raw[fork_start..fork_end], &self.sb)?
+        };
         if parsed.entries.iter().any(|e| e.name == name) {
             return Err(Error::AlreadyExists);
         }
@@ -642,12 +748,30 @@ impl Filesystem {
         // unless the entry will not fit, in which case the directory
         // leaves its inode entirely and this becomes a conversion.
         let fork_space = fork_end - fork_start;
-        let short_form =
-            self.short_form_with_entry(&parsed, name, ino, kind.ftype(), fork_space)?;
+        let short_form = if in_block {
+            None
+        } else {
+            self.short_form_with_entry(&parsed, name, ino, kind.ftype(), fork_space)?
+        };
 
-        let converted = match &short_form {
-            Some(_) => None,
-            None => Some(self.convert_to_block_form(
+        let inserted = if in_block {
+            Some(self.add_to_block_form(
+                parent,
+                &dir_inode,
+                &dir_raw,
+                dir_block::Entry {
+                    name: name.to_vec(),
+                    ino,
+                    ftype: kind.ftype(),
+                },
+            )?)
+        } else {
+            None
+        };
+        let converted = match (&short_form, in_block) {
+            (_, true) => None,
+            (Some(_), _) => None,
+            (None, _) => Some(self.convert_to_block_form(
                 allocations.group(&self.sb, self.device(), self.sb.split_ino(parent).0)?,
                 parent,
                 &parsed,
@@ -663,25 +787,40 @@ impl Filesystem {
         // is their length — a short-form directory's size is its fork,
         // and a converted one's is the block it now occupies.
         let (fork, dir_fields, dir_size, dir_blocks, dir_nextents, dir_format) =
-            match (&short_form, &converted) {
-                (Some(fork), _) => (
-                    fork.clone(),
-                    XFS_ILOG_DDATA,
-                    fork.len() as u64,
+            if inserted.is_some() {
+                // The entry went into a block the directory already had, so the
+                // fork, the size and the block count are what they were. The
+                // fork is logged as it stands: it is the same extent record,
+                // and replay writing it again changes nothing.
+                (
+                    dir_raw[fork_start..fork_start + dir_inode.nextents as usize * 16].to_vec(),
+                    XFS_ILOG_DEXT,
+                    dir_inode.size,
                     dir_inode.nblocks,
                     dir_inode.nextents,
-                    Format::Local,
-                ),
-                (None, Some(c)) => (
-                    c.fork.clone(),
-                    XFS_ILOG_DEXT,
-                    c.size,
-                    // One extent, however many blocks long.
-                    c.blocks,
-                    1,
                     Format::Extents,
-                ),
-                (None, None) => unreachable!("one of the two is always taken"),
+                )
+            } else {
+                match (&short_form, &converted) {
+                    (Some(fork), _) => (
+                        fork.clone(),
+                        XFS_ILOG_DDATA,
+                        fork.len() as u64,
+                        dir_inode.nblocks,
+                        dir_inode.nextents,
+                        Format::Local,
+                    ),
+                    (None, Some(c)) => (
+                        c.fork.clone(),
+                        XFS_ILOG_DEXT,
+                        c.size,
+                        // One extent, however many blocks long.
+                        c.blocks,
+                        1,
+                        Format::Extents,
+                    ),
+                    (None, None) => unreachable!("one of the two is always taken"),
+                }
             };
 
         let mut dir_core = dir_raw.clone();
@@ -756,7 +895,11 @@ impl Filesystem {
         // create's shape is unchanged by any of this. What the
         // allocation touched is not here -- it is in `allocation_items`,
         // once for the operation however many takes it made.
-        let extra: Vec<crate::buf_write::BufferItem> = converted.map_or_else(Vec::new, |c| c.items);
+        let extra: Vec<crate::buf_write::BufferItem> = match (converted, inserted) {
+            (Some(c), _) => c.items,
+            (_, Some(i)) => i.items,
+            _ => Vec::new(),
+        };
 
         let allocation_items = allocations.into_items()?;
 
