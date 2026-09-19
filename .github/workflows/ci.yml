@@ -388,7 +388,7 @@ jobs:
                        deeptree_oracle random_operations_replay many_ops_per_mount log_reuse \
                        block_form_insert truncate_btree_fork scratch_isolation \
                        inode_chunk_alignment agfl_refill dirty_log_mount repair_verdict \
-                       wide_inode_directory; do
+                       wide_inode_directory split_checkpoint; do
             ./scripts/ci-test.sh --test "$suite" 2>&1 | tee -a "$log"
             rc=${PIPESTATUS[0]}
             if [ "$rc" -ne 0 ]; then

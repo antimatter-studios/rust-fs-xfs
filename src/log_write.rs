@@ -71,6 +71,7 @@ use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_
 use crate::format::log_items::rec_header::XLOG_VERSION_2;
 
 /// One operation: its flags and its payload.
+#[derive(Clone)]
 pub struct Op {
     pub flags: u8,
     pub data: Vec<u8>,
@@ -724,6 +725,75 @@ pub fn record_blocks(tid: u32, ops: &[Op], iclog_size: u32) -> Result<u32> {
         )));
     }
     Ok(1 + payload.len().div_ceil(BBSIZE) as u32)
+}
+
+/// Divide one checkpoint's operations into records, each of which fits
+/// an in-core log buffer (#216).
+///
+/// A checkpoint is not required to fit one record. The kernel writes a
+/// large one as a sequence of them, and this driver refused it instead —
+/// so a truncate that frees three thousand separate runs, which is what
+/// an ordinary fragmented file leaves behind, could not be performed at
+/// all.
+///
+/// # What ties the records together
+///
+/// The transaction id. Every operation carries it, recovery gathers
+/// operations by it, and the transaction is applied when its `COMMIT`
+/// arrives — which is in the last record. So the split needs no marker
+/// of its own at an operation boundary: the first record holds the
+/// `START`, the last holds the `COMMIT`, and the ones between are
+/// ordinary records whose operations happen to belong to a transaction
+/// that began earlier.
+///
+/// # Why the division is at operation boundaries
+///
+/// An operation split in the middle is a different thing again: the two
+/// halves carry `XLOG_OP_TRUNCATED` and `XLOG_OP_CONTINUATION`, and
+/// recovery joins them before reading the item. Nothing this driver
+/// writes needs it — the largest operation it emits is one filesystem
+/// block of a tree, and a record holds several — so an operation that
+/// alone exceeds a record is refused, which is a far narrower refusal
+/// than the one this replaces and says which operation it was.
+pub fn split_into_records(ops: &[Op], iclog_size: u32) -> Result<Vec<Vec<Op>>> {
+    let max_payload = max_payload(iclog_size)?;
+    let mut out: Vec<Vec<Op>> = Vec::new();
+    let mut current: Vec<Op> = Vec::new();
+    let mut used = 0usize;
+
+    for op in ops {
+        let cost = OP_HEADER_SIZE + op.data.len();
+        if cost > max_payload {
+            return Err(Error::UnsupportedFeature(format!(
+                "one operation of this checkpoint is {cost} bytes and the log's records \
+                 hold at most {max_payload}; splitting a single operation across records \
+                 is not implemented"
+            )));
+        }
+        if used + cost > max_payload {
+            out.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += cost;
+        current.push(op.clone());
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    // A checkpoint with no operations is not one; the caller always
+    // builds at least a start and a commit.
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
+    Ok(out)
+}
+
+/// How many basic blocks the records of `groups` occupy in total.
+pub fn blocks_for_records(tid: u32, groups: &[Vec<Op>]) -> usize {
+    groups
+        .iter()
+        .map(|ops| 1 + payload(tid, ops).len().div_ceil(BBSIZE))
+        .sum()
 }
 
 /// The sequence number a record written at `head` is given: its cycle and
