@@ -92,7 +92,11 @@ fn case(name: &str) -> bool {
                 [ "$(stat -c%s "$m/spanning")" = 0 ] && echo "EMPTIED" || echo "NOT_EMPTIED"
                 # The file that was inside one group has to be untouched.
                 [ "$(stat -c%s "$m/withingroup")" = 262144 ] && echo "NEIGHBOUR_OK" || echo "NEIGHBOUR_CHANGED"
-                umount "$m"
+                # RETRIED ONCE. A busy unmount under a loaded runner is
+                # ordinary and clears in a moment; one that does not is the
+                # failure worth reporting, because the kernel writes the
+                # summary counters at unmount and nothing else does.
+                if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
                 mounted=$((mounted + 1))
             fi
             check=$(mktemp -u /tmp/repair-XXXXXX.img)

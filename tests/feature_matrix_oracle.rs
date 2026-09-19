@@ -306,7 +306,11 @@ fn exercise(img: &Path, op: &str) -> Outcome {
         mounted=0
         for attempt in 1 2 3; do
             if mount -o loop,nouuid "$img" "$m"; then
-                umount "$m"
+                # RETRIED ONCE. A busy unmount under a loaded runner is
+                # ordinary and clears in a moment; one that does not is the
+                # failure worth reporting, because the kernel writes the
+                # summary counters at unmount and nothing else does.
+                if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
                 mounted=$((mounted + 1))
             fi
             out=$(xfs_repair -n "$img" 2>&1) && rc=0 || rc=$?

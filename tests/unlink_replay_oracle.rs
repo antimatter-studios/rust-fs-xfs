@@ -101,7 +101,11 @@ fn unlink_and_replay(case: &str) -> Option<()> {
             else
                 echo "REUSE_FAILED"
             fi
-            umount "$m"
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12

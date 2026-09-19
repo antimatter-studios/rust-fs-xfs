@@ -178,7 +178,11 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
             r#"
             m=$(mktemp -d)
             if mount -o loop,nouuid /share/{name} "$m"; then
-                umount "$m"
+                # RETRIED ONCE. A busy unmount under a loaded runner is
+                # ordinary and clears in a moment; one that does not is the
+                # failure worth reporting, because the kernel writes the
+                # summary counters at unmount and nothing else does.
+                if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
                 echo MOUNTED
             else
                 echo MOUNT_FAILED

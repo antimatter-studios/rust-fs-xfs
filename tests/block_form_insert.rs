@@ -108,7 +108,11 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
             echo "FIRST $(stat -c %i "$m/d/entry_0000")"
             echo "LAST $(stat -c %i "$m/d/$(ls "$m/d" | sort | tail -1)")"
             echo "NAMES $(ls "$m/d" | sort | tr '\n' ' ')"
-            umount "$m"
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
             echo MOUNTED
         else
             echo MOUNT_FAILED

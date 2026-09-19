@@ -109,7 +109,11 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         if mount -o loop,nouuid "$img" "$m"; then
             echo "NAMES $(ls "$m/sf" | sort | tr '\n' ' ')"
             echo "INO $(stat -c %i "$m/sf/cccc" 2>/dev/null || echo none)"
-            umount "$m"
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -8

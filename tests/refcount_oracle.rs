@@ -52,7 +52,12 @@ fn replay(img: &Path) -> bool {
     let script = format!(
         r#"
         m=$(mktemp -d)
-        mount -o loop,nouuid {image} "$m" && umount "$m" || echo MOUNT_FAILED
+        mount -o loop,nouuid {image} "$m" || echo MOUNT_FAILED
+        # RETRIED ONCE. A busy unmount under a loaded runner is
+        # ordinary and clears in a moment; one that does not is the
+        # failure worth reporting, because the kernel writes the
+        # summary counters at unmount and nothing else does.
+        if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         rmdir "$m" 2>/dev/null
         echo DONE
         "#
