@@ -29,6 +29,8 @@ trap 'rm -rf "$sandbox"' EXIT
 mkdir -p "$sandbox/scripts" "$sandbox/tests/vagrant/debian/.vagrant" "$sandbox/bin"
 cp "$REPO/scripts/vm.sh" "$sandbox/scripts/"
 HOLD="$sandbox/tests/vagrant/debian/.vagrant/keep-running"
+LEASES="$sandbox/tests/vagrant/debian/.vagrant/leases"
+USED="$sandbox/tests/vagrant/debian/.vagrant/last-used"
 LOG="$sandbox/vagrant.log"
 
 # `vagrant` records what it was asked to do; `status` reports a stopped
@@ -102,6 +104,64 @@ if grep -q 'vm:up' "$sandbox/out"; then
 else
     printf 'FAIL  held machine: silent about why it was left\n'; fails=$((fails + 1))
 fi
+
+# A MACHINE SOMEBODY IS USING RIGHT NOW (#224). Two chore invocations
+# in one checkout: the second one's after_all reaper used to stop the
+# machine the first was in the middle of using, and the first failed
+# with whatever it was doing at the time. A lease says which processes
+# are using it, and a live one is not a leak.
+set_pgrep 0
+rm -f "$HOLD"
+mkdir -p "$LEASES"
+: > "$LEASES/$$"          # this shell, which is certainly alive
+rm -f "$USED"
+code=$(reap)
+check "$code" "0" "machine in use: succeeds"
+check "$(halted)" "no" "machine in use: is LEFT RUNNING"
+if grep -q 'in use' "$sandbox/out"; then
+    printf 'ok    machine in use: says who has it\n'
+else
+    printf 'FAIL  machine in use: silent about why it was left\n'; fails=$((fails + 1))
+fi
+
+# A lease whose process is gone is not a use. It is exactly what a run
+# killed outright leaves behind, and leaving it to disarm the reaper
+# would be worse than having no lease at all.
+set_pgrep 0
+rm -f "$HOLD"
+rm -rf "$LEASES"
+mkdir -p "$LEASES"
+: > "$LEASES/2147483647"  # a pid no process can have here
+rm -f "$USED"
+code=$(reap)
+check "$code" "0" "dead lease: succeeds"
+check "$(halted)" "yes" "dead lease: the machine IS stopped"
+if [ -e "$LEASES/2147483647" ]; then
+    printf 'FAIL  dead lease: left behind to disarm the next reap\n'; fails=$((fails + 1))
+else
+    printf 'ok    dead lease: cleared\n'
+fi
+
+# BETWEEN TWO CALLS THERE IS NO PROCESS TO LEASE. A suite that shells
+# out to `vm.sh run` in a loop holds nothing in the gaps, and the
+# reaper fires on every chore invocation — so recent use counts as use.
+set_pgrep 0
+rm -f "$HOLD"
+rm -rf "$LEASES"
+date +%s > "$USED"
+code=$(reap)
+check "$code" "0" "used a moment ago: succeeds"
+check "$(halted)" "no" "used a moment ago: is LEFT RUNNING"
+
+# And an old one is not. The window is what tells a machine between two
+# calls from one nothing has touched since a run died.
+set_pgrep 0
+rm -f "$HOLD"
+echo 0 > "$USED"
+code=$(reap)
+check "$code" "0" "idle since the epoch: succeeds"
+check "$(halted)" "yes" "idle since the epoch: the machine IS stopped"
+rm -f "$USED"
 
 # Stopping clears the hold: a halted machine is not one anybody is
 # working in, and a marker left behind would disarm the net for good.
