@@ -242,7 +242,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         rm "$m/orphan"
         xfs_io -x -c 'shutdown -f' "$m" && echo SHUTDOWN_OK
         exec 9<&-
-        umount "$m" || umount -l "$m"
+        umount "$m" || umount -l "$m" || echo UMOUNT_FAILED
         rmdir "$m"
         cp {dirty} {replayed}
         m2=$(mktemp -d)
@@ -256,7 +256,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
                 fi
             done
             cd /
-            umount "$m2"
+            umount "$m2" || echo UMOUNT_FAILED
         else
             echo REPLAY_MOUNT_FAILED
             dmesg | tail -10

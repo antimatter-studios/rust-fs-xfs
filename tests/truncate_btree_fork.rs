@@ -60,7 +60,7 @@ fn a_file_with_a_btree_fork_is_truncated() {
         done
         sync
         echo "EXTENTS $(xfs_bmap "$m/frag" | grep -c ':')"
-        umount "$m"
+        umount "$m" || echo UMOUNT_FAILED
         rmdir "$m"
         echo DONE
         "#,
@@ -107,7 +107,7 @@ fn a_file_with_a_btree_fork_is_truncated() {
             echo "SIZE $(stat -c %s "$m/frag")"
             echo "BLOCKS $(stat -c %b "$m/frag")"
             echo "FREE_AFTER $(df --output=avail -k "$m" | tail -1)"
-            umount "$m"
+            umount "$m" || echo UMOUNT_FAILED
             echo MOUNTED
         else
             echo MOUNT_FAILED
