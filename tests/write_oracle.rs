@@ -26,11 +26,15 @@
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, scratch, share};
+
+/// Where this suite's scratch volumes live: under
+/// `.vm-share/scratch/`, not beside the fixtures another suite is
+/// reading while this one writes (#223).
+const SUITE: &str = "write_oracle";
 
 /// The file the write lands in: 8 MiB of random bytes, so it is
 /// extent-backed, fully written, not sparse and not shared — every
@@ -45,25 +49,6 @@ const TARGET: &str = "/large.bin";
 /// A working copy left behind is therefore not merely untidy: it fails
 /// unrelated tests, which is exactly what happened the first time this
 /// suite ran.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Scratch(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -89,7 +74,7 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
     }
     // A separate image, so a failure leaves the fixtures usable and a
     // rerun starts from the same state.
-    let scratch = Scratch::from(&source, "xfswrite.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfswrite.img");
     let img = scratch.path();
 
     // What the file holds now, and what it should hold afterwards.
@@ -129,7 +114,7 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         r#"
         set -e
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/xfswrite.img "$img"
+        cp {source} "$img"
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
@@ -138,7 +123,8 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         echo "SHA $(sha256sum "$mnt{TARGET}" | cut -d' ' -f1)"
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         echo DONE
-        "#
+        "#,
+        source = scratch.guest(),
     );
     let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
@@ -190,7 +176,7 @@ fn a_read_only_mount_of_a_real_volume_refuses_to_write() {
         eprintln!("no xfsdata-default fixture — skipping");
         return;
     }
-    let scratch = Scratch::from(&source, "xfswrite-ro.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfswrite-ro.img");
     let img = scratch.path();
     let before = {
         let d = FileDevice::open(img).expect("open");
@@ -234,7 +220,7 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         eprintln!("no xfsdata-default fixture — skipping");
         return;
     }
-    let scratch = Scratch::from(&source, "xfsattr.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfsattr.img");
     let img = scratch.path();
 
     // A time far enough from any the fixture already holds that a field
@@ -265,7 +251,7 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         r#"
         set -e
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/xfsattr.img "$img"
+        cp {source} "$img"
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
@@ -276,7 +262,8 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         echo "MTIME_NS $(stat -c%y "$mnt{TARGET}")"
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         echo DONE
-        "#
+        "#,
+        source = scratch.guest(),
     );
     let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
@@ -346,7 +333,7 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         eprintln!("no xfsdata-default fixture — skipping");
         return;
     }
-    let scratch = Scratch::from(&source, "xfstrunc.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfstrunc.img");
     let img = scratch.path();
 
     // Deliberately not block-aligned, so the partial-block tail has to be
@@ -375,7 +362,7 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         r#"
         set -e
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/xfstrunc.img "$img"
+        cp {source} "$img"
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 || true
         echo "REPAIR_END"
@@ -386,7 +373,8 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
         umount "$mnt"; rmdir "$mnt"; rm -f "$img"
         echo DONE
-        "#
+        "#,
+        source = scratch.guest(),
     );
     let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");

@@ -43,7 +43,12 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volume lives, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "agfl_refill";
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -52,43 +57,6 @@ use std::sync::Arc;
 /// in the share as a fixture. And the share itself when this test made it,
 /// because a suite that finds an empty share fails where a missing one
 /// skips (`log_oracle` in the fixture-less test jobs).
-struct Scratch {
-    image: std::path::PathBuf,
-}
-
-impl Scratch {
-    /// IN A DIRECTORY OF ITS OWN, not beside the fixtures. Cargo runs test
-    /// binaries at the same time, and the suites that scan the share take
-    /// every `.img` in it for a fixture — so a scratch image sitting there
-    /// while this test writes to it fails them with a dirty log. A
-    /// subdirectory is not an `.img`, so their scans pass it by.
-    fn new(image: std::path::PathBuf) -> Self {
-        std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
-        Scratch { image }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // KEPT WHEN THE TEST FAILED, because this step keeps no artefact
-        // of its own and the next occurrence is as unreadable as the
-        // last one without the volume it happened to (#199). A failure
-        // ends the job, so nothing after this point reads the share and
-        // a kept image costs nothing but the runner's disk.
-        if std::thread::panicking() {
-            eprintln!(
-                "keeping {} for the artefact upload: the volume this failed on",
-                self.image.display()
-            );
-            return;
-        }
-        let _ = std::fs::remove_file(&self.image);
-        if let Some(dir) = self.image.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-}
-
 const DIRS: usize = 5;
 const PER_DIR: usize = 100;
 
@@ -103,18 +71,19 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
         eprintln!("no .vm-share — skipped");
         return;
     }
-    let name = format!("agfl-refill/agfl-refill-{}.img", std::process::id());
-    let image = share().join(&name);
-    let _scratch = Scratch::new(image.clone());
-    std::fs::File::create(&image)
-        .and_then(|f| f.set_len(320 * 1024 * 1024))
-        .unwrap();
+    let scratch = scratch::Volume::empty(
+        SUITE,
+        &format!("{}.img", std::process::id()),
+        320 * 1024 * 1024,
+    );
+    let image = scratch.path().to_path_buf();
+    let name = scratch.guest();
 
     let Some(built) = kernel_run(&format!(
         r#"
-        mkfs.xfs -q -f -b size=1024 -d agcount=2 -m rmapbt=1,reflink=0 /share/{name} 2>&1 || echo MKFS_FAILED
+        mkfs.xfs -q -f -b size=1024 -d agcount=2 -m rmapbt=1,reflink=0 {name} 2>&1 || echo MKFS_FAILED
         m=$(mktemp -d)
-        mount -o loop /share/{name} "$m" || echo MOUNT_FAILED
+        mount -o loop {name} "$m" || echo MOUNT_FAILED
         for d in $(seq 0 {last_dir}); do
             mkdir "$m/d$d"
             for f in $(seq 0 {last_file}); do
@@ -161,12 +130,12 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
     let replay = format!(
         r#"
         counters() {{
-            xfs_db -r -c 'sb 0' -c 'print fdblocks icount ifree' /share/{name} 2>&1
+            xfs_db -r -c 'sb 0' -c 'print fdblocks icount ifree' {name} 2>&1
             for ag in 0 1; do
                 echo "== agf $ag"
                 xfs_db -r -c "agf $ag" \
                     -c 'print freeblks flcount flfirst fllast btreeblks rmapblocks levels longest' \
-                    /share/{name} 2>&1
+                    {name} 2>&1
             done
         }}
         before=$(counters)
@@ -180,7 +149,7 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
         # and then skips the superblock counters at unmount, which is the
         # same `sb_fdblocks N, counted N-1` an unnoticed failed unmount
         # produces. `findmnt` after the fact says which it was.
-        if mount_said=$(mount -o loop,nouuid /share/{name} "$m" 2>&1); then
+        if mount_said=$(mount -o loop,nouuid {name} "$m" 2>&1); then
             how=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS "$m" 2>&1)
             # A read-only mount is not this oracle's mount. XFS recovers
             # the log even read-only -- it has to -- so the group headers
@@ -228,7 +197,7 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
         rmdir "$m" 2>/dev/null
         after=$(counters)
         echo "REPAIR_BEGIN"
-        out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
+        out=$(xfs_repair -n {name} 2>&1) && rc=0 || rc=$?
         echo "$out"
         echo "REPAIR_RC=$rc"
         echo "REPAIR_END"
@@ -243,7 +212,7 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
             echo "$mount_said"
             echo "== what the kernel said while it had this volume"
             dmesg | tail -30
-            xfs_logprint -t /share/{name} 2>&1 | tail -20
+            xfs_logprint -t {name} 2>&1 | tail -20
         fi
         echo DONE
         "#

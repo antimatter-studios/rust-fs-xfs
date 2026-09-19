@@ -31,7 +31,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volumes live: under
+/// `.vm-share/scratch/`, not beside the fixtures another suite is
+/// reading while this one writes (#223).
+const SUITE: &str = "rename_oracle";
 
 /// A directory small enough to live inside its inode, built by the
 /// fixture script with two equal-length names.
@@ -40,25 +45,6 @@ const DIR: &str = "/sf";
 /// A working image in the shared folder, removed when it goes out of
 /// scope. Every other suite treats each `.img` there as a fixture, so
 /// one left behind fails unrelated tests.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Scratch(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 fn fixture() -> Option<PathBuf> {
     let p = share().join("xfslog-b4096-i512.img");
     p.exists().then_some(p)
@@ -80,7 +66,7 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         eprintln!("no xfslog fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-rename.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-rename.img");
     let img = scratch.path();
 
     let (dir_ino, moved_ino) = inodes_of(img, "aaaa");
@@ -114,9 +100,10 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         );
     }
 
-    let script = r#"
+    let script = format!(
+        r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/xfs-rename.img "$img"
+        cp {source} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
@@ -134,8 +121,10 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         rm -f "$img"
         echo "DONE"
         echo DONE
-        "#;
-    let Some(out) = kernel_run(script) else {
+        "#,
+        source = scratch.guest(),
+    );
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
@@ -178,7 +167,7 @@ fn a_name_that_is_taken_is_refused() {
     let Some(source) = fixture() else {
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-rename-taken.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-rename-taken.img");
     let img = scratch.path();
     let (dir_ino, _) = inodes_of(img, "aaaa");
 
@@ -202,7 +191,7 @@ fn a_name_that_is_not_there_is_refused() {
     let Some(source) = fixture() else {
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-rename-missing.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-rename-missing.img");
     let img = scratch.path();
     let (dir_ino, _) = inodes_of(img, "aaaa");
 
@@ -222,7 +211,7 @@ fn a_directory_past_short_form_is_refused() {
     let Some(source) = fixture() else {
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-rename-big.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-rename-big.img");
     let img = scratch.path();
 
     let dev = FileDevice::open_rw(img).expect("open read-write");
@@ -244,7 +233,7 @@ fn a_read_only_mount_refuses_to_rename() {
     let Some(source) = fixture() else {
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-rename-ro.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-rename-ro.img");
     let img = scratch.path();
     let (dir_ino, _) = inodes_of(img, "aaaa");
 

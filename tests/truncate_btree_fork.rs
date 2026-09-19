@@ -17,7 +17,12 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volume lives, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "truncate_btree_fork";
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -26,38 +31,27 @@ use std::sync::Arc;
 /// in the inode: a v3 inode holds a few dozen records at most.
 const PIECES: u32 = 3000;
 
-struct Scratch(std::path::PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        if let Some(dir) = self.0.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-}
-
 #[test]
 fn a_file_with_a_btree_fork_is_truncated() {
     if !share().exists() {
         eprintln!("no .vm-share — skipped");
         return;
     }
-    let name = format!("btree-fork/btree-fork-{}.img", std::process::id());
-    let image = share().join(&name);
-    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
-    let _scratch = Scratch(image.clone());
-    std::fs::File::create(&image)
-        .and_then(|f| f.set_len(400 * 1024 * 1024))
-        .unwrap();
+    let scratch = scratch::Volume::empty(
+        SUITE,
+        &format!("{}.img", std::process::id()),
+        400 * 1024 * 1024,
+    );
+    let image = scratch.path().to_path_buf();
+    let name = scratch.guest();
 
     // Built, measured empty, then filled: the free-block count before the
     // file existed is what the truncate has to give back.
     let Some(built) = kernel_run(&format!(
         r#"
-        mkfs.xfs -q -f -m rmapbt=1 /share/{name} 2>&1 && echo MKFS_OK
+        mkfs.xfs -q -f -m rmapbt=1 {name} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
-        mount -o loop /share/{name} "$m" && echo MOUNT_OK
+        mount -o loop {name} "$m" && echo MOUNT_OK
         echo "FREE_BEFORE $(df --output=avail -k "$m" | tail -1)"
         # Every other block, so no two pieces are adjacent and each is a
         # record of its own.
@@ -109,7 +103,7 @@ fn a_file_with_a_btree_fork_is_truncated() {
     let out = kernel_run(&format!(
         r#"
         m=$(mktemp -d)
-        if mount -o loop,nouuid /share/{name} "$m"; then
+        if mount -o loop,nouuid {name} "$m"; then
             echo "SIZE $(stat -c %s "$m/frag")"
             echo "BLOCKS $(stat -c %b "$m/frag")"
             echo "FREE_AFTER $(df --output=avail -k "$m" | tail -1)"
@@ -121,7 +115,7 @@ fn a_file_with_a_btree_fork_is_truncated() {
         fi
         rmdir "$m"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n {name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
         echo DONE
         "#

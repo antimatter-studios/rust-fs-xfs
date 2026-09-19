@@ -27,33 +27,17 @@
 //! ```
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, scratch, share};
+
+/// Where this suite's scratch volumes live, under
+/// `.vm-share/scratch/`, out of the way of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "refcount_oracle";
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let dir = share().join("scratch");
-        std::fs::create_dir_all(&dir).expect("scratch directory");
-        let path = dir.join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Self(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 /// A reflink filesystem whose fixture really does share an extent —
 /// `build-feature-matrix-fixtures.sh` makes `sf/shared.bin` a reflink
@@ -64,11 +48,11 @@ fn fixture() -> Option<PathBuf> {
 }
 
 fn replay(img: &Path) -> bool {
-    let name = img.file_name().unwrap().to_string_lossy().into_owned();
+    let image = scratch::guest_path(img);
     let script = format!(
         r#"
         m=$(mktemp -d)
-        mount -o loop,nouuid /share/scratch/{name} "$m" && umount "$m" || echo MOUNT_FAILED
+        mount -o loop,nouuid {image} "$m" && umount "$m" || echo MOUNT_FAILED
         rmdir "$m" 2>/dev/null
         echo DONE
         "#
@@ -96,7 +80,7 @@ fn letting_go_of_a_shared_extent_leaves_the_blocks_with_the_other_file() {
         eprintln!("no xfsfeat-reflink fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "refcount-share-scratch.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "refcount-share-scratch.img");
     let img = scratch.path();
 
     let (victim, survivor, block, wanted) = {
@@ -175,7 +159,7 @@ fn the_last_owner_gives_the_blocks_back() {
         eprintln!("no xfsfeat-reflink fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "refcount-last-scratch.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "refcount-last-scratch.img");
     let img = scratch.path();
 
     let (owners, block) = {

@@ -392,3 +392,117 @@ pub mod repair {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Scratch volumes (#223)
+// ---------------------------------------------------------------------
+
+/// An image a suite writes to, kept away from the fixtures.
+///
+/// `allow(dead_code)`: compiled into every test binary that says
+/// `mod common;`, including the read-only ones that never make a scratch
+/// volume.
+#[allow(dead_code)]
+pub mod scratch {
+    use super::share;
+    use std::path::{Path, PathBuf};
+
+    /// Where a suite's scratch volumes live: `.vm-share/scratch/<suite>/`.
+    ///
+    /// NOT BESIDE THE FIXTURES, which is the whole point. Several suites
+    /// walk every `*.img` in `.vm-share` and grade the driver against
+    /// whatever they find; cargo runs test binaries in parallel; and an
+    /// image another suite is halfway through writing is not a fixture.
+    /// That is order-dependent failure with no symptom beyond a number
+    /// being off by one — see #124, `sb_fdblocks 84960, counted 84959`.
+    ///
+    /// The scanners use `read_dir`, which does not recurse, so a
+    /// subdirectory is invisible to them. One directory per suite so a
+    /// failure names its owner, and so two suites cannot collide on a
+    /// name either.
+    pub fn dir(suite: &str) -> PathBuf {
+        let d = share().join("scratch").join(suite);
+        std::fs::create_dir_all(&d)
+            .unwrap_or_else(|e| panic!("making the scratch directory for {suite}: {e}"));
+        d
+    }
+
+    /// Where a path under the fixture directory is inside the guest,
+    /// which mounts that directory at `/share`.
+    ///
+    /// For the helpers that are handed a path rather than the volume
+    /// that made it.
+    pub fn guest_path(path: &Path) -> String {
+        let under = path
+            .strip_prefix(share())
+            .unwrap_or_else(|_| panic!("{} is not under the fixture directory", path.display()));
+        format!("/share/{}", under.display())
+    }
+
+    /// A scratch volume, removed when this is dropped.
+    pub struct Volume {
+        path: PathBuf,
+        suite: String,
+    }
+
+    impl Volume {
+        /// A copy of `source` to write to.
+        pub fn copy_of(suite: &str, source: &Path, name: &str) -> Volume {
+            let path = dir(suite).join(name);
+            std::fs::copy(source, &path).unwrap_or_else(|e| {
+                panic!("copying {} to {}: {e}", source.display(), path.display())
+            });
+            Volume {
+                path,
+                suite: suite.to_string(),
+            }
+        }
+
+        /// An empty file of `bytes`, for a guest to make a filesystem in.
+        pub fn empty(suite: &str, name: &str, bytes: u64) -> Volume {
+            let path = dir(suite).join(name);
+            std::fs::File::create(&path)
+                .and_then(|f| f.set_len(bytes))
+                .unwrap_or_else(|e| panic!("making {}: {e}", path.display()));
+            Volume {
+                path,
+                suite: suite.to_string(),
+            }
+        }
+
+        /// Where it is on this machine.
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Where it is inside the guest, which mounts the same directory
+        /// at `/share`.
+        pub fn guest(&self) -> String {
+            format!(
+                "/share/scratch/{}/{}",
+                self.suite,
+                self.path
+                    .file_name()
+                    .expect("a scratch volume has a name")
+                    .to_string_lossy()
+            )
+        }
+
+        /// Keep it, and say where. For a failure worth looking at
+        /// afterwards: the drop below would otherwise take the evidence
+        /// with it.
+        pub fn keep(self) -> PathBuf {
+            let path = self.path.clone();
+            std::mem::forget(self);
+            path
+        }
+    }
+
+    impl Drop for Volume {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            // Empty afterwards or not; a suite still running keeps its own.
+            let _ = std::fs::remove_dir(self.path.parent().expect("a parent"));
+        }
+    }
+}

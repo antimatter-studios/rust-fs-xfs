@@ -20,33 +20,17 @@
 //! replayed what this driver logged, is the record there or not?
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, scratch, share};
+
+/// Where this suite's scratch volumes live, under
+/// `.vm-share/scratch/`, out of the way of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "rmap_oracle";
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let dir = share().join("scratch");
-        std::fs::create_dir_all(&dir).expect("scratch directory");
-        let path = dir.join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Self(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 /// A filesystem with a reverse-mapping tree and something in it.
 fn fixture() -> Option<PathBuf> {
@@ -57,11 +41,11 @@ fn fixture() -> Option<PathBuf> {
 /// Have the kernel replay the log, so the image reflects what was
 /// logged rather than what was on disk before it.
 fn replay(img: &Path) -> bool {
-    let name = img.file_name().unwrap().to_string_lossy().into_owned();
+    let image = scratch::guest_path(img);
     let script = format!(
         r#"
         m=$(mktemp -d)
-        mount -o loop,nouuid /share/scratch/{name} "$m" && umount "$m" || echo MOUNT_FAILED
+        mount -o loop,nouuid {image} "$m" && umount "$m" || echo MOUNT_FAILED
         rmdir "$m" 2>/dev/null
         echo DONE
         "#
@@ -94,7 +78,7 @@ fn freeing_a_file_removes_its_reverse_mapping_records() {
         eprintln!("no xfsfeat-rmapbt fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "rmap-free-scratch.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "rmap-free-scratch.img");
     let img = scratch.path();
 
     let ino = {
@@ -137,7 +121,7 @@ fn writing_a_file_adds_a_reverse_mapping_record_for_it() {
         eprintln!("no xfsfeat-rmapbt fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "rmap-alloc-scratch.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "rmap-alloc-scratch.img");
     let img = scratch.path();
 
     let ino = {
