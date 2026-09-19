@@ -28,6 +28,7 @@
 #
 # Usage:  scripts/ci-test.sh --test truncate_oracle [more cargo args]
 #         CI_TEST_FLOOR=5 scripts/ci-test.sh --test oracle_vm_fixtures
+#         CI_TEST_FLOOR=12 scripts/ci-test.sh --ignored
 #         scripts/ci-test.sh --floor-check <floor> <logfile> <label>
 #         scripts/ci-test.sh --self-test
 #
@@ -171,7 +172,25 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     exit "$fail"
 fi
 
-out=$(cargo test --locked --release "$@" -- --nocapture 2>&1) && status=0 || status=$?
+# HARNESS ARGUMENTS THE CALLER ASKED FOR, which today is `--ignored`
+# and only that (#200).
+#
+# The xfsprogs-gated run selects the `#[ignore]`d suites, and it used to
+# run `cargo test -- --ignored` directly — outside this script, and so
+# outside the skip gate, which is the one thing here that stops a skip
+# reading as a pass. Those suites are exactly the kind it exists for:
+# `oracle_mkfs` prints a note per field it could not compare, and that
+# note is in the `--self-test` corpus above as a skip this must catch.
+#
+# It goes after the `--`, where the harness reads it, rather than into
+# `"$@"`, where cargo would.
+harness=()
+if [ "${1:-}" = "--ignored" ]; then
+    harness+=(--ignored)
+    shift
+fi
+
+out=$(cargo test --locked --release "$@" -- --nocapture "${harness[@]}" 2>&1) && status=0 || status=$?
 echo "$out"
 
 if [ "$status" -ne 0 ]; then

@@ -496,28 +496,20 @@ jobs:
           ./scripts/build-xfsprogs.sh ~/xfsprogs-pinned
           echo "XFSPROGS_PARENT_BIN=$HOME/xfsprogs-pinned/sbin" >> "$GITHUB_ENV"
       #
-      # THIS ONE DOES NOT GO THROUGH ci-test.sh, so it gets its floor
-      # inline. That bypass is #200's subject — the skip gate cannot see
-      # this run, and tests/oracle_mkfs.rs prints a skip note per field
-      # it cannot compare — and it is deliberately not fixed here. The
-      # floor is the half that does not need the rerouting: `--ignored`
-      # selects a disjoint set from every other run in this file, so it
-      # can empty on its own, and an #[ignore] attribute added or a
-      # filter that stops matching would leave "0 passed" and a green
-      # step. 14 executed on 2026-09-17 in run 35256241155 (job
-      # 105320488253); floor 12.
+      # THROUGH ci-test.sh LIKE EVERY OTHER RUN IN THIS JOB (#200). It
+      # used to be a bare `cargo test -- --ignored`, which meant the skip
+      # gate could not see it — and these are exactly the suites it
+      # exists for: `oracle_mkfs` prints a note per field it could not
+      # compare against `xfs_db`, and that note is in the script's own
+      # `--self-test` corpus as a skip it must catch.
+      #
+      # The floor stays, because `--ignored` selects a disjoint set from
+      # every other run in this file and so can empty on its own: an
+      # `#[ignore]` attribute added, or a filter that stops matching,
+      # would leave "0 passed" and a green step. 14 executed on
+      # 2026-09-17 in run 35256241155 (job 105320488253); floor 12.
       - name: Run the xfsprogs-gated oracle tests
-        run: |
-          set -uo pipefail
-          # ERREXIT OFF ON PURPOSE. The runner's default shell is
-          # `bash -e -o pipefail`, so a failing run would end the step
-          # before the count below ever printed — and a truncated run is
-          # exactly the one worth naming. `rc` still decides the step.
-          set +e
-          cargo test --locked --release -- --ignored 2>&1 | tee "$RUNNER_TEMP/ignored-tests.log"
-          rc=${PIPESTATUS[0]}
-          ./scripts/ci-test.sh --floor-check 12 "$RUNNER_TEMP/ignored-tests.log" "the xfsprogs-gated --ignored run" || rc=1
-          exit "$rc"
+        run: CI_TEST_FLOOR=12 ./scripts/ci-test.sh --ignored
 
       # Mounting is the end of the argument. xfs_db agreeing with us
       # proves we read the metadata correctly; the kernel mounting the
