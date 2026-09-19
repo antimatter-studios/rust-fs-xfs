@@ -209,13 +209,28 @@ impl Filesystem {
         let tid = crate::log_write::transaction_id(&head);
         let ops = build(tid);
 
+        // A CHECKPOINT IS A SEQUENCE OF RECORDS, NOT ONE (#216). A large
+        // one — a truncate that gives three thousand separate runs back
+        // to a group, which is what an ordinary fragmented file leaves —
+        // does not fit an in-core buffer, and the kernel writes several
+        // records rather than refusing.
+        let groups = crate::log_write::split_into_records(&ops, head.iclog_size)?;
+        let needed = crate::log_write::blocks_for_records(tid, &groups) as u32;
+
         // THE RING IS REUSED RATHER THAN EXHAUSTED. A record may not
         // straddle the wrap, so one that will not fit in what is left
         // starts again at the beginning — and may only do so once
         // everything the records it would overwrite describe is on disk.
         // That is the push, and it is what lets a mount keep going instead
         // of filling the log and stopping (#89).
-        if crate::log_write::record_blocks(tid, &ops, head.iclog_size)? > head.free_blocks {
+        //
+        // THE WHOLE CHECKPOINT IS PLACED AT ONCE, not record by record. A
+        // wrap part-way through would push the buffers of everything
+        // before it and move the tail past this checkpoint's own first
+        // records — leaving recovery to find a transaction that starts
+        // after its own beginning, which it discards. So the space for
+        // every record is found before any of them is written.
+        if needed > head.free_blocks {
             self.sync()?;
             // THE GAP AT THE END IS FILLED, NOT LEFT. A reader walks the
             // cycle number stamped in every block and expects one place
@@ -252,30 +267,49 @@ impl Filesystem {
             self.wraps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
+        if needed > head.free_blocks {
+            return Err(Error::UnsupportedFeature(format!(
+                "this checkpoint needs {needed} basic blocks and the whole log holds \
+                 {}; a checkpoint larger than the log cannot be written",
+                head.free_blocks
+            )));
+        }
+
         let mut oldest = self.oldest_record.lock().expect("oldest record poisoned");
         let tail = oldest.unwrap_or_else(|| crate::log_write::lsn_of(&head));
-        let lsn = crate::log_write::append_at_with_tail(
-            device.as_ref(),
-            &self.sb,
-            &head,
-            tid,
-            &ops,
-            tail,
-        )?;
-        oldest.get_or_insert(lsn);
+        // THE TAIL NAMES THIS CHECKPOINT'S FIRST RECORD, whichever record
+        // is being written: recovery starts there and reads forward to
+        // the commit.
+        let mut at = head;
+        let mut first = None;
+        let mut lsn = 0;
+        for group in &groups {
+            lsn = crate::log_write::append_at_with_tail(
+                device.as_ref(),
+                &self.sb,
+                &at,
+                tid,
+                group,
+                tail,
+            )?;
+            first.get_or_insert(lsn);
+            let used = crate::log_write::record_blocks(tid, group, at.iclog_size)?;
+            at = crate::log::Head {
+                block: at.block + used,
+                cycle: at.cycle,
+                prev_block: at.block,
+                free_blocks: at.free_blocks - used,
+                iclog_size: at.iclog_size,
+            };
+        }
+        // The checkpoint's own beginning is what recovery may not pass.
+        oldest.get_or_insert(first.expect("a checkpoint has at least one record"));
         self.logged_anything
             .store(true, std::sync::atomic::Ordering::SeqCst);
         drop(oldest);
 
         // Where the next record goes, so it does not have to be found again.
-        let used = crate::log_write::record_blocks(tid, &ops, head.iclog_size)?;
-        *self.next_head.lock().expect("next head poisoned") = Some(crate::log::Head {
-            block: head.block + used,
-            cycle: head.cycle,
-            prev_block: head.block,
-            free_blocks: head.free_blocks - used,
-            iclog_size: head.iclog_size,
-        });
+        *self.next_head.lock().expect("next head poisoned") = Some(at);
 
         // AND THE MEMORY IS BOUNDED. Every buffer a record carried is held
         // until something writes it where it belongs, so a mount that never

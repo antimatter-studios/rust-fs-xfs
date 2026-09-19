@@ -94,6 +94,15 @@ fn a_checkpoint_larger_than_one_log_buffer_is_written_and_replayed() {
         let ino = fs.lookup_path("/gone").expect("the fragmented file").ino;
         fs.truncate_to_zero(ino)
             .expect("a truncate whose checkpoint does not fit one record");
+        // AND SOMETHING AFTER IT, in the same mount. The records that
+        // follow a split checkpoint name a tail, and recovery starts
+        // there: if the tail names the split checkpoint's LAST record
+        // rather than its first, recovery begins in the middle of it,
+        // finds a transaction with no start, discards it — and the
+        // truncate above is silently not applied.
+        let root = fs.lookup_path("/").expect("the root").ino;
+        fs.create_file(root, b"after", 0o100644)
+            .expect("an operation after the split checkpoint");
     }
 
     let out = kernel_run(&format!(
@@ -104,6 +113,7 @@ fn a_checkpoint_larger_than_one_log_buffer_is_written_and_replayed() {
             echo "BLOCKS $(stat -c %b "$m/gone")"
             echo "KEPT_SUM $(md5sum < "$m/kept" | cut -d' ' -f1)"
             echo "KEPT_SIZE $(stat -c %s "$m/kept")"
+            echo "AFTER $([ -e "$m/after" ] && echo yes || echo no)"
             if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
             echo MOUNTED
         else
@@ -137,6 +147,12 @@ fn a_checkpoint_larger_than_one_log_buffer_is_written_and_replayed() {
         kept_sum,
         "the neighbouring file's contents changed, which is what a record applied to \
          the wrong blocks looks like:\n{out}"
+    );
+    assert_eq!(
+        field(&out, "AFTER"),
+        "yes",
+        "the operation after the split checkpoint is missing, so the records that \
+         followed it were not replayed:\n{out}"
     );
     repair::assert_agreed(&out, "the volume after a checkpoint spanning records");
 }
