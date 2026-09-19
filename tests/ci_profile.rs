@@ -1920,6 +1920,63 @@ mod kernel_oracle_job {
     }
 }
 
+/// A pull request gets CI whatever it is based on (#241).
+///
+/// `on: pull_request: branches: [main]` means a pull request based on
+/// anything else runs no job in this workflow, and nothing says so: the
+/// pull request simply has no checks. PR #229, stacked on another fix,
+/// reported `CLEAN` with none at all beside siblings showing three —
+/// and with `.github-guard` requiring only `ci-ok` (#207), such a pull
+/// request has no `ci-ok` to wait for either.
+#[test]
+fn ci_runs_on_a_pull_request_against_any_base() {
+    let path = manifest_dir().join(".github/workflows/ci.yml");
+    let text = read_or_panic(&path);
+    let filter: Vec<String> = {
+        let mut out = Vec::new();
+        let mut in_on = false;
+        let mut in_pr = false;
+        for line in text.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let t = line.trim();
+            if t.starts_with('#') {
+                continue;
+            }
+            if indent == 0 && !t.is_empty() {
+                in_on = t == "on:";
+                in_pr = false;
+                continue;
+            }
+            if !in_on {
+                continue;
+            }
+            if indent == 2 && t.ends_with(':') {
+                in_pr = t == "pull_request:";
+                continue;
+            }
+            if in_pr && indent == 4 {
+                if let Some(list) = t.strip_prefix("branches:") {
+                    out.extend(
+                        list.trim()
+                            .trim_matches(['[', ']'].as_slice())
+                            .split(',')
+                            .map(|b| b.trim().trim_matches('\'').to_string())
+                            .filter(|b| !b.is_empty()),
+                    );
+                }
+            }
+        }
+        out
+    };
+    assert!(
+        filter.is_empty(),
+        "ci.yml runs on pull requests only against {filter:?}. One based on anything \
+         else — a stacked pull request, which this repository uses — runs no job here \
+         at all, and nothing says so: it simply has no checks, and no `ci-ok` for \
+         protection to wait for."
+    );
+}
+
 /// The `--ignored` run goes through the skip gate like every other run
 /// in its job (#200).
 ///
