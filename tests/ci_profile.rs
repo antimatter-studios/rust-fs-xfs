@@ -1669,3 +1669,224 @@ mod handshake {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// The kernel oracle's own job (#208)
+// ---------------------------------------------------------------------
+
+/// The job that grades this driver against the kernel and `xfs_db` is
+/// the only check here that is not this crate marking its own homework,
+/// and nothing asserted that it still exists.
+///
+/// Renamed, given an `if:`, given `continue-on-error:`, stripped of its
+/// `xfsprogs` install or of the suites it selects — any one of those
+/// leaves a green check whose name still reads like cross-validation
+/// while nothing is cross-validated. rust-img-qcow2#97 is what that
+/// looks like once it has happened: a probe that returned early on every
+/// runner, in every job, on every push, while the test reported `ok`.
+/// Neither an executed-test floor nor a required check can see it — an
+/// early return counts as passed, and the job still reports green under
+/// the required name.
+///
+/// The three facts are asserted separately because they fail separately.
+mod kernel_oracle_job {
+    use super::{manifest_dir, read_or_panic};
+
+    /// The check `.github-guard` requires whose name is the kernel
+    /// gate's. Read from the file rather than written here, so a rename
+    /// that updates one and not the other is what fails.
+    fn required_kernel_check() -> String {
+        let guard = read_or_panic(&manifest_dir().join(".github-guard"));
+        let mut required: Vec<String> = guard
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once("required ="))
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+            .collect();
+        required.retain(|name| name.contains("kernel") || name.contains("xfs_db"));
+        assert_eq!(
+            required.len(),
+            1,
+            "`.github-guard` should require exactly one kernel-oracle check, and it \
+             requires {required:?} — if the gate was renamed, this test's idea of \
+             which check it is has to be renamed with it"
+        );
+        required.remove(0)
+    }
+
+    fn workflow() -> String {
+        read_or_panic(&manifest_dir().join(".github/workflows/ci.yml"))
+    }
+
+    /// The lines of the job whose `name:` is `check`, with its key.
+    fn job_named(workflow: &str, check: &str) -> (String, Vec<String>) {
+        let lines: Vec<&str> = workflow.lines().collect();
+        let mut at = 0;
+        let mut found: Option<(String, Vec<String>)> = None;
+        while at < lines.len() {
+            let line = lines[at];
+            let indent = line.len() - line.trim_start().len();
+            let is_job_key = indent == 2
+                && line.trim().ends_with(':')
+                && !line.trim_start().starts_with('#')
+                && !line.trim().contains(' ');
+            if !is_job_key {
+                at += 1;
+                continue;
+            }
+            let key = line.trim().trim_end_matches(':').to_string();
+            let mut body = Vec::new();
+            at += 1;
+            while at < lines.len() {
+                let l = lines[at];
+                let ind = l.len() - l.trim_start().len();
+                if ind <= 2 && !l.trim().is_empty() && !l.trim_start().starts_with('#') {
+                    break;
+                }
+                body.push(l.to_string());
+                at += 1;
+            }
+            let names_it = body.iter().any(|l| {
+                let t = l.trim();
+                t.strip_prefix("name:")
+                    .is_some_and(|v| v.trim().trim_matches(['"', '\'']) == check)
+            });
+            if names_it {
+                found = Some((key, body));
+                break;
+            }
+        }
+        found.unwrap_or_else(|| {
+            panic!(
+                "no job in ci.yml is named {check:?}, which is the check \
+                 `.github-guard` requires — so the gate that grades this driver \
+                 against a real kernel either does not exist or reports under a \
+                 name nothing requires"
+            )
+        })
+    }
+
+    /// It exists, it gates pull requests, and nothing lets it pass by
+    /// not running.
+    #[test]
+    fn the_kernel_gate_exists_and_cannot_opt_out() {
+        let workflow = workflow();
+        let check = required_kernel_check();
+        let (key, body) = job_named(&workflow, &check);
+
+        // The workflow has to report on a pull request at all.
+        assert!(
+            workflow.contains("  pull_request:"),
+            "ci.yml does not trigger on pull_request, so nothing it contains gates a merge"
+        );
+
+        // AT THE JOB LEVEL, indent 4: a condition there decides whether
+        // the gate runs at all.
+        for line in &body {
+            let indent = line.len() - line.trim_start().len();
+            let t = line.trim();
+            if indent != 4 || t.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !t.starts_with("if:"),
+                "the {key} job carries `{t}` — a condition there is how an oracle stops \
+                 running while its check stays green"
+            );
+            assert!(
+                !t.starts_with("continue-on-error:"),
+                "the {key} job carries `{t}`, so it reports success whatever the kernel \
+                 said"
+            );
+        }
+
+        // AND ON THE STEPS THAT DO THE WORK. Not on every step: this job
+        // ends with an `if: failure()` step that keeps the volume a
+        // failing replay was judged on, and a step that runs only after
+        // something has already failed cannot hide anything.
+        for step in steps(&body) {
+            let load_bearing = step.iter().any(|l| {
+                l.contains("xfsprogs")
+                    || l.contains("build-fixtures-native.sh")
+                    || l.contains("ci-test.sh")
+            });
+            if !load_bearing {
+                continue;
+            }
+            for line in &step {
+                let t = line.trim().trim_start_matches("- ");
+                if t.starts_with('#') {
+                    continue;
+                }
+                assert!(
+                    !t.starts_with("if:") && !t.starts_with("continue-on-error:"),
+                    "a step of the {key} job that installs the oracle's tools, builds \
+                     its fixtures or runs its suites carries `{t}` — which is how the \
+                     work stops happening while the check stays green"
+                );
+            }
+        }
+    }
+
+    /// The job's steps, each as its own block of lines.
+    fn steps(body: &[String]) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for line in body {
+            let indent = line.len() - line.trim_start().len();
+            if indent == 6 && line.trim_start().starts_with("- ") {
+                out.push(vec![line.clone()]);
+            } else if let Some(last) = out.last_mut() {
+                last.push(line.clone());
+            }
+        }
+        out
+    }
+
+    /// It still installs the tools it grades with.
+    #[test]
+    fn the_kernel_gate_still_installs_xfsprogs() {
+        let workflow = workflow();
+        let check = required_kernel_check();
+        let (key, body) = job_named(&workflow, &check);
+        let installs = body
+            .iter()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .any(|l| l.contains("apt-get install") && l.contains("xfsprogs"));
+        assert!(
+            installs,
+            "the {key} job does not install xfsprogs, so mkfs.xfs and xfs_db are not \
+             there — every oracle in it skips, and a skip reads as a pass"
+        );
+    }
+
+    /// And it still builds fixtures and runs the suites that use them.
+    #[test]
+    fn the_kernel_gate_still_builds_fixtures_and_runs_the_oracles() {
+        let workflow = workflow();
+        let check = required_kernel_check();
+        let (key, body) = job_named(&workflow, &check);
+        let text: String = body
+            .iter()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("build-fixtures-native.sh"),
+            "the {key} job does not build the fixture matrix, so the suites it runs \
+             have nothing to read and skip"
+        );
+        assert!(
+            text.contains("ci-test.sh"),
+            "the {key} job does not run anything through ci-test.sh, which is what \
+             turns a suite's skip into a failure — without it the job can pass while \
+             every oracle in it returns early"
+        );
+        assert!(
+            text.contains("--floor-check"),
+            "the {key} job does not check a floor on what it executed, so a selection \
+             that matched nothing reports the same green as a full run"
+        );
+    }
+}
