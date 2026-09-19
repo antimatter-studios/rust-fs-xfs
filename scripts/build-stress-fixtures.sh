@@ -65,8 +65,25 @@ IMAGE_SIZE=500M      # mkfs.xfs refuses anything under ~300 MB
 # all. The finished image is copied across at the end.
 WORK="${XFS_STRESS_WORK:-/var/tmp/xfs-stress}"
 
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 for tool in mkfs.xfs xfs_repair fsstress fsx filefrag; do
     command -v "$tool" >/dev/null || {
@@ -97,10 +114,10 @@ record_fixture() {
     # Read-only, and norecovery: the log was left clean by the unmount
     # above, and this must not be the thing that changes the image.
     local mnt; mnt=$(mktemp -d)
-    $SUDO mount -o ro,norecovery,loop "$img" "$mnt"
+    as_root mount -o ro,norecovery,loop "$img" "$mnt"
     (
         cd "$mnt"
-        $SUDO find . -mindepth 1 | sort | while read -r p; do
+        as_root find . -mindepth 1 | sort | while read -r p; do
             rel="${p#.}"
             if   [ -L "$p" ]; then printf '%s\tlink\t0\t%s\n' "$rel" "$(readlink "$p")"
             elif [ -d "$p" ]; then printf '%s\tdir\t0\t-\n'   "$rel"
@@ -114,7 +131,7 @@ record_fixture() {
             else                   printf '%s\tunknown\t0\t-\n' "$rel"
             fi
         done
-    ) | $SUDO tee "$base.manifest" > /dev/null
+    ) | as_root tee "$base.manifest" > /dev/null
 
     # What shape the fixture actually came out. A stress run is random: a
     # seed that happened to produce a flat tree of ten empty files would
@@ -126,14 +143,14 @@ record_fixture() {
     local extents_max=0 extents_file="-" sparse=0
     while read -r f; do
         local n sz blk
-        n=$($SUDO filefrag "$mnt$f" 2>/dev/null | sed -n 's/.*: \([0-9]*\) extents\? found.*/\1/p' | head -1)
+        n=$(as_root filefrag "$mnt$f" 2>/dev/null | sed -n 's/.*: \([0-9]*\) extents\? found.*/\1/p' | head -1)
         [ -n "$n" ] || continue
         if [ "$n" -gt "$extents_max" ]; then extents_max=$n; extents_file=$f; fi
-        sz=$($SUDO stat -c%s "$mnt$f"); blk=$($SUDO stat -c%b "$mnt$f")
+        sz=$(as_root stat -c%s "$mnt$f"); blk=$(as_root stat -c%b "$mnt$f")
         # 512-byte blocks. Fewer allocated than the length implies holes.
         if [ "$sz" -gt $(( blk * 512 )) ]; then sparse=$(( sparse + 1 )); fi
     done < <(awk -F'\t' '$2 == "file" { print $1 }' "$base.manifest")
-    $SUDO umount "$mnt"; rmdir "$mnt"
+    as_root umount "$mnt"; rmdir "$mnt"
 
     {
         printf 'case=%s\n' "$name"
@@ -196,14 +213,14 @@ for variant in "ops:" "ops1k:-b size=1024"; do
     mkfs.xfs -f -q $mkfs_args "$img" >/dev/null 2>&1
 
     mnt=$(mktemp -d)
-    $SUDO mount -o loop "$img" "$mnt"
-    $SUDO mkdir -p "$mnt/stress"
+    as_root mount -o loop "$img" "$mnt"
+    as_root mkdir -p "$mnt/stress"
     # fsstress exits non-zero on an operation the filesystem declined,
     # which is ordinary -- the point is the state it leaves behind.
-    $SUDO fsstress -d "$mnt/stress" -n "$FSSTRESS_OPS" -p 1 -s "$SEED" \
+    as_root fsstress -d "$mnt/stress" -n "$FSSTRESS_OPS" -p 1 -s "$SEED" \
         > "$WORK/$case_name.fsstress.log" 2>&1 || true
     sync
-    $SUDO umount "$mnt"; rmdir "$mnt"
+    as_root umount "$mnt"; rmdir "$mnt"
 
     record_fixture "$case_name" "$img" "fsstress -n $FSSTRESS_OPS -p 1 -s $SEED $mkfs_args"
 
@@ -232,11 +249,11 @@ truncate -s "$IMAGE_SIZE" "$img"
 mkfs.xfs -f -q "$img" >/dev/null 2>&1
 
 mnt=$(mktemp -d)
-$SUDO mount -o loop "$img" "$mnt"
-$SUDO mkdir -p "$mnt/fsx"
+as_root mount -o loop "$img" "$mnt"
+as_root mkdir -p "$mnt/fsx"
 # Its own logs must not become part of the fixture, so they are kept off
 # the filesystem under test.
-if $SUDO fsx -N "$FSX_OPS" -S "$SEED" -l "$FSX_MAXLEN" -P "$WORK/fsxlogs" -q \
+if as_root fsx -N "$FSX_OPS" -S "$SEED" -l "$FSX_MAXLEN" -P "$WORK/fsxlogs" -q \
        "$mnt/fsx/hammered.bin" > "$WORK/fsx.fsx.log" 2>&1; then
     :
 else
@@ -245,11 +262,11 @@ else
     # not be built from it.
     echo 'fsx and the kernel disagreed; refusing to build a fixture from it:'
     tail -20 "$WORK/fsx.fsx.log"
-    $SUDO umount "$mnt"; rmdir "$mnt"
+    as_root umount "$mnt"; rmdir "$mnt"
     exit 1
 fi
 sync
-$SUDO umount "$mnt"; rmdir "$mnt"
+as_root umount "$mnt"; rmdir "$mnt"
 
 record_fixture fsx "$img" "fsx -N $FSX_OPS -S $SEED -l $FSX_MAXLEN"
 

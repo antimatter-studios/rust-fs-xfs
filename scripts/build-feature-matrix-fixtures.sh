@@ -45,8 +45,25 @@ set -euo pipefail
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 SIZE="${XFS_FIXTURE_SIZE:-400M}"
 
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
 
@@ -135,7 +152,7 @@ for combo in "${COMBOS[@]}"; do
     fi
 
     m=$(mktemp -d)
-    $SUDO mount -o loop "$img" "$m"
+    as_root mount -o loop "$img" "$m"
 
     # THE SAME TREE ON EVERY ROW, so a difference in the result is a
     # difference in the features and nothing else. Each entry exists for
@@ -145,13 +162,13 @@ for combo in "${COMBOS[@]}"; do
     # -- because a rename inside one rewrites the inode's own fork, and a
     # rename in a block-form directory is a different operation this
     # driver refuses by name.
-    $SUDO mkdir -p "$m/sf"
-    echo one | $SUDO tee "$m/sf/aaaa" > /dev/null   # renamed
-    echo two | $SUDO tee "$m/sf/bbbb" > /dev/null   # left alone, must survive
-    $SUDO dd if=/dev/urandom of="$m/sf/data.bin" bs=4096 count=32 status=none  # truncated
-    $SUDO touch "$m/sf/empty.bin"                   # written into
-    $SUDO touch "$m/sf/victim"                      # unlinked
-    $SUDO touch "$m/sf/attrs"                       # chmod/utimes
+    as_root mkdir -p "$m/sf"
+    echo one | as_root tee "$m/sf/aaaa" > /dev/null   # renamed
+    echo two | as_root tee "$m/sf/bbbb" > /dev/null   # left alone, must survive
+    as_root dd if=/dev/urandom of="$m/sf/data.bin" bs=4096 count=32 status=none  # truncated
+    as_root touch "$m/sf/empty.bin"                   # written into
+    as_root touch "$m/sf/victim"                      # unlinked
+    as_root touch "$m/sf/attrs"                       # chmod/utimes
 
     # A SHARED EXTENT, where the filesystem allows one.
     #
@@ -161,7 +178,7 @@ for combo in "${COMBOS[@]}"; do
     # driver that cannot tell the difference would hand out blocks
     # another file is still using. A fixture with the feature enabled and
     # nothing shared does not test that at all.
-    if $SUDO cp --reflink=always "$m/sf/data.bin" "$m/sf/shared.bin" 2>/dev/null; then
+    if as_root cp --reflink=always "$m/sf/data.bin" "$m/sf/shared.bin" 2>/dev/null; then
         echo "  (shared extent created: sf/shared.bin reflinks sf/data.bin)"
 
         # PART SHARED AND PART NOT, which is the harder case and the
@@ -173,8 +190,8 @@ for combo in "${COMBOS[@]}"; do
         #
         # Freeing it is then three different answers in one extent: give
         # back the middle, leave the two ends with the other file.
-        $SUDO cp --reflink=always "$m/sf/data.bin" "$m/sf/partial.bin" 2>/dev/null
-        $SUDO dd if=/dev/urandom of="$m/sf/partial.bin" bs=4096 count=8 seek=12 \
+        as_root cp --reflink=always "$m/sf/data.bin" "$m/sf/partial.bin" 2>/dev/null
+        as_root dd if=/dev/urandom of="$m/sf/partial.bin" bs=4096 count=8 seek=12 \
             conv=notrunc status=none 2>/dev/null
         echo "  (partly shared file created: sf/partial.bin, middle overwritten)"
     else
@@ -196,7 +213,7 @@ for combo in "${COMBOS[@]}"; do
     # attribute fork. The same measurement build-dirconv-fixtures.sh
     # makes, for the same reason: assuming a number here produced a test
     # that failed on a runner where it was 17 rather than 30.
-    $SUDO mkdir -p "$m/full"
+    as_root mkdir -p "$m/full"
     # MIXED CASE, on purpose.
     #
     # A case-insensitive filesystem hashes names for the directory index
@@ -204,20 +221,20 @@ for combo in "${COMBOS[@]}"; do
     # are the same value and a fixture made only of those cannot tell a
     # driver using the wrong one apart. Every name here was lowercase,
     # and the `ci` row passed without proving anything.
-    for name in Mixed UPPER CamelCase mIxEd; do $SUDO touch "$m/full/$name"; done
+    for name in Mixed UPPER CamelCase mIxEd; do as_root touch "$m/full/$name"; done
     n=0
     while [ "$n" -lt 400 ]; do
-        $SUDO touch "$m/full/e$n"
-        $SUDO sync
-        [ "$($SUDO stat -c %b "$m/full")" != "0" ] && break
+        as_root touch "$m/full/e$n"
+        as_root sync
+        [ "$(as_root stat -c %b "$m/full")" != "0" ] && break
         n=$((n + 1))
     done
     if [ "$n" -ge 400 ]; then
         echo "FAILED $name — 400 entries did not overflow the inode" >&2
-        $SUDO umount "$m"; rmdir "$m"; exit 1
+        as_root umount "$m"; rmdir "$m"; exit 1
     fi
-    $SUDO rm -f "$m/full/e$n"
-    $SUDO sync
+    as_root rm -f "$m/full/e$n"
+    as_root sync
 
     # DIRECTORIES IN GROUPS ABOVE THE FIRST.
     #
@@ -228,23 +245,23 @@ for combo in "${COMBOS[@]}"; do
     # and a linear block number are equal there, and differ everywhere
     # else. A fixture that never leaves the first group cannot tell the
     # two apart.
-    $SUDO mkdir -p "$m/spread"
-    for n in $(seq 1 64); do $SUDO mkdir -p "$m/spread/d$n"; done
+    as_root mkdir -p "$m/spread"
+    for n in $(seq 1 64); do as_root mkdir -p "$m/spread/d$n"; done
 
     # Enough inodes that the group's chunk is neither fresh nor full, so
     # creating and unlinking move real records rather than the first and
     # only ones.
-    $SUDO mkdir -p "$m/fill"
-    for n in $(seq 1 40); do $SUDO touch "$m/fill/f$n"; done
+    as_root mkdir -p "$m/fill"
+    for n in $(seq 1 40); do as_root touch "$m/fill/f$n"; done
 
     # The `fullinodes` row uses up every inode the group's one chunk
     # holds, so that creating anything has to make a new chunk. 64 to a
     # chunk, minus what the tree above already took.
     if [ "$name" = fullinodes ]; then
-        $SUDO mkdir -p "$m/eat"
+        as_root mkdir -p "$m/eat"
         n=0
         while [ "$n" -lt 200 ]; do
-            $SUDO touch "$m/eat/i$n"
+            as_root touch "$m/eat/i$n"
             n=$((n + 1))
         done
     fi
@@ -252,7 +269,7 @@ for combo in "${COMBOS[@]}"; do
     sync
     # Unmounted rather than only synced: a mounted filesystem's headers
     # are a cache of what is in memory, and the tests read the image.
-    $SUDO umount "$m"; rmdir "$m"
+    as_root umount "$m"; rmdir "$m"
 
     echo "BUILT xfsfeat-$name  ($args)"
     built=$((built + 1))
