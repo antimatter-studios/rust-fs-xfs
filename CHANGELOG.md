@@ -8,6 +8,27 @@ never does.
 
 ### Added
 
+- **The parsers are fuzzed, on two tiers.** Nothing in this crate had a
+  fuzz target, and the 2026-09-06 hardening wave — declared sizes used as
+  allocation sizes, walks with no visit budget, arithmetic that wrapped
+  with `overflow-checks` off — was a list of what a fuzzer finds in
+  minutes and a person finds by reading for an afternoon. Both halves
+  read one committed corpus of real structure blocks, cut out of an image
+  `mkfs.xfs` wrote and rebuildable in two seconds by
+  `scripts/make-fuzz-corpus.sh`. `fuzz/` holds thirteen `cargo-fuzz`
+  targets covering the superblock, the AG headers and free list, inodes
+  in each format, every directory block form, the btree leaves the
+  free-space, rmap and refcount trees share, the block-map btree and the
+  extent list; they run nightly on a bounded budget and upload whatever
+  they find. `tests/fuzz_decoders.rs` is the gate: it replays the corpus
+  verbatim and applies deterministic seeded mutations to it, 43,000 cases
+  in under half a second on the stable toolchain, so anything the fuzzer
+  finds stays fixed once its input is committed. It fails on a hang as
+  well as a panic, naming the target, seed and case; it refuses a case
+  count below a floor, so a suite that stopped generating work cannot
+  pass by doing nothing; and it refuses a `cargo-fuzz` target that has no
+  counterpart in the gate, so the two tiers cannot drift (#96).
+
 - **A checkpoint larger than one in-core log buffer is written as several
   records.** One operation's record had to fit a single buffer — 32 KiB on
   an ordinary log — and anything larger was refused, which an ordinary
