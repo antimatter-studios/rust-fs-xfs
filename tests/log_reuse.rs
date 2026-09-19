@@ -65,7 +65,11 @@ fn a_mount_writes_past_the_end_of_the_log() {
         m=$(mktemp -d)
         mount -o loop {name} "$m" && echo MOUNT_OK
         for d in $(seq 0 {last}); do mkdir "$m/d$d"; done
-        umount "$m" || echo UMOUNT_FAILED
+        # RETRIED ONCE. A busy unmount under a loaded runner is
+        # ordinary and clears in a moment; one that does not is the
+        # failure worth reporting, because the kernel writes the
+        # summary counters at unmount and nothing else does.
+        if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         rmdir "$m"
         echo DONE
         "#,
@@ -147,7 +151,11 @@ fn a_mount_writes_past_the_end_of_the_log() {
         if mount -o loop,nouuid {name} "$m"; then
             echo "KEPT $(find "$m" -name 'kept*' | wc -l)"
             echo "LEFTOVER $(find "$m" -name 'f0*' | wc -l)"
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
             echo MOUNTED
         else
             echo MOUNT_FAILED

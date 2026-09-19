@@ -131,7 +131,11 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
                 [ "$(stat -c %s "$m/$f")" = "1048576" ] || ok=no
             done
             echo "NEIGHBOURS $ok"
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12

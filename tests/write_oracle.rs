@@ -135,7 +135,10 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
             exit 0
         fi
         echo "SHA $(sha256sum "$mnt{TARGET}" | cut -d' ' -f1)"
-        umount "$mnt" || echo UMOUNT_FAILED; rmdir "$mnt"; rm -f "$img"
+        # Retried once: a busy unmount under load clears in a moment,
+        # and one that does not is what leaves the counters unwritten.
+        if ! umount "$mnt"; then sleep 2; umount "$mnt" || echo UMOUNT_FAILED; fi
+        rmdir "$mnt"; rm -f "$img"
         echo DONE
         "#,
         source = scratch.guest(),
@@ -292,7 +295,10 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         echo "MODE $(stat -c%a "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
         echo "MTIME_NS $(stat -c%y "$mnt{TARGET}")"
-        umount "$mnt" || echo UMOUNT_FAILED; rmdir "$mnt"; rm -f "$img"
+        # Retried once: a busy unmount under load clears in a moment,
+        # and one that does not is what leaves the counters unwritten.
+        if ! umount "$mnt"; then sleep 2; umount "$mnt" || echo UMOUNT_FAILED; fi
+        rmdir "$mnt"; rm -f "$img"
         echo DONE
         "#,
         source = scratch.guest(),
@@ -421,7 +427,10 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         echo "SIZE $(stat -c%s "$mnt{TARGET}")"
         echo "BLOCKS $(stat -c%b "$mnt{TARGET}")"
         echo "MTIME $(stat -c%Y "$mnt{TARGET}")"
-        umount "$mnt" || echo UMOUNT_FAILED; rmdir "$mnt"; rm -f "$img"
+        # Retried once: a busy unmount under load clears in a moment,
+        # and one that does not is what leaves the counters unwritten.
+        if ! umount "$mnt"; then sleep 2; umount "$mnt" || echo UMOUNT_FAILED; fi
+        rmdir "$mnt"; rm -f "$img"
         echo DONE
         "#,
         source = scratch.guest(),

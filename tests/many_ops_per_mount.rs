@@ -94,7 +94,11 @@ fn a_mount_writes_several_journalled_operations() {
             echo "DIR $(ls "$m/d" 2>&1 | sort | tr '\n' ' ')"
             echo "SIZE $(stat -c %s "$m/d/renamed")"
             echo "INOS $(stat -c %i "$m/second" "$m/d" "$m/d/renamed" | sort -u | wc -l)"
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
             echo MOUNTED
         else
             echo MOUNT_FAILED

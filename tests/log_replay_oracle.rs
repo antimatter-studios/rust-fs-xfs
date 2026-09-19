@@ -170,7 +170,11 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
         mnt=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$mnt"; then
             echo "MODE $(stat -c %a "$mnt")"
-            umount "$mnt" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$mnt"; then sleep 2; umount "$mnt" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -8

@@ -256,7 +256,11 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
                 fi
             done
             cd /
-            umount "$m2" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m2"; then sleep 2; umount "$m2" || echo UMOUNT_FAILED; fi
         else
             echo REPLAY_MOUNT_FAILED
             dmesg | tail -10

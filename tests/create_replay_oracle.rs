@@ -143,7 +143,11 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
             if [ -d "$m/fill" ]; then
                 echo "FILL $(ls "$m/fill" | wc -l)"
             fi
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -329,7 +333,11 @@ fn chunk_case(case: &str) -> bool {
             # out, and the ninth was the test's own.
             touch "$m/needsachunk" && echo "WRITABLE" || echo "NOT_WRITABLE"
             echo "STAT $(stat -c%i "$m/needsachunk")"
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -482,7 +490,11 @@ fn the_kernel_uses_a_directory_this_driver_made() {
             else
                 echo "USABLE failed"
             fi
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12
@@ -703,7 +715,11 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
             # is maintained, not merely read.
             : > "$m/d/afterwards" 2>/dev/null && echo "ADD_OK" || echo "ADD_FAILED"
             rm -f "$m/d/{added}" 2>/dev/null && echo "REMOVE_OK" || echo "REMOVE_FAILED"
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         else
             echo "MOUNT_FAILED"
             dmesg | tail -12

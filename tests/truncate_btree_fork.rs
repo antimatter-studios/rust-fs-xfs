@@ -60,7 +60,11 @@ fn a_file_with_a_btree_fork_is_truncated() {
         done
         sync
         echo "EXTENTS $(xfs_bmap "$m/frag" | grep -c ':')"
-        umount "$m" || echo UMOUNT_FAILED
+        # RETRIED ONCE. A busy unmount under a loaded runner is
+        # ordinary and clears in a moment; one that does not is the
+        # failure worth reporting, because the kernel writes the
+        # summary counters at unmount and nothing else does.
+        if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         rmdir "$m"
         echo DONE
         "#,
@@ -107,7 +111,11 @@ fn a_file_with_a_btree_fork_is_truncated() {
             echo "SIZE $(stat -c %s "$m/frag")"
             echo "BLOCKS $(stat -c %b "$m/frag")"
             echo "FREE_AFTER $(df --output=avail -k "$m" | tail -1)"
-            umount "$m" || echo UMOUNT_FAILED
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
             echo MOUNTED
         else
             echo MOUNT_FAILED
