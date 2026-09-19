@@ -1692,38 +1692,26 @@ mod handshake {
 mod kernel_oracle_job {
     use super::{manifest_dir, read_or_panic};
 
-    /// The check `.github-guard` requires whose name is the kernel
-    /// gate's. Read from the file rather than written here, so a rename
-    /// that updates one and not the other is what fails.
-    fn required_kernel_check() -> String {
-        let guard = read_or_panic(&manifest_dir().join(".github-guard"));
-        let mut required: Vec<String> = guard
+    /// Every check `.github-guard` requires.
+    fn required_checks() -> Vec<String> {
+        read_or_panic(&manifest_dir().join(".github-guard"))
             .lines()
             .map(str::trim)
             .filter(|l| !l.starts_with('#'))
             .filter_map(|l| l.split_once("required ="))
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
-            .collect();
-        required.retain(|name| name.contains("kernel") || name.contains("xfs_db"));
-        assert_eq!(
-            required.len(),
-            1,
-            "`.github-guard` should require exactly one kernel-oracle check, and it \
-             requires {required:?} — if the gate was renamed, this test's idea of \
-             which check it is has to be renamed with it"
-        );
-        required.remove(0)
+            .collect()
     }
 
     fn workflow() -> String {
         read_or_panic(&manifest_dir().join(".github/workflows/ci.yml"))
     }
 
-    /// The lines of the job whose `name:` is `check`, with its key.
-    fn job_named(workflow: &str, check: &str) -> (String, Vec<String>) {
+    /// Every job in the workflow, as (key, `name:`, its lines).
+    fn jobs(workflow: &str) -> Vec<(String, String, Vec<String>)> {
         let lines: Vec<&str> = workflow.lines().collect();
+        let mut out = Vec::new();
         let mut at = 0;
-        let mut found: Option<(String, Vec<String>)> = None;
         while at < lines.len() {
             let line = lines[at];
             let indent = line.len() - line.trim_start().len();
@@ -1747,23 +1735,61 @@ mod kernel_oracle_job {
                 body.push(l.to_string());
                 at += 1;
             }
-            let names_it = body.iter().any(|l| {
-                let t = l.trim();
-                t.strip_prefix("name:")
-                    .is_some_and(|v| v.trim().trim_matches(['"', '\'']) == check)
-            });
-            if names_it {
-                found = Some((key, body));
-                break;
-            }
+            let name = body
+                .iter()
+                .find_map(|l| {
+                    let t = l.trim();
+                    (l.len() - l.trim_start().len() == 4)
+                        .then(|| t.strip_prefix("name:"))
+                        .flatten()
+                        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+                })
+                .unwrap_or_else(|| key.clone());
+            out.push((key, name, body));
         }
-        found.unwrap_or_else(|| {
-            panic!(
-                "no job in ci.yml is named {check:?}, which is the check \
-                 `.github-guard` requires — so the gate that grades this driver \
-                 against a real kernel either does not exist or reports under a \
-                 name nothing requires"
-            )
+        out
+    }
+
+    /// THE KERNEL GATE IS THE JOB THAT INSTALLS THE ORACLE'S TOOLS.
+    ///
+    /// Found by what it does rather than by a name written down
+    /// somewhere else, because a name is the thing that drifts — and
+    /// since #207 the required check is the aggregate, so
+    /// `.github-guard` does not name this job at all.
+    fn kernel_gate(workflow: &str) -> (String, String, Vec<String>) {
+        let mut found: Vec<(String, String, Vec<String>)> = jobs(workflow)
+            .into_iter()
+            .filter(|(_, _, body)| {
+                body.iter()
+                    .filter(|l| !l.trim_start().starts_with('#'))
+                    .any(|l| l.contains("apt-get install") && l.contains("xfsprogs"))
+            })
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one job should install xfsprogs and grade this driver against a \
+             real kernel, and {} do — if the gate was split or renamed, this test's \
+             idea of which job it is has to be updated with it",
+            found.len()
+        );
+        found.remove(0)
+    }
+
+    /// Whether `check` gates a merge: `.github-guard` requires it, or
+    /// requires an aggregate that `needs:` it (#207).
+    fn gates_a_merge(workflow: &str, key: &str, name: &str) -> bool {
+        let required = required_checks();
+        if required.iter().any(|r| r == name || r == key) {
+            return true;
+        }
+        jobs(workflow).iter().any(|(agg_key, agg_name, body)| {
+            let aggregate = required.iter().any(|r| r == agg_name || r == agg_key);
+            let waits_on = body
+                .iter()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .any(|l| l.contains("needs:") && l.contains(key));
+            aggregate && waits_on
         })
     }
 
@@ -1772,8 +1798,13 @@ mod kernel_oracle_job {
     #[test]
     fn the_kernel_gate_exists_and_cannot_opt_out() {
         let workflow = workflow();
-        let check = required_kernel_check();
-        let (key, body) = job_named(&workflow, &check);
+        let (key, name, body) = kernel_gate(&workflow);
+        assert!(
+            gates_a_merge(&workflow, &key, &name),
+            "the {key} job grades this driver against a real kernel and nothing requires \
+             it: `.github-guard` names neither it nor an aggregate that waits on it, so \
+             a merge does not depend on what it found"
+        );
 
         // The workflow has to report on a pull request at all.
         assert!(
@@ -1847,8 +1878,7 @@ mod kernel_oracle_job {
     #[test]
     fn the_kernel_gate_still_installs_xfsprogs() {
         let workflow = workflow();
-        let check = required_kernel_check();
-        let (key, body) = job_named(&workflow, &check);
+        let (key, _, body) = kernel_gate(&workflow);
         let installs = body
             .iter()
             .filter(|l| !l.trim_start().starts_with('#'))
@@ -1864,8 +1894,7 @@ mod kernel_oracle_job {
     #[test]
     fn the_kernel_gate_still_builds_fixtures_and_runs_the_oracles() {
         let workflow = workflow();
-        let check = required_kernel_check();
-        let (key, body) = job_named(&workflow, &check);
+        let (key, _, body) = kernel_gate(&workflow);
         let text: String = body
             .iter()
             .filter(|l| !l.trim_start().starts_with('#'))
