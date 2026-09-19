@@ -603,3 +603,46 @@ jobs:
             exit 1
           fi
           echo "no XFS warnings or errors in dmesg."
+
+  # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#207).
+  #
+  # Branch protection names checks, and a check is a job name. Naming
+  # each one means the list has to be edited whenever a job is renamed,
+  # split into a matrix leg or added — and until someone does, the new
+  # work is required by nobody. That is what `.github-guard` already
+  # describes having happened here: `test-darwin` ran on every pull
+  # request, reported, and could not block one, and nothing in the
+  # repository had an opinion about it.
+  #
+  # The opposite spelling is worse. A required check no job produces
+  # reads as permanently pending, and with `enforce_admins` on nothing
+  # merges and there is no failure to point at.
+  #
+  # `if: always()` because a job that was cancelled or skipped is not a
+  # job that passed, and an aggregate that only runs when its needs
+  # succeeded cannot say so — it would be skipped itself, and a skipped
+  # required check never reports.
+  ci-ok:
+    name: ci-ok
+    needs: [test, darwin, validate-kernel-xfs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every gating job must have concluded success
+        run: |
+          echo "test:                ${{ needs.test.result }}"
+          echo "darwin:              ${{ needs.darwin.result }}"
+          echo "validate-kernel-xfs: ${{ needs.validate-kernel-xfs.result }}"
+          failed=0
+          for one in "test:${{ needs.test.result }}" \
+                     "darwin:${{ needs.darwin.result }}" \
+                     "validate-kernel-xfs:${{ needs.validate-kernel-xfs.result }}"; do
+              job=${one%%:*}
+              result=${one#*:}
+              if [ "$result" != "success" ]; then
+                  echo "::error::$job concluded '$result', not 'success' -- failure, cancellation and skipping all mean the gate did not run to completion"
+                  failed=1
+              fi
+          done
+          [ "$failed" = 0 ] || exit 1
+          echo "all gating jobs succeeded"

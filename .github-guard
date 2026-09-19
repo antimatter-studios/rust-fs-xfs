@@ -42,17 +42,19 @@
 # GitHub reads "required and absent" as pending, with enforce_admins on and
 # no failure to point at.
 #
-# No aggregate `ci-ok`-style job exists here yet, so the three real job names
-# are declared instead. An always-run job that `needs:` all three and fails on
-# failure/cancelled/skipped would be the better end state — it survives a
-# rename, a matrix split or a path filter without stranding a merge — but
-# adding one belongs in its own change, where the skipped/cancelled semantics
-# can be reviewed on their own.
+# ONE NAME, NOW THAT THERE IS A JOB THAT STANDS FOR THE REST (#207).
 #
-# Names must match the check-run names GitHub reports, which here are the
-# `name:` of each job rather than its key: `test-${{ matrix.os }}` renders as
-# `test-ubuntu-latest`, and the kernel gate's name is a sentence with spaces.
+# `ci-ok` in ci.yml `needs:` every other job and fails unless each concluded
+# success, with `if: always()` so a cancelled or skipped job is still judged.
+# Requiring it alone is what survives the next rename, matrix split or added
+# job: those change what `ci-ok` waits on, in the same diff that makes them,
+# rather than changing what a settings page says days later.
+#
+# tests/ci_aggregate_gate.rs holds both halves to it — every job in ci.yml has
+# to be in `ci-ok`'s `needs`, and this file has to require `ci-ok` and nothing
+# else.
+#
+# Names must match the check-run names GitHub reports, which are the `name:`
+# of each job rather than its key.
 [checks]
-	required = test-ubuntu-latest
-	required = test-darwin
-	required = validate against xfs_db + in-kernel XFS driver
+	required = ci-ok
