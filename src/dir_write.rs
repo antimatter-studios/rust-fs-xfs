@@ -397,6 +397,15 @@ fn next_cookie(parsed: &dir::ShortFormDir, has_ftype: bool) -> u32 {
         .unwrap_or_else(|| first_cookie(has_ftype))
 }
 
+/// `XFS_DIR2_MAX_SHORT_INUM` — the largest inode number the kernel will
+/// store in a four-byte short-form entry.
+///
+/// Not `u32::MAX`, which is what the field physically holds. Between the
+/// two a truncating writer is lucky rather than right: the value
+/// round-trips, and the kernel would still have widened the directory.
+/// Above it the top half is simply gone (#235).
+const MAX_SHORT_INUM: u64 = 0x7fff_ffff;
+
 /// Encode a short-form directory from its header and a final list of
 /// entries.
 ///
@@ -411,7 +420,34 @@ fn encode_short_form(
     entries: &[SfEntry],
     fork_space: usize,
 ) -> Result<Vec<u8>> {
-    let wide = parsed.i8count != 0;
+    // THE WIDTH COMES FROM THE NUMBERS, NOT FROM THE HEADER THAT WAS
+    // READ (#235).
+    //
+    // This was `parsed.i8count != 0`, so a directory made while the
+    // inode numbers were small stayed four bytes wide however large the
+    // next one was, and `e.ino as u32` dropped the top half of it. A
+    // create in the third allocation group of a volume with
+    // terabyte-sized groups wrote inode 4294967437 as 141 — an entry
+    // naming a different, existing inode, with nothing reported.
+    //
+    // So the count is recomputed from what is about to be written, as
+    // `xfs_dir2_sf_check` computes it: every inode number past
+    // `MAX_SHORT_INUM`, the parent included. When it is non-zero every
+    // number in the directory is stored in eight bytes, which is what
+    // makes a conversion out of an addition — the kernel's
+    // `xfs_dir2_sf_toino8`. It also means a removal narrows the
+    // directory again when the last wide entry goes, rather than
+    // leaving a count that no longer matches its entries.
+    let wide_numbers = usize::from(parsed.parent_ino > MAX_SHORT_INUM)
+        + entries.iter().filter(|e| e.ino > MAX_SHORT_INUM).count();
+    let i8count = u8::try_from(wide_numbers).map_err(|_| {
+        Error::UnsupportedFeature(format!(
+            "a short-form directory holds {wide_numbers} inode numbers past \
+             {MAX_SHORT_INUM} and the count field holds {}",
+            u8::MAX
+        ))
+    })?;
+    let wide = i8count != 0;
     let header = if wide {
         XFS_DIR2_SF_HDR_SIZE_8
     } else {
@@ -429,7 +465,7 @@ fn encode_short_form(
             entries.len()
         ))
     })?);
-    out.push(parsed.i8count);
+    out.push(i8count);
     if wide {
         out.extend_from_slice(&parsed.parent_ino.to_be_bytes());
     } else {
