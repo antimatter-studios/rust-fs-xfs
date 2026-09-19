@@ -122,13 +122,30 @@ fn xfs_db_superblock(img: &Path) -> HashMap<String, String> {
     map
 }
 
-/// Compare one field, reporting the field name on mismatch.
-fn expect_field(oracle: &HashMap<String, String>, field: &str, ours: u64, label: &str) {
+/// How many of the fields below have to be compared for the run to have
+/// checked anything (#200).
+///
+/// A FLOOR, BECAUSE THE FAILURE HERE IS AN ABSENCE. `expect_field`
+/// returns when `xfs_db` did not report a field, which is right — an
+/// older or newer xfsprogs reports a different set, and a comparison
+/// that cannot be made is not a failure. But nothing counted them: if
+/// the output format shifts, or the `k = v` parse stops splitting the
+/// lines the way it expects, every lookup misses, twenty notes are
+/// printed, and the test reports ok having compared nothing at all.
+///
+/// Twenty-three fields are asked for. Eighteen is the floor: room for a
+/// few to go missing between xfsprogs versions, and nowhere near room
+/// for the parse to have failed.
+const FIELDS_COMPARED_FLOOR: usize = 18;
+
+/// Compare one field, reporting the field name on mismatch, and say
+/// whether a comparison was actually made.
+fn expect_field(oracle: &HashMap<String, String>, field: &str, ours: u64, label: &str) -> bool {
     let Some(theirs) = oracle.get(field) else {
         // Field absent from this xfsprogs version's output; nothing to
         // compare against, and silently passing would be dishonest.
         eprintln!("note: xfs_db did not report `{field}`, skipping that comparison");
-        return;
+        return false;
     };
     let theirs_n: u64 = theirs
         .parse()
@@ -137,6 +154,7 @@ fn expect_field(oracle: &HashMap<String, String>, field: &str, ours: u64, label:
         ours, theirs_n,
         "{label}: field `{field}` — this driver says {ours}, xfs_db says {theirs_n}"
     );
+    true
 }
 
 /// Parse the superblock at offset 0 of `img` with this driver.
@@ -153,40 +171,125 @@ fn assert_agrees_with_oracle(size_mib: u64, args: &[&str], label: &str) {
     };
     let ours = parse_ours(&img);
     let theirs = xfs_db_superblock(&img);
+    let mut compared = 0usize;
 
-    expect_field(&theirs, "blocksize", u64::from(ours.blocksize), label);
-    expect_field(&theirs, "dblocks", ours.dblocks, label);
-    expect_field(&theirs, "rblocks", ours.rblocks, label);
-    expect_field(&theirs, "rootino", ours.rootino, label);
-    expect_field(&theirs, "agblocks", u64::from(ours.agblocks), label);
-    expect_field(&theirs, "agcount", u64::from(ours.agcount), label);
-    expect_field(&theirs, "logstart", ours.logstart, label);
-    expect_field(&theirs, "logblocks", u64::from(ours.logblocks), label);
-    expect_field(&theirs, "sectsize", u64::from(ours.sectsize), label);
-    expect_field(&theirs, "inodesize", u64::from(ours.inodesize), label);
-    expect_field(&theirs, "inopblock", u64::from(ours.inopblock), label);
-    expect_field(&theirs, "blocklog", u64::from(ours.blocklog), label);
-    expect_field(&theirs, "sectlog", u64::from(ours.sectlog), label);
-    expect_field(&theirs, "inodelog", u64::from(ours.inodelog), label);
-    expect_field(&theirs, "inopblog", u64::from(ours.inopblog), label);
-    expect_field(&theirs, "agblklog", u64::from(ours.agblklog), label);
-    expect_field(&theirs, "icount", ours.icount, label);
-    expect_field(&theirs, "ifree", ours.ifree, label);
-    expect_field(&theirs, "fdblocks", ours.fdblocks, label);
-    expect_field(&theirs, "inoalignmt", u64::from(ours.inoalignmt), label);
-    expect_field(&theirs, "dirblklog", u64::from(ours.dirblklog), label);
-    expect_field(&theirs, "logsunit", u64::from(ours.logsunit), label);
-    expect_field(
+    compared += usize::from(expect_field(
+        &theirs,
+        "blocksize",
+        u64::from(ours.blocksize),
+        label,
+    ));
+    compared += usize::from(expect_field(&theirs, "dblocks", ours.dblocks, label));
+    compared += usize::from(expect_field(&theirs, "rblocks", ours.rblocks, label));
+    compared += usize::from(expect_field(&theirs, "rootino", ours.rootino, label));
+    compared += usize::from(expect_field(
+        &theirs,
+        "agblocks",
+        u64::from(ours.agblocks),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "agcount",
+        u64::from(ours.agcount),
+        label,
+    ));
+    compared += usize::from(expect_field(&theirs, "logstart", ours.logstart, label));
+    compared += usize::from(expect_field(
+        &theirs,
+        "logblocks",
+        u64::from(ours.logblocks),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "sectsize",
+        u64::from(ours.sectsize),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "inodesize",
+        u64::from(ours.inodesize),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "inopblock",
+        u64::from(ours.inopblock),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "blocklog",
+        u64::from(ours.blocklog),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "sectlog",
+        u64::from(ours.sectlog),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "inodelog",
+        u64::from(ours.inodelog),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "inopblog",
+        u64::from(ours.inopblog),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "agblklog",
+        u64::from(ours.agblklog),
+        label,
+    ));
+    compared += usize::from(expect_field(&theirs, "icount", ours.icount, label));
+    compared += usize::from(expect_field(&theirs, "ifree", ours.ifree, label));
+    compared += usize::from(expect_field(&theirs, "fdblocks", ours.fdblocks, label));
+    compared += usize::from(expect_field(
+        &theirs,
+        "inoalignmt",
+        u64::from(ours.inoalignmt),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "dirblklog",
+        u64::from(ours.dirblklog),
+        label,
+    ));
+    compared += usize::from(expect_field(
+        &theirs,
+        "logsunit",
+        u64::from(ours.logsunit),
+        label,
+    ));
+    compared += usize::from(expect_field(
         &theirs,
         "features_incompat",
         u64::from(ours.features_incompat),
         label,
-    );
-    expect_field(
+    ));
+    compared += usize::from(expect_field(
         &theirs,
         "features_ro_compat",
         u64::from(ours.features_ro_compat),
         label,
+    ));
+
+    assert!(
+        compared >= FIELDS_COMPARED_FLOOR,
+        "{label}: only {compared} of the fields asked for were compared against \
+         xfs_db, and the floor is {FIELDS_COMPARED_FLOOR} — a run that compared \
+         nothing prints notes and reports ok, which is what #200 was about. Either \
+         this xfsprogs reports a very different set of fields, or the `k = v` parse \
+         above stopped matching its output."
     );
 
     std::fs::remove_dir_all(img.parent().unwrap()).ok();

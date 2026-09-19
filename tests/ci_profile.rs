@@ -1889,4 +1889,37 @@ mod kernel_oracle_job {
              that matched nothing reports the same green as a full run"
         );
     }
+
+/// The `--ignored` run goes through the skip gate like every other run
+/// in its job (#200).
+///
+/// `scripts/ci-test.sh` is the thing that stops a skip reading as a pass
+/// here: it fails the job when a suite's output matches the skip
+/// wording. The xfsprogs-gated run — the one that covers
+/// `tests/oracle_mkfs.rs` and `tests/parent_exchrange_oracle.rs` — was a
+/// bare `cargo test -- --ignored`, so every skip it printed was a line
+/// of log and nothing else. Those are exactly the suites the script
+/// exists for: `oracle_mkfs` prints a note per field it could not
+/// compare against `xfs_db`, and that note is in the script's own
+/// `--self-test` corpus as a skip it must catch.
+#[test]
+fn the_ignored_run_is_not_a_bare_cargo_test() {
+    let workflow = read_or_panic(&manifest_dir().join(".github/workflows/ci.yml"));
+    let offending: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter(|l| l.contains("--ignored"))
+        .filter(|l| l.contains("cargo test") && !l.contains("ci-test.sh"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "these run the ignored suites outside ci-test.sh, so a skip in them is a line \
+         of log rather than a failure: {offending:?}"
+    );
+    assert!(
+        workflow.contains("ci-test.sh --ignored"),
+        "nothing in ci.yml runs the xfsprogs-gated suites at all — they are \
+         `#[ignore]`d, so no other run selects them"
+    );
 }
