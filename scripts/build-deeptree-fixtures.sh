@@ -33,8 +33,25 @@ set -euo pipefail
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 SIZE="${XFS_FIXTURE_SIZE:-400M}"
 
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
 
@@ -85,22 +102,22 @@ for spec in "${FIXTURES[@]}"; do
     fi
 
     m=$(mktemp -d)
-    $SUDO mount -o loop "$img" "$m"
+    as_root mount -o loop "$img" "$m"
 
     # The inode-tree fixture wants inodes rather than fragments: four
     # thousand empty files in one directory, which is 62 chunks of 64.
     if [ "$name" = inobt2 ]; then
-        $SUDO mkdir -p "$m/many"
-        seq 1 4000 | sed "s|^|$m/many/f|" | $SUDO xargs -n 200 touch
+        as_root mkdir -p "$m/many"
+        seq 1 4000 | sed "s|^|$m/many/f|" | as_root xargs -n 200 touch
         sync
     fi
 
-    $SUDO mkdir -p "$m/frag"
+    as_root mkdir -p "$m/frag"
     n=0
     while [ "$n" -lt "$files" ]; do
         # One block each. `dd` rather than `truncate` so the block is
         # really allocated rather than left as a hole.
-        $SUDO dd if=/dev/zero of="$m/frag/f$n" bs=1024 count=1 status=none
+        as_root dd if=/dev/zero of="$m/frag/f$n" bs=1024 count=1 status=none
         n=$((n + 1))
     done
     sync
@@ -109,7 +126,7 @@ for spec in "${FIXTURES[@]}"; do
     # rather than a run that merges with its neighbours.
     n=0
     while [ "$n" -lt "$files" ]; do
-        $SUDO rm -f "$m/frag/f$n"
+        as_root rm -f "$m/frag/f$n"
         n=$((n + 2))
     done
     sync
@@ -120,20 +137,20 @@ for spec in "${FIXTURES[@]}"; do
     # at all, so a truncate had nothing to free and the oracle recorded
     # "no such file or directory" as though the driver had refused.
     if [ ! -f "$m/frag/f1" ]; then
-        $SUDO dd if=/dev/zero of="$m/frag/f1" bs=1024 count=1 status=none
+        as_root dd if=/dev/zero of="$m/frag/f1" bs=1024 count=1 status=none
     fi
 
     # A directory one entry short of leaving its inode, and a file to
     # write into, so the write oracles have something to do here that
     # allocates.
-    $SUDO mkdir -p "$m/sf"
-    echo one | $SUDO tee "$m/sf/aaaa" > /dev/null
-    echo two | $SUDO tee "$m/sf/bbbb" > /dev/null
-    $SUDO touch "$m/sf/empty.bin"
-    $SUDO touch "$m/sf/victim"
+    as_root mkdir -p "$m/sf"
+    echo one | as_root tee "$m/sf/aaaa" > /dev/null
+    echo two | as_root tee "$m/sf/bbbb" > /dev/null
+    as_root touch "$m/sf/empty.bin"
+    as_root touch "$m/sf/victim"
     sync
 
-    $SUDO umount "$m"; rmdir "$m"
+    as_root umount "$m"; rmdir "$m"
 
     # WHAT THIS IS FOR, CHECKED RATHER THAN ASSUMED. A fixture built to
     # have a two-level tree and holding a one-level tree looks like a

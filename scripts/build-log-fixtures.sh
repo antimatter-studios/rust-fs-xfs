@@ -30,8 +30,25 @@ set -euo pipefail
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 SIZE="${XFS_FIXTURE_SIZE:-400M}"
 
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
 
@@ -76,20 +93,20 @@ for geom in "${GEOMETRIES[@]}"; do
     fi
 
     m=$(mktemp -d)
-    $SUDO mount -o loop "$img" "$m"
+    as_root mount -o loop "$img" "$m"
     # Enough inodes to span more than one cluster, so the fixture
     # exercises the cluster boundary rather than only its start.
-    $SUDO mkdir -p "$m/logged"
-    for n in $(seq 1 200); do echo "entry $n" | $SUDO tee "$m/logged/f$n" > /dev/null; done
+    as_root mkdir -p "$m/logged"
+    for n in $(seq 1 200); do echo "entry $n" | as_root tee "$m/logged/f$n" > /dev/null; done
     # A directory small enough to stay inside its inode, for the tests
     # that rewrite a short-form directory. Two entries of equal name
     # length, so a rename between them changes nothing but the name and
     # cannot be passed by accident.
-    $SUDO mkdir -p "$m/sf"
-    echo one | $SUDO tee "$m/sf/aaaa" > /dev/null
-    echo two | $SUDO tee "$m/sf/bbbb" > /dev/null
+    as_root mkdir -p "$m/sf"
+    echo one | as_root tee "$m/sf/aaaa" > /dev/null
+    echo two | as_root tee "$m/sf/bbbb" > /dev/null
     sync
-    $SUDO umount "$m"; rmdir "$m"
+    as_root umount "$m"; rmdir "$m"
     echo "BUILT b=$bsize i=$isize $extra"
 done
 

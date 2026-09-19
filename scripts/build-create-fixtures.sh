@@ -52,8 +52,25 @@ OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-sha
 SIZE="${XFS_FIXTURE_SIZE:-400M}"
 
 # Root inside the VM or a container, sudo on a CI runner.
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
 
@@ -89,21 +106,21 @@ for entry in "${CASES[@]}"; do
     mkfs.xfs $args -f -q "$base-before.img" >/dev/null
 
     m="$(mktemp -d)"
-    $SUDO mount -o loop "$base-before.img" "$m"
-    $SUDO mkdir "$m/fill"
+    as_root mount -o loop "$base-before.img" "$m"
+    as_root mkdir "$m/fill"
     i=1
-    while [ "$i" -le "$fill" ]; do $SUDO touch "$m/fill/f$i"; i=$((i + 1)); done
+    while [ "$i" -le "$fill" ]; do as_root touch "$m/fill/f$i"; i=$((i + 1)); done
     sync
     # Unmounted rather than only synced: a mounted filesystem's group
     # header is a cache of what is in memory, and the tests read the
     # image rather than the mount.
-    $SUDO umount "$m"
+    as_root umount "$m"
 
     cp --reflink=never "$base-before.img" "$base-after.img"
-    $SUDO mount -o loop "$base-after.img" "$m"
-    $SUDO touch "$m/victim"
+    as_root mount -o loop "$base-after.img" "$m"
+    as_root touch "$m/victim"
     sync
-    $SUDO umount "$m"
+    as_root umount "$m"
     rmdir "$m"
 
     echo "BUILT $name (after $fill files, $args)"

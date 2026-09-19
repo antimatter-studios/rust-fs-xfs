@@ -59,8 +59,25 @@ OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-sha
 SIZE="${XFS_FIXTURE_SIZE:-300M}"
 
 # Root inside the VM, sudo on a CI runner.
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 mkdir -p "$OUT"
 
@@ -82,8 +99,8 @@ for entry in "${CASES[@]}"; do
     mkfs.xfs -m crc=1,rmapbt=0 -f -q "$before" >/dev/null
 
     m="$(mktemp -d)"
-    $SUDO mount -o loop "$before" "$m"
-    $SUDO mkdir "$m/d"
+    as_root mount -o loop "$before" "$m"
+    as_root mkdir "$m/d"
 
     # Fill the directory to just short of overflowing. How many entries
     # that is depends on the name length and on the inode size, so it is
@@ -96,34 +113,34 @@ for entry in "${CASES[@]}"; do
     # need the filesystem unmounted.
     n=0
     while [ "$n" -lt 200 ]; do
-        $SUDO touch "$m/d/f$n"
-        $SUDO sync
-        if [ "$($SUDO stat -c %b "$m/d")" != "0" ]; then break; fi
+        as_root touch "$m/d/f$n"
+        as_root sync
+        if [ "$(as_root stat -c %b "$m/d")" != "0" ]; then break; fi
         n=$((n + 1))
     done
     if [ "$n" -ge 200 ]; then
         echo "FAILED $name — 200 entries did not overflow the inode" >&2
-        $SUDO umount "$m"; rmdir "$m"
+        as_root umount "$m"; rmdir "$m"
         exit 1
     fi
     last="$n"
-    $SUDO rm -f "$m/d/f$last"
-    $SUDO sync
+    as_root rm -f "$m/d/f$last"
+    as_root sync
     # Unmounted rather than only synced: a mounted filesystem's metadata
     # is a cache of what is in memory, and the tests read the image.
-    $SUDO umount "$m"
+    as_root umount "$m"
 
     cp --reflink=never "$before" "$final"
-    $SUDO mount -o loop "$final" "$m"
+    as_root mount -o loop "$final" "$m"
     # The entry that tips it over.
-    $SUDO touch "$m/d/f$last"
+    as_root touch "$m/d/f$last"
     i=0
     while [ "$i" -lt "$after" ]; do
-        $SUDO touch "$m/d/after$i"
+        as_root touch "$m/d/after$i"
         i=$((i + 1))
     done
-    $SUDO sync
-    $SUDO umount "$m"
+    as_root sync
+    as_root umount "$m"
     rmdir "$m"
 
     echo "BUILT  xfsdirconv-$name (converted when entry f$last was added)"

@@ -33,8 +33,25 @@ set -euo pipefail
 
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+# Root inside the VM or a container, sudo on a CI runner — CARRYING PATH
+# AND HOME THROUGH.
+#
+# `sudo` replaces PATH with its own secure_path, so an xfsprogs installed
+# for this user — under ~/.local/bin, or a wrapper that finds its binary
+# through $HOME — is simply not there when the command runs as root, and
+# the failure reads as "command not found" from a script whose output
+# nobody reads until a suite fails three steps later.
+#
+# That is #211 (a shutdown that never happened, swallowed by `|| true`)
+# and #221 (an `xfs_bmap` that was never found, so every fixture was
+# built as the same case). Both were read as driver faults first.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
 
@@ -58,19 +75,19 @@ for entry in "${CASES[@]}"; do
     mkfs.xfs -f -q $args -d agcount=4 "$img" >/dev/null
 
     m=$(mktemp -d)
-    $SUDO mount -o loop "$img" "$m"
+    as_root mount -o loop "$img" "$m"
 
     # Bigger than any one group can hold, so the allocator has to split
     # it. Written with dd rather than truncate: a sparse file has no
     # blocks to free and would make this fixture prove nothing.
-    $SUDO dd if=/dev/zero of="$m/spanning" bs=1M count=100 status=none
+    as_root dd if=/dev/zero of="$m/spanning" bs=1M count=100 status=none
 
     # A file inside one group, so the same test can show that the
     # ordinary case still works.
-    $SUDO dd if=/dev/zero of="$m/withingroup" bs=4096 count=64 status=none
+    as_root dd if=/dev/zero of="$m/withingroup" bs=4096 count=64 status=none
 
     sync
-    $SUDO umount "$m"; rmdir "$m"
+    as_root umount "$m"; rmdir "$m"
 
     groups=$(xfs_db -r -c "path /spanning" -c "bmap" "$img" 2>/dev/null | wc -l)
     echo "BUILT xfscrossag-$name ($args, spanning file in $groups extent lines)"

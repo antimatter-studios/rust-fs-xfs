@@ -49,8 +49,25 @@ SIZE="${XFS_FIXTURE_SIZE:-400M}"
 FILE_MB="${XFS_FIXTURE_FILE_MB:-1}"
 
 # Root inside the VM or a container, sudo on a CI runner.
-SUDO=""
-[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+#
+# CARRYING PATH AND HOME THROUGH, because `sudo` replaces PATH with its
+# own secure_path: an xfsprogs installed for this user -- under
+# ~/.local/bin, or a wrapper that finds its binary through $HOME -- is
+# simply not there when the command runs as root.
+#
+# That is what made this script produce fixtures that were not what they
+# said they were (#221). `xfs_bmap` ran under plain `sudo`, was not
+# found, and `span` came back empty; every neighbour then read as
+# "none", the removals below were skipped, and all four cases were built
+# as `lone`. The suite said so three steps later, as a driver fault.
+# Same defect as #211, in the next script along.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo env PATH="$PATH" HOME="$HOME" "$@"
+    fi
+}
 
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
 command -v xfs_bmap >/dev/null || { echo "xfs_bmap not found; install xfsprogs" >&2; exit 1; }
@@ -59,7 +76,16 @@ mkdir -p "$OUT"
 
 # The first extent's device range, in 512-byte basic blocks. The third
 # line of `xfs_bmap -v` is the first extent; its third field is the range.
-span()  { $SUDO xfs_bmap -v "$1" | sed -n 3p | awk '{print $3}'; }
+span() {
+    local out
+    out="$(as_root xfs_bmap -v "$1" | sed -n 3p | awk '{print $3}')"
+    # `a..b`, in basic blocks, or this script has no idea where the file
+    # is and every case below is built by accident.
+    case "$out" in
+        *..*) echo "$out" ;;
+        *) echo "xfs_bmap did not report an extent for $1: '$out'" >&2; exit 1 ;;
+    esac
+}
 first() { echo "$1" | awk -F'\\.\\.' '{print $1}'; }
 last()  { echo "$1" | awk -F'\\.\\.' '{print $2}'; }
 
@@ -70,13 +96,13 @@ for CASE in lone after before between; do
     mkfs.xfs -f -q -m crc=1,rmapbt=0 "$base-before.img" >/dev/null
 
     m="$(mktemp -d)"
-    $SUDO mount -o loop "$base-before.img" "$m"
+    as_root mount -o loop "$base-before.img" "$m"
 
     # A row of files, the middle one of which will be truncated. Created
     # in place rather than renamed into place: a rename after the fact
     # leaves the row in a different order than it reads.
     for n in f1 f2 victim f4 f5; do
-        $SUDO dd if=/dev/zero of="$m/$n" bs=1M count="$FILE_MB" status=none
+        as_root dd if=/dev/zero of="$m/$n" bs=1M count="$FILE_MB" status=none
     done
     sync
 
@@ -92,24 +118,41 @@ for CASE in lone after before between; do
 
     # Remove whichever neighbours this case wants gone, so the victim's
     # blocks are freed next to free space, or not, as named.
+    #
+    # A MISSING NEIGHBOUR IS A FAILED BUILD, not a quieter fixture. The
+    # allocator decides where these files land, and a kernel that puts
+    # them somewhere else leaves `after` with nothing to merge with --
+    # so it is built as `lone`, passes its own build, and fails the
+    # suite later as though the driver had changed (#221).
+    need() {
+        [ -n "$2" ] && return 0
+        echo "the $CASE fixture needs a file immediately $1 the victim, and this" >&2
+        echo "kernel put none there: victim at $victim_start..$victim_end." >&2
+        echo "The neighbours it did place:" >&2
+        for n in f1 f2 f4 f5; do
+            echo "  $n $(span "$m/$n")" >&2
+        done
+        exit 1
+    }
     case "$CASE" in
         lone)    ;;
-        after)   [ -n "$next" ] && $SUDO rm -f "$m/$next" ;;
-        before)  [ -n "$prev" ] && $SUDO rm -f "$m/$prev" ;;
-        between) [ -n "$next" ] && $SUDO rm -f "$m/$next"
-                 [ -n "$prev" ] && $SUDO rm -f "$m/$prev" ;;
+        after)   need after "$next";  as_root rm -f "$m/$next" ;;
+        before)  need before "$prev"; as_root rm -f "$m/$prev" ;;
+        between) need after "$next";  need before "$prev"
+                 as_root rm -f "$m/$next"
+                 as_root rm -f "$m/$prev" ;;
     esac
     sync
     # Unmounted rather than only synced: a mounted filesystem's group
     # header is a cache of what is in memory, and the tests read the
     # image rather than the mount.
-    $SUDO umount "$m"
+    as_root umount "$m"
 
     cp --reflink=never "$base-before.img" "$base-after.img"
-    $SUDO mount -o loop "$base-after.img" "$m"
-    $SUDO truncate -s 0 "$m/victim"
+    as_root mount -o loop "$base-after.img" "$m"
+    as_root truncate -s 0 "$m/victim"
     sync
-    $SUDO umount "$m"
+    as_root umount "$m"
     rmdir "$m"
 
     echo "BUILT $CASE  victim at $victim_start..$victim_end, neighbour before=${prev:-none} after=${next:-none}"
