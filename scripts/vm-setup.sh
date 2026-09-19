@@ -112,12 +112,34 @@ toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$REPO/rust-toolchain.toml" 
 [ -n "$toolchain" ] || { echo "vm-setup: no channel in $REPO/rust-toolchain.toml" >&2; exit 1; }
 
 mkdir -p "$RUST_ROOT"
+# A PROVISION THAT WAS INTERRUPTED leaves rustup's download directory
+# holding a `.partial` whose final name it then cannot produce —
+# "could not rename 'downloaded' file ... No such file or directory" —
+# and every later run fails the same way, because the wreckage lives on
+# the VM's own disk and outlives a `vm:down`. Measured on this guest
+# after a reaper stopped it mid-install. The directory is a cache: it
+# costs a re-download and nothing else.
+rm -rf "$RUSTUP_HOME/downloads" "$RUSTUP_HOME/tmp"
 if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
         sh -s -- -y --no-modify-path --default-toolchain none >/dev/null
 fi
-"$CARGO_HOME/bin/rustup" toolchain install "$toolchain" \
-    --component rustfmt --component clippy --profile minimal >/dev/null
+# INSTALLED, OR REINSTALLED FROM SCRATCH. An install that was
+# interrupted leaves a toolchain directory half populated, and rustup
+# will not finish it: it refuses with "detected conflict: 'bin/rust-gdb'"
+# or "could not rename 'component' file ... Directory not empty", on
+# every later run, because the wreckage is on the VM's own disk and
+# outlives a `vm:down`. Measured on this guest after a reaper stopped it
+# mid-install. rustup is idempotent and quick when the toolchain is
+# whole, so the retry costs nothing in the ordinary case and a
+# re-download in the one case it is for.
+if ! "$CARGO_HOME/bin/rustup" toolchain install "$toolchain" \
+    --component rustfmt --component clippy --profile minimal >/dev/null 2>&1; then
+    echo "vm-setup: the pinned toolchain is half installed; removing it and trying once more"
+    rm -rf "$RUSTUP_HOME/toolchains/$toolchain"* "$RUSTUP_HOME/tmp" "$RUSTUP_HOME/downloads"
+    "$CARGO_HOME/bin/rustup" toolchain install "$toolchain" \
+        --component rustfmt --component clippy --profile minimal >/dev/null
+fi
 "$CARGO_HOME/bin/rustup" default "$toolchain" >/dev/null
 "$CARGO_HOME/bin/cargo" --version
 
