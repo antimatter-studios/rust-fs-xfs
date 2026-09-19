@@ -24,6 +24,13 @@
 //! them, because Ubuntu's are older. `#[ignore]`-gated like the other
 //! inline xfsprogs oracles.
 
+// Only the repair check is wanted here — this oracle runs the tools on
+// this machine rather than through a guest — and a module included whole
+// is a module whose other helpers are unused in this binary.
+#[allow(dead_code)]
+mod common;
+
+use common::repair;
 use fs_core::FileDevice;
 use fs_xfs::superblock::incompat;
 use fs_xfs::{Error, Filesystem};
@@ -121,7 +128,11 @@ fn build(tag: &str, args: &[&str]) -> (PathBuf, Vec<u8>) {
     }
     db.args(["-c", "path /top.txt", "-c", "attr_set -u colour red"]);
     run(db.arg(&img));
-    run(Command::new(tool("xfs_repair")).arg("-n").arg(&img));
+    repair::assert_agreed_running(
+        tool("xfs_repair").to_str().expect("a path"),
+        img.to_str().expect("a path"),
+        "the fixture this oracle grades against",
+    );
     (dir, big_bytes)
 }
 

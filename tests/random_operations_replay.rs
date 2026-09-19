@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::write::AttrChange;
 use fs_xfs::Filesystem;
@@ -185,9 +185,9 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
                 dmesg | tail -12
             fi
             rmdir "$m"
-            out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
-            echo "REPAIR_RC=$rc"
-            [ "$rc" = 0 ] || echo "$out"
+            echo "REPAIR_BEGIN"
+            xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+            echo "REPAIR_END"
             echo DONE
             "#
         );
@@ -202,10 +202,17 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
                 return;
             };
             assert!(
-                out.contains("MOUNTED") && out.contains("REPAIR_RC=0"),
-                "[seed {seed}] after step {step} the kernel or xfs_repair rejected the \
-                 volume:\n{out}\noperations:\n{}",
+                out.contains("MOUNTED"),
+                "[seed {seed}] after step {step} the kernel refused the volume:\n{out}\n\
+                 operations:\n{}",
                 log.join("\n")
+            );
+            repair::assert_agreed(
+                &out,
+                &format!(
+                    "[seed {seed}] after step {step}, with these operations:\n{}",
+                    log.join("\n")
+                ),
             );
         }
         let _ = std::fs::remove_file(&image);

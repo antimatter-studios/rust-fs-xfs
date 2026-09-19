@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -120,18 +120,19 @@ fn a_file_with_a_btree_fork_is_truncated() {
             dmesg | tail -10
         fi
         rmdir "$m"
-        out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
-        echo "REPAIR_RC=$rc"
-        [ "$rc" = 0 ] || echo "$out" | tail -20
+        echo "REPAIR_BEGIN"
+        xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        echo "REPAIR_END"
         echo DONE
         "#
     ))
     .expect("kernel");
 
     assert!(
-        out.contains("MOUNTED") && out.contains("REPAIR_RC=0"),
-        "the kernel or xfs_repair rejected the volume:\n{out}"
+        out.contains("MOUNTED"),
+        "the kernel refused the volume:\n{out}"
     );
+    repair::assert_agreed(&out, "the volume after the truncate");
     assert_eq!(guest(&out, "SIZE"), "0", "the file after the truncate");
     assert_eq!(guest(&out, "BLOCKS"), "0", "and what it still holds");
 

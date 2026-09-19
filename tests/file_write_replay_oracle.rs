@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 
 /// The file the fixtures leave empty, which this one fills.
 const VICTIM: &str = "/victim";
@@ -200,16 +200,7 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
          blocks handed out twice looks like\n{out}"
     );
 
-    let repair: String = out
-        .lines()
-        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
-        .take_while(|l| !l.starts_with("REPAIR_END"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        repair.contains("REPAIR_RC=0"),
-        "{case}: xfs_repair found something wrong after the replay:\n{repair}"
-    );
+    repair::assert_agreed(&out, &format!("{case}, after the replay"));
 
     Some(())
 }

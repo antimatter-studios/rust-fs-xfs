@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 
 /// `di_mode` within the inode core, big-endian on disk.
 const DI_MODE: usize = 2;
@@ -218,16 +218,7 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
          record asked for {NEW_MODE:o}\n{out}"
     );
 
-    let report: String = out
-        .lines()
-        .skip_while(|l| !l.starts_with("REPAIR_BEGIN"))
-        .take_while(|l| !l.starts_with("REPAIR_END"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        report.contains("REPAIR_RC=0"),
-        "the checker rejected the filesystem after the replay:\n{report}"
-    );
+    repair::assert_agreed(&out, "the filesystem after the replay");
 }
 
 /// A read-only mount must refuse to write a record at all.

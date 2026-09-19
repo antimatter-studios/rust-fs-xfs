@@ -43,7 +43,7 @@
 
 mod common;
 
-use common::{kernel_run, share};
+use common::{kernel_run, repair, share};
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -227,11 +227,12 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
         fi
         rmdir "$m" 2>/dev/null
         after=$(counters)
+        echo "REPAIR_BEGIN"
         out=$(xfs_repair -n /share/{name} 2>&1) && rc=0 || rc=$?
+        echo "$out"
         echo "REPAIR_RC=$rc"
+        echo "REPAIR_END"
         if [ "$rc" != 0 ] || [ "$mounted" != yes ]; then
-            echo "== xfs_repair -n, in full"
-            echo "$out"
             echo "== counters before the mount"
             echo "$before"
             echo "== counters after the mount"
@@ -262,9 +263,9 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
                     .unwrap_or_else(|e| panic!("write {file}, after {written} writes: {e:?}"));
             }
             let out = kernel_run(&replay).expect("kernel");
+            repair::assert_agreed(&out, &format!("after writing {file} (write {written})"));
             assert!(
                 out.contains("MOUNTED")
-                    && out.contains("REPAIR_RC=0")
                     && !out.contains("STILL_MOUNTED")
                     && !out.contains("MOUNTED_READ_ONLY"),
                 "after writing {file} (write {written}), the kernel or xfs_repair \
