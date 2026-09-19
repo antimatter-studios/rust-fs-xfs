@@ -91,7 +91,7 @@ fn a_report_from_an_unreplayed_log_is_refused() {
         mount -o loop {name} "$m" && echo MOUNT_OK
         for i in $(seq 0 199); do : > "$m/f_$i"; done
         xfs_io -x -c 'shutdown -f' "$m" && echo SHUTDOWN_OK
-        umount "$m" || umount -l "$m"
+        umount "$m" || umount -l "$m" || echo UMOUNT_FAILED
         rmdir "$m"
         {repair}
         echo DONE
