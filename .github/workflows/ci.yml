@@ -4,8 +4,13 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # NO BRANCH FILTER ON PULL REQUESTS (#241). With `branches: [main]` a
+  # pull request based on anything else ran no job in this workflow, and
+  # nothing said so — PR #229, stacked on another fix, reported `CLEAN`
+  # with no checks at all beside siblings showing three. Reopened
+  # against main it ran, and found a real failure the stacked version
+  # could never have found.
   pull_request:
-    branches: [main]
   # Callable so the release workflow runs THIS gate rather than keeping
   # its own copy. The two previously duplicated ~150 lines of kernel
   # validation and drifted three separate times — the release gate lost
