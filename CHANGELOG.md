@@ -8,6 +8,19 @@ never does.
 
 ### Added
 
+- **A checkpoint larger than one in-core log buffer is written as several
+  records.** One operation's record had to fit a single buffer — 32 KiB on
+  an ordinary log — and anything larger was refused, which an ordinary
+  operation reaches: truncating a file interleaved with another leaves
+  three thousand free runs that do not merge, the group's trees are laid
+  out again over dozens of blocks, and every one of them is logged. The
+  operations are divided at operation boundaries and written as a sequence
+  of records; nothing marks the split, because the transaction id ties them
+  together, the first record holds the `START` and the last the `COMMIT`.
+  An operation that alone exceeds a record is still refused, and says which
+  one it was. The whole checkpoint is placed before any of it is written,
+  so a wrap cannot leave recovery to start in the middle of it (#216).
+
 - **A volume with a dirty log mounts, replaying into memory.** A crash, a
   panic or a yanked cable leaves the log holding committed transactions the
   metadata has never been given, and such a volume was refused outright —
@@ -103,6 +116,19 @@ never does.
   and clamped by the on-disk encoding, which is unchanged.
 
 ### Fixed
+
+- **A short-form directory's inode-number width comes from its inode
+  numbers.** The width was taken from the header that was parsed, so a
+  directory made while the numbers were small stayed four bytes wide
+  however large the next one was, and the top half of it was dropped:
+  measured, this driver created inode 4294967437 in the third allocation
+  group of a volume with terabyte groups and the kernel read the name back
+  as inode **141**. An entry naming a different, existing inode, with
+  nothing reported. The count is recomputed from what is about to be
+  written, as `xfs_dir2_sf_check` computes it — every number past
+  `XFS_DIR2_MAX_SHORT_INUM`, the parent included — which makes an addition
+  the conversion the kernel calls `xfs_dir2_sf_toino8`, and narrows the
+  directory again when the last wide entry goes (#235).
 
 - **A file whose extents live in a B+tree can be truncated.** Once a file has
   more extents than its inode holds, its map moves into a B+tree, and
