@@ -73,10 +73,17 @@ fn every_oracle_reads_its_repair_report_through_the_check() {
 /// exists to name.
 #[test]
 fn a_report_from_an_unreplayed_log_is_refused() {
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. `chore fixtures` makes it
+    // before anything else runs, and this test writes its scratch volume
+    // beside the fixtures. An absent share is that build not having
+    // happened, which has to be seen rather than skipped.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let volume = scratch::Volume::empty(
         "repair_verdict",
         &format!("{}.img", std::process::id()),
@@ -84,7 +91,7 @@ fn a_report_from_an_unreplayed_log_is_refused() {
     );
     let name = volume.guest();
 
-    let Some(out) = kernel_run(&format!(
+    let out = kernel_run(&format!(
         r#"
         mkfs.xfs -q -f {name} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
@@ -97,10 +104,7 @@ fn a_report_from_an_unreplayed_log_is_refused() {
         echo DONE
         "#,
         repair = repair::script(&name),
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(
         out.contains("MKFS_OK") && out.contains("MOUNT_OK") && out.contains("SHUTDOWN_OK"),
         "building the crashed volume failed:\n{out}"

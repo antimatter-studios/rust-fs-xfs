@@ -3,7 +3,7 @@
 # build-stress-fixtures.sh — build XFS filesystems whose contents were
 # decided by a stress generator rather than by hand.
 #
-# scripts/vm-build-data-fixtures.sh writes a tree somebody sat down and
+# The data set writes a tree somebody sat down and
 # thought of: a small file, a big file, a sparse file, 400 directory
 # entries. That is a good tree, and it is also a tree shaped by the same
 # assumptions the driver was written under. It will never contain the
@@ -30,7 +30,7 @@
 # it is copied, quoted or adapted into this repository, and its source
 # and build tree live only in the guest. Running a program does not make
 # the caller a derivative work of it. See
-# tests/vagrant/debian/provision-stress-tools.sh, which builds it — the
+# scripts/guest-stress-tools.sh, which builds it — the
 # same script a CI runner uses, since it is plain apt and make.
 #
 # REPRODUCIBILITY. Both generators take a seed and an operation count,
@@ -42,10 +42,10 @@ set -euo pipefail
 
 # WHERE THIS RUNS. Anywhere with xfsprogs, fsstress, fsx, filefrag and
 # the privilege to loop-mount: a CI runner, a container, or the oracle
-# VM. `vm-build-stress-fixtures.sh` ships this same file into the VM, so
+# harness guest. scripts/guest-build-fixtures.sh runs this same file there, so
 # the two cannot drift.
 #
-# The generators are built by tests/vagrant/debian/provision-stress-tools.sh,
+# The generators are built by scripts/guest-stress-tools.sh,
 # which is apt and make and runs on a runner unchanged.
 
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
@@ -88,7 +88,7 @@ as_root() {
 for tool in mkfs.xfs xfs_repair fsstress fsx filefrag; do
     command -v "$tool" >/dev/null || {
         echo "$tool not found. xfsprogs and e2fsprogs from the distribution;" >&2
-        echo "fsstress and fsx from tests/vagrant/debian/provision-stress-tools.sh" >&2
+        echo "fsstress and fsx from scripts/guest-stress-tools.sh" >&2
         exit 1
     }
 done

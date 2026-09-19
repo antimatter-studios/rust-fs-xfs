@@ -2,7 +2,7 @@
 #
 # build-log-fixtures.sh — build filesystems whose logs hold work.
 #
-# The geometry fixtures from vm-build-fixtures.sh are formatted and never
+# The geometry fixtures are formatted and never
 # mounted, so their logs contain one unmount record and nothing else.
 # That is the right shape for checking the superblock parser and the
 # wrong one for checking anything about the log: a log with no items in
@@ -19,13 +19,13 @@
 # arithmetic and nothing about the rule, so this varies it as far as
 # mkfs.xfs will allow.
 #
-#   ./scripts/vm-build-log-fixtures.sh
+#   chore fixtures -- log
 set -euo pipefail
 
 # WHERE THIS RUNS. Anywhere with xfsprogs and the privilege to
 # loop-mount: a CI runner, a container, or the oracle VM.
-# `vm-build-log-fixtures.sh` ships this same file into the VM, so the two
-# cannot drift.
+# scripts/guest-build-fixtures.sh runs this same file in the guest, and
+# it is the only caller, so there is nothing to drift from.
 
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"
 SIZE="${XFS_FIXTURE_SIZE:-400M}"

@@ -20,16 +20,18 @@
 //! VM, which is where the tooling and a Linux kernel are. `scripts/vm.sh`
 //! bridges the two.
 //!
-//! Fixtures are gitignored and the VM is not always up, so this skips
-//! rather than fails when either is missing. Generate fixtures with
-//! `./scripts/vm-build-data-fixtures.sh`.
+//! The fixtures are gitignored and generated, and nothing here is
+//! optional any more: `chore fixtures` builds the data set in the
+//! harness guest, and the kernel and the tooling are that same guest, so
+//! a missing image, a missing tool and an unreachable VM are each a
+//! failure that names the task which provides it.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, scratch, share};
+use common::{kernel_run, scratch};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -67,11 +69,7 @@ fn resolve(fs: &Filesystem, path: &str) -> Option<(fs_xfs::inode::Inode, Vec<u8>
 /// reads back correctly and that nothing else on the volume was harmed.
 #[test]
 fn an_in_place_write_survives_the_kernel_and_the_checker() {
-    let source = share().join("xfsdata-default.img");
-    if !source.exists() {
-        eprintln!("no xfsdata-default fixture — skipping");
-        return;
-    }
+    let source = common::fixture("xfsdata-default.img");
     // A separate image, so a failure leaves the fixtures usable and a
     // rerun starts from the same state.
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfswrite.img");
@@ -83,10 +81,17 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
     let expected = {
         let dev = FileDevice::open(img).expect("open read-only");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount read-only");
-        let Some((inode, raw)) = resolve(&fs, TARGET) else {
-            eprintln!("fixture has no {TARGET} — skipping");
-            return;
-        };
+        // THE TARGET IS PART OF THE FIXTURE. The data set is built by
+        // writing a known tree, `/large.bin` among it, so an image
+        // without it is that build having produced something else and
+        // not a volume this test may pass over.
+        let (inode, raw) = resolve(&fs, TARGET).unwrap_or_else(|| {
+            panic!(
+                "{} has no {TARGET}, which the data fixture is built to contain. \
+                 Rebuild the set with `chore fixtures`.",
+                img.display()
+            )
+        });
         let mut whole = fs.read_file(&inode, &raw).expect("read the file");
         assert!(
             offset as usize + payload.len() < whole.len(),
@@ -143,10 +148,9 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
         "#,
         source = scratch.guest(),
     );
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The verification always happens: the script runs in the harness
+    // guest, so there is no case where the write went unread.
+    let out = kernel_run(&script);
     assert!(
         !out.contains("MOUNT_FAILED"),
         "the kernel refused the volume after this driver wrote to it, which is a \
@@ -193,11 +197,7 @@ fn an_in_place_write_survives_the_kernel_and_the_checker() {
 /// touching the device.
 #[test]
 fn a_read_only_mount_of_a_real_volume_refuses_to_write() {
-    let source = share().join("xfsdata-default.img");
-    if !source.exists() {
-        eprintln!("no xfsdata-default fixture — skipping");
-        return;
-    }
+    let source = common::fixture("xfsdata-default.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfswrite-ro.img");
     let img = scratch.path();
     let before = {
@@ -237,11 +237,7 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
     use fs_xfs::inode::Timestamp;
     use fs_xfs::write::AttrChange;
 
-    let source = share().join("xfsdata-default.img");
-    if !source.exists() {
-        eprintln!("no xfsdata-default fixture — skipping");
-        return;
-    }
+    let source = common::fixture("xfsdata-default.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfsattr.img");
     let img = scratch.path();
 
@@ -303,10 +299,9 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
         "#,
         source = scratch.guest(),
     );
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The verification always happens: the script runs in the harness
+    // guest, so there is no case where the write went unread.
+    let out = kernel_run(&script);
     assert!(
         !out.contains("MOUNT_FAILED"),
         "the kernel refused the volume after this driver wrote to it, which is a \
@@ -371,11 +366,7 @@ fn an_attribute_change_survives_the_kernel_and_the_checker() {
 fn a_truncate_survives_the_kernel_and_the_checker() {
     use fs_xfs::inode::Timestamp;
 
-    let source = share().join("xfsdata-default.img");
-    if !source.exists() {
-        eprintln!("no xfsdata-default fixture — skipping");
-        return;
-    }
+    let source = common::fixture("xfsdata-default.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfstrunc.img");
     let img = scratch.path();
 
@@ -435,10 +426,9 @@ fn a_truncate_survives_the_kernel_and_the_checker() {
         "#,
         source = scratch.guest(),
     );
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("oracle VM unavailable — skipping verification");
-        return;
-    };
+    // The verification always happens: the script runs in the harness
+    // guest, so there is no case where the write went unread.
+    let out = kernel_run(&script);
     assert!(
         !out.contains("MOUNT_FAILED"),
         "the kernel refused the volume after this driver wrote to it, which is a \

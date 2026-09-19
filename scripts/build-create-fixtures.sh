@@ -42,7 +42,7 @@
 # # Where this runs
 #
 # Anywhere with xfsprogs and the privilege to loop-mount: a CI runner, a
-# container, or the oracle VM. `vm-build-create-fixtures.sh` is a thin
+# container, or the harness guest. scripts/guest-build-fixtures.sh is a thin
 # wrapper that ships this same file into the VM, so the two cannot drift.
 #
 #   ./scripts/build-create-fixtures.sh

@@ -12,8 +12,9 @@
 //! at exactly the files the sequence describes, with `xfs_repair` clean —
 //! and the memory held must stay under the bound throughout.
 //!
-//! Skips when no kernel is reachable (see `common::transport`); ci-test.sh
-//! turns that skip into a failure in CI.
+//! The kernel is the one in the fs-linux-test-harness guest, so there is
+//! no reachable-kernel question to skip on: a guest that cannot be
+//! reached fails the run.
 
 mod common;
 
@@ -43,15 +44,21 @@ const MAX_DIRTY_BYTES: usize = 16 * 1024 * 1024;
 
 #[test]
 fn a_mount_writes_past_the_end_of_the_log() {
-    // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
-    // volume, but it builds it in the share, and a share that exists is
-    // what the suites scanning it take for a fixture set: creating one
-    // here makes them fail where they would have skipped. The job that
-    // runs this builds the fixtures first, so the directory is there.
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. This builds its own volume,
+    // but it builds it in the share, and `chore fixtures` makes that
+    // directory before anything else runs. The old reasoning for
+    // returning early here was that creating the directory would leave
+    // the suites which scan it looking at a set holding nothing but this
+    // scratch image; those suites fail on an empty set themselves now,
+    // so an absent share is simply the fixture build not having
+    // happened, and that has to be seen.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let scratch = scratch::Volume::empty(
         SUITE,
         &format!("{}.img", std::process::id()),
@@ -75,12 +82,8 @@ fn a_mount_writes_past_the_end_of_the_log() {
         "#,
         last = DIRS - 1
     ));
-    let Some(built) = built else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
     assert!(
-        built.contains("MKFS_OK") && built.contains("MOUNT_OK"),
+        built.contains("MKFS_OK") && built.contains("MOUNT_OK") && !built.contains("UMOUNT_FAILED"),
         "building the volume failed:\n{built}"
     );
     let path = image.to_str().unwrap().to_string();
@@ -167,8 +170,7 @@ fn a_mount_writes_past_the_end_of_the_log() {
         echo "REPAIR_END"
         echo DONE
         "#
-    ))
-    .expect("kernel");
+    ));
 
     assert!(
         out.contains("MOUNTED"),

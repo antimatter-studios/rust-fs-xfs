@@ -45,8 +45,26 @@ than the floor it was given. A skip is the loud way for a suite to prove
 nothing. Executing nothing at all is the quiet one: the harness exits 0
 on `0 passed; 0 failed` and prints no skip line for the gate to find, so
 only a count of what ran can tell that apart from a full run. Every test
-run in `ci.yml` now carries a floor measured from a real CI log, with the
-count, the date and the run id beside it.
+run carries a floor measured from a real CI log, with the count, the date
+and the run id beside it.
+
+**Every tier goes through that script now**, which is what makes the
+guarantee worth anything. It used to be reachable only from the suites
+`ci.yml` happened to name in a `for suite in ...` list — so a suite left
+out of the list was a suite whose skip nobody checked, which is the same
+failure the list was written to prevent. The tiers are
+`chore test:unit`, `test:images`, `test:oracle`, `test:kernel`,
+`test:vm` and `test:scripts`, and each of them either runs `ci-test.sh`
+or hands it the log to gate (`--gate`, which the debug unit tier uses
+because `ci-test.sh`'s run mode pins `--release`).
+
+The gate's own `--self-test` — which holds the skip pattern to the exact
+wordings the suites use, in both directions, so that neither a real skip
+slips through nor a passing summary line is failed for saying "skipped" —
+**had never run once**, from the day it was written until #200. It is a
+shell test now: `tests/scripts/ci-test-self-test.sh`, picked up by
+`chore test:scripts` by glob, because a guard that has to be registered
+somewhere before it runs is a guard that gets silently skipped.
 
 ## What the corpus caught once it ran
 
@@ -95,16 +113,27 @@ implementation, which is the only opinion that counts.
 
     cargo llvm-cov --all-features --summary-only
 
-Fixtures first, or the number will be lower and the suites will say so:
+Fixtures first, or the number will be lower and the suites will fail
+saying so:
 
-    sudo ./scripts/build-fixtures-native.sh
-    sudo ./scripts/build-dirconv-fixtures.sh
-    sudo ./scripts/build-truncate-fixtures.sh
-    sudo ./scripts/build-unlink-fixtures.sh
-    sudo ./scripts/build-create-fixtures.sh
-    sudo ./scripts/build-log-fixtures.sh
+    chore siblings
+    chore fixtures
 
-Each needs xfsprogs and the privilege to loop-mount, so Linux — a CI
-runner, a container, or the oracle VM via the matching `vm-build-*`
-wrapper. The stress corpus is separate and slower; see
-`.github/workflows/stress.yml`.
+One task for every set, because there is one place the fixtures are
+built. Each of these images needs the canonical `mkfs.xfs` and, for the
+populated ones,
+the real kernel's XFS driver and the privilege to loop-mount — so all of
+it happens inside the fs-linux-test-harness guest, on every machine.
+There is no host-side builder and no `sudo` in this repository any more.
+The pair that used to be here — a native builder for a CI runner and a
+VM builder for a developer's loop — were the same work written twice,
+they had already drifted once (#110), and while they both existed a
+fixture could be built by one kernel and graded by another, which is
+what #211 and #212 are.
+
+`chore fixtures -- dirconv truncate unlink create log` rebuilds just the
+sets a particular row above depends on. The stress corpus is not in the
+default set because its generators are built from source first: ask for
+it by name with `chore fixtures -- stress`, or let the weekly
+`.github/workflows/stress.yml` run do it, which builds it in the same
+guest.

@@ -4,10 +4,11 @@
 # fixtures are built from.
 #
 # Sourced by both builders of that matrix:
-#   scripts/build-fixtures-native.sh (CI, on the Linux runner)
-#   scripts/vm-build-fixtures.sh     (a developer's loop, in the VM)
+#   scripts/guest-build-fixtures.sh  (the harness guest, everywhere)
 #
-# One copy, because two drifted (#110): the VM list gained `nosparse`,
+# There used to be two builders and this list was copied into each of
+# them. One copy, because the two drifted (#110): the VM list gained
+# `nosparse`,
 # which CI never built, and the native list pinned `default` to
 # rmapbt=0, which the VM left to whichever mkfs.xfs the guest carried.
 # CI and a developer's local run stop meaning the same thing the moment

@@ -34,7 +34,7 @@
 # # Where this runs
 #
 # Anywhere with xfsprogs and the privilege to loop-mount: a CI runner, a
-# container, or the oracle VM. `vm-build-truncate-fixtures.sh` is a thin
+# container, or the harness guest. scripts/guest-build-fixtures.sh is a thin
 # wrapper that ships this same file into the VM and runs it there, so the
 # two cannot drift — the geometry fixtures had two builders that did.
 #

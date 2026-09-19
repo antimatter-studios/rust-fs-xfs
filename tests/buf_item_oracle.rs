@@ -24,12 +24,17 @@
 //! An operation too large for the remainder of a record is truncated and
 //! continued in the next one. Reassembling those is a property of the
 //! record framing rather than of the item, so items containing a split
-//! operation are counted and skipped, and the count is reported — a
-//! silent skip could hide the whole corpus going missing.
+//! operation are set aside and their number is reported with the total —
+//! a count that went unreported could hide the whole corpus going
+//! missing. That is a class of item this suite does not cover, not a
+//! test declining to run.
 //!
-//! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-log-fixtures.sh` and
-//! `./scripts/vm-build-stress-fixtures.sh`.
+//! The fixtures are gitignored and generated: `chore fixtures` builds
+//! the log and data sets, and `chore fixtures stress` the stress corpora
+//! separately, since those build fsstress and fsx from source and take
+//! tens of minutes.
+
+mod common;
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::buf_write::BufferItem;
@@ -49,7 +54,7 @@ const OP_CONTINUES: u8 = 0x04;
 const OP_WAS_CONTINUED: u8 = 0x18;
 
 fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
+    common::share()
 }
 
 fn le16(b: &[u8], i: usize) -> u16 {
@@ -327,14 +332,17 @@ fn every_kernel_buffer_item_re_encodes_identically() {
         }
     }
 
-    if images_read == 0 {
-        eprintln!(
-            "no fixture images found in {}; build them with \
-             ./scripts/vm-build-log-fixtures.sh",
-            share().display()
-        );
-        return;
-    }
+    // NONE OF THE LISTED IMAGES BEING THERE IS THE FIXTURE BUILD MISSING.
+    // The individual `exists` above stays because the stress corpora are
+    // a separate, very slow set — `chore fixtures` does not build them —
+    // but the log and data images it does build are in this list, so an
+    // empty run means there are no fixtures at all.
+    assert!(
+        images_read > 0,
+        "none of {IMAGES:?} is in {}: the fixtures are gitignored and generated. \
+         Build them with `chore fixtures`. Tests never skip on a missing fixture.",
+        share().display()
+    );
 
     // A test that silently matched nothing would pass just as loudly as
     // one that matched everything.
@@ -343,7 +351,10 @@ fn every_kernel_buffer_item_re_encodes_identically() {
         "only {total} buffer items were found across {images_read} images, \
          which is too few to have exercised the encoder"
     );
-    eprintln!("re-encoded {total} kernel buffer items ({split} skipped as split across records)");
+    eprintln!(
+        "re-encoded {total} kernel buffer items across {images_read} images \
+         ({split} more were split across records, which the record-framing tests cover)"
+    );
 }
 
 /// The invariants the format document states, checked against the
@@ -395,7 +406,14 @@ fn the_kernels_items_satisfy_the_documented_invariants() {
         }
     }
 
-    if checked > 0 {
-        eprintln!("{checked} kernel buffer items satisfy the documented invariants");
-    }
+    // THE FLOOR IS THE ONLY GUARD LEFT HERE. Nothing above fails when a
+    // log simply holds no buffer item, so a corpus that went missing
+    // would leave every assertion unrun; the count is what says the
+    // invariants were applied to something.
+    assert!(
+        checked > 0,
+        "no buffer item was found in any of {IMAGES:?}, so none of the documented \
+         invariants was checked. `chore fixtures` rebuilds the set."
+    );
+    eprintln!("{checked} kernel buffer items satisfy the documented invariants");
 }

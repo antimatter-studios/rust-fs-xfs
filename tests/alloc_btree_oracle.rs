@@ -24,7 +24,7 @@
 //! way twice for the two sets to still match.
 //!
 //! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-log-fixtures.sh`.
+//! `chore fixtures -- log`.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::ag::Agf;
@@ -186,7 +186,7 @@ fn every_group_of_every_fixture_reconciles() {
     }
 
     if images == 0 {
-        eprintln!("no XFS fixtures found; build them with ./scripts/vm-build-log-fixtures.sh");
+        eprintln!("no XFS fixtures found; build them with chore fixtures -- log");
         return;
     }
     eprintln!("{groups} allocation groups across {images} images reconcile: {names:?}");

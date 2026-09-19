@@ -27,7 +27,7 @@
 //! ```
 
 mod common;
-use common::{kernel_run, scratch, share};
+use common::{fixture, kernel_run, scratch};
 
 /// Where this suite's scratch volumes live, under
 /// `.vm-share/scratch/`, out of the way of the suites that scan the
@@ -36,33 +36,44 @@ const SUITE: &str = "refcount_oracle";
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-
-/// A reflink filesystem whose fixture really does share an extent —
-/// `build-feature-matrix-fixtures.sh` makes `sf/shared.bin` a reflink
-/// copy of `sf/data.bin`.
-fn fixture() -> Option<PathBuf> {
-    let p = share().join("xfsfeat-reflink.img");
-    p.exists().then_some(p)
-}
 
 fn replay(img: &Path) -> bool {
     let image = scratch::guest_path(img);
     let script = format!(
         r#"
         m=$(mktemp -d)
-        mount -o loop,nouuid {image} "$m" || echo MOUNT_FAILED
-        # RETRIED ONCE. A busy unmount under a loaded runner is
-        # ordinary and clears in a moment; one that does not is the
-        # failure worth reporting, because the kernel writes the
-        # summary counters at unmount and nothing else does.
-        if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
+        if mount -o loop,nouuid {image} "$m"; then
+            # RETRIED ONCE. A busy unmount under a loaded runner is
+            # ordinary and clears in a moment; one that does not is the
+            # failure worth reporting, because the kernel writes the
+            # summary counters at unmount and nothing else does.
+            #
+            # REPORTED APART FROM THE MOUNT: the two were one `||`
+            # before, so a failed unmount was announced as a mount the
+            # kernel had refused, and an unmount of a mount that never
+            # happened was announced as a failed unmount.
+            if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
+        else
+            echo MOUNT_FAILED
+        fi
         rmdir "$m" 2>/dev/null
         echo DONE
         "#
     );
-    kernel_run(&script).is_some_and(|out| !out.contains("MOUNT_FAILED"))
+    let out = kernel_run(&script);
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "the volume could not be unmounted, so the summary counters were never \
+         written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
+         exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
+    );
+    // False means one thing now: the kernel refused the mount, so the
+    // log was not replayed. The replay itself always happens, in the
+    // harness guest.
+    !out.contains("MOUNT_FAILED")
 }
 
 fn open(img: &Path) -> Filesystem {
@@ -81,10 +92,12 @@ fn is_free(fs: &Filesystem, block: u32) -> bool {
 /// must not put the blocks back in free space.
 #[test]
 fn letting_go_of_a_shared_extent_leaves_the_blocks_with_the_other_file() {
-    let Some(source) = fixture() else {
-        eprintln!("no xfsfeat-reflink fixture — skipping");
-        return;
-    };
+    // The reflink fixture really does share an extent:
+    // `build-feature-matrix-fixtures.sh` makes `sf/shared.bin` a reflink
+    // copy of `sf/data.bin`. It is built on every run now, so an image
+    // that is not there is a fixture build that did not happen, and this
+    // fails rather than passing having looked at nothing.
+    let source = fixture("xfsfeat-reflink.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "refcount-share-scratch.img");
     let img = scratch.path();
 
@@ -117,10 +130,11 @@ fn letting_go_of_a_shared_extent_leaves_the_blocks_with_the_other_file() {
         fs.truncate_to_zero(victim)
             .expect("letting go of a shared extent is allowed; the blocks simply stay");
     }
-    if !replay(img) {
-        eprintln!("no kernel to replay the record — skipping the check");
-        return;
-    }
+    assert!(
+        replay(img),
+        "the kernel refused to mount the volume, so what this driver logged was \
+         never replayed"
+    );
 
     let fs = open(img);
     assert!(
@@ -160,10 +174,7 @@ fn letting_go_of_a_shared_extent_leaves_the_blocks_with_the_other_file() {
 /// would be asserting that this driver frees blocks a file still holds.
 #[test]
 fn the_last_owner_gives_the_blocks_back() {
-    let Some(source) = fixture() else {
-        eprintln!("no xfsfeat-reflink fixture — skipping");
-        return;
-    };
+    let source = fixture("xfsfeat-reflink.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "refcount-last-scratch.img");
     let img = scratch.path();
 
@@ -190,10 +201,11 @@ fn the_last_owner_gives_the_blocks_back() {
             .expect("mount read-write");
         fs.truncate_to_zero(ino).expect("truncate");
         drop(fs);
-        if !replay(img) {
-            eprintln!("no kernel to replay the record — skipping the check");
-            return;
-        }
+        assert!(
+            replay(img),
+            "the kernel refused to mount the volume, so what this driver logged was \
+             never replayed"
+        );
     }
 
     assert!(

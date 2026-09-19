@@ -27,7 +27,7 @@ set -euo pipefail
 
 # WHERE THIS RUNS. Anywhere with xfsprogs and the privilege to
 # loop-mount: a CI runner, a container, or the oracle VM.
-# `vm-build-deeptree-fixtures.sh` ships this same file into the VM, so
+# scripts/guest-build-fixtures.sh runs this same file in the guest, so
 # the two cannot drift.
 
 OUT="${XFS_FIXTURE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.vm-share}"

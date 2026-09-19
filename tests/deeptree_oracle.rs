@@ -13,8 +13,11 @@
 //! driver fills its blocks evenly and the kernel fills them as splits
 //! happened to leave them.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone. Build them
-//! with `scripts/vm-build-deeptree-fixtures.sh`.
+//! The fixtures are gitignored and generated; `chore fixtures` builds
+//! the deep-tree set in the harness guest. A checkout without them is
+//! that build not having happened, so this fails and names the task
+//! rather than returning early — a suite that laid out no tree at all
+//! reported exactly the same green as one that laid out every tree.
 
 mod common;
 use common::{kernel_run, share};
@@ -44,21 +47,11 @@ fn copy_of(src: &Path, name: &str) -> Option<Copy> {
     Some(Copy(dst))
 }
 
+/// Every deep-tree fixture, in a stable order. An empty set is a
+/// fixture build that did not happen, and `common::fixtures_matching`
+/// says so rather than handing back nothing to test.
 fn deep_fixtures() -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("xfsdeep-") && n.ends_with(".img"))
-        })
-        .collect();
-    out.sort();
-    out
+    common::fixtures_matching("xfsdeep-", ".img")
 }
 
 fn decode_run(buf: &[u8], at: usize) -> FreeExtent {
@@ -150,10 +143,6 @@ fn relay(img: &Path, fs: &Filesystem, agno: u32, order: Order) -> Result<usize, 
 #[test]
 fn a_tree_laid_out_again_is_one_xfs_repair_accepts() {
     let fixtures = deep_fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no xfsdeep-* fixtures — skipping");
-        return;
-    }
 
     let mut judged = 0;
     let mut broken: Vec<String> = Vec::new();
@@ -203,14 +192,15 @@ fn a_tree_laid_out_again_is_one_xfs_repair_accepts() {
             echo DONE
             "#
         );
-        let Some(out) = kernel_run(&script) else {
-            eprintln!("{name}: no kernel to judge with — skipping");
-            continue;
-        };
-        if !out.contains("REPAIR_END") {
-            eprintln!("{name}: the judge did not run — skipping");
-            continue;
-        }
+        // Every fixture that was laid out again is judged: the script
+        // runs in the harness guest, so there is no case where the
+        // checker was not asked.
+        let out = kernel_run(&script);
+        assert!(
+            out.contains("REPAIR_END"),
+            "{name}: the checker's output was cut short, so its verdict cannot be \
+             read:\n{out}"
+        );
 
         judged += 1;
         if !out.contains("REPAIR_RC=0") {
@@ -247,10 +237,6 @@ fn a_tree_laid_out_again_is_one_xfs_repair_accepts() {
 #[test]
 fn every_write_into_a_group_with_deep_trees_is_sound() {
     let fixtures = deep_fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no xfsdeep-* fixtures — skipping");
-        return;
-    }
 
     // One per write path that touches a group's trees: taking blocks for
     // a new file, taking them for a file's data, giving them back, and
@@ -351,11 +337,18 @@ fn every_write_into_a_group_with_deep_trees_is_sound() {
                 echo DONE
                 "#
             );
-            let Some(out) = kernel_run(&script) else {
-                eprintln!("{name} {op}: no kernel to judge with — skipping");
-                continue;
-            };
+            // Every operation is judged: the replay runs in the harness
+            // guest, so there is no case where the kernel was not asked.
+            let out = kernel_run(&script);
             judged += 1;
+            assert!(
+                !out.contains("UMOUNT_FAILED"),
+                "{name} {op}: the volume could not be unmounted, so the summary \
+                 counters were never written back to it. `xfs_repair` reports \
+                 `sb_fdblocks N, counted N-1` for exactly that -- the free-block \
+                 count it disagrees about is the one the unmount never wrote, not \
+                 one this driver got wrong:\n{out}"
+            );
             if !out.contains("REPAIR_RC=0") || out.contains("MOUNT_FAILED") {
                 broken.push(format!("{name} {op}: the kernel objected:\n{out}"));
             } else {
@@ -389,10 +382,6 @@ fn every_write_into_a_group_with_deep_trees_is_sound() {
 #[test]
 fn every_group_tree_reads_at_whatever_depth_it_is() {
     let fixtures = deep_fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no xfsdeep-* fixtures — skipping");
-        return;
-    }
 
     let mut deep = 0;
     for src in &fixtures {

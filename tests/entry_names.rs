@@ -10,23 +10,23 @@
 //!
 //! A refusal must also leave the mount's one checkpoint unspent, so a
 //! valid rename afterwards still goes through. `mkfs.xfs -p` makes the
-//! image. Skips when xfsprogs is not installed.
+//! image, in the fs-linux-test-harness guest, which always has it — the
+//! refusal this covers is the driver's, and a run that did not build the
+//! image has not observed it.
 
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
+
+mod common;
+use common::oracle;
 
 #[test]
 fn a_name_no_entry_can_hold_is_refused() {
-    if !Command::new("mkfs.xfs")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        eprintln!("skip: xfsprogs not installed");
-        return;
-    }
+    // The protofile, the files it names and the image are all made under
+    // `std::env::temp_dir()`, which `scripts/with-test-temp.sh` points at
+    // a directory inside this repository — the one tree the guest running
+    // mkfs.xfs can see.
     let root = std::env::temp_dir().join(format!("fs_xfs_entry_names_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("empty"), b"").unwrap();
@@ -42,17 +42,12 @@ fn a_name_no_entry_can_hold_is_refused() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(300 * 1024 * 1024))
         .unwrap();
-    let out = Command::new("mkfs.xfs")
+    let out = oracle("mkfs.xfs")
         .args(["-q", "-f", "-p"])
         .arg(root.join("proto"))
         .arg(&image)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .output();
+    assert!(out.ok(), "{}{}", out.stdout, out.stderr);
 
     let dev = Arc::new(FileDevice::open_rw(image.to_str().unwrap()).unwrap());
     let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");

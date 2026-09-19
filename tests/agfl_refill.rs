@@ -14,8 +14,9 @@
 //! and the driver is the one growing it: where the kernel had grown it, the
 //! driver's denser layout gave blocks back. The kernel replays every write and `xfs_repair -n` judges it,
 //! and no write may be refused, well past the point where the list
-//! ran dry. Skips when no kernel is reachable (see
-//! `common::transport`); ci-test.sh turns that skip into a failure in CI.
+//! ran dry. Every replay happens in the fs-linux-test-harness guest, so
+//! there is no reachable-kernel question left to skip on: a guest that
+//! cannot be reached fails the run.
 //!
 //! # What the oracle needs from the harness, and did not check (#199)
 //!
@@ -53,24 +54,26 @@ use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
 
-/// Removes the image however the test ends: every suite reads each `.img`
-/// in the share as a fixture. And the share itself when this test made it,
-/// because a suite that finds an empty share fails where a missing one
-/// skips (`log_oracle` in the fixture-less test jobs).
 const DIRS: usize = 5;
 const PER_DIR: usize = 100;
 
 #[test]
 fn writes_on_rmapbt_keep_going_past_the_free_list() {
-    // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
-    // volume, but it builds it in the share, and a share that exists is
-    // what the suites scanning it take for a fixture set: creating one
-    // here makes them fail where they would have skipped. The job that
-    // runs this builds the fixtures first, so the directory is there.
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. This builds its own volume,
+    // but it builds it in the share, and `chore fixtures` makes that
+    // directory before anything else runs. The old reasoning for
+    // returning early here was that creating the directory would leave
+    // the suites which scan it looking at a set holding nothing but this
+    // scratch image; those suites fail on an empty set themselves now,
+    // so an absent share is simply the fixture build not having
+    // happened, and that has to be seen.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let scratch = scratch::Volume::empty(
         SUITE,
         &format!("{}.img", std::process::id()),
@@ -79,7 +82,7 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
     let image = scratch.path().to_path_buf();
     let name = scratch.guest();
 
-    let Some(built) = kernel_run(&format!(
+    let built = kernel_run(&format!(
         r#"
         mkfs.xfs -q -f -b size=1024 -d agcount=2 -m rmapbt=1,reflink=0 {name} 2>&1 || echo MKFS_FAILED
         m=$(mktemp -d)
@@ -101,10 +104,7 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
         "#,
         last_dir = DIRS - 1,
         last_file = PER_DIR - 1,
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(
         built.contains("BUILT") && !built.contains("FAILED"),
         "building the volume failed:\n{built}"
@@ -235,7 +235,7 @@ fn writes_on_rmapbt_keep_going_past_the_free_list() {
                 fs.write_into_empty_file(ino, &[0x5A; 1024])
                     .unwrap_or_else(|e| panic!("write {file}, after {written} writes: {e:?}"));
             }
-            let out = kernel_run(&replay).expect("kernel");
+            let out = kernel_run(&replay);
             repair::assert_agreed(&out, &format!("after writing {file} (write {written})"));
             assert!(
                 out.contains("MOUNTED")

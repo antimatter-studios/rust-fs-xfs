@@ -117,11 +117,20 @@ Every one of them is invisible to a round-trip test and fatal against a real
 filesystem. All three died on the first run against `xfs_db`.
 
 ```sh
-./scripts/test.sh                 # unit tests; green on a fresh clone
-./scripts/test.sh -- --ignored    # adds tests that shell out to xfsprogs (Linux)
+chore test:unit    # no tool, no fixture, no VM; green after `chore siblings`
+chore test:images  # adds the tests that read a fixture, still without a VM
+chore test         # everything, exactly as CI runs it
+./scripts/test.sh --test oracle_vm_fixtures -- --nocapture   # one suite, by hand
 ```
 
-The wrapper exports an isolated `TMPDIR` and cleans the child it owns. An exact
+There is no `--ignored` tier and no host-side oracle. Every test that runs a tool runs
+it in the guest, and a test that cannot reach one **fails** rather than reporting `ok`
+— see `## Generating fixtures` below.
+
+`scripts/test.sh` and every tier go through `scripts/with-test-temp.sh`, which exports
+an isolated `TMPDIR` and cleans the child it owns. That wrapper is not only tidiness:
+the guest sees this repository and nothing else of the host, so a scratch directory
+under `/tmp` is a path the tool asked to read an image cannot open. An exact
 `FS_XFS_TEST_TMPDIR` is caller-managed; `FS_XFS_TEST_TMP_BASE` receives a unique
 child; GitHub Actions uses `RUNNER_TEMP`; and Raspberry Pi uses this checkout's
 `./tmp` so fixture churn follows the checkout onto NVMe rather than the system
@@ -129,40 +138,77 @@ SD card. Other hosts use `TMPDIR` or their platform temporary mechanism.
 
 ### Generating fixtures
 
-`mkfs.xfs` and `xfs_db` are Linux-only. On macOS an oracle VM supplies them — Debian
-arm64 under QEMU, hardware-accelerated via HVF, so there is no emulation penalty:
+**Every fixture is made by one kernel and one `mkfs.xfs` — the guest's — on a
+developer's machine and on a CI runner alike.** A fixture is only evidence if the
+thing that built it is the same everywhere: `mkfs.xfs` on a workstation is whatever
+that machine happens to have (nothing at all on a Mac, 6.1 on Debian 12, 6.6 on
+Ubuntu 24.04), and the kernel is worse, because a runner gets whichever one the cloud
+booted that week. CI used to install xfsprogs on the runner, build the images there and
+loop-mount them with `sudo`, while a developer got a Debian VM with a different
+`mkfs.xfs` and a different kernel — so the two halves of the same gate were graded by
+two different oracles. That is exactly what #211 and #212 are. There is one guest now,
+supplied by
+[fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+and configured by `fs-linux-test-harness.toml`; there is no host-side build and no
+`sudo` anywhere.
 
 ```sh
-./scripts/install-host-tools.sh      # what the VM needs on this machine
-./scripts/vm.sh up                   # boot (first run provisions)
-./scripts/vm-build-fixtures.sh       # the geometry matrix, for the superblock tests
-./scripts/vm-build-log-fixtures.sh   # populated filesystems, for the log tests
-./scripts/vm-build-stress-fixtures.sh  # trees built by a stress generator
+chore siblings          # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
+chore tools             # what the HOST needs: ripgrep and the VM. NOT xfsprogs
+chore fixtures          # every set but stress, built in the guest, into .vm-share/
+chore fixtures -- log truncate   # just those sets
+chore fixtures -- stress         # asked for by name; see below
 ./scripts/test.sh --test oracle_vm_fixtures -- --nocapture
 ```
 
-The fixture scripts build different things. `vm-build-fixtures.sh` formats a
-filesystem per geometry and never mounts it, which is what the superblock and inode
-parsers need. `vm-build-log-fixtures.sh` mounts, writes and unmounts, so the log keeps
-the records that were written along the way — a log with nothing in it cannot disagree
-with us about how an item is written.
+The sets build different things, and the difference is the reason each exists.
+`geometry` formats a filesystem per entry in `scripts/fixture-geometries.sh` and
+**never mounts it**, which is what the superblock and inode parsers need: nothing has
+touched those images since `mkfs.xfs` wrote them. `log` mounts, writes and unmounts, so
+the log keeps the records written along the way — a log with nothing in it cannot
+disagree with us about how an item is written — and it varies the inode size, because a
+logged inode addresses the *cluster* holding it by a rule that is not in the record.
+`data` writes a tree somebody sat down and thought of — a small file, a big file, a
+sparse file, several hundred directory entries — which is what the read path is walked
+over. `truncate`, `create`, `unlink`, `dirconv`, `crossag`, `deeptree` and
+`feature-matrix` are each the *before* state one suite of write tests needs the kernel
+to have produced, so that what this driver does to them is measured against a volume it
+did not make.
 
-`vm-build-stress-fixtures.sh` is the one whose contents nobody chose. It runs the two
-stress generators from the filesystem test suite against a mounted filesystem and keeps
-what they leave behind, with a manifest of every path generated inside Linux by the
-kernel's own driver. The generators are built in the guest from a pinned release tag and
-their binaries are only ever executed — see `tests/vagrant/debian/provision-stress-tools.sh`,
-which records why.
+`stress` is the set whose contents nobody chose, and it is not in the default list: it
+runs the two stress generators from the filesystem test suite against a mounted
+filesystem and keeps what they leave behind, with a manifest of every path generated
+inside Linux by the kernel's own driver. It is asked for by name because the generators
+are built from source first and that takes tens of minutes — and a set quietly dropped
+by a catch-all is the same shape of problem as an oracle that skips, so
+`scripts/build-fixtures.sh` names `stress` as the one its default list leaves out
+rather than letting "all" mean something narrower than it says.
 
-The comparison runs on the host, so the VM is only needed when fixtures are
-regenerated — not on every `cargo test`. In CI no VM is involved at all: GitHub's Linux
-runners are already Linux and build the same matrix natively.
+**Licensing.** The filesystem test suite (fstests) is GPL-2.0. It is cloned, built and
+executed **inside the guest only**; its source and its build artefacts never enter this
+repository, nothing from it is copied, quoted or adapted here, and the two binaries are
+invoked as external programs. Running a program does not make the caller a derivative
+work of it; vendoring its code would. `scripts/guest-stress-tools.sh` records that, and
+pins the build to a dated release tag so a rebuilt VM gets the same generators rather
+than whatever upstream looks like that day.
 
-Prerequisites are installed by `./scripts/install-host-tools.sh`, which also says what
-each is for. `vm.sh` checks them before every boot, so a missing one is reported with
-the command that fixes it rather than as a failure to start.
+**Nothing skips on a missing fixture.** The images are gitignored, and a test that
+cannot find the one it needs fails naming `chore fixtures`. It used to print a skip line
+and return `ok`, which reads exactly like a pass: `truncate_oracle` skipped on every CI
+run from the day it was written, and `truncate.rs` sat at 5% line coverage underneath a
+green suite. `scripts/ci-test.sh` is the other half of that guarantee — it fails a run
+whose output matches a skip, and one that executed fewer tests than its floor.
 
-Other `vm.sh` verbs: `run <cmd>`, `share`, `put <file>`, `down`, `destroy`.
+`chore tools` installs what the **host** needs — ripgrep, and Vagrant, QEMU and KVM/HVF
+for the VM — and says what each is for. It deliberately installs no xfsprogs: a
+workstation that has none is a workstation on which no test can quietly ask the wrong
+oracle, and `tests/test_contract.rs` fails the suite if one tries.
+
+The harness's own tasks are available as `chore vm:up`, `vm:down`, `vm:status`,
+`vm:run -- <cmd>`, `vm:exec -- <cmd>`, `vm:provision`, `vm:destroy` and
+`vm:host:check`. `chore test:oracle` and `chore test:kernel` bring the VM up once for
+the whole tier and leave it to the reaper, so thirty test binaries share one boot and
+one multiplexed SSH connection.
 
 ## Building
 
@@ -173,7 +219,10 @@ cargo clippy --all-targets -- -D warnings
 
 Builds as both an `rlib` and a `staticlib`, so it links into a Rust dependency graph or
 alongside sibling drivers in a C/Swift/Go consumer. Requires the sibling
-`../rust-fs-core` checkout.
+`../rust-fs-core` checkout, which `chore siblings` clones and moves to the ref pinned
+in `chores.yml`. `chore staticlib` builds the library and its headers into this crate's
+own `dist/`, and `chore artifact` prints the absolute path of that directory — a
+consumer copies its contents rather than being told where cargo puts things.
 
 Install the git hooks once per clone:
 

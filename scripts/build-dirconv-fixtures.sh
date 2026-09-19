@@ -20,7 +20,7 @@
 # # This runs on Linux, and there is only one copy of it
 #
 # It needs mkfs.xfs and the ability to mount, so it runs either inside
-# the oracle VM (via vm-build-dirconv-fixtures.sh) or directly on a Linux
+# the harness guest (via scripts/guest-build-fixtures.sh) or directly on a Linux
 # CI runner. Both call THIS script.
 #
 # That is deliberate. The geometry fixtures are built by two scripts —

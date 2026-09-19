@@ -79,7 +79,19 @@ fn every_builder_that_needs_root_defines_the_same_helper() {
         let body = std::fs::read_to_string(&path).expect("a script");
         // A builder that mounts anything needs root; one that only calls
         // mkfs on a file does not.
-        if !body.contains("mount ") {
+        //
+        // WHAT IT RUNS, NOT WHAT IT SAYS, which is the same rule the
+        // scan above already follows. `scripts/build-fixtures.sh` drives
+        // the build from the host and mounts nothing — the guest does
+        // the mounting — but it explains the repository mount in prose,
+        // and reading the prose put it here, demanding a root helper
+        // that would have nothing to do.
+        let mounts = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .any(|l| l.contains("mount "));
+        if !mounts {
             continue;
         }
         if !body.contains("as_root()") || !body.contains("sudo env PATH=") {

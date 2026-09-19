@@ -18,62 +18,30 @@
 //! each volume as built, and xfs_db counts the attribute entries the driver
 //! must report.
 //!
-//! Needs xfsprogs 6.10 or newer, the first with parent pointers.
-//! `XFSPROGS_PARENT_BIN` names a directory holding such a `mkfs.xfs`,
-//! `xfs_db` and `xfs_repair`; without it they come from `PATH`. CI builds
-//! them, because Ubuntu's are older. `#[ignore]`-gated like the other
-//! inline xfsprogs oracles.
+//! Parent pointers arrived in xfsprogs 6.10 and Debian's is 6.1, so these
+//! tools are not the guest's ordinary ones: `scripts/vm-setup.sh` builds a
+//! newer xfsprogs beside them and `common::parent_oracle` names it. That
+//! build is pinned there, once, for every host this suite runs on, which
+//! is why nothing here asks a tool its version — a test that probes for a
+//! capability is a test that can decide it has nothing to do, and this one
+//! covers a format the driver either reads or does not.
 
-// Only the repair check is wanted here — this oracle runs the tools on
-// this machine rather than through a guest — and a module included whole
-// is a module whose other helpers are unused in this binary.
-#[allow(dead_code)]
 mod common;
 
-use common::repair;
+use common::{parent_oracle, repair, Oracle};
 use fs_core::FileDevice;
 use fs_xfs::superblock::incompat;
 use fs_xfs::{Error, Filesystem};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
-fn tool(name: &str) -> PathBuf {
-    let path = match std::env::var_os("XFSPROGS_PARENT_BIN") {
-        Some(dir) => Path::new(&dir).join(name),
-        None => PathBuf::from(name),
-    };
-    let out = Command::new(&path)
-        .arg("-V")
-        .output()
-        .unwrap_or_else(|e| panic!("{}: {e}; install xfsprogs 6.10 or newer", path.display()));
-    let version = String::from_utf8_lossy(&out.stdout);
-    let (major, minor) = version
-        .rsplit(' ')
-        .next()
-        .and_then(|v| {
-            let mut parts = v.trim().split('.').map(|p| p.parse::<u32>().ok());
-            Some((parts.next()??, parts.next()??))
-        })
-        .unwrap_or_else(|| panic!("{}: unreadable version {version:?}", path.display()));
-    assert!(
-        (major, minor) >= (6, 10),
-        "{} is {major}.{minor}; parent pointers need xfsprogs 6.10 or newer \
-         (set XFSPROGS_PARENT_BIN to a directory holding one)",
-        path.display()
-    );
-    path
-}
-
-fn run(cmd: &mut Command) -> String {
-    let out = cmd.output().expect("run xfsprogs");
-    assert!(
-        out.status.success(),
-        "{cmd:?} failed:\n{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+/// Run one of the pinned tools in the guest, and return its stdout. A
+/// tool that fails here has been handed a volume it could not build or
+/// could not read, which is the finding, so both streams come with it.
+fn run(call: Oracle) -> String {
+    let out = call.output();
+    assert!(out.ok(), "xfsprogs failed:\n{}{}", out.stdout, out.stderr);
+    out.stdout
 }
 
 /// A volume made by `mkfs.xfs $args` from a protofile:
@@ -81,6 +49,13 @@ fn run(cmd: &mut Command) -> String {
 /// - `/top.txt`, with one (short form);
 /// - `/dir/link`, a symlink;
 /// - `/many/`, with 200 entries, which is past block form.
+///
+/// The protofile and the source files it names are handed to mkfs.xfs as
+/// paths, and mkfs.xfs reads them in the guest, so they have to be
+/// somewhere the guest has: `std::env::temp_dir()` is that, because
+/// `scripts/with-test-temp.sh` points TMPDIR at a directory inside this
+/// repository and the harness mounts the repository in the guest at the
+/// path the host knows it by.
 fn build(tag: &str, args: &[&str]) -> (PathBuf, Vec<u8>) {
     let dir = std::env::temp_dir().join(format!("fs-xfs-99-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -114,23 +89,27 @@ fn build(tag: &str, args: &[&str]) -> (PathBuf, Vec<u8>) {
         .unwrap()
         .set_len(300 * 1024 * 1024)
         .unwrap();
-    run(Command::new(tool("mkfs.xfs"))
+    run(parent_oracle("mkfs.xfs")
         .args(["-q", "-f"])
         .args(args)
         .arg("-p")
         .arg(&proto_path)
         .arg(&img));
 
-    let mut db = Command::new(tool("xfs_db"));
-    db.args(["-x", "-c", "path /dir/hello.txt"]);
+    let mut db = parent_oracle("xfs_db").args(["-x", "-c", "path /dir/hello.txt"]);
     for i in 0..30 {
-        db.args(["-c", &format!("attr_set -u name_{i:02} value_{i:02}")]);
+        db = db
+            .arg("-c")
+            .arg(format!("attr_set -u name_{i:02} value_{i:02}"));
     }
-    db.args(["-c", "path /top.txt", "-c", "attr_set -u colour red"]);
+    db = db.args(["-c", "path /top.txt", "-c", "attr_set -u colour red"]);
     run(db.arg(&img));
-    repair::assert_agreed_running(
-        tool("xfs_repair").to_str().expect("a path"),
-        img.to_str().expect("a path"),
+    // The pinned build, in the guest, and its report read as a verdict:
+    // a clean exit beside "valuable metadata changes in a log" is the
+    // tool declining to look, not this volume being sound (#124).
+    let out = parent_oracle("xfs_repair").arg("-n").arg(&img).output();
+    repair::assert_agreed(
+        &out.repair_report(),
         "the fixture this oracle grades against",
     );
     (dir, big_bytes)
@@ -139,16 +118,10 @@ fn build(tag: &str, args: &[&str]) -> (PathBuf, Vec<u8>) {
 /// How many attribute entries xfs_db sees on `path`, and how many of them
 /// are parent pointers.
 fn xfs_db_attr_counts(img: &Path, path: &str) -> (usize, usize) {
-    let out = run(Command::new(tool("xfs_db"))
-        .args([
-            "-r",
-            "-c",
-            &format!("path {path}"),
-            "-c",
-            "print core.aformat",
-            "-c",
-            "print a",
-        ])
+    let out = run(parent_oracle("xfs_db")
+        .args(["-r", "-c"])
+        .arg(format!("path {path}"))
+        .args(["-c", "print core.aformat", "-c", "print a"])
         .arg(img));
     if out.contains("core.aformat = 1 (local)") {
         let count = out
@@ -162,16 +135,10 @@ fn xfs_db_attr_counts(img: &Path, path: &str) -> (usize, usize) {
         return (count, parents);
     }
     // A leaf: one block, as 32 small entries are.
-    let leaf = run(Command::new(tool("xfs_db"))
-        .args([
-            "-r",
-            "-c",
-            &format!("path {path}"),
-            "-c",
-            "ablock 0",
-            "-c",
-            "print",
-        ])
+    let leaf = run(parent_oracle("xfs_db")
+        .args(["-r", "-c"])
+        .arg(format!("path {path}"))
+        .args(["-c", "ablock 0", "-c", "print"])
         .arg(img));
     let count = leaf
         .lines()
@@ -279,7 +246,6 @@ fn check_reads(tag: &str, args: &[&str], bits: u32) {
 }
 
 #[test]
-#[ignore = "needs xfsprogs 6.10 or newer"]
 fn a_parent_pointer_volume_reads_and_refuses_writes() {
     check_reads(
         "parent",
@@ -289,7 +255,6 @@ fn a_parent_pointer_volume_reads_and_refuses_writes() {
 }
 
 #[test]
-#[ignore = "needs xfsprogs 6.10 or newer"]
 fn an_exchange_range_volume_reads_and_refuses_writes() {
     check_reads("exchange", &["-i", "exchange=1"], incompat::EXCHRANGE);
 }

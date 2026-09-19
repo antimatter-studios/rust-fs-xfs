@@ -17,11 +17,16 @@
 //!   caller misdiagnoses: reporting EIO for a missing file sends a user
 //!   hunting for hardware faults.
 //!
-//! Fixtures are gitignored, so these skip cleanly on a fresh clone.
+//! The fixture these mount is built by `chore fixtures` and is always
+//! there; a checkout without it is a build that did not happen, so
+//! `common::fixture` fails and names the task rather than letting the
+//! suite return early and report ok.
+
+mod common;
 
 use fs_xfs::capi::*;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Errno values the ABI documents. Spelled out rather than imported so
 /// the test asserts the contract rather than mirroring the source.
@@ -31,28 +36,27 @@ const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const ERANGE: i32 = 34;
 
-fn fixture() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".vm-share")
-        .join("xfsdata-default.img");
-    p.exists().then_some(p)
-}
+/// The image every test here mounts. It holds the files these tests name
+/// — `/small.txt`, `/large.bin`, `/sub` — and nothing else in this suite
+/// knows how to make one.
+const IMAGE: &str = "xfsdata-default.img";
 
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap()
 }
 
-/// Mount the fixture, or `None` when it is absent.
-fn mount() -> Option<*mut fs_xfs_fs> {
-    let path = fixture()?;
+/// Mount the fixture. A missing image fails the test, naming the task
+/// that builds it, rather than returning nothing to test.
+fn mount() -> *mut fs_xfs_fs {
+    let path = common::fixture(IMAGE);
     let c = cstr(path.to_str().unwrap());
     let fs = unsafe { fs_xfs_mount(c.as_ptr()) };
     assert!(
         !fs.is_null(),
-        "mounting the fixture failed: {}",
+        "mounting .vm-share/{IMAGE} failed: {}",
         last_error()
     );
-    Some(fs)
+    fs
 }
 
 fn last_error() -> String {
@@ -75,10 +79,7 @@ fn zeroed_attr() -> fs_xfs_attr_t {
 
 #[test]
 fn mounts_and_reports_volume_info() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut info: fs_xfs_volume_info_t = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { fs_xfs_get_volume_info(fs, &mut info) }, 0);
 
@@ -104,10 +105,7 @@ fn mounts_and_reports_volume_info() {
 
 #[test]
 fn stats_a_file_and_a_directory() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
 
     let mut a = zeroed_attr();
     assert_eq!(
@@ -137,10 +135,7 @@ fn stats_a_file_and_a_directory() {
 /// otherwise a caller cannot tell a link from what it points at.
 #[test]
 fn stat_does_not_follow_symlinks() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut a = zeroed_attr();
     assert_eq!(
         unsafe { fs_xfs_stat(fs, cstr("/link-short").as_ptr(), &mut a) },
@@ -152,10 +147,7 @@ fn stat_does_not_follow_symlinks() {
 
 #[test]
 fn iterates_a_directory_to_completion() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let iter = unsafe { fs_xfs_dir_open(fs, cstr("/").as_ptr()) };
     assert!(!iter.is_null(), "opening the root failed: {}", last_error());
 
@@ -199,10 +191,7 @@ fn iterates_a_directory_to_completion() {
 /// exercises the block/leaf path through the ABI.
 #[test]
 fn iterates_a_large_directory() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let iter = unsafe { fs_xfs_dir_open(fs, cstr("/manyfiles").as_ptr()) };
     assert!(!iter.is_null(), "{}", last_error());
 
@@ -220,10 +209,7 @@ fn iterates_a_large_directory() {
 
 #[test]
 fn reads_file_contents() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0u8; 64];
     let n = unsafe {
         fs_xfs_read_file(
@@ -267,10 +253,7 @@ fn reads_file_contents() {
 
 #[test]
 fn reads_a_symlink_target() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0 as c_char; 512];
     let n = unsafe {
         fs_xfs_readlink(
@@ -295,10 +278,7 @@ fn reads_a_symlink_target() {
 /// EROFS driver, so the family agrees.
 #[test]
 fn readlink_refuses_a_buffer_too_small_for_the_target() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0x7F as c_char; 5];
     let n = unsafe {
         fs_xfs_readlink(
@@ -334,10 +314,7 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
 /// volume is damaged". Getting it wrong sends a user to the wrong place.
 #[test]
 fn a_missing_path_reports_enoent_not_eio() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut a = zeroed_attr();
     assert_eq!(
         unsafe { fs_xfs_stat(fs, cstr("/no-such-file").as_ptr(), &mut a) },
@@ -355,10 +332,7 @@ fn a_missing_path_reports_enoent_not_eio() {
 
 #[test]
 fn listing_a_file_reports_enotdir() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let iter = unsafe { fs_xfs_dir_open(fs, cstr("/small.txt").as_ptr()) };
     assert!(
         iter.is_null(),
@@ -370,10 +344,7 @@ fn listing_a_file_reports_enotdir() {
 
 #[test]
 fn reading_a_directory_as_a_file_reports_eisdir() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     let mut buf = [0u8; 16];
     let n = unsafe {
         fs_xfs_read_file(
@@ -465,10 +436,7 @@ fn null_pointers_fail_instead_of_crashing() {
 
 #[test]
 fn null_output_pointers_fail_instead_of_crashing() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     unsafe {
         assert_eq!(fs_xfs_get_volume_info(fs, std::ptr::null_mut()), -1);
         assert_eq!(
@@ -534,10 +502,7 @@ unsafe extern "C" fn ctx_read(
 
 #[test]
 fn mounts_over_a_caller_supplied_reader() {
-    let Some(img) = fixture() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let img = common::fixture(IMAGE);
     let ctx = Box::new(FileContext {
         bytes: std::fs::read(&img).unwrap(),
         fail: false,
@@ -617,10 +582,7 @@ fn last_error_is_never_null() {
 /// A non-UTF-8 path is rejected rather than misinterpreted.
 #[test]
 fn a_non_utf8_path_is_rejected() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     // 0xFF is not valid UTF-8 in any position.
     let bad = [b'/' as c_char, 0xFFu8 as c_char, 0];
     let mut attr = zeroed_attr();
@@ -644,11 +606,12 @@ const ENOTSUP: i32 = if cfg!(target_os = "macos") { 45 } else { 95 };
 struct WritableCopy(PathBuf);
 
 impl WritableCopy {
-    fn new(name: &str) -> Option<Self> {
-        let src = fixture()?;
+    fn new(name: &str) -> Self {
+        let src = common::fixture(IMAGE);
         let dst = src.with_file_name(name);
-        std::fs::copy(&src, &dst).ok()?;
-        Some(WritableCopy(dst))
+        std::fs::copy(&src, &dst)
+            .unwrap_or_else(|e| panic!("copying .vm-share/{IMAGE} to {name}: {e}"));
+        WritableCopy(dst)
     }
     fn open_rw(&self) -> *mut fs_xfs_fs {
         let c = cstr(self.0.to_str().unwrap());
@@ -671,10 +634,7 @@ impl Drop for WritableCopy {
 /// should still be stopped.
 #[test]
 fn a_read_only_handle_says_so_and_refuses() {
-    let Some(fs) = mount() else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let fs = mount();
     assert_eq!(unsafe { fs_xfs_is_writable(fs) }, 0);
 
     let data = b"nope";
@@ -694,10 +654,7 @@ fn a_read_only_handle_says_so_and_refuses() {
 
 #[test]
 fn a_read_write_handle_says_so() {
-    let Some(copy) = WritableCopy::new("xfscapi-rw.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-rw.img");
     let fs = copy.open_rw();
     assert_eq!(unsafe { fs_xfs_is_writable(fs) }, 1);
     unsafe { fs_xfs_umount(fs) };
@@ -706,10 +663,7 @@ fn a_read_write_handle_says_so() {
 /// A write through the ABI must be readable back through it.
 #[test]
 fn a_write_round_trips_through_the_abi() {
-    let Some(copy) = WritableCopy::new("xfscapi-write.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-write.img");
     let fs = copy.open_rw();
     let path = cstr("/large.bin");
     let payload = b"written through the C ABI";
@@ -747,10 +701,7 @@ fn a_write_round_trips_through_the_abi() {
 /// change, and the ABI must say which kind of refusal that is.
 #[test]
 fn writing_past_the_end_is_enotsup() {
-    let Some(copy) = WritableCopy::new("xfscapi-past-end.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-past-end.img");
     let fs = copy.open_rw();
     let data = b"beyond";
     let n = unsafe {
@@ -770,10 +721,7 @@ fn writing_past_the_end_is_enotsup() {
 /// Truncate through the ABI, and the size visible afterwards.
 #[test]
 fn a_truncate_is_visible_through_the_abi() {
-    let Some(copy) = WritableCopy::new("xfscapi-trunc.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-trunc.img");
     let fs = copy.open_rw();
     let path = cstr("/large.bin");
 
@@ -795,10 +743,7 @@ fn a_truncate_is_visible_through_the_abi() {
 /// in the arguments.
 #[test]
 fn growing_by_truncate_is_enotsup() {
-    let Some(copy) = WritableCopy::new("xfscapi-grow.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-grow.img");
     let fs = copy.open_rw();
     let rc = unsafe {
         fs_xfs_truncate(
@@ -817,10 +762,7 @@ fn growing_by_truncate_is_enotsup() {
 /// Attributes set through the ABI, and read back through it.
 #[test]
 fn attributes_round_trip_through_the_abi() {
-    let Some(copy) = WritableCopy::new("xfscapi-attrs.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-attrs.img");
     let fs = copy.open_rw();
     let path = cstr("/small.txt");
 
@@ -851,10 +793,7 @@ fn attributes_round_trip_through_the_abi() {
 /// by arithmetic.
 #[test]
 fn a_mode_with_type_bits_is_refused_through_the_abi() {
-    let Some(copy) = WritableCopy::new("xfscapi-badmode.img") else {
-        eprintln!("no fixture — skipping");
-        return;
-    };
+    let copy = WritableCopy::new("xfscapi-badmode.img");
     let fs = copy.open_rw();
     let rc = unsafe {
         fs_xfs_set_attributes(

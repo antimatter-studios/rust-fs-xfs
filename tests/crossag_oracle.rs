@@ -17,7 +17,7 @@
 //! 75 MB groups and a 100 MB file is all it takes.
 
 mod common;
-use common::{kernel_run, scratch, share};
+use common::{kernel_run, scratch};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -44,12 +44,8 @@ fn groups_of(fs: &Filesystem, path: &str) -> Vec<u32> {
 }
 
 /// Free the spanning file and let the kernel and the checker judge.
-fn case(name: &str) -> bool {
-    let source = share().join(format!("xfscrossag-{name}.img"));
-    if !source.exists() {
-        eprintln!("no xfscrossag-{name} fixture — skipping");
-        return false;
-    }
+fn case(name: &str) {
+    let source = common::fixture(&format!("xfscrossag-{name}.img"));
     let scratch_name = format!("xfs-crossag-{name}-scratch.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, &scratch_name);
     let image = scratch.guest();
@@ -118,14 +114,21 @@ fn case(name: &str) -> bool {
         "#
     );
 
-    let Some(out) = kernel_run(&script) else {
-        eprintln!("no kernel to replay the record — skipping the check");
-        return false;
-    };
+    // The replay always happens: the script runs in the harness guest,
+    // and a guest that cannot be reached is a failure rather than a
+    // reason to judge nothing.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "{name}: the kernel refused the filesystem after a cross-group free:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "{name}: the volume could not be unmounted, so the summary counters were \
+         never written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` \
+         for exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
     assert!(
         out.contains("EMPTIED"),
@@ -162,7 +165,6 @@ fn case(name: &str) -> bool {
         );
     }
     eprintln!("{name}: freed inode {ino} across groups {groups:?}");
-    true
 }
 
 /// A file across several groups is freed, and every group involved gets
@@ -172,17 +174,12 @@ fn a_file_across_groups_is_freed_into_all_of_them() {
     let mut ran = Vec::new();
     // With and without a reverse map: the map is the harder one, because
     // each group keeps its own and a record has to come out of each.
+    // BOTH CASES RUN. `chore fixtures` builds the crossag set in the
+    // harness guest, so a before-image that is not there is that build
+    // having failed rather than a geometry this machine cannot make.
     for name in ["plain", "rmap"] {
-        if case(name) {
-            ran.push(name);
-        }
-    }
-    if ran.is_empty() {
-        eprintln!(
-            "no xfscrossag fixtures — skipping. Build them with \
-             `sudo ./scripts/build-crossag-fixtures.sh` (needs xfsprogs, so Linux)."
-        );
-        return;
+        case(name);
+        ran.push(name);
     }
     eprintln!("freed across groups for: {ran:?}");
 }

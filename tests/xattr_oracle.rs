@@ -6,41 +6,25 @@
 //! a leaf holding remote values over several blocks. `attr_set` fills a value
 //! with `v`s to the length asked, and `xfs_db` itself reports which shape
 //! each fork took, so both the answer and the shape come from the reference
-//! tool. `xfs_repair -n` must accept the image first. Skips when xfsprogs is
-//! not installed.
+//! tool. `xfs_repair -n` must accept the image first.
+//!
+//! Every one of those tools runs in the fs-linux-test-harness guest, which
+//! always has them, so there is no "not installed" and nothing to skip: a
+//! shape the reference tool would not build is a fixture this test never
+//! got, not a reason to report ok.
 
-// Only the repair check is wanted here — this oracle runs the tools on
-// this machine rather than through a guest — and a module included whole
-// is a module whose other helpers are unused in this binary.
-#[allow(dead_code)]
 mod common;
 
-use common::repair;
+use common::oracle;
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::sync::Arc;
 
-fn xfsprogs() -> bool {
-    Command::new("mkfs.xfs")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 fn xfs_db(image: &str, args: &[String]) -> String {
-    let out = Command::new("xfs_db")
-        .args(args)
-        .arg(image)
-        .output()
-        .expect("xfs_db");
-    assert!(
-        out.status.success(),
-        "xfs_db {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    let out = oracle("xfs_db").args(args).arg(image).output();
+    assert!(out.ok(), "xfs_db {args:?}: {}{}", out.stdout, out.stderr);
+    out.stdout
 }
 
 /// `(namespace flag, on-disk name, value length)`.
@@ -83,10 +67,10 @@ fn plan() -> Vec<(&'static str, &'static str, Vec<Attr>)> {
 
 #[test]
 fn attributes_read_back_as_xfs_db_wrote_them() {
-    if !xfsprogs() {
-        eprintln!("skip: xfsprogs not installed");
-        return;
-    }
+    // The protofile, the file it copies in and the image all have to be
+    // where the guest can reach them, and they are:
+    // `scripts/with-test-temp.sh` points TMPDIR at a directory inside this
+    // repository, which is the tree the harness mounts in the guest.
     let root = std::env::temp_dir().join(format!("fs_xfs_xattr_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let empty = root.join("empty");
@@ -103,17 +87,12 @@ fn attributes_read_back_as_xfs_db_wrote_them() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(300 * 1024 * 1024))
         .unwrap();
-    let out = Command::new("mkfs.xfs")
+    let out = oracle("mkfs.xfs")
         .args(["-q", "-f", "-p"])
         .arg(root.join("proto"))
         .arg(&image)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .output();
+    assert!(out.ok(), "{}{}", out.stdout, out.stderr);
     let image = image.to_str().unwrap().to_string();
 
     let inos: BTreeMap<&str, u64> = {
@@ -134,7 +113,7 @@ fn attributes_read_back_as_xfs_db_wrote_them() {
         }
         xfs_db(&image, &args);
     }
-    repair::assert_agreed_running("xfs_repair", &image, "the fixture this oracle reads");
+    common::assert_xfs_repair_clean(&image, "the fixture this oracle reads");
 
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
     for (file, shape, attrs) in &plan {

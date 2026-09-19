@@ -16,17 +16,17 @@
 //! fast: the VM is only needed when fixtures are regenerated, not on
 //! every `cargo test`.
 //!
-//! Fixtures are gitignored and absent on a fresh clone, so this test
-//! skips rather than fails when `.vm-share` is empty. Generate them with:
-//!
-//! ```sh
-//! ./scripts/vm.sh up
-//! ./scripts/vm-build-fixtures.sh
-//! ```
+//! The fixtures are gitignored and generated: `chore fixtures` builds
+//! every image and its dumps in the harness guest. An empty `.vm-share`
+//! is that build not having happened, so this fails and names the task
+//! — a parser compared against no image at all passes just as quietly as
+//! one compared against every image.
+
+mod common;
 
 use fs_xfs::superblock::Superblock;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Parse an `xfs_db ... print` dump into a field map, normalising the
 /// numeric forms the debugger uses (plain decimal, or `0x`-prefixed hex).
@@ -50,25 +50,29 @@ fn parse_sbdump(text: &str) -> HashMap<String, u64> {
     map
 }
 
-/// Locate every `.img` in `.vm-share` that has a matching `.sbdump`.
+/// Every image in `.vm-share` that has a matching `.sbdump`.
+///
+/// The image and its dump are written by the same guest run, so a set
+/// with images but no dumps is that run having stopped between the two.
+/// Both that and an empty share are failures here: this suite's whole
+/// claim is that the parser was compared against the reference
+/// debugger, and it cannot be made against nothing.
 fn fixtures() -> Vec<(String, PathBuf, PathBuf)> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
-        let dump = p.with_extension("sbdump");
-        if dump.exists() {
+    let out: Vec<(String, PathBuf, PathBuf)> = common::fixtures_matching("xfs", ".img")
+        .into_iter()
+        .filter_map(|p| {
+            let dump = p.with_extension("sbdump");
             let name = p.file_stem().unwrap().to_string_lossy().into_owned();
-            out.push((name, p, dump));
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+            dump.is_file().then_some((name, p, dump))
+        })
+        .collect();
+    assert!(
+        !out.is_empty(),
+        "there are images in {} but not one has an .sbdump beside it, so there is \
+         nothing to compare this parser against. The dumps are written with the \
+         images: rebuild the set with `chore fixtures`.",
+        common::share().display()
+    );
     out
 }
 
@@ -90,10 +94,6 @@ fn expect(oracle: &HashMap<String, u64>, field: &str, ours: u64, label: &str, ch
 #[test]
 fn agrees_with_xfs_db_on_every_field() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures in .vm-share — run ./scripts/vm-build-fixtures.sh; skipping");
-        return;
-    }
 
     let mut total_fields = 0usize;
     for (label, img, dump) in &fixtures {
@@ -214,10 +214,6 @@ fn agrees_with_xfs_db_on_every_field() {
 #[test]
 fn ag_headers_parse_on_real_images() {
     let fixtures = fixtures();
-    if fixtures.is_empty() {
-        eprintln!("no fixtures in .vm-share — skipping");
-        return;
-    }
 
     for (label, img, _) in &fixtures {
         let bytes = std::fs::read(img).expect("read image");
@@ -266,8 +262,11 @@ fn real_ag_headers_reject_wrong_index() {
             .map(|sb| sb.agcount > 1)
             .unwrap_or(false)
     }) else {
-        eprintln!("no multi-AG fixture available — skipping");
-        return;
+        panic!(
+            "no fixture has more than one allocation group, so the identity check has \
+             nothing to be wrong about. The geometry set includes a four-group image; \
+             rebuild it with `chore fixtures`."
+        );
     };
 
     let bytes = std::fs::read(img).unwrap();
@@ -337,19 +336,11 @@ fn inode_offset(sb: &Superblock, ino: u64) -> usize {
 /// must match what xfs_db reports for the same inode.
 #[test]
 fn root_inode_agrees_with_xfs_db() {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        eprintln!("no .vm-share — skipping");
-        return;
-    };
-
     let mut examined = 0usize;
     let mut total_fields = 0usize;
-    for e in entries.flatten() {
-        let img = e.path();
-        if img.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    // Only the images whose dump was taken; the floor below is what says
+    // some of them were.
+    for img in common::fixtures_matching("xfs", ".img") {
         let dump_path = img.with_extension("inodedump");
         if !dump_path.exists() {
             continue;
@@ -442,12 +433,7 @@ fn root_inode_agrees_with_xfs_db() {
 /// is internally perfect and its checksum is valid.
 #[test]
 fn real_inode_rejects_wrong_number() {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let img = share.join("xfs-default.img");
-    if !img.exists() {
-        eprintln!("no xfs-default.img — skipping");
-        return;
-    }
+    let img = common::fixture("xfs-default.img");
     let bytes = std::fs::read(&img).unwrap();
     let sb = Superblock::parse(&bytes).unwrap();
     let off = inode_offset(&sb, sb.rootino);

@@ -37,12 +37,17 @@ const AT_LEAST: usize = 100;
 
 #[test]
 fn a_directory_takes_entries_after_it_leaves_the_inode() {
-    // No fixture directory means no fixture set here; the job that runs
-    // this builds them first.
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. `chore fixtures` makes it
+    // before anything else runs, and this test writes its scratch volume
+    // beside the fixtures. An absent share is that build not having
+    // happened, which has to be seen rather than skipped.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let scratch = scratch::Volume::empty(
         SUITE,
         &format!("{}.img", std::process::id()),
@@ -50,12 +55,9 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
     );
     let image = scratch.path().to_path_buf();
     let name = scratch.guest();
-    let Some(built) = kernel_run(&format!(
+    let built = kernel_run(&format!(
         "mkfs.xfs -q -f {name} 2>&1 && echo MKFS_OK; echo DONE"
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(built.contains("MKFS_OK"), "mkfs.xfs failed:\n{built}");
     let path = image.to_str().unwrap().to_string();
 
@@ -124,8 +126,7 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
         echo "REPAIR_END"
         echo DONE
         "#
-    ))
-    .expect("kernel");
+    ));
 
     assert!(
         out.contains("MOUNTED"),
