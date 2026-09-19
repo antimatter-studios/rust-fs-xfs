@@ -56,7 +56,18 @@ command -v cargo >/dev/null ||
 # skipped, and refuses one that executed fewer tests than its floor. A
 # guest run is the path a Mac takes to reach these tests at all, so it is
 # the last place that should be graded more loosely than the rest.
+#
+# WITH THE SELECTION `chore test` USES when the caller names none: every
+# suite but the stress corpus, which `chore fixtures` does not build. A
+# bare `cargo test` here selected that corpus too, and the Mac path — the
+# only way a Mac reaches these tests — failed on three images nothing had
+# built.
 echo "== in-guest suite: $(uname -srm), $(cargo --version)"
 started=$(date +%s)
-scripts/ci-test.sh "$@"
+if [ "$#" -gt 0 ]; then
+    scripts/ci-test.sh "$@"
+else
+    # shellcheck disable=SC2046  # the words are the point
+    scripts/ci-test.sh $(scripts/test-targets.sh all)
+fi
 echo "== in-guest suite: $(( $(date +%s) - started ))s"

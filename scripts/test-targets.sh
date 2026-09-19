@@ -12,6 +12,8 @@
 #   oracle  every tests/*.rs that runs an xfsprogs tool (in the guest)
 #   kernel  every tests/*.rs that asks the real kernel to mount, replay
 #           or write (in the guest)
+#   all     every suite `chore test` runs: the four tiers together, which
+#           is every tests/*.rs EXCEPT the stress corpus
 #
 # DERIVED FROM THE TESTS THEMSELVES, not from a list someone has to keep.
 # The old arrangement was that list: ci.yml named thirty-two suites in a
@@ -124,6 +126,14 @@ for f in "$REPO"/tests/*.rs; do
             fi
             ;;
         stress) is_stress "$name" && args+=(--test "$name") ;;
+        # "EVERYTHING" IS NOT `cargo test` WITH NO ARGUMENTS, and that is
+        # the whole of what this selection exists to say. A bare run also
+        # selects tests/stress_oracle.rs, whose corpus `chore fixtures`
+        # deliberately does not build — so the two runs that are meant to
+        # be everything failed on three missing images instead:
+        # `chore test:native`'s release pass, and the in-guest suite,
+        # which is how a Mac reaches these tests at all.
+        all) is_stress "$name" || args+=(--test "$name") ;;
         oracle)
             if printf '%s\n' "$calls" | grep -qE "$TOOL" &&
                ! printf '%s\n' "$calls" | grep -qE "$KERNEL"; then
@@ -131,10 +141,10 @@ for f in "$REPO"/tests/*.rs; do
             fi
             ;;
         kernel) printf '%s\n' "$calls" | grep -qE "$KERNEL" && args+=(--test "$name") ;;
-        *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel" >&2; exit 2 ;;
+        *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|all" >&2; exit 2 ;;
     esac
 done
 case "$tier" in
-    unit) printf '%s\n' --lib --bins "${args[@]}" ;;
+    unit|all) printf '%s\n' --lib --bins "${args[@]}" ;;
     *) printf '%s\n' "${args[@]}" ;;
 esac

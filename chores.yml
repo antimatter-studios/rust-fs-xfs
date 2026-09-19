@@ -440,7 +440,7 @@ tasks:
       - task: test:oracle
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'scripts/tier.sh "test:native (whole suite, release)" suite 3200 197000 -- scripts/ci-test.sh'
+      - 'scripts/tier.sh "test:native (whole suite, release)" suite 3200 197000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
       - task: test:scripts
       # THE LAST LINE: one number across the tiers, and where the detail is.
       - scripts/test-verdict.sh unit oracle kernel suite

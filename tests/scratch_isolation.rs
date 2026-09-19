@@ -17,9 +17,6 @@
 //! them already placing the image somewhere safe and the rest not — so
 //! what this pins is that there is one of them.
 
-// Only `share` and the scratch helper are wanted here; the rest of the
-// module is unused in this binary rather than unused.
-#[allow(dead_code)]
 mod common;
 
 use common::{scratch, share};

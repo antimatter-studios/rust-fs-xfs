@@ -43,9 +43,28 @@ case " ${CLI_ARGS:-} " in
     *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
 esac
 
-exec "$BUDGET" \
+# HOW MANY TESTS THIS TIER ACTUALLY EXECUTED, on the verdict line.
+#
+# The count is in the log, which is where a quiet run puts everything —
+# so the one number that says whether the tier still runs anything was
+# the one number nobody could see in CI without downloading the log.
+# It is what the floors in chores.yml are measured from, and a tier
+# shrinking is visible in nothing else: a suite that stopped being
+# selected, a filter that matched nothing and a build that produced no
+# test binary all print the same green.
+#
+# Printed after the budget's own verdict and only on a pass; a failure
+# already prints the tail of the log, which holds the count too.
+"$BUDGET" \
     --log "$REPO/tmp/logs/$LOG_NAME.log" \
     --max-lines "$MAX_LINES" \
     --max-bytes "$MAX_BYTES" \
     --label "$LABEL" \
     -- "$@"
+status=$?
+if [ "$status" -eq 0 ]; then
+    awk -v label="$LABEL" \
+        '/^test result: ok\./ { n += $4 } END { printf "%s: %d tests executed\n", label, n + 0 }' \
+        "$REPO/tmp/logs/$LOG_NAME.log"
+fi
+exit "$status"

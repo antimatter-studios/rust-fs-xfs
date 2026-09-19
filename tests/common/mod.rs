@@ -607,11 +607,6 @@ pub fn fixtures_matching(prefix: &str, suffix: &str) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------
 
 /// Asking `xfs_repair` about a volume, and reading the answer.
-///
-/// `allow(dead_code)`: this module is compiled into every test binary
-/// that says `mod common;`, including the ones that never run the tool,
-/// and unused here means unused *in that binary* rather than unused.
-#[allow(dead_code)]
 pub mod repair {
     /// What `xfs_repair` said it was doing when it was asked about an
     /// image whose log had not been replayed.
@@ -719,11 +714,6 @@ pub mod repair {
 // ---------------------------------------------------------------------
 
 /// An image a suite writes to, kept away from the fixtures.
-///
-/// `allow(dead_code)`: compiled into every test binary that says
-/// `mod common;`, including the read-only ones that never make a scratch
-/// volume.
-#[allow(dead_code)]
 pub mod scratch {
     use super::share;
     use std::path::{Path, PathBuf};
