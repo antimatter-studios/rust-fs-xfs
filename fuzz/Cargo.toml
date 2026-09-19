@@ -1,0 +1,113 @@
+[package]
+name = "fs-xfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The explorer half of the fuzzing setup. The gate half is
+# tests/fuzz_decoders.rs in the parent crate, which replays and mutates
+# the same corpus on the stable toolchain -- see that file's header for
+# why the work is split in two.
+#
+# Run one target:
+#   cargo +nightly fuzz run superblock -- -max_total_time=60
+# Run all of them, which is what CI does:
+#   scripts/fuzz-all.sh 60
+
+[dependencies]
+libfuzzer-sys = "0.4"
+am-fs-xfs = { path = ".." }
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agf"
+path = "fuzz_targets/agf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agi"
+path = "fuzz_targets/agi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agfl"
+path = "fuzz_targets/agfl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inode"
+path = "fuzz_targets/inode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_dinode"
+path = "fuzz_targets/log_dinode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dir_data_block"
+path = "fuzz_targets/dir_data_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dir_block_form"
+path = "fuzz_targets/dir_block_form.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dir_leaf"
+path = "fuzz_targets/dir_leaf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dir_node"
+path = "fuzz_targets/dir_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btree_leaf"
+path = "fuzz_targets/btree_leaf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bmbt"
+path = "fuzz_targets/bmbt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extent_list"
+path = "fuzz_targets/extent_list.rs"
+test = false
+doc = false
+bench = false
