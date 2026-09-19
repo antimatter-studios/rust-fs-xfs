@@ -33,33 +33,18 @@
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volumes live: under
+/// `.vm-share/scratch/`, not beside the fixtures another suite is
+/// reading while this one writes (#223).
+const SUITE: &str = "unlink_replay_oracle";
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Scratch(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Remove the victim from a copy of `case`'s before-image, then have the
 /// kernel replay the record.
 fn unlink_and_replay(case: &str) -> Option<()> {
@@ -68,7 +53,8 @@ fn unlink_and_replay(case: &str) -> Option<()> {
         return None;
     }
     let name = format!("xfs-unlink-{case}-scratch.img");
-    let scratch = Scratch::from(&source, &name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, &name);
+    let image = scratch.guest();
     let img = scratch.path();
 
     let removed = {
@@ -99,7 +85,7 @@ fn unlink_and_replay(case: &str) -> Option<()> {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp {image} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
@@ -202,7 +188,7 @@ fn what_it_will_not_do_is_refused() {
 
     // A name that is not there.
     {
-        let scratch = Scratch::from(&source, "xfs-unlink-missing-scratch.img");
+        let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-unlink-missing-scratch.img");
         let dev = FileDevice::open_rw(scratch.path()).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
         let root = fs.superblock().rootino;
@@ -217,7 +203,7 @@ fn what_it_will_not_do_is_refused() {
 
     // A directory, which has `.` and `..` to account for.
     {
-        let scratch = Scratch::from(&source, "xfs-unlink-dir-scratch.img");
+        let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-unlink-dir-scratch.img");
         let dev = FileDevice::open_rw(scratch.path()).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
         let root = fs.superblock().rootino;

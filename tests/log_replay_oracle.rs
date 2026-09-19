@@ -44,7 +44,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volumes live: under
+/// `.vm-share/scratch/`, not beside the fixtures another suite is
+/// reading while this one writes (#223).
+const SUITE: &str = "log_replay_oracle";
 
 /// `di_mode` within the inode core, big-endian on disk.
 const DI_MODE: usize = 2;
@@ -62,25 +67,6 @@ const PERM_BITS: u16 = 0o7777;
 /// scope — including on a panic. Every other suite here treats each
 /// `.img` in that directory as a fixture to check, so one left behind
 /// fails unrelated tests.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Scratch(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 fn fixture(name: &str) -> Option<PathBuf> {
     let p = share().join(name);
     p.exists().then_some(p)
@@ -106,7 +92,7 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
         eprintln!("no xfs-default fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-log-replay.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-log-replay.img");
     let img = scratch.path();
 
     // Log a core that differs from the one on disk in exactly one field.
@@ -176,9 +162,10 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
     // assertions below as output, together with what the kernel said
     // about it, rather than killing the script and looking like an
     // unavailable VM.
-    let script = r#"
+    let script = format!(
+        r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/xfs-log-replay.img "$img"
+        cp {source} "$img"
         dmesg -C >/dev/null 2>&1
         mnt=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$mnt"; then
@@ -195,8 +182,10 @@ fn the_kernel_replays_a_record_this_driver_wrote() {
         rm -f "$img"
         echo "DONE"
         echo DONE
-        "#;
-    let Some(out) = kernel_run(script) else {
+        "#,
+        source = scratch.guest(),
+    );
+    let Some(out) = kernel_run(&script) else {
         eprintln!("oracle VM unavailable — skipping verification");
         return;
     };
@@ -228,7 +217,7 @@ fn a_read_only_mount_refuses_to_log() {
         eprintln!("no xfs-default fixture — skipping");
         return;
     };
-    let scratch = Scratch::from(&source, "xfs-log-replay-ro.img");
+    let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-log-replay-ro.img");
     let img = scratch.path();
 
     let dev = FileDevice::open(img).expect("open read-only");

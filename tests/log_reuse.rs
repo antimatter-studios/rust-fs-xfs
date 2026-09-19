@@ -17,7 +17,12 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volume lives, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "log_reuse";
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -36,31 +41,6 @@ const MOST_OPERATIONS: u32 = 120_000;
 /// What this driver holds in memory before it pushes, from `fs.rs`.
 const MAX_DIRTY_BYTES: usize = 16 * 1024 * 1024;
 
-struct Scratch {
-    image: std::path::PathBuf,
-}
-
-impl Scratch {
-    /// IN A DIRECTORY OF ITS OWN, not beside the fixtures. Cargo runs test
-    /// binaries at the same time, and the suites that scan the share take
-    /// every `.img` in it for a fixture — so a scratch image sitting there
-    /// while this test writes to it fails them with a dirty log. A
-    /// subdirectory is not an `.img`, so their scans pass it by.
-    fn new(image: std::path::PathBuf) -> Self {
-        std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
-        Scratch { image }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.image);
-        if let Some(dir) = self.image.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-}
-
 #[test]
 fn a_mount_writes_past_the_end_of_the_log() {
     // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
@@ -72,17 +52,18 @@ fn a_mount_writes_past_the_end_of_the_log() {
         eprintln!("no .vm-share — skipped");
         return;
     }
-    let name = format!("log-reuse/log-reuse-{}.img", std::process::id());
-    let image = share().join(&name);
-    let _scratch = Scratch::new(image.clone());
-    std::fs::File::create(&image)
-        .and_then(|f| f.set_len(320 * 1024 * 1024))
-        .unwrap();
+    let scratch = scratch::Volume::empty(
+        SUITE,
+        &format!("{}.img", std::process::id()),
+        320 * 1024 * 1024,
+    );
+    let image = scratch.path().to_path_buf();
+    let name = scratch.guest();
     let built = kernel_run(&format!(
         r#"
-        mkfs.xfs -q -f /share/{name} 2>&1 && echo MKFS_OK
+        mkfs.xfs -q -f {name} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
-        mount -o loop /share/{name} "$m" && echo MOUNT_OK
+        mount -o loop {name} "$m" && echo MOUNT_OK
         for d in $(seq 0 {last}); do mkdir "$m/d$d"; done
         umount "$m"
         rmdir "$m"
@@ -163,7 +144,7 @@ fn a_mount_writes_past_the_end_of_the_log() {
     let out = kernel_run(&format!(
         r#"
         m=$(mktemp -d)
-        if mount -o loop,nouuid /share/{name} "$m"; then
+        if mount -o loop,nouuid {name} "$m"; then
             echo "KEPT $(find "$m" -name 'kept*' | wc -l)"
             echo "LEFTOVER $(find "$m" -name 'f0*' | wc -l)"
             umount "$m"
@@ -174,7 +155,7 @@ fn a_mount_writes_past_the_end_of_the_log() {
         fi
         rmdir "$m"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n {name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
         echo DONE
         "#

@@ -32,11 +32,15 @@
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volumes live, under `.vm-share/scratch/`
+/// rather than beside the fixtures other suites are reading (#223).
+const SUITE: &str = "file_write_replay_oracle";
 
 /// The file the fixtures leave empty, which this one fills.
 const VICTIM: &str = "/victim";
@@ -44,25 +48,6 @@ const VICTIM: &str = "/victim";
 /// A working image in the shared folder, removed when it goes out of
 /// scope. Every other suite treats each `.img` there as a fixture, so
 /// one left behind fails unrelated tests.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Scratch(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Contents that cannot be mistaken for anything already on the
 /// filesystem.
 ///
@@ -84,8 +69,7 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
     if !source.exists() {
         return None;
     }
-    let name = format!("xfs-write-{case}-scratch.img");
-    let scratch = Scratch::from(&source, &name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, &format!("{case}.img"));
     let img = scratch.path();
 
     let data = payload(bytes);
@@ -134,7 +118,7 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp {source} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
@@ -158,7 +142,8 @@ fn write_and_replay(case: &str, bytes: usize) -> Option<()> {
         echo "REPAIR_END"
         rm -f "$img"
         echo "DONE"
-        "#
+        "#,
+        source = scratch.guest(),
     );
 
     let out = kernel_run(&script)?;

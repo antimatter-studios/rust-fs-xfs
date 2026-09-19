@@ -31,34 +31,19 @@
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, scratch, share};
+
+/// Where this suite's scratch volumes live: under
+/// `.vm-share/scratch/`, not beside the fixtures another suite is
+/// reading while this one writes (#223).
+const SUITE: &str = "create_replay_oracle";
 
 /// A working image in the shared folder, removed when it goes out of
 /// scope. Every other suite treats each `.img` there as a fixture, so
 /// one left behind fails unrelated tests.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Scratch(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Create a file in a copy of `case`'s before-image, then have the
 /// kernel replay the record.
 ///
@@ -73,7 +58,8 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
         return None;
     }
     let name = format!("xfs-create-{case}-scratch.img");
-    let scratch = Scratch::from(&source, &name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, &name);
+    let image = scratch.guest();
     let img = scratch.path();
 
     let mut created = Vec::new();
@@ -147,7 +133,7 @@ fn create_and_replay(case: &str, names: &[&str]) -> Option<()> {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp {image} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
@@ -301,7 +287,8 @@ fn chunk_case(case: &str) -> bool {
     }
     let name = format!("xfs-create-{case}-scratch.img");
     let name = name.as_str();
-    let scratch = Scratch::from(&source, name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, name);
+    let image = scratch.guest();
 
     let (before_free, root) = {
         let fs = Filesystem::mount(Arc::new(FileDevice::open(scratch.path()).expect("open")))
@@ -331,7 +318,7 @@ fn chunk_case(case: &str) -> bool {
         # test then reads back. The other scripts here work on a copy to
         # keep a fixture pristine; this one is already a scratch, and the
         # replay is the point.
-        if mount -o loop,nouuid /share/{name} "$m"; then
+        if mount -o loop,nouuid {image} "$m"; then
             [ -e "$m/needsachunk" ] && echo "PRESENT" || echo "MISSING"
             # The inode has to be usable, not merely listed. `touch`
             # rather than a write: writing would ALLOCATE, and this test
@@ -349,7 +336,7 @@ fn chunk_case(case: &str) -> bool {
         # The checker runs on a copy on local storage: it wants the host
         # filesystem's geometry and gets ENOTDIR from the share.
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp {image} "$img"
         # RETRY IF THE LOG DID NOT GO IN. Mounting replays it; when that
         # does not happen, xfs_repair describes an unreplayed log instead
         # and warns that what follows is spurious --
@@ -455,7 +442,8 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         return;
     }
     let name = "xfs-mkdir-scratch.img";
-    let scratch = Scratch::from(&source, name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, name);
+    let image = scratch.guest();
     let img = scratch.path();
 
     let (made, parent_nlink_before) = {
@@ -473,7 +461,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp {image} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
@@ -623,7 +611,8 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
         return;
     }
     let name = "xfs-dirconv-scratch.img";
-    let scratch = Scratch::from(&source, name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, name);
+    let image = scratch.guest();
     let img = scratch.path();
 
     // What the directory held before, so the check afterwards knows what
@@ -695,7 +684,7 @@ fn the_kernel_uses_a_directory_this_driver_converted() {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
-        cp /share/{name} "$img"
+        cp {image} "$img"
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then

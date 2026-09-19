@@ -16,7 +16,12 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volume lives, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "block_form_insert";
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -30,17 +35,6 @@ const TRIES: u32 = 300;
 /// rather than a smaller pass.
 const AT_LEAST: usize = 100;
 
-struct Scratch(std::path::PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        if let Some(dir) = self.0.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-}
-
 #[test]
 fn a_directory_takes_entries_after_it_leaves_the_inode() {
     // No fixture directory means no fixture set here; the job that runs
@@ -49,15 +43,15 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
         eprintln!("no .vm-share — skipped");
         return;
     }
-    let name = format!("block-insert/block-insert-{}.img", std::process::id());
-    let image = share().join(&name);
-    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
-    let _scratch = Scratch(image.clone());
-    std::fs::File::create(&image)
-        .and_then(|f| f.set_len(320 * 1024 * 1024))
-        .unwrap();
+    let scratch = scratch::Volume::empty(
+        SUITE,
+        &format!("{}.img", std::process::id()),
+        320 * 1024 * 1024,
+    );
+    let image = scratch.path().to_path_buf();
+    let name = scratch.guest();
     let Some(built) = kernel_run(&format!(
-        "mkfs.xfs -q -f /share/{name} 2>&1 && echo MKFS_OK; echo DONE"
+        "mkfs.xfs -q -f {name} 2>&1 && echo MKFS_OK; echo DONE"
     )) else {
         eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
         return;
@@ -109,7 +103,7 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
     let out = kernel_run(&format!(
         r#"
         m=$(mktemp -d)
-        if mount -o loop,nouuid /share/{name} "$m"; then
+        if mount -o loop,nouuid {name} "$m"; then
             echo "COUNT $(ls "$m/d" | wc -l)"
             echo "FIRST $(stat -c %i "$m/d/entry_0000")"
             echo "LAST $(stat -c %i "$m/d/$(ls "$m/d" | sort | tail -1)")"
@@ -122,7 +116,7 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
         fi
         rmdir "$m"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n {name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
         echo DONE
         "#

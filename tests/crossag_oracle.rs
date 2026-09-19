@@ -17,31 +17,16 @@
 //! 75 MB groups and a 100 MB file is all it takes.
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, scratch, share};
+
+/// Where this suite's scratch volumes live: under
+/// `.vm-share/scratch/`, not beside the fixtures another suite is
+/// reading while this one writes (#223).
+const SUITE: &str = "crossag_oracle";
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn from(source: &Path, name: &str) -> Self {
-        let path = share().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Self(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 /// Which groups a file's extents are in.
 fn groups_of(fs: &Filesystem, path: &str) -> Vec<u32> {
@@ -66,7 +51,8 @@ fn case(name: &str) -> bool {
         return false;
     }
     let scratch_name = format!("xfs-crossag-{name}-scratch.img");
-    let scratch = Scratch::from(&source, &scratch_name);
+    let scratch = scratch::Volume::copy_of(SUITE, &source, &scratch_name);
+    let image = scratch.guest();
 
     let (ino, groups, free_before) = {
         let fs = Filesystem::mount(Arc::new(FileDevice::open(scratch.path()).expect("open")))
@@ -102,7 +88,7 @@ fn case(name: &str) -> bool {
         m=$(mktemp -d)
         mounted=0
         for attempt in 1 2 3; do
-            if mount -o loop,nouuid /share/{scratch_name} "$m"; then
+            if mount -o loop,nouuid {image} "$m"; then
                 [ "$(stat -c%s "$m/spanning")" = 0 ] && echo "EMPTIED" || echo "NOT_EMPTIED"
                 # The file that was inside one group has to be untouched.
                 [ "$(stat -c%s "$m/withingroup")" = 262144 ] && echo "NEIGHBOUR_OK" || echo "NEIGHBOUR_CHANGED"
@@ -110,7 +96,7 @@ fn case(name: &str) -> bool {
                 mounted=$((mounted + 1))
             fi
             check=$(mktemp -u /tmp/repair-XXXXXX.img)
-            cp /share/{scratch_name} "$check"
+            cp {image} "$check"
             out=$(xfs_repair -n "$check" 2>&1) && rc=0 || rc=$?
             rm -f "$check"
             case "$out" in

@@ -17,38 +17,18 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volume lives, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "many_ops_per_mount";
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
 
 /// Removes the image however the test ends, and the share if this made it:
 /// every suite reads each `.img` there as a fixture.
-struct Scratch {
-    image: std::path::PathBuf,
-}
-
-impl Scratch {
-    /// IN A DIRECTORY OF ITS OWN, not beside the fixtures. Cargo runs test
-    /// binaries at the same time, and the suites that scan the share take
-    /// every `.img` in it for a fixture — so a scratch image sitting there
-    /// while this test writes to it fails them with a dirty log. A
-    /// subdirectory is not an `.img`, so their scans pass it by.
-    fn new(image: std::path::PathBuf) -> Self {
-        std::fs::create_dir_all(image.parent().expect("the image has a directory")).unwrap();
-        Scratch { image }
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.image);
-        if let Some(dir) = self.image.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-}
-
 #[test]
 fn a_mount_writes_several_journalled_operations() {
     // NO FIXTURE DIRECTORY MEANS NO FIXTURE SET. This builds its own
@@ -60,14 +40,15 @@ fn a_mount_writes_several_journalled_operations() {
         eprintln!("no .vm-share — skipped");
         return;
     }
-    let name = format!("many-ops/many-ops-{}.img", std::process::id());
-    let image = share().join(&name);
-    let _scratch = Scratch::new(image.clone());
-    std::fs::File::create(&image)
-        .and_then(|f| f.set_len(320 * 1024 * 1024))
-        .unwrap();
+    let scratch = scratch::Volume::empty(
+        SUITE,
+        &format!("{}.img", std::process::id()),
+        320 * 1024 * 1024,
+    );
+    let image = scratch.path().to_path_buf();
+    let name = scratch.guest();
     let Some(mkfs) = kernel_run(&format!(
-        "mkfs.xfs -q -f /share/{name} 2>&1 && echo MKFS_OK; echo DONE"
+        "mkfs.xfs -q -f {name} 2>&1 && echo MKFS_OK; echo DONE"
     )) else {
         eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
         return;
@@ -108,7 +89,7 @@ fn a_mount_writes_several_journalled_operations() {
     let out = kernel_run(&format!(
         r#"
         m=$(mktemp -d)
-        if mount -o loop,nouuid /share/{name} "$m"; then
+        if mount -o loop,nouuid {name} "$m"; then
             echo "ROOT $(ls "$m" | sort | tr '\n' ' ')"
             echo "DIR $(ls "$m/d" 2>&1 | sort | tr '\n' ' ')"
             echo "SIZE $(stat -c %s "$m/d/renamed")"
@@ -121,7 +102,7 @@ fn a_mount_writes_several_journalled_operations() {
         fi
         rmdir "$m"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /share/{name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n {name} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
         echo DONE
         "#

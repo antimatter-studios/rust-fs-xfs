@@ -23,7 +23,12 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
+
+/// Where this suite's scratch volumes live, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "dirty_log_mount";
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::Filesystem;
 use std::sync::Arc;
@@ -44,19 +49,6 @@ const REUSED: u32 = 40;
 /// exist in the log and nowhere else, so a driver that does not replay
 /// cannot see one of them.
 const UNFLUSHED: u32 = 50;
-
-struct Scratch(Vec<std::path::PathBuf>);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = std::fs::remove_file(path);
-        }
-        if let Some(dir) = self.0.first().and_then(|p| p.parent()) {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
-}
 
 /// One line per name, in the shape the guest prints: `D <path>`,
 /// `F <path> <size> <md5>`, `L <path> <target>`.
@@ -189,16 +181,11 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         return;
     }
     let pid = std::process::id();
-    let dirty = format!("dirty-log/dirty-{pid}.img");
-    let replayed = format!("dirty-log/replayed-{pid}.img");
-    let image = share().join(&dirty);
-    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
-    let _scratch = Scratch(vec![image.clone(), share().join(&replayed)]);
-    for name in [&dirty, &replayed] {
-        std::fs::File::create(share().join(name))
-            .and_then(|f| f.set_len(400 * 1024 * 1024))
-            .unwrap();
-    }
+    let crashed = scratch::Volume::empty(SUITE, &format!("dirty-{pid}.img"), 400 * 1024 * 1024);
+    let copy = scratch::Volume::empty(SUITE, &format!("replayed-{pid}.img"), 400 * 1024 * 1024);
+    let image = crashed.path().to_path_buf();
+    let dirty = crashed.guest();
+    let replayed = copy.guest();
 
     // THE CRASH IS `shutdown -f`: the log is flushed and the filesystem
     // is stopped before anything checkpoints it, which is the state a
@@ -206,9 +193,9 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
     let Some(built) = kernel_run(&format!(
         r#"
         export LC_ALL=C
-        mkfs.xfs -q -f /share/{dirty} 2>&1 && echo MKFS_OK
+        mkfs.xfs -q -f {dirty} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
-        mount -o loop /share/{dirty} "$m" && echo MOUNT_OK
+        mount -o loop {dirty} "$m" && echo MOUNT_OK
         mkdir "$m/settled"
         for i in $(seq 0 {settled_last}); do
             printf 'settled %04d\n' $i > "$m/settled/settled_$(printf %04d $i)"
@@ -257,9 +244,9 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         exec 9<&-
         umount "$m" || umount -l "$m"
         rmdir "$m"
-        cp /share/{dirty} /share/{replayed}
+        cp {dirty} {replayed}
         m2=$(mktemp -d)
-        if mount -o loop,nouuid /share/{replayed} "$m2"; then
+        if mount -o loop,nouuid {replayed} "$m2"; then
             echo REPLAY_MOUNT_OK
             cd "$m2"
             find . -mindepth 1 | sort | while read -r p; do
@@ -276,7 +263,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
         fi
         rmdir "$m2"
         echo "REPAIR_BEGIN"
-        xfs_repair -n /share/{replayed} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
+        xfs_repair -n {replayed} 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
         echo DONE
         "#,

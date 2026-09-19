@@ -24,7 +24,7 @@
 
 mod common;
 
-use common::{kernel_run, repair, share};
+use common::{kernel_run, repair, scratch, share};
 
 /// The oracles this rule is about: every test that asks `xfs_repair` for
 /// a verdict has to read the answer through the shared check.
@@ -77,19 +77,18 @@ fn a_report_from_an_unreplayed_log_is_refused() {
         eprintln!("no .vm-share — skipped");
         return;
     }
-    let name = format!("repair-verdict/dirty-{}.img", std::process::id());
-    let image = share().join(&name);
-    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
-    let _scratch = Scratch(image.clone());
-    std::fs::File::create(&image)
-        .and_then(|f| f.set_len(300 * 1024 * 1024))
-        .unwrap();
+    let volume = scratch::Volume::empty(
+        "repair_verdict",
+        &format!("{}.img", std::process::id()),
+        300 * 1024 * 1024,
+    );
+    let name = volume.guest();
 
     let Some(out) = kernel_run(&format!(
         r#"
-        mkfs.xfs -q -f /share/{name} 2>&1 && echo MKFS_OK
+        mkfs.xfs -q -f {name} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
-        mount -o loop /share/{name} "$m" && echo MOUNT_OK
+        mount -o loop {name} "$m" && echo MOUNT_OK
         for i in $(seq 0 199); do : > "$m/f_$i"; done
         xfs_io -x -c 'shutdown -f' "$m" && echo SHUTDOWN_OK
         umount "$m" || umount -l "$m"
@@ -97,7 +96,7 @@ fn a_report_from_an_unreplayed_log_is_refused() {
         {repair}
         echo DONE
         "#,
-        repair = repair::script(&format!("/share/{name}")),
+        repair = repair::script(&name),
     )) else {
         eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
         return;
@@ -113,15 +112,4 @@ fn a_report_from_an_unreplayed_log_is_refused() {
         "xfs_repair was asked about an unreplayed log and the check accepted its \
          answer:\n{out}"
     );
-}
-
-struct Scratch(std::path::PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        if let Some(dir) = self.0.parent() {
-            let _ = std::fs::remove_dir(dir);
-        }
-    }
 }

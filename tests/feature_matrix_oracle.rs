@@ -30,12 +30,17 @@
 //! reasoning about the format.
 
 mod common;
-use common::{kernel_run, share};
+use common::{kernel_run, scratch, share};
+
+/// Where this suite's scratch volumes live, under
+/// `.vm-share/scratch/`, out of reach of the suites that scan the
+/// fixtures beside them (#223).
+const SUITE: &str = "feature_matrix_oracle";
 
 use fs_core::FileDevice;
 use fs_xfs::write::AttrChange;
 use fs_xfs::{Error, Filesystem};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// A copy of a fixture, removed when it goes out of scope.
@@ -50,31 +55,6 @@ use std::sync::Arc;
 /// `read_dir` does not recurse, so a subdirectory is invisible to them.
 /// The VM sees it as `/share/scratch` for the same reason it sees the
 /// rest: the share is mounted whole.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn dir() -> PathBuf {
-        let d = share().join("scratch");
-        std::fs::create_dir_all(&d).expect("make the scratch directory");
-        d
-    }
-
-    fn from(source: &Path, name: &str) -> Self {
-        let path = Self::dir().join(name);
-        std::fs::copy(source, &path).expect("copy the fixture");
-        Self(path)
-    }
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// The rows, named as `build-feature-matrix-fixtures.sh` writes them.
 const COMBOS: &[&str] = &[
     "v4",
@@ -304,11 +284,11 @@ fn exercise(img: &Path, op: &str) -> Outcome {
 
     // The kernel replays what was logged, then the checker judges. Both
     // are the reference implementation; neither is this repository.
-    let name = img.file_name().unwrap().to_string_lossy().into_owned();
+    let image = scratch::guest_path(img);
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/feat-XXXXXX.img)
-        cp /share/scratch/{name} "$img"
+        cp {image} "$img"
         m=$(mktemp -d)
 
         # MOUNT, CHECK, AND RETRY IF THE LOG DID NOT GO IN.
@@ -374,7 +354,11 @@ fn every_feature_combination_is_written_correctly_or_refused() {
             // A fresh copy per operation: the previous one may have
             // left a record in the log, and the next must start from
             // the filesystem as mkfs made it.
-            let scratch = Scratch::from(&source, &format!("xfsfeat-{combo}-{op}-scratch.img"));
+            let scratch = scratch::Volume::copy_of(
+                SUITE,
+                &source,
+                &format!("xfsfeat-{combo}-{op}-scratch.img"),
+            );
             checked += 1;
 
             match exercise(scratch.path(), op) {
