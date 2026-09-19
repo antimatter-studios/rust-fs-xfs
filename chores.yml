@@ -240,11 +240,11 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier. The number below is
-    # the old suite's, carried over so the tier is bounded from the first
-    # run rather than unbounded until somebody remembers; it is replaced
-    # with a measurement from a green run, and the replacement is the
-    # commit that may lower it.
+    # MEASURED in run 35435470063 on 2026-09-19: 501 lines / 32,219 bytes on
+    # the Linux runner and 534 / 33,680 on Darwin, whose test names wrap
+    # differently. The budget is half as much again as the larger of the
+    # two — room for the tier to grow before anyone has to think about
+    # it, and not so much that it stops measuring anything.
     #
     # IT DOES NOT GO THROUGH ci-test.sh's RUN MODE, and that is not an
     # exemption from the gate. That mode pins `--release` (which
@@ -253,11 +253,11 @@ tasks:
     # wrote to `ci-test.sh --gate`: the same skip pattern, the same
     # executed-test counter, one run.
     #
-    # The floor is 290: 312 executed on 2026-09-17 in run 35256241155
-    # (job 105320487901), less the usual margin. Raise it deliberately.
+    # The floor is 380: 427 executed in run 35435470063 on 2026-09-19
+    # (job 105877256028), less the usual margin. Raise it deliberately.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 700 40000 -- scripts/with-test-temp.sh cargo test --locked $(scripts/test-targets.sh unit) -- --nocapture'
-      - 'scripts/ci-test.sh --gate 290 tmp/logs/unit.log "the debug unit tier"'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked $(scripts/test-targets.sh unit) -- --nocapture'
+      - 'scripts/ci-test.sh --gate 380 tmp/logs/unit.log "the debug unit tier"'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -267,9 +267,11 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    # MEASURED in run 35435470063 on 2026-09-19: 567 lines / 33,542 bytes on
+    # aarch64 Linux and 589 / 34,505 on Darwin; budget half as much again.
+    # The floor is 90: 100 executed (job 105877826088), less the margin.
     cmds:
-      - 'scripts/tier.sh test:images images 1450 82000 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
+      - 'CI_TEST_FLOOR=90 scripts/tier.sh test:images images 900 52000 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
 
   test:stress:
     desc: 'The fsstress/fsx corpus read back — the one fixture set `chore fixtures` does not build by default'
@@ -287,10 +289,20 @@ tasks:
     # a pass, so it now fails there instead — which is what made the tier
     # necessary rather than tidy.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    # BUDGET NOT MEASURED HERE, because `chore test` never runs this and
+    # the pull-request gate therefore never produces a number for it.
+    # .github/workflows/stress.yml is where it runs, and the measurement
+    # comes from there.
+    #
+    # THE FLOOR IS THE WHOLE SUITE: three cases, and three is the count
+    # rather than the count less a margin. A margin under a three-case
+    # oracle is a floor of two, which is one silently dropped case away
+    # from meaning nothing — the same reasoning dir_block_oracle's floor
+    # already carries. Dropping a case here is meant to be a deliberate
+    # edit to this line.
     cmds:
       - 'scripts/build-fixtures.sh --check stress'
-      - 'scripts/tier.sh test:stress stress 400 24000 -- scripts/ci-test.sh $(scripts/test-targets.sh stress)'
+      - 'CI_TEST_FLOOR=3 scripts/tier.sh test:stress stress 400 24000 -- scripts/ci-test.sh $(scripts/test-targets.sh stress)'
 
   test:oracle:
     desc: 'The driver writes, xfsprogs reads back — every tool call made inside the harness VM'
@@ -303,11 +315,15 @@ tasks:
     # invocation ends — one boot for the tier, and no VM left behind by a
     # run that was interrupted.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    # MEASURED in run 35435470063 on 2026-09-19: 150 lines / 32,125 bytes —
+    # few lines, long ones, because every tool call and its verdict is in
+    # them. Budget double, which is where the line length makes the bytes
+    # the binding half.
+    # The floor is 16: 18 executed (job 105877826105), less the margin.
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'scripts/tier.sh test:oracle oracle 1750 104000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 scripts/tier.sh test:oracle oracle 300 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
@@ -317,12 +333,14 @@ tasks:
     # makes sense. These tests write with the Rust API, have the guest
     # mount the result, and compare what came back.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    # MEASURED in run 35435470063 on 2026-09-19: 482 lines / 26,812 bytes;
+    # budget half as much again.
+    # The floor is 36: 41 executed (job 105877826105), less the margin.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'scripts/tier.sh test:kernel kernel 2450 154000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 scripts/tier.sh test:kernel kernel 750 42000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -331,9 +349,14 @@ tasks:
     # the first run pays a full build and later runs are incremental.
     # FLTH_KEEP_VM=1 keeps the VM up for the next one.
     #
-    # BUDGET NOT YET MEASURED on the migrated tier. This one is measured
-    # in CI (suite-in-vm), which is a FIRST run: the guest build's
-    # per-crate lines are part of what it has to fit.
+    # MEASURED in run 35435470063 on 2026-09-19 (job 105877826117), which
+    # is a FIRST run: the guest build's per-crate lines are part of what
+    # it has to fit. 1,801 lines / 127,393 bytes; the line budget is half
+    # as much again and the byte budget is left where it was, because the
+    # guest build's lines are long and the bytes are the binding half.
+    # The floor is 525: 586 executed, less the usual margin. It is the
+    # same selection `test:native`'s release pass runs, so the two
+    # numbers move together.
     timeout: 150m
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
@@ -370,7 +393,7 @@ tasks:
           guest_args="$guest_args $arg"
         done
         # shellcheck disable=SC2086  # the words are the point
-        scripts/tier.sh test:vm vm 3200 190000 -- \
+        CI_TEST_FLOOR=525 scripts/tier.sh test:vm vm 2600 190000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -427,7 +450,9 @@ tasks:
     # those tests again: the price (a few minutes) of their evidence being
     # in every log, and of `test` staying plainly "everything".
     #
-    # BUDGET NOT YET MEASURED on the migrated tier — see test:unit.
+    # MEASURED in run 35435470063 on 2026-09-19 (job 105877826105): the
+    # release pass printed 1,656 lines / 122,595 bytes; budget half as
+    # much again. The floor is 525: 586 executed, less the usual margin.
     timeout: 120m
     on_timeout:
       - cmd: 'echo "timeout: reclaiming the harness VM (spent $TIMEOUT)"'
@@ -440,7 +465,7 @@ tasks:
       - task: test:oracle
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'scripts/tier.sh "test:native (whole suite, release)" suite 3200 197000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
+      - 'CI_TEST_FLOOR=525 scripts/tier.sh "test:native (whole suite, release)" suite 2400 180000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
       - task: test:scripts
       # THE LAST LINE: one number across the tiers, and where the detail is.
       - scripts/test-verdict.sh unit oracle kernel suite

@@ -24,15 +24,13 @@
 # job produces, which GitHub reads as permanently pending with enforce_admins
 # on and no failure to point at.
 #
-# ORDERING, BECAUSE THIS IS A CHICKEN AND EGG. github-guard reads this file
-# from the DEFAULT BRANCH, so the pull request that renames the jobs cannot
-# also be the one whose protection knows the new name — the old names are
-# still required while it is open, and they no longer report. The sequence
-# that works is: merge with the old names still required and
-# `validate against xfs_db + in-kernel XFS driver` failing to report, then
-# re-run github-guard against main, which reads this file and requires
-# `ci-ok` alone. Admin merge of this one pull request is the cost of the
-# change; every later one is gated by a name that survives a rename.
+# THE NAME DOES NOT MOVE WHEN THE JOBS DO, which is why this migration needs
+# no ordering dance. github-guard reads this file from the DEFAULT BRANCH, so
+# a pull request that renames a gating job cannot also be the one whose
+# protection knows the new name — it would leave the old names required and
+# never reporting. Requiring the aggregate means the jobs behind it can be
+# renamed, split or replaced wholesale, as they are here, in a single pull
+# request that protection never notices.
 #
 # The name must match the check-run name GitHub reports, which here is the
 # job's `name:` rather than its key — `ci-ok` for both.

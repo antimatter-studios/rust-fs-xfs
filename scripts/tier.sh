@@ -54,7 +54,11 @@ esac
 # test binary all print the same green.
 #
 # Printed after the budget's own verdict and only on a pass; a failure
-# already prints the tail of the log, which holds the count too.
+# already prints the tail of the log, which holds the count too. And only
+# for a tier that ran cargo at all: `test:scripts` runs shell tests,
+# which print no harness summary, and "0 tests executed" would read as a
+# tier that had stopped running rather than one that never counted this
+# way.
 "$BUDGET" \
     --log "$REPO/tmp/logs/$LOG_NAME.log" \
     --max-lines "$MAX_LINES" \
@@ -64,7 +68,9 @@ esac
 status=$?
 if [ "$status" -eq 0 ]; then
     awk -v label="$LABEL" \
-        '/^test result: ok\./ { n += $4 } END { printf "%s: %d tests executed\n", label, n + 0 }' \
+        '/^test result:/ { ran = 1 }
+         /^test result: ok\./ { n += $4 }
+         END { if (ran) printf "%s: %d tests executed\n", label, n + 0 }' \
         "$REPO/tmp/logs/$LOG_NAME.log"
 fi
 exit "$status"
