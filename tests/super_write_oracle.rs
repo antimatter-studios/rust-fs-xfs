@@ -22,28 +22,27 @@
 //! offset. The two together say the offset table is right *and* the
 //! model is complete, which is the pair a formatter needs.
 //!
-//! Fixtures are gitignored. Build them with `chore fixtures`.
+//! The fixtures are gitignored and generated, and `chore fixtures`
+//! builds every geometry. An empty `.vm-share` is that build not having
+//! happened, so this fails and names the task: a round trip performed
+//! against no superblock at all reads exactly like one performed
+//! against ten.
+
+mod common;
 
 use fs_xfs::super_write::apply;
 use fs_xfs::superblock::Superblock;
-use std::path::{Path, PathBuf};
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
+use std::path::Path;
 
 /// Every captured image, by name.
+///
+/// `common::fixtures_matching` fails when `.vm-share` holds none, which
+/// is the fixture build not having run; the geometry filter below is a
+/// choice about which of them are interesting here, and the floors in
+/// each test are what say enough of them survived it.
 fn fixtures() -> Vec<(String, Vec<u8>)> {
-    let dir = share();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    for p in common::fixtures_matching("xfs", ".img") {
         let name = p.file_stem().unwrap().to_string_lossy().to_string();
         // Only the geometry fixtures are plain formatted images; the
         // data/dirconv ones have been mounted and written to, which is
@@ -76,17 +75,15 @@ fn read_prefix(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
 #[test]
 fn applying_a_parsed_superblock_reproduces_it_byte_for_byte() {
     let all = fixtures();
-    if all.is_empty() {
-        eprintln!("no fixtures in .vm-share; build them with `chore fixtures`");
-        return;
-    }
 
     let mut checked = 0usize;
     for (name, original) in &all {
         let Ok(sb) = Superblock::parse(original) else {
             // A fixture this crate refuses to parse is a separate
-            // problem, and the parser's own tests own it.
-            eprintln!("{name}: does not parse, skipped");
+            // problem, and the parser's own tests own it. Reported
+            // rather than passed over silently, and the floor below is
+            // what says enough images did parse.
+            eprintln!("{name}: does not parse, so no round trip was made for it");
             continue;
         };
 
@@ -112,8 +109,8 @@ fn applying_a_parsed_superblock_reproduces_it_byte_for_byte() {
     eprintln!("{checked} superblocks reproduced byte for byte");
     assert!(
         checked >= 5,
-        "only {checked} fixtures checked — too few to span the geometries \
-         that move the log2 fields and the AG layout"
+        "only {checked} of the .vm-share images were checked — too few to span the \
+         geometries that move the log2 fields and the AG layout"
     );
 }
 
@@ -124,15 +121,9 @@ fn applying_a_parsed_superblock_reproduces_it_byte_for_byte() {
 #[test]
 fn the_round_trip_would_notice_a_changed_field() {
     let all = fixtures();
-    if all.is_empty() {
-        eprintln!("no fixtures in .vm-share; build them with `chore fixtures`");
-        return;
-    }
     let (name, original) = &all[0];
-    let Ok(mut sb) = Superblock::parse(original) else {
-        eprintln!("{name}: does not parse, skipped");
-        return;
-    };
+    let mut sb = Superblock::parse(original)
+        .unwrap_or_else(|e| panic!("{name} is a fixture this driver cannot parse: {e}"));
 
     // `icount` is a plain counter — safe to move without making the
     // superblock structurally invalid, and it is one `validate` does not
@@ -157,10 +148,6 @@ fn the_round_trip_would_notice_a_changed_field() {
 #[test]
 fn the_checksum_is_recomputed_from_the_bytes() {
     let all = fixtures();
-    if all.is_empty() {
-        eprintln!("no fixtures in .vm-share; build them with `chore fixtures`");
-        return;
-    }
 
     let mut checked = 0usize;
     for (name, original) in &all {
@@ -203,15 +190,11 @@ fn the_checksum_is_recomputed_from_the_bytes() {
 #[test]
 fn applying_into_an_empty_buffer_reproduces_the_original() {
     let all = fixtures();
-    if all.is_empty() {
-        eprintln!("no fixtures in .vm-share; build them with `chore fixtures`");
-        return;
-    }
 
     let mut checked = 0usize;
     for (name, original) in &all {
         let Ok(sb) = Superblock::parse(original) else {
-            eprintln!("{name}: does not parse, skipped");
+            eprintln!("{name}: does not parse, so no round trip was made for it");
             continue;
         };
 
@@ -238,7 +221,8 @@ fn applying_into_an_empty_buffer_reproduces_the_original() {
     eprintln!("{checked} superblocks rebuilt from the struct alone");
     assert!(
         checked >= 5,
-        "only {checked} fixtures checked — too few to span the geometries"
+        "only {checked} of the .vm-share images were checked — too few to span the \
+         geometries"
     );
 }
 
@@ -256,8 +240,12 @@ fn a_v4_superblock_is_written_without_the_v5_extension() {
         // version lives in the low nibble of sb_versionnum, at 100.
         b.len() > 102 && (u16::from_be_bytes([b[100], b[101]]) & 0x000f) == 4
     }) else {
-        eprintln!("no v4 fixture in .vm-share; build them with `chore fixtures`");
-        return;
+        panic!(
+            "no v4 fixture among {} images, so nothing here pins what a v4 write \
+             leaves past the 208-byte structure. `xfs-nocrc.img` is the v4 geometry; \
+             rebuild the set with `chore fixtures`.",
+            all.len()
+        );
     };
 
     let sb = Superblock::parse(original).expect("parse the v4 fixture");
@@ -297,8 +285,11 @@ fn each_carried_field_lands_at_its_own_offset() {
         .iter()
         .find(|(_, b)| b.len() > 102 && (u16::from_be_bytes([b[100], b[101]]) & 0x000f) == 5)
     else {
-        eprintln!("no v5 fixture in .vm-share; build them with `chore fixtures`");
-        return;
+        panic!(
+            "no v5 fixture among {} images, so none of the carried fields is read \
+             back at its own offset. Rebuild the set with `chore fixtures`.",
+            all.len()
+        );
     };
 
     let mut sb = Superblock::parse(original).expect("parse the v5 fixture");

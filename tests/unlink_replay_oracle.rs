@@ -27,16 +27,16 @@
 //! - and `xfs_repair` is what catches the trees and the group header
 //!   disagreeing.
 //!
-//! Fixtures are gitignored and the VM is not always up, so this skips
-//! rather than fails when either is missing. Build them with
-//! `./scripts/vm-build-unlink-fixtures.sh`.
+//! Fixtures are gitignored and generated, and both cases are built on
+//! every run now, so a missing one is a failure rather than a case left
+//! unjudged. Build them with `chore fixtures -- unlink`.
 
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, repair, scratch, share};
+use common::{fixture, kernel_run, repair, scratch};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -47,11 +47,8 @@ const SUITE: &str = "unlink_replay_oracle";
 /// scope.
 /// Remove the victim from a copy of `case`'s before-image, then have the
 /// kernel replay the record.
-fn unlink_and_replay(case: &str) -> Option<()> {
-    let source = share().join(format!("xfsunlink-{case}-before.img"));
-    if !source.exists() {
-        return None;
-    }
+fn unlink_and_replay(case: &str) {
+    let source = fixture(&format!("xfsunlink-{case}-before.img"));
     let name = format!("xfs-unlink-{case}-scratch.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, &name);
     let image = scratch.guest();
@@ -119,11 +116,21 @@ fn unlink_and_replay(case: &str) -> Option<()> {
         "#
     );
 
-    let out = kernel_run(&script)?;
+    // The replay always happens: the script runs in the harness guest,
+    // and a guest that cannot be reached is a failure rather than a
+    // fixture that went unjudged.
+    let out = kernel_run(&script);
 
     assert!(
         !out.contains("MOUNT_FAILED"),
         "{case}: the kernel refused the filesystem after the unlink was logged:\n{out}"
+    );
+    assert!(
+        !out.contains("UMOUNT_FAILED"),
+        "{case}: the volume could not be unmounted, so the summary counters were \
+         never written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` \
+         for exactly that -- the free-block count it disagrees about is the one the \
+         unmount never wrote, not one this driver got wrong:\n{out}"
     );
     assert!(
         out.contains("GONE"),
@@ -157,38 +164,25 @@ fn unlink_and_replay(case: &str) -> Option<()> {
     }
 
     repair::assert_agreed(&out, &format!("{case}, after the replay"));
-
-    Some(())
 }
 
 /// A file removed by this driver, agreed gone by the kernel.
 #[test]
 fn the_kernel_agrees_a_file_this_driver_removed_is_gone() {
-    let mut ran = Vec::new();
-    for case in ["spare", "wasfull"] {
-        match unlink_and_replay(case) {
-            Some(()) => ran.push(case),
-            None => eprintln!("{case}: fixture or VM unavailable — skipped"),
-        }
+    // Both cases are judged, every run: `chore fixtures -- unlink`
+    // builds both before-images, so one that is absent fails inside
+    // `unlink_and_replay` rather than leaving its case unexercised.
+    let cases = ["spare", "wasfull"];
+    for case in cases {
+        unlink_and_replay(case);
     }
-    if ran.is_empty() {
-        eprintln!(
-            "no unlink fixtures or no VM; build them with \
-             ./scripts/vm-build-unlink-fixtures.sh"
-        );
-        return;
-    }
-    eprintln!("the kernel agrees the removals landed for: {ran:?}");
+    eprintln!("the kernel agrees the removals landed for: {cases:?}");
 }
 
 /// The shapes an unlink will not attempt are refused by name.
 #[test]
 fn what_it_will_not_do_is_refused() {
-    let source = share().join("xfsunlink-spare-before.img");
-    if !source.exists() {
-        eprintln!("no unlink fixture — skipping");
-        return;
-    }
+    let source = fixture("xfsunlink-spare-before.img");
 
     // A name that is not there.
     {

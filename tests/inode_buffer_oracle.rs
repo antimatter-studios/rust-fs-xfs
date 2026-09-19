@@ -18,15 +18,20 @@
 //! populated, whether or not it was unmounted cleanly, so this reads
 //! thousands of examples out of images that exist for other reasons.
 //!
-//! Fixtures are gitignored, so this skips when there are none.
+//! Fixtures are gitignored and generated. `chore fixtures` builds them
+//! all, on every host, so a checkout with none of them fails here
+//! rather than reporting a green test that read no records at all.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::log::{BBSIZE, XLOG_HEADER_MAGIC};
 use fs_xfs::log_write::InodeBuffer;
 use fs_xfs::superblock::Superblock;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
+
+mod common;
+use common::fixtures_matching;
 
 /// `XFS_LI_INODE`, little-endian, at the start of the item.
 const XFS_LI_INODE: u16 = 0x123b;
@@ -39,10 +44,6 @@ mod at {
     pub const BLKNO: usize = 40;
     pub const LEN: usize = 48;
     pub const BOFFSET: usize = 52;
-}
-
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
 }
 
 fn le16(b: &[u8], i: usize) -> u16 {
@@ -138,19 +139,10 @@ fn inode_items(path: &Path) -> Option<Logged> {
 
 #[test]
 fn the_cluster_buffer_matches_what_the_kernel_recorded() {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        eprintln!("no .vm-share — skipping");
-        return;
-    };
-
     let mut checked = 0usize;
     let mut geometries = Vec::new();
 
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    for p in fixtures_matching("", ".img") {
         let Some(Logged { sb, items }) = inode_items(&p) else {
             continue;
         };
@@ -184,10 +176,15 @@ fn the_cluster_buffer_matches_what_the_kernel_recorded() {
         }
     }
 
-    if checked == 0 {
-        eprintln!("no fixture holds a logged inode — skipping");
-        return;
-    }
+    // Every fixture is populated through the log, so all of them hold
+    // logged inodes; none of them holding one is the fixture build
+    // having gone wrong rather than a run with nothing to compare.
+    assert!(
+        checked > 0,
+        "no .vm-share image holds a logged inode, so nothing was compared against \
+         the kernel's addressing. The fixtures are populated through the log and \
+         always carry inode items; `chore fixtures` rebuilds them."
+    );
 
     geometries.sort_unstable();
     geometries.dedup();

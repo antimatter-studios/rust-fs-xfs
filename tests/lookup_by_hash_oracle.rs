@@ -10,30 +10,29 @@
 //! In every shape, every listed name must look up to its listed inode, the
 //! colliding pair to their own contents, and absent names to nothing. In the
 //! node-form directory one lookup must also reach the device only a handful
-//! of times, where listing it reads every data block. Skips when xfsprogs is
-//! not installed.
+//! of times, where listing it reads every data block.
+//!
+//! The directories come from `mkfs.xfs` in the fs-linux-test-harness guest,
+//! which always has it. Twenty thousand entries is the only way to reach
+//! node form, so a run that did not build them has not exercised the index
+//! at all — that is a failure, not a case to pass over.
 
 use fs_core::{CountingDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::fmt::Write as _;
-use std::process::Command;
 use std::sync::Arc;
+
+mod common;
+use common::oracle;
 
 const COLLIDING: [&str; 2] = ["aaaaaaaa", "aaaqaaa`"];
 
-fn mkfs_available() -> bool {
-    Command::new("mkfs.xfs")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 #[test]
 fn a_lookup_goes_through_the_hash_index() {
-    if !mkfs_available() {
-        eprintln!("skip: xfsprogs not installed");
-        return;
-    }
+    // The protofile, the files it names and the image are all made under
+    // `std::env::temp_dir()`, which `scripts/with-test-temp.sh` points at
+    // a directory inside this repository — the one tree the guest running
+    // mkfs.xfs can see.
     let root = std::env::temp_dir().join(format!("fs_xfs_lookup_hash_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let empty = root.join("empty");
@@ -75,17 +74,12 @@ fn a_lookup_goes_through_the_hash_index() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(512 * 1024 * 1024))
         .unwrap();
-    let out = Command::new("mkfs.xfs")
+    let out = oracle("mkfs.xfs")
         .args(["-q", "-f", "-p"])
         .arg(&proto_path)
         .arg(&image)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .output();
+    assert!(out.ok(), "{}{}", out.stdout, out.stderr);
 
     let counting = Arc::new(CountingDevice::new(Arc::new(
         FileDevice::open(image.to_str().unwrap()).unwrap(),

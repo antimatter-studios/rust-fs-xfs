@@ -18,32 +18,23 @@
 //! - the data is `h_len` bytes **as written**, with the cycle stamp
 //!   already applied. The checksum is taken after packing, not before.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone.
+//! Fixtures are gitignored and generated. They are built on every run
+//! now — `chore fixtures` makes the whole set — so a clone with none of
+//! them fails here rather than passing having verified nothing.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::log::{record_checksum, BBSIZE, XLOG_HEADER_MAGIC};
 use fs_xfs::superblock::Superblock;
-use std::path::{Path, PathBuf};
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
+mod common;
+use common::fixtures_matching;
 
 /// Every checksummed record in every fixture must verify.
 #[test]
 fn every_record_the_kernel_wrote_verifies() {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        eprintln!("no .vm-share — skipping");
-        return;
-    };
-
     let mut images = 0usize;
     let mut records = 0usize;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    for p in fixtures_matching("", ".img") {
         let Ok(dev) = FileDevice::open(&p) else {
             continue;
         };
@@ -109,10 +100,17 @@ fn every_record_the_kernel_wrote_verifies() {
         }
     }
 
-    if records == 0 {
-        eprintln!("no fixtures with checksummed log records — skipping");
-        return;
-    }
+    // THE FLOOR IS THE ONLY GUARD LEFT. The comparison above happens
+    // once per record, so a run that found none would assert nothing and
+    // still report ok. Every fixture is made by one mkfs.xfs in the
+    // harness guest and every one of them carries records, so a total of
+    // zero is a fixture build that went wrong.
+    assert!(
+        records > 0,
+        "no .vm-share image holds a checksummed log record: the fixtures all carry \
+         records the kernel wrote, so this is the fixture build rather than a run \
+         with nothing to check. `chore fixtures` rebuilds them."
+    );
     eprintln!("{records} records across {images} filesystems");
 }
 

@@ -127,5 +127,16 @@ the small wins are what make it look tuned rather than broken.
 cargo test --release --test read_path_cost -- --nocapture
 ```
 
-It skips without fixtures. Build them with
-`scripts/vm-build-fixtures.sh`.
+It measures the largest tree it can find in `.vm-share/`, in order:
+`xfsfeat-everything.img` (the widest, from the `feature-matrix` set),
+then `xfsdeep-inobt2.img` (the deepest, from `deeptree`), then
+`xfsdata-default.img` (from `data`). Which one it used is the first line
+it prints, because a count is only comparable against the same image.
+Every one of them is populated, which is the point of the list: a bare
+geometry image was the last resort once, and a run that fell through to
+it measured an empty filesystem and then failed saying the fixture had
+nothing to walk — true about the wrong thing (#213). Build them in the
+harness guest with `chore fixtures`, or just the sets this needs with
+`chore fixtures -- feature-matrix deeptree data`. With none of them
+present the test fails, naming the task that builds them: a measurement
+of nothing cannot be mistaken for a measurement.

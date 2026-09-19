@@ -26,7 +26,7 @@
 //! the refusal cannot quietly become a wrong answer.
 //!
 //! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-create-fixtures.sh`.
+//! `chore fixtures -- create`.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::ag::Agi;
@@ -185,7 +185,7 @@ fn taking_an_inode_reproduces_what_the_kernel_did() {
     }
 
     if ran.is_empty() {
-        eprintln!("no create fixtures; build them with ./scripts/vm-build-create-fixtures.sh");
+        eprintln!("no create fixtures; build them with chore fixtures -- create");
         return;
     }
     assert_eq!(
@@ -336,7 +336,7 @@ fn giving_an_inode_back_reproduces_what_the_kernel_did() {
     }
 
     if ran.is_empty() {
-        eprintln!("no unlink fixtures; build them with ./scripts/vm-build-unlink-fixtures.sh");
+        eprintln!("no unlink fixtures; build them with chore fixtures -- unlink");
         return;
     }
     assert_eq!(

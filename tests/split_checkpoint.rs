@@ -38,14 +38,21 @@ const PIECES: u32 = 1500;
 
 #[test]
 fn a_checkpoint_larger_than_one_log_buffer_is_written_and_replayed() {
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. `chore fixtures` makes it
+    // before anything else runs, and this test writes its scratch volume
+    // beside the fixtures. An absent share is that build not having
+    // happened, which has to be seen rather than skipped.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let volume = scratch::Volume::empty(SUITE, "interleaved.img", 400 * 1024 * 1024);
     let image = volume.guest();
 
-    let Some(built) = kernel_run(&format!(
+    let built = kernel_run(&format!(
         r#"
         mkfs.xfs -q -f -m rmapbt=1 {image} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
@@ -66,10 +73,7 @@ fn a_checkpoint_larger_than_one_log_buffer_is_written_and_replayed() {
         echo DONE
         "#,
         last = PIECES - 1,
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(
         built.contains("MKFS_OK") && built.contains("MOUNT_OK"),
         "building the volume failed:\n{built}"
@@ -125,8 +129,7 @@ fn a_checkpoint_larger_than_one_log_buffer_is_written_and_replayed() {
         echo DONE
         "#,
         repair = repair::script(&image),
-    ))
-    .expect("kernel");
+    ));
 
     assert!(
         out.contains("MOUNTED"),

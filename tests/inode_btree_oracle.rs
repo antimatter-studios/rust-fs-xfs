@@ -25,7 +25,7 @@
 //! have to misread it into two consistent halves for this to pass.
 //!
 //! Fixtures are gitignored. Build them with
-//! `./scripts/vm-build-fixtures.sh`.
+//! `chore fixtures`.
 
 use fs_core::{BlockRead, FileDevice};
 use fs_xfs::ag::Agi;
@@ -193,7 +193,7 @@ fn every_group_of_every_fixture_reconciles() {
     }
 
     if images == 0 {
-        eprintln!("no XFS fixtures found; build them with ./scripts/vm-build-fixtures.sh");
+        eprintln!("no XFS fixtures found; build them with chore fixtures");
         return;
     }
     eprintln!(
@@ -250,7 +250,7 @@ fn both_record_shapes_are_covered() {
     assert!(
         plain > 0,
         "no fixture has sparse inodes off, so the plain record is never read — build \
-         them with ./scripts/vm-build-fixtures.sh, which includes a v5 image made with \
+         them with chore fixtures, which includes a v5 image made with \
          -i sparse=0 for exactly this reason"
     );
 }

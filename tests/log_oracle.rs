@@ -24,37 +24,41 @@
 //! state from the AGI unlinked lists, so a filesystem interrupted in the
 //! middle of any of this passed as clean.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone. Generate
-//! them with `./scripts/vm-build-data-fixtures.sh`.
+//! Both fixtures are gitignored and generated, and `chore fixtures`
+//! builds both in the harness guest. A missing `xfsdirty.img` is that
+//! build not having happened rather than a filesystem that came out
+//! clean by chance, so it fails here and names the task: this is the
+//! one suite whose whole claim rests on an image being dirty, and it
+//! spent long enough passing with no image at all.
 
+mod common;
+
+use common::share;
 use fs_core::FileDevice;
 use fs_xfs::Filesystem;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-fn share() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share")
-}
-
 /// The crashed fixture, with the verdict `xfs_repair` gave it.
-fn dirty_fixture() -> Option<(PathBuf, String)> {
-    let img = share().join("xfsdirty.img");
-    let verdict = share().join("xfsdirty.verdict");
-    if !img.exists() || !verdict.exists() {
-        return None;
-    }
-    let v = std::fs::read_to_string(&verdict).ok()?.trim().to_string();
-    Some((img, v))
+///
+/// Both files come out of the same guest run, so either one missing is
+/// the fixture build having failed and not a filesystem that happened to
+/// shut down tidily.
+fn dirty_fixture() -> (PathBuf, String) {
+    let img = common::fixture("xfsdirty.img");
+    let verdict = common::fixture("xfsdirty.verdict");
+    let v = std::fs::read_to_string(&verdict)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", verdict.display()))
+        .trim()
+        .to_string();
+    (img, v)
 }
 
 /// A filesystem whose log holds unapplied changes is replayed, and says
 /// so (#90).
 #[test]
 fn a_dirty_log_is_replayed_rather_than_read_past() {
-    let Some((img, verdict)) = dirty_fixture() else {
-        eprintln!("no xfsdirty fixture in .vm-share — skipping");
-        return;
-    };
+    let (img, verdict) = dirty_fixture();
 
     // The fixture only tests anything if the reference tool agrees it is
     // dirty. A kernel or xfsprogs that shut the filesystem down more
@@ -97,17 +101,8 @@ fn a_dirty_log_is_replayed_rather_than_read_past() {
 /// dirty logs and useless about everything else.
 #[test]
 fn cleanly_unmounted_filesystems_still_mount() {
-    let Ok(entries) = std::fs::read_dir(share()) else {
-        eprintln!("no .vm-share — skipping");
-        return;
-    };
-
     let mut mounted = 0usize;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
+    for p in common::fixtures_matching("xfs", ".img") {
         let name = p
             .file_stem()
             .unwrap_or_default()
@@ -129,6 +124,11 @@ fn cleanly_unmounted_filesystems_still_mount() {
             Err(_) => {}
         }
     }
+    // THE ONLY GUARD LEFT IN THIS TEST. The set itself can no longer be
+    // empty — `common::fixtures_matching` fails first — but every image
+    // in it could still be declined for some other reason, and the arm
+    // that swallows those is deliberately broad. This count is what
+    // says the check accepted something.
     assert!(
         mounted > 0,
         "no clean fixture mounted, so nothing here shows the check accepts anything"

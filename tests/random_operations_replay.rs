@@ -17,8 +17,9 @@
 //! A run of 480 steps over six seeds, and 60 steps over each of 1 KiB blocks,
 //! rmapbt, reflink off and 8 KiB directory blocks, found nothing on the day it
 //! was written; it is here so the next change to a write path meets it.
-//! Skips when no kernel is reachable (see `common::transport`); ci-test.sh
-//! turns that skip into a failure in CI.
+//! The kernel is the one in the fs-linux-test-harness guest, so there is
+//! no reachable-kernel question to skip on: a guest that cannot be
+//! reached fails the run.
 
 mod common;
 
@@ -159,16 +160,12 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(320 * 1024 * 1024))
             .unwrap();
-        // Formatted where the kernel runs, so a host without xfsprogs, such
-        // as the macOS runner, skips with the kernel rather than failing
-        // here.
-        let Some(mkfs) = kernel_run(&format!(
+        // Formatted where the kernel runs, which is the harness guest and
+        // nowhere else: the host's own xfsprogs is never asked, so a host
+        // without one — the macOS runner — formats here like any other.
+        let mkfs = kernel_run(&format!(
             "mkfs.xfs -q -f /share/{name} && echo MKFS_OK || echo MKFS_FAILED; echo DONE"
-        )) else {
-            let _ = std::fs::remove_file(&image);
-            eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-            return;
-        };
+        ));
         assert!(mkfs.contains("MKFS_OK"), "mkfs.xfs failed:\n{mkfs}");
         let image_path = image.to_str().unwrap().to_string();
 
@@ -200,11 +197,17 @@ fn random_operation_sequences_replay_to_volumes_xfs_repair_accepts() {
         let mut log = Vec::new();
         for step in 0..STEPS {
             log.push(operate(&image_path, &mut rng, step));
-            let Some(out) = kernel_run(&script) else {
-                let _ = std::fs::remove_file(&image);
-                eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-                return;
-            };
+            // Every step is replayed and judged: the script runs in the
+            // harness guest, so there is no step that goes unchecked.
+            let out = kernel_run(&script);
+            assert!(
+                !out.contains("UMOUNT_FAILED"),
+                "[seed {seed}] after step {step} the volume could not be unmounted, so \
+                 the summary counters were never written back to it. `xfs_repair` \
+                 reports `sb_fdblocks N, counted N-1` for exactly that -- the \
+                 free-block count it disagrees about is the one the unmount never \
+                 wrote, not one this driver got wrong:\n{out}"
+            );
             assert!(
                 out.contains("MOUNTED"),
                 "[seed {seed}] after step {step} the kernel refused the volume:\n{out}\n\

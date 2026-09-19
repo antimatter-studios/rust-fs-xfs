@@ -3,24 +3,37 @@
 # git-config format: check with `git config -f .github-guard --list`, and
 # double-quote any value containing # or ;.
 
-# Required status checks for main. A declaration beats discovery exactly.
+# What must pass before main takes a merge. github-guard reads this from the
+# default branch on the server and applies it to branch protection.
 #
-# Discovery requires checks BY JOB NAME, which is a guess at the PR gate and
-# drifts silently: a renamed job, an added workflow, or any future check
-# reporting under the github-actions app changes what is required without
-# anyone deciding to. Pinning it costs nothing and makes the intent reviewable.
+#   ci-ok   ci.yml: the one always-run gate. It `needs:` every other job and
+#           fails when any of them failed, was cancelled or was SKIPPED: the
+#           unit tier with no fixtures, the kernel-made fixtures built in the
+#           fs-linux-test-harness VM, the whole suite with every xfsprogs call
+#           and every kernel mount inside that VM (x86_64), the tiers that
+#           need no VM on aarch64 Linux and on aarch64 Darwin, and the suite
+#           compiled and run inside the guest.
 #
-# WHAT THIS FILE FIXES TODAY (#201). The settings page required two of the
-# three checks ci.yml produces:
+# WHY ONE NAME AND NOT FIVE (#207). The list used to name three real job
+# names — `test-ubuntu-latest`, `test-darwin` and
+# `validate against xfs_db + in-kernel XFS driver` — which meant that
+# renaming a job, splitting it into a matrix leg or adding one changed what
+# gates a merge without anyone deciding to. Both failure directions had
+# already happened in this constellation: a job that ran on every pull
+# request and gated nothing (#201, `test-darwin`), and a required context no
+# job produces, which GitHub reads as permanently pending with enforce_admins
+# on and no failure to point at.
 #
-#     ["test-ubuntu-latest","validate against xfs_db + in-kernel XFS driver"]
+# THE NAME DOES NOT MOVE WHEN THE JOBS DO, which is why this migration needs
+# no ordering dance. github-guard reads this file from the DEFAULT BRANCH, so
+# a pull request that renames a gating job cannot also be the one whose
+# protection knows the new name — it would leave the old names required and
+# never reporting. Requiring the aggregate means the jobs behind it can be
+# renamed, split or replaced wholesale, as they are here, in a single pull
+# request that protection never notices.
 #
-# `test-darwin` ran on every pull request, reported, and could not block one.
-# Nothing noticed, because nothing in the repository had an opinion about the
-# list: a job was added, its check was never added to a settings page nobody
-# re-reads, and the difference between "this job runs" and "this job gates"
-# was invisible from the workflow. It is written down here now, so adding a
-# job and forgetting to require it is a reviewable diff rather than a silence.
+# The name must match the check-run name GitHub reports, which here is the
+# job's `name:` rather than its key — `ci-ok` for both.
 #
 # WHY test-darwin GATES rather than advising. It builds the staticlib that
 # DiskJockey's XFS extension links against, for aarch64-apple-darwin, and runs

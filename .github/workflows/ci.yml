@@ -1,5 +1,62 @@
 name: CI
 
+# EVERY JOB RUNS CHORE TASKS, so a green local `chore test` is the same
+# evidence as a green run here (see the test contract at the top of
+# chores.yml):
+#
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with .vm-share empty is what proves the split.
+#   fixtures     `chore fixtures`: the kernel-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture and every host).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY xfsprogs call
+#                and every kernel mount happening inside the harness VM.
+#                Nothing installs xfsprogs on the runner, and a step makes
+#                the runner's own copy unusable so that a green run is
+#                evidence of it.
+#   test-arm64   aarch64 matters on its own but GitHub's arm64 runners
+#                have NO KVM, so no VM can run: this job runs the tiers
+#                that need none — lint, the unit tier, and the
+#                fixture-reading tests.
+#   test-darwin  the target this crate SHIPS to. It builds the staticlib
+#                for aarch64-apple-darwin and runs the tiers a Mac can
+#                run, which is the same set as arm64 Linux: there is no
+#                XFS, no loop mount and no xfsprogs on a Mac at all, and
+#                the failures this job exists to catch are the ones no
+#                Linux job can see — ENOTSUP is 45 here and 95 there,
+#                `c_char` signedness at the C ABI boundary, and pointer
+#                width and alignment assumptions x86_64 Linux happens to
+#                satisfy.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a Mac runs the oracle and kernel
+#                tiers at all, and this job is what keeps that path
+#                working.
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails
+#                it). #207.
+#
+# WHAT THIS REPLACES. The gate used to install xfsprogs on the runner,
+# build the fixtures there with the runner's mkfs.xfs, loop-mount them
+# with `sudo` against the runner's kernel, and name thirty-two suites by
+# hand in a `for suite in ...` list. A developer got the same fixtures
+# from a Debian VM with a different mkfs.xfs and a different kernel, so
+# the two halves of "the same suite" were graded by two different
+# oracles — which is what #211 and #212 are. There is one oracle now and
+# it is the guest's.
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a
+# verdict; a tier that prints more than its measured budget FAILS (exit
+# 65), which is how a job that starts emitting thousands of lines turns
+# red here rather than being noticed by whoever scrolls it next. The
+# executed-test floors and the skip gate are in the tasks too, through
+# scripts/ci-test.sh: a suite that selected nothing, or printed a skip,
+# fails wherever it runs.
+
 on:
   push:
     branches: [main]
@@ -19,186 +76,253 @@ on:
   # gate is worse than none, because it still reports green.
   workflow_call:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
-  # (`am-fs-core = { path = "../rust-fs-core", version = "0.2" }`). Must match
-  # the `am-fs-core` version recorded in Cargo.lock, or `--locked` will refuse
-  # to build. Bump in lockstep with the constraint in Cargo.toml.
-  FS_CORE_REF: v0.2.10
+  CHORE_VERSION: "0.11.0"
 
 jobs:
-  test:
-    name: test-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
+  unit:
+    name: unit (no tools, no fixtures)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
-      # Pinned to the same channel as rust-toolchain.toml. The toml wins
-      # regardless (rustup honours it and would download that channel on
-      # first cargo invocation); naming it here just avoids fetching two
-      # toolchains. Move both together, and in lockstep with the sister
-      # fs-* crates — a mixed toolchain across statically linked crates
-      # duplicates _rust_eh_personality at link time downstream.
+      - name: Install chore
+        # Pinned (CHORE_VERSION) and checked against the release's
+        # checksums: the siblings, the tools and the tests all come
+        # through it.
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      # The oracle tests are #[ignore]-gated so this stays green without
-      # xfsprogs installed; the validate-kernel-xfs job below opts them in.
-      #
-      # A FLOOR, BECAUSE THE FAILURE MODE HERE IS AN ABSENCE (#201). The
-      # harness exits 0 on "0 passed; 0 failed", so a selection that
-      # matched nothing, a build that produced no test binaries, and a
-      # suite list that came out empty all report the same green as a
-      # full run. Nothing in this job could tell those apart, and the
-      # #[ignore] gating above means "fewer tests than expected" is the
-      # normal-looking state here rather than an obvious one.
-      #
-      # 518 executed on 2026-09-17 in run 35256241155 (job 105320487901,
-      # main at 19f6acbf). The floor is 480 — the measured count less
-      # about 7%, room for a suite to be reorganised without a red job.
-      # It moves up with the suite and never down.
-      - name: The suite, and proof it was a suite rather than nothing
-        run: |
-          set -uo pipefail
-          # ERREXIT OFF ON PURPOSE. The runner's default shell is
-          # `bash -e -o pipefail`, so a failing run would end the step
-          # before the count below ever printed — and a truncated run is
-          # exactly the one worth naming. `rc` still decides the step.
-          set +e
-          cargo test --locked --release 2>&1 | tee "$RUNNER_TEMP/release-tests.log"
-          rc=${PIPESTATUS[0]}
-          # Checked even when the run failed: a truncated run is worth
-          # naming too, and `rc` still decides the step's fate.
-          ./scripts/ci-test.sh --floor-check 480 "$RUNNER_TEMP/release-tests.log" "the release run in test-ubuntu-latest" || rc=1
-          exit "$rc"
-
-      # AND ONCE WITHOUT `--release`, WHICH IS NOT THE SAME RUN.
-      #
-      # Overflow checks are on in debug and off in release, so a
-      # release-only gate cannot observe a defect whose only symptom is an
-      # arithmetic overflow.
-      #
-      # THIS COMMENT NO LONGER CARRIES THE ARGUMENT, and that is the point.
-      # It used to reason from the manifest -- `[profile.release]` sets
-      # `lto`, `codegen-units`, `opt-level` and `panic` and not
-      # `overflow-checks`, and there is no `.cargo/config.toml` override, so
-      # the defaults hold. Every clause of that was true and the conclusion
-      # was still only as good as the list: `.cargo/config.toml` was named
-      # as absent by a comment that nothing checked, and a
-      # CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable set at job level was not
-      # named at all. Both turn the checks off with this step running and
-      # green. A comment asserting an invariant is not the invariant. The
-      # step below asks the build instead.
-      #
-      # That is not hypothetical. The neighbouring NTFS driver had a live
-      # instance: `signed_bytes_needed` computed `1i64 << 63` -- which is
-      # `i64::MIN` -- and negated it. Measured there with the defect
-      # reintroduced and nothing else changed:
-      #
-      #     cargo test --locked --release --lib   ->  EXIT=0,   40 passed
-      #     cargo test --locked --lib             ->  EXIT=101, 4 failed
-      #
-      # In release the wrap left the function returning the right answer
-      # through its fallback, so the defect was invisible to every job that
-      # repository ran. Its tests were correct and thorough and would still
-      # have gone green with the bug present.
-      #
-      # `--lib` only: this is a second compile of the same sources, and the
-      # unit tests are where the arithmetic lives. The oracle and fixture
-      # suites need xfsprogs or a VM and are gated elsewhere; running them
-      # again in another profile buys nothing and costs a great deal.
-      #
-      # THE VARIABLE IS PART OF THE STEP, not decoration. It tells the
-      # suite that this is the run which is supposed to trap an overflow,
-      # and `overflow_checks::the_build_the_gate_asked_to_check_does_check`
-      # in src/lib.rs then performs one and fails if the build let it
-      # through. That is the only check immune to WHERE the setting was
-      # turned off: a manifest key in any of four spellings, a
-      # CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable at step or job level,
-      # a .cargo/config.toml, or whatever cargo adds next. Each of those
-      # was found separately while trying to scan for them.
-      #
-      # The release step must not set it -- the checks are off there on
-      # purpose, because that is what ships.
-      #
-      # Do not remove this as a duplicate of the line above it, and do not
-      # drop the variable from it. tests/ci_profile.rs asserts that a
-      # cargo test here runs without --release AND sets this, and says why.
-      #
-      # The floor for this selection is its own: --lib is a different
-      # selection from the release run above, and either can empty
-      # without the other noticing. 312 executed on 2026-09-17 in run
-      # 35256241155 (job 105320487901); floor 290.
-      - name: The debug run, and proof it was a run rather than nothing
-        run: |
-          set -uo pipefail
-          # ERREXIT OFF ON PURPOSE. The runner's default shell is
-          # `bash -e -o pipefail`, so a failing run would end the step
-          # before the count below ever printed — and a truncated run is
-          # exactly the one worth naming. `rc` still decides the step.
-          set +e
-          EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 | tee "$RUNNER_TEMP/lib-tests.log"
-          rc=${PIPESTATUS[0]}
-          ./scripts/ci-test.sh --floor-check 290 "$RUNNER_TEMP/lib-tests.log" "the debug --lib run in test-ubuntu-latest" || rc=1
-          exit "$rc"
-
-      # The VM-teardown guards, which decide whether a machine is left
-      # running. They stub pgrep and vagrant, so they need neither.
-      #
-      # These existed and ran nowhere: the same hole the fixture oracles
-      # had, in the tests written to close it.
-      - name: Semantics a unit test cannot reach
+          key: ${{ runner.os }}-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: No fixtures are present
         run: |
           set -euo pipefail
-          for t in tests/scripts/*.sh; do
-            echo "::group::$t"
-            bash "$t"
-            echo "::endgroup::"
-          done
+          if ls .vm-share/*.img >/dev/null 2>&1; then
+            echo "::error::.vm-share/ has images; this job must prove the unit tier needs none"
+            exit 1
+          fi
+      - name: chore test:unit
+        run: chore test:unit
 
-  # The platform the artifact ships to (#115). chores.yml builds
-  # libfs_xfs.a for aarch64-apple-darwin and Swift links it, but every
-  # other job here runs on Linux, so the one target-conditional value in
-  # the C ABI -- ENOTSUP, 45 on Darwin and 95 on Linux -- was never
-  # compiled with its Darwin branch, and tests/capi.rs's ENOTSUP asserts
-  # never ran against it. This builds the shipped staticlib for that
-  # triple and runs the suite there. The oracle suites are #[ignore]-gated
-  # and need xfsprogs or a VM, so they stay on the Linux jobs.
-  darwin:
-    name: test-darwin
-    # arm64 by label, not by whatever macos-latest resolves to: the tests
-    # built for aarch64-apple-darwin have to run on the host.
-    runs-on: macos-15
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      # TARRED, AND TARRED SPARSE. These are two dozen filesystem images
+      # of 400 to 500 MB each, almost all of it holes: `tar --sparse`
+      # keeps them that way, where handing actions/upload-artifact the
+      # directory would have it read every hole as zeros. The consuming
+      # jobs untar rather than downloading a directory, so the holes
+      # survive the round trip and the runner's disk is not filled with
+      # nothing.
+      - name: Pack the fixtures, keeping their holes
+        run: |
+          set -euo pipefail
+          du -sh .vm-share
+          tar --sparse -czf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share .
+          ls -lh "$RUNNER_TEMP/fixtures.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: ${{ runner.temp }}/fixtures.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: test (x86_64, oracles in the VM)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: ${{ runner.temp }}
+      - name: Unpack the fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p .vm-share
+          tar -xzf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share
+          ls -1 .vm-share | wc -l | xargs echo "fixtures:"
+          ./scripts/build-fixtures.sh --check
+      # THE EVIDENCE, NOT THE CLAIM. Nothing this job runs may use the
+      # runner's own xfsprogs: the tools belong to the guest, and a test
+      # that reached for one here would be answered by a different
+      # version than every other machine gets. Each is replaced with a
+      # stub that fails loudly, so a violation turns the run red with a
+      # message saying so rather than quietly passing on the wrong
+      # version.
+      - name: Make the runner's own xfsprogs unusable
+        run: |
+          set -eu
+          for tool in mkfs.xfs xfs_db xfs_repair xfs_logprint xfs_io xfs_admin xfs_bmap xfs_info; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      # The volumes a kernel replay was judged on, when it went wrong.
+      # The failures these catch are ones that reproduce from the image
+      # and from nothing else.
+      - name: Keep the volumes a failing run was judged on
+        if: failure()
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/keep"
+          cp -f .vm-share/*.img "$RUNNER_TEMP/keep/" 2>/dev/null || true
+          cp -rf tmp/logs "$RUNNER_TEMP/keep/logs" 2>/dev/null || true
+          tar -czf "$RUNNER_TEMP/failed-run.tar.gz" -C "$RUNNER_TEMP" keep
+      - name: Upload them
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-run-x86_64
+          path: ${{ runner.temp }}/failed-run.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: fixtures
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: ${{ runner.temp }}
+      - name: Unpack the fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p .vm-share
+          tar -xzf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share
+          ls -1 .vm-share | wc -l | xargs echo "fixtures:"
+          ./scripts/build-fixtures.sh --check
+      - name: chore lint
+        run: chore lint
+      - name: chore test:unit
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+
+  test-darwin:
+    name: test-darwin
+    needs: fixtures
+    # arm64 by label, not by whatever macos-latest resolves to: the tests
+    # built for aarch64-apple-darwin have to run on the host.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
           targets: aarch64-apple-darwin
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -206,449 +330,96 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-darwin-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: ${{ runner.temp }}
+      - name: Unpack the fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p .vm-share
+          tar -xzf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share
+          ls -1 .vm-share | wc -l | xargs echo "fixtures:"
+          ./scripts/build-fixtures.sh --check
+      # What DiskJockey's XFS extension links against. A break here ships
+      # to the consumer, and every Linux job stays green through it.
       - name: Build the shipped staticlib for aarch64-apple-darwin
         run: cargo build --locked --release --lib --target aarch64-apple-darwin
-      # Its own floor, because this is its own selection on its own
-      # host: the Linux jobs going green says nothing about whether the
-      # aarch64-apple-darwin binaries were built and run. 518 executed on
-      # 2026-09-17 in run 35256241155 (job 105320488018); floor 480.
-      - name: The suite on the target it ships to, and proof it ran
-        run: |
-          set -uo pipefail
-          # ERREXIT OFF ON PURPOSE. The runner's default shell is
-          # `bash -e -o pipefail`, so a failing run would end the step
-          # before the count below ever printed — and a truncated run is
-          # exactly the one worth naming. `rc` still decides the step.
-          set +e
-          cargo test --locked --release --target aarch64-apple-darwin 2>&1 | tee "$RUNNER_TEMP/darwin-tests.log"
-          rc=${PIPESTATUS[0]}
-          ./scripts/ci-test.sh --floor-check 480 "$RUNNER_TEMP/darwin-tests.log" "the aarch64-apple-darwin run" || rc=1
-          exit "$rc"
+      # NO `chore lint` HERE. `cargo fmt --check` is the same answer on
+      # every platform and the two Linux jobs already ask it, and clippy
+      # has never run on Darwin in this repository — turning it on in the
+      # same change that moves every oracle into a VM would mix a lint
+      # sweep into a migration. What this job is for is the code paths
+      # only this target compiles, and the tiers below build all of them.
+      - name: chore test:unit
+        run: chore test:unit
+      # The tiers a Mac can run, which is the same set as the arm64 Linux
+      # job. The oracle and kernel tiers need the guest, and on a Mac
+      # that is `chore test` -> `chore test:vm`, which needs a nested
+      # hypervisor GitHub's macOS runners do not give us. `suite-in-vm`
+      # runs that path on Linux instead, so it cannot rot.
+      - name: chore test:images
+        run: chore test:images
 
-  # ---------------------------------------------------------------------
-  # Real-kernel cross-validation gate. This job BLOCKS — it is not
-  # advisory, and it is not continue-on-error.
-  #
-  # WHY THIS EXISTS
-  #
-  # The unit tests in src/ parse superblocks and AG headers that this
-  # crate constructed itself. That proves the parser is self-consistent.
-  # It does not prove the parser reads XFS the way the rest of the world
-  # reads it: when the fixture and the parser share a misunderstanding,
-  # the test passes and the bug is invisible.
-  #
-  # Three real bugs were shipped into this crate and caught only by
-  # comparing against xfs_db — every one of them passed the unit tests:
-  #
-  #   1. The superblock magic was transposed. Our fixtures were written
-  #      with the same transposition, so the round-trip agreed with
-  #      itself and no real XFS volume would ever have been recognised.
-  #   2. Several checksum fields were read little-endian in a format that
-  #      is otherwise big-endian throughout. Self-built fixtures encoded
-  #      them the same wrong way, so verification "succeeded".
-  #   3. Checksums were computed over the whole sector instead of over
-  #      the struct. Again symmetric, again invisible, again wrong
-  #      against every filesystem a real mkfs.xfs produces.
-  #
-  # The only defence against that class of bug is an independent oracle.
-  # So on every PR and push we build real filesystems with the canonical
-  # mkfs.xfs, dump each superblock with xfs_db, and require this driver's
-  # reading of every field to match the reference debugger's. Then we
-  # loop-mount the images with the in-kernel XFS driver, which is the
-  # final proof the bytes are a filesystem Linux itself accepts, and we
-  # scrape dmesg afterwards because the kernel will complain about
-  # metadata it tolerates but dislikes — a successful mount alone is not
-  # a clean bill of health.
-  #
-  # GitHub's Linux runners are already Linux, so unlike the macOS
-  # developer workflow (scripts/vm.sh drives a Debian VM for mkfs.xfs and
-  # xfs_db) no VM is needed here. The fixtures land in the same
-  # .vm-share/ directory that tests/oracle_vm_fixtures.rs reads, using the
-  # same `xfs-<name>.img` + `xfs-<name>.sbdump` pairing, so CI and the
-  # local loop exercise byte-identical code paths.
-  # ---------------------------------------------------------------------
-  validate-kernel-xfs:
-    name: validate against xfs_db + in-kernel XFS driver
-    runs-on: ubuntu-latest
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-      # xfsprogs provides mkfs.xfs (builds the fixtures) and xfs_db (the
-      # oracle we grade ourselves against). Print the version: which
-      # geometries and feature flags are accepted depends on it, and the
-      # skip messages below are only readable next to it.
-      - name: Install xfsprogs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xfsprogs
-          mkfs.xfs -V
-          xfs_db -V
-      - name: Cache cargo registry
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-kxfs-${{ hashFiles('**/Cargo.lock') }}
-
-      # Builds the same fixture set as scripts/vm-build-fixtures.sh: both
-      # read scripts/fixture-geometries.sh, so CI and a developer's local
-      # run cannot drift apart (#110).
-      #
-      # The geometries are chosen to move the fields most likely to be
-      # misread: block and inode size change every log2-derived field,
-      # agcount changes the inode-number split, and the feature flags
-      # change the AG layout and the feature bitmasks.
-      # Both this gate and the release gate call the same script.
-      # They previously each carried their own inline copy, the two
-      # drifted, and the release gate silently stopped generating the
-      # inode dumps its own test needed.
-      - name: Build the XFS fixture matrix
-        run: ./scripts/with-test-temp.sh ./scripts/build-fixtures-native.sh
-
-      # The directory-conversion fixtures, which need to mount and so
-      # cannot come from build-fixtures-native.sh. Same script the VM
-      # runner calls — deliberately one copy, because the geometry
-      # fixtures already have two builders and the warning above about
-      # them drifting was written after they did.
-      #
-      # Without this the block-form comparison in tests/dir_block_oracle.rs
-      # finds no fixtures and skips, which reads exactly like passing.
-      - name: Build the directory-conversion fixtures
-        run: ./scripts/with-test-temp.sh ./scripts/build-dirconv-fixtures.sh
-
-      # The write-path fixtures: the same filesystem before and after the
-      # kernel truncated a file, and before and after it removed one.
-      #
-      # These existed only as VM scripts, so nothing here could build them
-      # and tests/truncate_oracle.rs plus tests/unlink_replay_oracle.rs
-      # skipped in CI on every run -- which reads exactly like passing.
-      # It showed up as coverage: truncate.rs sat at 5% and unlink.rs at
-      # 26% while their oracles reported ok. The logic moved into these
-      # native scripts and the vm-build-* ones now just ship them into the
-      # VM, so there is one copy rather than two that can drift.
-      # The populated filesystems and the crashed one. These were the
-      # last fixture set only the VM could build, which is why
-      # write_oracle, endtoend_oracle, dir_oracle and log_oracle all
-      # skipped here. The deep-tree set -- groups whose free-space, rmap
-      # and inode trees are more than one block deep -- was built by
-      # nothing, so deeptree_oracle and the multi-level write path it
-      # checks never ran (#107).
-      - name: Build the write-path and data fixtures
-        run: |
-          sudo apt-get install -y -qq attr
-          ./scripts/with-test-temp.sh bash -euo pipefail -c '
-            ./scripts/build-truncate-fixtures.sh
-            ./scripts/build-unlink-fixtures.sh
-            ./scripts/build-create-fixtures.sh
-            ./scripts/build-log-fixtures.sh
-            ./scripts/build-data-fixtures.sh
-            ./scripts/build-feature-matrix-fixtures.sh
-            ./scripts/build-crossag-fixtures.sh
-            ./scripts/build-deeptree-fixtures.sh
-          '
-
-      # Freeing an extent and freeing an inode are the two write
-      # operations whose result cannot be checked by looking at it: a
-      # zero-length file looks the same however its blocks were returned.
-      # The before/after pair is the only oracle, so these run where the
-      # pair can actually be built.
-      #
-      # Every suite whose fixtures this job builds is in the list, not
-      # only the replay ones. A fixture-gated suite left out runs only in
-      # the test job, which has no .vm-share, and skips there: capi (#104),
-      # dir_oracle (#105), rmap_oracle and refcount_oracle (#106), the
-      # nine in #108, and fs_refusals, alloc_btree_oracle and
-      # inode_alloc_oracle all passed that way without reading an image.
-      # ci-test.sh fails the job if any of them skips here, and
-      # tests/every_fixture_suite_is_run_gated.rs fails if a suite that
-      # reads .vm-share is added without being listed somewhere like this.
-      - name: Replay against the kernel every oracle that can reach one
-        run: |
-          set -uo pipefail
-          # ERREXIT OFF ON PURPOSE. The runner's default shell is
-          # `bash -e -o pipefail`, so a failing run would end the step
-          # before the count below ever printed — and a truncated run is
-          # exactly the one worth naming. `rc` still decides the step.
-          set +e
-          log="$RUNNER_TEMP/kernel-oracles.log"
-          : > "$log"
-          rc=0
-          for suite in truncate_oracle truncate_replay_oracle unlink_replay_oracle \
-                       create_replay_oracle log_replay_oracle file_write_replay_oracle \
-                       rename_oracle write_oracle endtoend_oracle log_oracle \
-                       feature_matrix_oracle crossag_oracle \
-                       dir_oracle rmap_oracle refcount_oracle \
-                       super_write_oracle inode_btree_oracle \
-                       buf_item_oracle inode_buffer_oracle log_checksum_oracle \
-                       log_encode_oracle log_dinode_oracle \
-                       file_handle_oracle read_path_cost \
-                       capi fs_refusals alloc_btree_oracle inode_alloc_oracle \
-                       deeptree_oracle random_operations_replay many_ops_per_mount log_reuse \
-                       block_form_insert truncate_btree_fork scratch_isolation \
-                       inode_chunk_alignment agfl_refill dirty_log_mount repair_verdict \
-                       wide_inode_directory split_checkpoint; do
-            ./scripts/ci-test.sh --test "$suite" 2>&1 | tee -a "$log"
-            rc=${PIPESTATUS[0]}
-            if [ "$rc" -ne 0 ]; then
-              echo "::error::$suite failed; the floor below is checked against what did run"
-              break
-            fi
-          done
-          # THE TOTAL, ON TOP OF THE PER-SUITE FLOOR ci-test.sh APPLIES
-          # (#201). The script refuses any single suite that executed
-          # nothing; this refuses the step as a whole shrinking. The two
-          # answer different questions: one suite emptying is caught by
-          # the script, and the list above losing entries -- an edit that
-          # drops names from the `for` line, a `break` that fires early,
-          # a rename that leaves a suite unbuilt -- is only visible in the
-          # total.
-          #
-          # 117 executed on 2026-09-17 in run 35256241155 (job
-          # 105320488253, main at 19f6acbf), across the 31 suites listed
-          # there; agfl_refill has been added since, so the real figure
-          # today is higher. Floor 105, the measured count less about
-          # 10%. Raise it, never lower it.
-          ./scripts/ci-test.sh --floor-check 105 "$log" "the kernel-reachable oracle suites" || rc=1
-          exit "$rc"
-
-      # THE FAILURE THAT COST TWO RED `main` RUNS LEFT NOTHING BEHIND.
-      # This step keeps no artefact, so the only record of a kernel
-      # rejecting a volume is whatever the suite printed, and #199 was
-      # read from twenty lines of `xfs_repair` with the interesting part
-      # cut off. `agfl_refill` now keeps its volume when it fails (and
-      # only then); this puts it where the next reader can fetch it.
-      #
-      # `if: failure()` runs after ANY failing step above, which is why
-      # it says so when there is nothing to collect rather than failing
-      # a job that is already failing for another reason.
-      - name: Keep the volume a kernel replay was judged on
-        if: failure()
-        run: |
-          shopt -s nullglob
-          kept=(.vm-share/agfl-refill-*.img)
-          if [ ${#kept[@]} -eq 0 ]; then
-            echo "no volume kept — this failure was not agfl_refill's"
-            exit 0
-          fi
-          # --sparse because the volumes are 320 MiB holding a few of
-          # them, and the artefact upload would otherwise carry the holes.
-          tar --sparse -cJf "$RUNNER_TEMP/agfl-refill-volumes.tar.xz" "${kept[@]}"
-          ls -l "$RUNNER_TEMP/agfl-refill-volumes.tar.xz"
-      - name: Upload the kept volume
-        if: failure()
-        uses: actions/upload-artifact@v4
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
         with:
-          name: agfl-refill-volumes
-          path: ${{ runner.temp }}/agfl-refill-volumes.tar.xz
-          if-no-files-found: ignore
-
-      # The strongest check in the suite: build a block-form directory
-      # from the short-form one, and require it to equal the block the
-      # kernel built for the same entries, byte for byte apart from the
-      # checksum and sequence number it stamps after logging.
-      - name: Compare our block-form directory against the kernel's
-        #
-        # CI_TEST_FLOOR, not an argument: an option between the script
-        # and `--test` would make tests/every_fixture_suite_is_run_gated.rs
-        # read this suite as unrun. 3 executed on 2026-09-17 in run
-        # 35256241155 (job 105320488253), and the floor is 3 rather than
-        # the measured count less a margin: a margin under a three-test
-        # oracle is a floor of 2, which is one silently dropped
-        # comparison away from meaning nothing. Dropping a case here is
-        # meant to be a deliberate edit to this line.
-        run: CI_TEST_FLOOR=3 ./scripts/ci-test.sh --test dir_block_oracle
-
-      # The comparison itself: parse each image with this driver and
-      # require every field to equal what xfs_db reported for it. This
-      # MUST run before the mount step below — mounting replays the log
-      # and writes back the superblock's free-space and inode counters,
-      # which would leave the images disagreeing with the dumps that were
-      # taken straight out of mkfs.
-      - name: Cross-validate every superblock field against xfs_db
-        #
-        # 5 executed on 2026-09-17 in run 35256241155 (job 105320488253)
-        # — one per fixture geometry — and the floor is that count for
-        # the same reason as dir_block_oracle above: this is the suite
-        # whose whole purpose is comparing against xfs_db, and a
-        # geometry quietly disappearing from .vm-share takes its
-        # comparison with it while the rest still reports ok.
-        run: CI_TEST_FLOOR=5 ./scripts/ci-test.sh --test oracle_vm_fixtures
-
-      # The #[ignore]-gated oracle suite in tests/oracle_mkfs.rs does the
-      # same field-by-field comparison, but builds its own images inline
-      # rather than reading .vm-share. It is ignored by default so a
-      # checkout without xfsprogs stays green; xfsprogs is installed here,
-      # so opt it in.
-      #
-      # Parent pointers and exchange-range need xfsprogs 6.10 or newer, and
-      # this runner's is older, so tests/parent_exchrange_oracle.rs gets a
-      # pinned build of its own through XFSPROGS_PARENT_BIN (#99).
-      - name: Cache the pinned xfsprogs build
-        uses: actions/cache@v4
-        with:
-          path: ~/xfsprogs-pinned
-          key: ${{ runner.os }}-xfsprogs-${{ hashFiles('scripts/build-xfsprogs.sh') }}
-      - name: Build the pinned xfsprogs
-        run: |
-          sudo apt-get install -y -qq liburcu-dev libinih-dev uuid-dev libblkid-dev \
-            libdevmapper-dev autoconf automake libtool gettext pkg-config
-          ./scripts/build-xfsprogs.sh ~/xfsprogs-pinned
-          echo "XFSPROGS_PARENT_BIN=$HOME/xfsprogs-pinned/sbin" >> "$GITHUB_ENV"
-      #
-      # THROUGH ci-test.sh LIKE EVERY OTHER RUN IN THIS JOB (#200). It
-      # used to be a bare `cargo test -- --ignored`, which meant the skip
-      # gate could not see it — and these are exactly the suites it
-      # exists for: `oracle_mkfs` prints a note per field it could not
-      # compare against `xfs_db`, and that note is in the script's own
-      # `--self-test` corpus as a skip it must catch.
-      #
-      # The floor stays, because `--ignored` selects a disjoint set from
-      # every other run in this file and so can empty on its own: an
-      # `#[ignore]` attribute added, or a filter that stops matching,
-      # would leave "0 passed" and a green step. 14 executed on
-      # 2026-09-17 in run 35256241155 (job 105320488253); floor 12.
-      - name: Run the xfsprogs-gated oracle tests
-        run: CI_TEST_FLOOR=12 ./scripts/ci-test.sh --ignored
-
-      # Mounting is the end of the argument. xfs_db agreeing with us
-      # proves we read the metadata correctly; the kernel mounting the
-      # image proves the image was a genuine XFS filesystem in the first
-      # place and not something only our tooling believes in.
-      #
-      # Mount copies, not the fixtures: a mount is a write, and the
-      # fixtures are the evidence the previous step was graded on. Keeping
-      # them pristine means the steps can be reordered or re-run without
-      # silently invalidating each other.
-      - name: Loop-mount the fixtures with the in-kernel XFS driver
+          name: fixtures
+          path: ${{ runner.temp }}
+      - name: Unpack the fixtures
         run: |
           set -euo pipefail
-          share="$GITHUB_WORKSPACE/.vm-share"
-          # Start from a clean kernel ring buffer so the scrape below can
-          # attribute every XFS line to the mounts this job performed.
-          sudo dmesg -C
+          mkdir -p .vm-share
+          tar -xzf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share
+          ls -1 .vm-share | wc -l | xargs echo "fixtures:"
+          ./scripts/build-fixtures.sh --check
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        run: chore test:vm
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
 
-          mounted=0
-          for img in "$share"/xfs-*.img; do
-            name="$(basename "$img" .img)"
-            work="$RUNNER_TEMP/$name.mnt.img"
-            mnt="$RUNNER_TEMP/mnt-$name"
-            cp --sparse=always "$img" "$work"
-            sudo mkdir -p "$mnt"
-
-            if sudo mount -t xfs -o loop "$work" "$mnt"; then
-              # Prove the mount is live, not just attached: write, sync,
-              # read back, and confirm the driver-visible root directory
-              # actually holds something.
-              echo "kernel-mount smoke test" | sudo tee "$mnt/ci-probe.txt" > /dev/null
-              sudo sync
-              sudo grep -q "kernel-mount smoke test" "$mnt/ci-probe.txt"
-              sudo ls -la "$mnt"
-              sudo umount "$mnt"
-              echo "MOUNTED $name — the in-kernel XFS driver accepted this image"
-              mounted=$((mounted + 1))
-            elif [ "$name" = "xfs-nocrc" ]; then
-              # crc=0 is the deprecated V4 format. Kernels built without
-              # CONFIG_XFS_SUPPORT_V4 refuse it outright, and that is the
-              # kernel's choice rather than a defect in the image — the
-              # xfs_db comparison above already validated our reading of
-              # it. Loud, not fatal.
-              echo "::warning title=V4 image not mounted::$name (crc=0, deprecated V4) was refused by this kernel; the xfs_db comparison still covered it"
-            else
-              echo "$name: the in-kernel XFS driver refused to mount this image" >&2
-              exit 1
-            fi
-            sudo rm -f "$work"
-          done
-
-          # The default geometry is the one image that must always mount.
-          # If it did not, either mkfs skipped it or the kernel rejected
-          # it, and both mean this gate proved nothing.
-          if [ ! -f "$share/xfs-default.img" ]; then
-            echo "xfs-default.img was never built — the mount gate proved nothing" >&2
-            exit 1
-          fi
-          echo "images accepted by the in-kernel XFS driver: $mounted"
-
-      # A mount that succeeds can still have made the kernel unhappy:
-      # corrupt-but-tolerated metadata, geometry it dislikes, log recovery
-      # it had to do. Those land in dmesg at warning level or above and
-      # are exactly the signal that something in our fixture pipeline is
-      # off, so treat them as failures rather than noise.
-      - name: Fail on XFS complaints in dmesg
-        run: |
-          set -euo pipefail
-          echo "--- all XFS kernel messages from this job ---"
-          sudo dmesg | grep -i 'XFS' || echo "(none)"
-          echo "---------------------------------------------"
-          # Informational mount chatter ("Mounting V5 Filesystem", "Ending
-          # clean mount") is emitted at notice/info level and filtered out
-          # by --level. Two warnings are allowed through, both of which
-          # describe the V4 format itself rather than any defect in the
-          # image we produced:
-          #   - the deprecation notice, a schedule announcement;
-          #   - the 2038 timestamp ceiling, which is simply what V4 is
-          #     without the bigtime feature. A V4 fixture is deliberate
-          #     coverage, so the kernel stating its limits is expected.
-          # Keep both patterns narrow. Widening this allowlist is how a
-          # gate quietly stops being a gate.
-          sudo dmesg --level=warn,err,crit,alert,emerg \
-            | grep -i 'XFS' \
-            | grep -v -i 'Deprecated V4 format' \
-            | grep -v -i 'supports timestamps until' \
-            > "$RUNNER_TEMP/xfs-dmesg-warnings.txt" || true
-          if [ -s "$RUNNER_TEMP/xfs-dmesg-warnings.txt" ]; then
-            echo "the kernel complained about the XFS images:" >&2
-            cat "$RUNNER_TEMP/xfs-dmesg-warnings.txt" >&2
-            exit 1
-          fi
-          echo "no XFS warnings or errors in dmesg."
-
-  # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#207).
-  #
-  # Branch protection names checks, and a check is a job name. Naming
-  # each one means the list has to be edited whenever a job is renamed,
-  # split into a matrix leg or added — and until someone does, the new
-  # work is required by nobody. That is what `.github-guard` already
-  # describes having happened here: `test-darwin` ran on every pull
-  # request, reported, and could not block one, and nothing in the
-  # repository had an opinion about it.
-  #
-  # The opposite spelling is worse. A required check no job produces
-  # reads as permanently pending, and with `enforce_admins` on nothing
-  # merges and there is no failure to point at.
-  #
-  # `if: always()` because a job that was cancelled or skipped is not a
-  # job that passed, and an aggregate that only runs when its needs
-  # succeeded cannot say so — it would be skipped itself, and a skipped
-  # required check never reports.
   ci-ok:
     name: ci-ok
-    needs: [test, darwin, validate-kernel-xfs]
+    # THE ONE REQUIRED CHECK (#207). Requiring the gate rather than each
+    # job means a job can be renamed, split or made conditional without
+    # leaving a required check that never reports — which GitHub reads as
+    # permanently pending, with nothing to point at. It is also the only
+    # shape in which a job-level `if:` is safe.
     if: always()
+    needs: [unit, fixtures, test, test-arm64, test-darwin, suite-in-vm]
     runs-on: ubuntu-latest
     steps:
-      - name: every gating job must have concluded success
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "test:                ${{ needs.test.result }}"
-          echo "darwin:              ${{ needs.darwin.result }}"
-          echo "validate-kernel-xfs: ${{ needs.validate-kernel-xfs.result }}"
-          failed=0
-          for one in "test:${{ needs.test.result }}" \
-                     "darwin:${{ needs.darwin.result }}" \
-                     "validate-kernel-xfs:${{ needs.validate-kernel-xfs.result }}"; do
-              job=${one%%:*}
-              result=${one#*:}
-              if [ "$result" != "success" ]; then
-                  echo "::error::$job concluded '$result', not 'success' -- failure, cancellation and skipping all mean the gate did not run to completion"
-                  failed=1
-              fi
-          done
-          [ "$failed" = 0 ] || exit 1
-          echo "all gating jobs succeeded"
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad="$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $bad (failed, cancelled or skipped)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"

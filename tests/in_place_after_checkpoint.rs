@@ -14,25 +14,25 @@
 //! change fares no better: replay puts back the core the record holds,
 //! because the in-place edit doesn't move the inode's LSN.
 //!
-//! `mkfs.xfs -p` makes a file with 64 KiB of data in one extent. Skips when
-//! xfsprogs is not installed.
+//! `mkfs.xfs -p` makes a file with 64 KiB of data in one extent, in the
+//! fs-linux-test-harness guest, which always has it: the fence this covers
+//! is only observed on a real one-extent file, so a run without the image
+//! is a run that checked nothing rather than a run to pass over.
 
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use fs_xfs::write::AttrChange;
 use fs_xfs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
+
+mod common;
+use common::oracle;
 
 #[test]
 fn in_place_writes_are_refused_once_the_mount_has_logged_a_change() {
-    if !Command::new("mkfs.xfs")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        eprintln!("skip: xfsprogs not installed");
-        return;
-    }
+    // The protofile, the files it names and the image are all made under
+    // `std::env::temp_dir()`, which `scripts/with-test-temp.sh` points at
+    // a directory inside this repository — the one tree the guest running
+    // mkfs.xfs can see.
     let root = std::env::temp_dir().join(format!("fs_xfs_in_place_fence_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
@@ -49,17 +49,12 @@ fn in_place_writes_are_refused_once_the_mount_has_logged_a_change() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(300 * 1024 * 1024))
         .unwrap();
-    let out = Command::new("mkfs.xfs")
+    let out = oracle("mkfs.xfs")
         .args(["-q", "-f", "-p"])
         .arg(root.join("proto"))
         .arg(&image)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .output();
+    assert!(out.ok(), "{}{}", out.stdout, out.stderr);
 
     let dev = Arc::new(FileDevice::open_rw(image.to_str().unwrap()).unwrap());
     let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount rw");

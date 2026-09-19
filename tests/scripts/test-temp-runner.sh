@@ -181,46 +181,57 @@ if [[ "$SELECTED" != "$EXACT" || ! -d "$EXACT" ]]; then
 fi
 rmdir "$EXACT"
 
+# THE ENVIRONMENT NO LONGER CHOOSES. The wrapper used to fall back to
+# $RUNNER_TEMP on a GitHub runner, to the checkout on a Raspberry Pi, and
+# to $TMPDIR everywhere else — three different answers for the same
+# question, and two of them name a directory the harness guest cannot
+# see. The oracle tools run in that guest, which is given this repository
+# and nothing else of the host, so scratch is inside the checkout on
+# every machine.
 FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE= \
     GITHUB_ACTIONS=true RUNNER_TEMP="$TEST_BASE" TMPDIR=/must-not-be-used \
     "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
 SELECTED="$(cat "$OUTPUT")"
-
 case "$SELECTED" in
-    "$TEST_BASE"/fs-xfs-tests.*) ;;
+    "$REPO"/tmp/fs-xfs-tests.*) ;;
     *)
-        echo "FAIL  GitHub scratch directory is outside RUNNER_TEMP: $SELECTED" >&2
+        echo "FAIL  a runner's own temporary directory was used instead of the checkout: $SELECTED" >&2
         exit 1
         ;;
 esac
-
 if [[ -e "$SELECTED" ]]; then
-    echo "FAIL  runner did not clean its GitHub scratch directory: $SELECTED" >&2
+    echo "FAIL  runner did not clean the scratch directory it owned: $SELECTED" >&2
     exit 1
 fi
 
 FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE= GITHUB_ACTIONS=false RUNNER_TEMP= \
     env -u TMPDIR "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
 SELECTED="$(cat "$OUTPUT")"
-if [[ -r /proc/device-tree/model ]] && grep -aq 'Raspberry Pi' /proc/device-tree/model; then
-    case "$SELECTED" in
-        "$REPO"/tmp/fs-xfs-tests.*) ;;
-        *)
-            echo "FAIL  Raspberry Pi scratch directory is outside the worktree: $SELECTED" >&2
-            exit 1
-            ;;
-    esac
-else
-    case "$(basename "$SELECTED")" in
-        fs-xfs-tests.*) ;;
-        *)
-            echo "FAIL  platform fallback did not create an isolated scratch directory: $SELECTED" >&2
-            exit 1
-            ;;
-    esac
-fi
+case "$SELECTED" in
+    "$REPO"/tmp/fs-xfs-tests.*) ;;
+    *)
+        echo "FAIL  the default scratch directory is outside the worktree: $SELECTED" >&2
+        exit 1
+        ;;
+esac
 if [[ -e "$SELECTED" ]]; then
     echo "FAIL  runner did not clean its default scratch directory: $SELECTED" >&2
+    exit 1
+fi
+
+# A base outside the repository is REFUSED, not quietly accepted: an
+# image there is a path the guest cannot open, and the failure would
+# arrive much later as a tool reporting "No such file or directory"
+# about a file that plainly exists.
+OUTSIDE="$(mktemp -d)"
+set +e
+FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$OUTSIDE" \
+    "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT" 2>/dev/null
+STATUS=$?
+set -e
+rmdir "$OUTSIDE" 2>/dev/null || rm -rf "$OUTSIDE"
+if [[ "$STATUS" -eq 0 ]]; then
+    echo "FAIL  a scratch base outside the repository was accepted: $(cat "$OUTPUT")" >&2
     exit 1
 fi
 

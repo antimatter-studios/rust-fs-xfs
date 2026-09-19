@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 #
-# provision-stress-tools.sh — put `fsstress` and `fsx` in the guest.
+# guest-stress-tools.sh — put `fsstress` and `fsx` in the guest.
+#
+# Run INSIDE the fs-linux-test-harness VM by
+# scripts/guest-build-fixtures.sh, and only when the `stress` set is
+# asked for: building fstests takes minutes, and no other fixture set
+# wants it, so scripts/vm-setup.sh deliberately leaves it out of the
+# provision every boot would pay for.
 #
 # These two come from the filesystem test suite (fstests, formerly
 # xfstests). `fsstress` runs long randomised sequences of filesystem
 # operations; `fsx` hammers one file with randomised reads, writes,
 # truncates, hole punches and mmap operations. Both reach on-disk states
 # that a hand-written fixture never will, which is the whole reason they
-# are here: scripts/vm-build-stress-fixtures.sh uses them to *generate*
+# are here: scripts/build-stress-fixtures.sh uses them to *generate*
 # filesystems, and the kernel plus the reference checker remain the
 # oracles.
 #

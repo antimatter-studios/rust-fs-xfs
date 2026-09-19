@@ -62,14 +62,21 @@ const DIRECTORIES: u32 = 40;
 
 #[test]
 fn a_create_in_a_high_numbered_directory_keeps_the_inode_number() {
-    if !share().exists() {
-        eprintln!("no .vm-share — skipped");
-        return;
-    }
+    // THE SHARED DIRECTORY IS ALWAYS THERE. `chore fixtures` makes it
+    // before anything else runs, and this test writes its scratch volume
+    // beside the fixtures. An absent share is that build not having
+    // happened, which has to be seen rather than skipped.
+    assert!(
+        share().is_dir(),
+        "{} is not there: the fixtures are gitignored and generated, and this test \
+         writes its scratch volume beside them. `chore fixtures` builds the set and \
+         makes the directory. Tests never skip on a missing fixture.",
+        share().display()
+    );
     let volume = scratch::Volume::empty(SUITE, "wide.img", VOLUME_BYTES);
     let image = volume.guest();
 
-    let Some(built) = kernel_run(&format!(
+    let built = kernel_run(&format!(
         r#"
         mkfs.xfs -q -f -d agsize={AGSIZE_BLOCKS}b -l size=64m {image} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
@@ -89,10 +96,7 @@ fn a_create_in_a_high_numbered_directory_keeps_the_inode_number() {
         echo DONE
         "#,
         last = DIRECTORIES - 1,
-    )) else {
-        eprintln!("no kernel reachable (fixture or VM unavailable) — skipped");
-        return;
-    };
+    ));
     assert!(
         built.contains("MKFS_OK") && built.contains("MOUNT_OK"),
         "building the volume failed:\n{built}"
@@ -170,8 +174,7 @@ fn a_create_in_a_high_numbered_directory_keeps_the_inode_number() {
         echo DONE
         "#,
         repair = repair::script(&image),
-    ))
-    .expect("kernel");
+    ));
 
     assert!(
         out.contains("MOUNTED"),

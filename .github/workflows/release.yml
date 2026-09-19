@@ -45,9 +45,12 @@ jobs:
           fi
           echo "tag and Cargo.toml agree on $version"
 
-  # The whole branch gate, unmodified: fmt, clippy, the test suite, and
+  # The whole branch gate, unmodified: fmt, clippy, every test tier, and
   # the real-kernel cross-validation against xfs_db and the in-kernel XFS
-  # driver.
+  # driver — which now happens inside the fs-linux-test-harness VM, the
+  # same guest a developer's `chore test` uses, so the release gate, the
+  # branch gate and a local run are graded by one kernel and one
+  # xfsprogs.
   gate:
     name: branch gate
     uses: ./.github/workflows/ci.yml

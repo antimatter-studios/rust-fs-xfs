@@ -30,13 +30,11 @@
 //! once per path, and today every one of those is a fresh call to the
 //! device.
 //!
-//! Fixtures are gitignored, so this skips on a fresh clone.
+//! The fixtures are gitignored and generated; `chore fixtures` builds
+//! them. Finding none to measure is that build not having happened, so
+//! this fails and names the task rather than reporting a measurement of
+//! nothing as a pass.
 
-// EACH INTEGRATION TEST COMPILES `common` SEPARATELY, so everything in
-// it that this one does not use -- which is the whole VM transport,
-// since nothing here needs a kernel -- looks dead to the lint. It is
-// used, by the oracles next door.
-#[allow(dead_code)]
 mod common;
 use common::share;
 
@@ -66,17 +64,30 @@ struct Cost {
 /// and then failed with "the fixture had nothing to walk" — a true
 /// statement about the wrong thing, since what had gone wrong was that the
 /// populated fixtures were never built (#213).
+///
+/// The order is a PREFERENCE, not a fallback. All three come out of the
+/// same `chore fixtures` run, so finding none of them is that build not
+/// having happened — which is a fact worth failing on, rather than a
+/// measurement this suite may quietly decline to take.
 const POPULATED: [&str; 3] = [
     "xfsfeat-everything.img",
     "xfsdeep-inobt2.img",
     "xfsdata-default.img",
 ];
 
-fn fixture() -> Option<PathBuf> {
+fn fixture() -> PathBuf {
     POPULATED
         .iter()
         .map(|name| share().join(name))
-        .find(|path| path.exists())
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "none of {POPULATED:?} is in {}: the fixtures are gitignored and \
+                 generated. Build them with `chore fixtures`, then run this again. \
+                 Tests never skip on a missing fixture.",
+                share().display()
+            )
+        })
 }
 
 /// The counter sits BELOW the cache, so what it reports is what
@@ -150,15 +161,7 @@ fn report(what: &str, c: &Cost) {
 /// it fails on a fixture rebuild.
 #[test]
 fn what_a_read_costs_in_calls_to_the_device() {
-    let Some(img) = fixture() else {
-        eprintln!(
-            "no populated fixtures ({}) — skipping. Build them with \
-             ./scripts/build-feature-matrix-fixtures.sh, ./scripts/build-deeptree-fixtures.sh \
-             or ./scripts/build-data-fixtures.sh",
-            POPULATED.join(", ")
-        );
-        return;
-    };
+    let img = fixture();
     eprintln!("measuring {}", img.display());
 
     eprintln!("--- uncached ---");
@@ -186,9 +189,11 @@ fn what_a_read_costs_in_calls_to_the_device() {
     // records the uncached read at 522 calls and 754 KB. (btrfs loads its
     // tree at mount and legitimately records zero for one fixture.)
     //
-    // ONLY WHEN THE FILES HAD BYTES TO RETURN. A freshly formatted fixture
-    // (`xfs-4ags.img`, the fallback) holds no regular files, so a correct
-    // driver reads nothing there (Greptile on #177).
+    // ONLY WHEN THE FILES HAD BYTES TO RETURN. A freshly formatted
+    // fixture holds no regular files, so a correct driver reads nothing
+    // there (Greptile on #177). None of POPULATED is one, which is why
+    // that list exists (#213), and the assertion stays because the
+    // condition it covers is about the image rather than about the list.
     assert!(
         uncached.read_returned == 0 || uncached.read.bytes > 0,
         "the read pass returned {} bytes and fetched none from the device",

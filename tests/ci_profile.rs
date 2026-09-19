@@ -1,23 +1,63 @@
-//! The debug test run guards itself.
+//! The debug test run, and the independent oracle, guard themselves.
 //!
-//! `ci.yml` runs the unit suite twice: once `--release`, once not. The
-//! second run looks redundant and is not. Overflow checks are on in debug
-//! and off in release, so a defect whose only symptom is an arithmetic
-//! overflow panic cannot be observed by a release-only gate — which is
-//! what this crate had, in every workflow it has: `ci.yml` was `--release`
-//! at both invocations, `scripts/ci-test.sh` fixes `--release` for the
-//! whole suite matrix, and `release.yml` runs no `cargo test` at all.
+//! The suite runs twice: once `--release`, through
+//! `scripts/ci-test.sh`, and once in the debug profile, which is
+//! `chores.yml`'s `test:unit` task. The second run looks redundant and
+//! is not. Overflow checks are on in debug and off in release, so a
+//! defect whose only symptom is an arithmetic overflow panic cannot be
+//! observed by a release-only gate — which is what this crate had, in
+//! every workflow it has had: `ci.yml` was `--release` at both
+//! invocations, `scripts/ci-test.sh` fixes `--release` for the whole
+//! suite, and `release.yml` runs no `cargo test` at all.
 //!
-//! The comment above that step explains the reasoning, but a comment is
-//! advice. Deleting the step leaves CI green, saves a compile, and puts
+//! THE COMMAND MOVED; THE PROPERTY DID NOT. Every CI job now runs a
+//! chore task and `ci.yml` contains no `cargo test` line at all. The
+//! debug run — the absent `--release` and the
+//! `EXPECT_OVERFLOW_CHECKS=1` handshake `src/lib.rs` reads — lives in
+//! `chores.yml` under `test:unit`, and the workflow's contribution is
+//! that a job whose result gates a pull request invokes that task.
+//! Neither half is worth anything alone: a task that builds in debug
+//! and is never run gates nothing, and a job that runs a task which has
+//! quietly acquired `--release` gates nothing either. So the two are
+//! asserted separately, because they fail separately and the reader
+//! needs to be sent to the right file.
+//!
+//! The comments above both explain the reasoning, but a comment is
+//! advice. Deleting either leaves CI green, saves a compile, and puts
 //! the blindness back. The failure mode is a well-intentioned tidy-up:
 //! nobody removes a test job on purpose, they consolidate two lines that
 //! appear to do the same thing.
 //!
 //! So the property gets a check of its own. It asserts that at least one
-//! `cargo test` in the gate still runs without `--release`, rather than
-//! that any particular line is present, so renaming or reformatting the
-//! step does not defeat it while a deletion does.
+//! `cargo test` in the task still runs without `--release`, and that at
+//! least one gating job still invokes the task, rather than that any
+//! particular line is present — so renaming or reformatting either does
+//! not defeat it while a deletion does.
+//!
+//! # The jobs that run the INDEPENDENT oracle guard themselves too
+//!
+//! #208. The evidence this crate rests on is not its own: it is
+//! xfsprogs reading back what the driver wrote, and the kernel mounting
+//! it. Nothing used to fail if the job that ran that oracle was
+//! renamed, given an `if:`, given `continue-on-error:`, stopped
+//! installing its tool, or stopped running its suite — any one of which
+//! leaves a green check whose name still reads like cross-validation
+//! while nothing is cross-validated. rust-img-qcow2#97 is what that
+//! looks like once it has happened: a probe that returned early on
+//! every runner, in every job, on every push and pull request, while
+//! the test reported `ok`. An executed-test floor cannot see it (an
+//! early return still counts as passed) and a required check cannot
+//! either (the job still reports green under the required name).
+//!
+//! The shape rust-img-qcow2#102 added is ported here to this
+//! repository's new one, and the facts are again asserted one test
+//! apiece: the workflow still triggers on `pull_request`; a gating job
+//! still builds the fixtures; a gating job still runs the whole suite;
+//! the oracle tools are still installed where the tests reach them,
+//! which is now the guest's provisioning rather than an `apt-get`
+//! step; the runner's own xfsprogs is still made unusable in the job
+//! that runs the suite; `ci-ok` still aggregates every job and still
+//! fails on a skip; and `.github-guard` still requires it.
 //!
 //! # Why this is an integration test and not a module under `src/`
 //!
@@ -35,17 +75,29 @@
 //! level up: a check that is present, that nothing runs. Being here
 //! makes it structural rather than remembered.
 //!
-//! It therefore runs in the `--release` step at `ci.yml:62` rather than
-//! in the debug step it protects. That is fine and deliberate: what it
-//! reads is a text file, so the profile it runs under is irrelevant to
-//! its result, and being in the first test step of the gate means a
-//! deleted debug step fails early.
+//! It therefore runs in whichever tier selects it — including the
+//! release one — rather than only in the debug run it protects. That is
+//! fine and deliberate: what it reads is a handful of text files, so
+//! the profile it is built in is irrelevant to its result.
 
 use saphyr::{LoadableYamlNode, Yaml};
 use std::path::{Path, PathBuf};
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The workflow this repository's pull requests are gated by.
+///
+/// `ci.yml` specifically, not every workflow. `stress.yml` is scheduled
+/// and `release.yml` runs no tests, so a debug run or an oracle job in
+/// either would satisfy a broader scan without covering a single pull
+/// request.
+fn ci_yml() -> PathBuf {
+    manifest_dir()
+        .join(".github")
+        .join("workflows")
+        .join("ci.yml")
 }
 
 /// Read a file the guards depend on, or fail.
@@ -66,18 +118,25 @@ fn read_or_panic(path: &Path) -> String {
     })
 }
 
-/// Every `cargo test` invocation in a workflow that would be compiled
+/// Every `cargo test` invocation in a script that would be compiled
 /// with overflow checks on.
 ///
-/// Four things disqualify a line, and each one is a way the guard could
-/// otherwise be satisfied by something that does not actually build in
-/// debug:
+/// The subject is `chores.yml`'s `test:unit` now -- `ci.yml` has no
+/// `cargo test` line left -- but the rules are unchanged, and so is
+/// the reason for each. Four things disqualify a line, and each one is
+/// a way the guard could otherwise be satisfied by something that does
+/// not actually build in debug:
 ///
-/// - it is a YAML comment. This is not defensive here, it is load
-///   bearing: `ci.yml` quotes `cargo test --locked --lib` verbatim
-///   inside the comment block that explains the step, so a scan that
-///   ignored comments would still find it after the step itself had
-///   been deleted, and would pass;
+/// - it is a comment. This is not defensive here, it is load bearing:
+///   the block above `test:unit` discusses the profile, the handshake
+///   and `ci-test.sh` at length, and `ci.yml` used to quote
+///   `cargo test --locked --lib` verbatim inside the comment
+///   explaining the step it has since lost -- so a scan that ignored
+///   comments would still find a run after the run itself had been
+///   deleted, and would pass. [`task_commands`] parses the manifest,
+///   which removes the comments before this sees anything; the rule
+///   stays because this function is also what reads a workflow's
+///   `run:` blocks, where the comments are the script's own;
 /// - it is an inline trailing comment on an otherwise-`--release` line;
 /// - it passes `--release`, or names a profile explicitly;
 /// - it sets a `CARGO_PROFILE_*` variable, which can turn overflow
@@ -85,10 +144,36 @@ fn read_or_panic(path: &Path) -> String {
 ///
 /// A line invoking `scripts/ci-test.sh` is not counted either, and needs
 /// no rule of its own: the script supplies `cargo test --release`
-/// itself, so no literal `cargo test` appears in the workflow. That
+/// itself, so no literal `cargo test` appears in the caller. That
 /// premise is asserted by [`ci_test_sh_still_supplies_release_itself`]
-/// rather than assumed.
+/// rather than assumed -- including for the `--gate` mode `test:unit`
+/// calls, which invokes no cargo at all.
 fn runs_with_overflow_checks(script: &str) -> Vec<String> {
+    cargo_test_commands(script)
+        .into_iter()
+        .filter(|command| {
+            !(command.contains("--release")
+                || command.contains("--profile")
+                || command.contains("CARGO_PROFILE_")
+                || selects_release_by_short_flag(command))
+        })
+        .collect()
+}
+
+/// Every `cargo test` invocation in a script, whatever profile it
+/// selects.
+///
+/// The unfiltered half of [`runs_with_overflow_checks`], and it is
+/// separate because the `test:unit` guard asks a question the filtered
+/// list cannot answer: not "is there a debug run" but "is EVERY cargo
+/// run in this task a debug one". Comparing the two lists is what
+/// makes a `--release` added beside the debug line a failure rather
+/// than a no-op, which is the likeliest way that task acquires one.
+///
+/// The comment rules are the ones described above: a line that is a
+/// comment is not a run, and a trailing comment is not part of the
+/// command.
+fn cargo_test_commands(script: &str) -> Vec<String> {
     script
         .lines()
         .filter_map(|raw| {
@@ -100,16 +185,60 @@ fn runs_with_overflow_checks(script: &str) -> Vec<String> {
             if !command.contains("cargo test") {
                 return None;
             }
-            if command.contains("--release")
-                || command.contains("--profile")
-                || command.contains("CARGO_PROFILE_")
-                || selects_release_by_short_flag(command)
-            {
-                return None;
-            }
             Some(command.to_string())
         })
         .collect()
+}
+
+/// Every non-comment line of `script` that invokes `chore <task>`.
+///
+/// The workflow no longer runs `cargo test`: it runs chore tasks, and
+/// what a job contributes to the gate is WHICH task it invokes. So the
+/// scan that used to look for a cargo command looks for a task name,
+/// through the same shell splitter ([`shell_commands`]) and with the
+/// same rules about comments — `ci.yml`'s prose names every task it
+/// runs, and a scan that counted the prose would still find
+/// `chore test:unit` after the step had been deleted.
+///
+/// THE TASK IS THE FIRST ARGUMENT THAT IS NOT A FLAG, which is how
+/// chore reads it, and it is compared WHOLE: `chore test:unit` is not
+/// `chore test`, and counting one as the other would let the aggregate
+/// tier stand in for the debug one. Anything after `--` belongs to the
+/// task rather than to chore, so it is not a task name.
+fn runs_chore_task(script: &str, task: &str) -> Vec<String> {
+    script
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.trim_start();
+            if line.starts_with('#') {
+                return None;
+            }
+            let command = line.split(" #").next().unwrap_or(line).trim();
+            shell_commands(command)
+                .iter()
+                .any(|words| chore_task_of(words) == Some(task))
+                .then(|| command.to_string())
+        })
+        .collect()
+}
+
+/// The task one command invokes, if the command is a `chore` run.
+///
+/// `chore` by name or by path, after any `NAME=value` assignments the
+/// shell applies rather than runs — the same reading
+/// [`selects_release_by_short_flag`] does for cargo, and for the same
+/// reason: in `echo chore test` the program is `echo`.
+fn chore_task_of(words: &[String]) -> Option<&str> {
+    let at = words.iter().position(|w| !is_assignment(w))?;
+    let program = words[at].as_str();
+    if program != "chore" && !program.ends_with("/chore") {
+        return None;
+    }
+    words[at + 1..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|&w| w != "--")
+        .find(|w| !w.starts_with('-'))
 }
 
 /// Whether `command` runs `cargo test` with the release profile selected
@@ -334,6 +463,25 @@ struct Step {
 
 #[derive(Debug)]
 struct Job {
+    /// The key under `jobs:`, which is what another job's `needs:`
+    /// names and what a check run is called when the job has no
+    /// `name:`.
+    id: String,
+    /// The `name:`, which is what GitHub reports as the check-run name
+    /// and therefore what branch protection can require. Absent means
+    /// the id is the name.
+    name: Option<String>,
+    /// The jobs this one waits for, in either spelling: a sequence or
+    /// a single scalar. `ci-ok` is nothing but this list, so a job
+    /// added to the file and forgotten here is exactly the hole the
+    /// aggregate exists to close.
+    needs: Vec<String>,
+    /// The `if:` value, kept rather than only counted, because
+    /// `ci-ok` is REQUIRED to carry one — `always()`, without which it
+    /// is skipped along with whatever it was aggregating. Everywhere
+    /// else the presence of the key is what matters and the value is
+    /// deliberately not read; see [`NON_GATING_KEYS`].
+    condition: Option<String>,
     keys: Vec<String>,
     steps: Vec<Step>,
 }
@@ -422,7 +570,7 @@ fn parse_workflow(text: &str) -> Workflow {
 
     let mut jobs = Vec::new();
     if let Some(mapping) = field(document, "jobs").and_then(Yaml::as_mapping) {
-        for (_, body) in mapping.iter() {
+        for (id, body) in mapping.iter() {
             let steps = field(body, "steps")
                 .and_then(Yaml::as_sequence)
                 .into_iter()
@@ -442,7 +590,25 @@ fn parse_workflow(text: &str) -> Workflow {
                         .to_string(),
                 })
                 .collect();
+            // `needs:` takes two legal shapes, a sequence or a single
+            // scalar, and both are lists of job ids.
+            let needs = match field(body, "needs") {
+                Some(needs) if needs.as_sequence().is_some() => needs
+                    .as_sequence()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|job| job.as_str().map(str::to_string))
+                    .collect(),
+                Some(needs) => needs.as_str().map(str::to_string).into_iter().collect(),
+                None => Vec::new(),
+            };
             jobs.push(Job {
+                id: id.as_str().unwrap_or_default().to_string(),
+                name: field(body, "name")
+                    .and_then(Yaml::as_str)
+                    .map(str::to_string),
+                needs,
+                condition: field(body, "if").and_then(Yaml::as_str).map(str::to_string),
                 keys: keys_of(body),
                 steps,
             });
@@ -523,6 +689,17 @@ fn not_a_pull_request_gate(workflow: &str) -> Option<String> {
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
+/// Whether a job's or a step's keys include one from
+/// [`NON_GATING_KEYS`].
+///
+/// A free function rather than a closure inside the walk, because the
+/// job-level guards ask it too: #208 wants the JOB that runs the
+/// oracle, not merely a step somewhere, and both have to read
+/// "gating" the same way or the two answers drift.
+fn carries_a_non_gating_key(keys: &[String]) -> bool {
+    keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()))
+}
+
 /// Walk a workflow's steps and collect what `select` finds in each
 /// `run:`.
 ///
@@ -539,14 +716,11 @@ const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 /// pull-request gate could see an overflow when the step it names does
 /// not run. Sharing the walk is what stops the two drifting apart
 /// again, rather than fixing them separately twice.
-fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> Vec<String> {
+fn scan_steps(workflow: &str, gating: bool, select: impl Fn(&str) -> Vec<String>) -> Vec<String> {
     let wf = parse_workflow(workflow);
     if gating && !runs_on_pull_request(&wf) {
         return Vec::new();
     }
-    let carries_a_non_gating_key =
-        |keys: &[String]| keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()));
-
     let mut out = Vec::new();
     for job in &wf.jobs {
         if gating && carries_a_non_gating_key(&job.keys) {
@@ -561,32 +735,134 @@ fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> 
     }
     out
 }
-/// The guard. Reads the workflow this repository's pull requests are
-/// gated by and refuses if nothing in it compiles the overflow checks.
-///
-/// `ci.yml` specifically, not every workflow. `stress.yml` is scheduled
-/// and `release.yml` runs no tests, so a debug run in either would
-/// satisfy a broader scan without covering a single pull request.
-#[test]
-fn the_gate_still_tests_in_a_profile_that_can_see_an_overflow() {
-    let path = manifest_dir()
-        .join(".github")
-        .join("workflows")
-        .join("ci.yml");
-    let workflow = read_or_panic(&path);
 
-    if let Some(why) = not_a_pull_request_gate(&workflow) {
-        panic!("{}: {why}", path.display());
+/// The jobs whose result gates a pull request and one of whose gating
+/// steps runs `chore <task>`.
+///
+/// The step-level walk above answers "does the gate run this
+/// anywhere"; this answers "which job does", which is the question
+/// #208 asks. The oracle guards need the job itself: the step that
+/// makes the runner's own xfsprogs unusable is only evidence if it is
+/// in the SAME job as the suite it is protecting, and a failure
+/// message that cannot name the job sends the reader to the wrong
+/// half of a 300-line workflow.
+fn gating_jobs_running<'a>(wf: &'a Workflow, task: &str) -> Vec<&'a Job> {
+    if !runs_on_pull_request(wf) {
+        return Vec::new();
     }
-    let debug_runs = gating_runs_with_overflow_checks(&workflow);
+    wf.jobs
+        .iter()
+        .filter(|job| {
+            !carries_a_non_gating_key(&job.keys)
+                && job.steps.iter().any(|step| {
+                    !carries_a_non_gating_key(&step.keys)
+                        && !runs_chore_task(&step.run, task).is_empty()
+                })
+        })
+        .collect()
+}
+
+/// The runs, in steps that gate a pull request, that invoke
+/// `chore <task>`.
+fn gating_chore_runs(workflow: &str, task: &str) -> Vec<String> {
+    scan_steps(workflow, true, |script| runs_chore_task(script, task))
+}
+/// The commands of one task in `chores.yml`, as chore would run them.
+///
+/// PARSED, NOT SCANNED, and for the reason
+/// [`runs_with_overflow_checks`] gives one file across: the comment
+/// block above `test:unit` discusses `--release`,
+/// `EXPECT_OVERFLOW_CHECKS` and `ci-test.sh` at length, so a text scan
+/// would read the prose explaining the task as the task itself and
+/// keep passing after the commands were gone. The parser drops every
+/// comment before this sees anything.
+///
+/// A `cmds:` entry is a scalar or a mapping carrying `cmd:`; both are
+/// commands. A `task:` reference is deliberately NOT followed: its
+/// commands belong to the task it names, so a `test:unit` that
+/// delegated its cargo run elsewhere returns nothing here and fails
+/// the guard rather than being credited with a run this cannot see.
+/// Red is the safe direction and the message says which file to open.
+fn task_commands(manifest: &str, task: &str) -> Vec<String> {
+    let documents = Yaml::load_from_str(manifest).unwrap_or_else(|e| {
+        panic!(
+            "chores.yml is not valid YAML: {e}. This guard reads the manifest rather \
+             than scanning its text, so a file it cannot parse is a failure and never \
+             a pass."
+        )
+    });
+    let Some(document) = documents.first() else {
+        return Vec::new();
+    };
+    let Some(body) = field(document, "tasks").and_then(|tasks| field(tasks, task)) else {
+        return Vec::new();
+    };
+    field(body, "cmds")
+        .and_then(Yaml::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .as_str()
+                .or_else(|| field(entry, "cmd").and_then(Yaml::as_str))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// THE FIRST HALF OF THE OVERFLOW GUARD: the task still builds in a
+/// profile that can see one.
+///
+/// The debug run is `chores.yml`'s now — `ci.yml` has no `cargo test`
+/// line left — so this is where the absence of `--release` has to be
+/// asserted. Without it, `test:unit` acquiring `--release` (the
+/// obvious way to make a slow tier faster, and it would look like
+/// every other tier here) leaves the workflow untouched, every job
+/// green, and no defect whose only symptom is an arithmetic overflow
+/// panic observable anywhere in this repository.
+///
+/// EVERY cargo run in the task is checked, not merely one of them. A
+/// guard satisfied by the presence of a debug line would be satisfied
+/// by a task that runs the suite twice, once in each profile, which is
+/// not what `test:unit` is for and is a compile nobody chose to pay
+/// for.
+#[test]
+fn the_unit_task_still_runs_cargo_in_a_profile_that_can_see_an_overflow() {
+    let path = manifest_dir().join("chores.yml");
+    let manifest = read_or_panic(&path);
+    let cmds = task_commands(&manifest, "test:unit");
+
+    // Non-emptiness first, twice over. `all()` over nothing is true,
+    // and a `test:unit` that had lost its commands — or been renamed —
+    // would satisfy the comparison below while establishing nothing.
     assert!(
-        !debug_runs.is_empty(),
-        "no `cargo test` in {} runs without `--release` IN A STEP WHOSE \
-         RESULT GATES A PULL REQUEST, so no defect whose \
-         only symptom is an arithmetic overflow panic can be observed by \
-         this repository's gate. Overflow checks are on in debug and off in \
-         release. If the debug step looked redundant beside the release one, \
-         it is not — see the comment above it.",
+        !cmds.is_empty(),
+        "{}: the task `test:unit` has no commands, or no longer exists under that \
+         name. It is the debug, overflow-checks-trapping run of this repository's \
+         gate, and ci.yml's `unit`, `test-arm64` and `test-darwin` jobs invoke it by \
+         name.",
+        path.display()
+    );
+    let invocations: Vec<String> = cmds.iter().flat_map(|c| cargo_test_commands(c)).collect();
+    assert!(
+        !invocations.is_empty(),
+        "{}: `test:unit` no longer invokes `cargo test` at all, so the tier the gate \
+         runs for its overflow checks compiles nothing. Its commands are {cmds:?}.",
+        path.display()
+    );
+
+    let debug = cmds
+        .iter()
+        .flat_map(|c| runs_with_overflow_checks(c))
+        .collect::<Vec<String>>();
+    let release: Vec<&String> = invocations.iter().filter(|c| !debug.contains(c)).collect();
+    assert!(
+        release.is_empty(),
+        "{}: `test:unit` selects the release profile in {release:?}. Overflow checks \
+         are on in debug and off in release, so this is the one tier that can observe \
+         a defect whose only symptom is an arithmetic overflow panic — and the rest of \
+         the suite already runs `--release` through scripts/ci-test.sh. If the debug \
+         run looked redundant beside it, it is not; see the comment above the task.",
         path.display()
     );
 }
@@ -613,11 +889,18 @@ fn debug_runs_that_prove_the_build_traps(script: &str) -> Vec<String> {
 /// The runs of steps that run in debug AND whose result ACTUALLY GATES
 /// a pull request.
 ///
-/// This is what the guard asks. [`runs_with_overflow_checks`] finds
-/// the command; this asks whether anything reads its result. Adding
-/// `if: false` to the guarded step in `ci.yml`, or
-/// `continue-on-error: true`, left all 27 guard tests green while the
-/// gate stopped gating. See #143.
+/// [`runs_with_overflow_checks`] finds the command; this asks whether
+/// anything reads its result. Adding `if: false` to the guarded step
+/// in `ci.yml`, or `continue-on-error: true`, left all 27 guard tests
+/// green while the gate stopped gating. See #143.
+///
+/// The workflow no longer carries the command itself — it invokes
+/// `chore test:unit`, and [`gating_chore_runs`] is what asks the same
+/// question about that. This is kept, and pinned by `mod gating`,
+/// because it is the shape both halves of the walk are held to: a
+/// `cargo test` appearing in a workflow step again must be read
+/// step-aware from the first day, not line-based until somebody
+/// notices.
 fn gating_runs_with_overflow_checks(workflow: &str) -> Vec<String> {
     scan_steps(workflow, true, runs_with_overflow_checks)
 }
@@ -646,10 +929,12 @@ fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
 /// spelling of "overflow checks are off" is present. Four spellings of
 /// the key were needed before it was right. Then two more routes turned
 /// up that are not in that file at all: a
-/// `CARGO_PROFILE_TEST_OVERFLOW_CHECKS` variable set at step or job
-/// level in the workflow, which the parser cannot see because it only
-/// reads `run:` lines, and a `.cargo/config.toml`, which nothing here
-/// reads. Both leave the debug step present, running, green and blind.
+/// `CARGO_PROFILE_TEST_OVERFLOW_CHECKS` variable exported around the
+/// task — by a job-level `env:` in the workflow, which the parser
+/// cannot see because it only reads `run:` lines, or by a `lifecycle:`
+/// or a wrapper script — and a `.cargo/config.toml`, which nothing
+/// here reads. Both leave the debug run present, running, green and
+/// blind.
 ///
 /// All six are the same shape: a scanner enumerating the ways a thing
 /// can be disabled, in the places it happens to look. Another pass buys
@@ -657,29 +942,74 @@ fn gating_runs_that_prove_the_build_traps(workflow: &str) -> Vec<String> {
 /// an overflow, see whether you are stopped -- and this test's job
 /// shrinks to making sure the gate still asks it.
 #[test]
-fn the_debug_run_asks_the_build_to_prove_it_traps_overflows() {
-    let path = manifest_dir()
-        .join(".github")
-        .join("workflows")
-        .join("ci.yml");
-    let workflow = read_or_panic(&path);
+fn the_unit_task_still_asks_the_build_to_prove_it_traps_overflows() {
+    let path = manifest_dir().join("chores.yml");
+    let manifest = read_or_panic(&path);
+    let cmds = task_commands(&manifest, "test:unit");
+    assert!(
+        !cmds.is_empty(),
+        "control: {} must declare a `test:unit` with commands, or the assertion \
+         below passes over an empty list",
+        path.display()
+    );
 
+    let proving: Vec<String> = cmds
+        .iter()
+        .flat_map(|c| debug_runs_that_prove_the_build_traps(c))
+        .collect();
+    assert!(
+        !proving.is_empty(),
+        "no `cargo test` in `test:unit` ({}) runs without `--release` while setting \
+         EXPECT_OVERFLOW_CHECKS=1, so nothing checks whether the profile the gate \
+         builds actually traps an arithmetic overflow. Reading Cargo.toml is not \
+         enough: the checks can also be turned off by a \
+         CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable in the task's environment, or by \
+         a .cargo/config.toml, neither of which is in any file this test reads. The \
+         handshake is what arms the one check that cannot be fooled by where the \
+         setting lives. Its commands are {cmds:?}.",
+        path.display()
+    );
+}
+
+/// THE SECOND HALF OF THE OVERFLOW GUARD: the gate still runs the
+/// task.
+///
+/// `chores.yml` can be as careful as it likes about the profile and
+/// buy nothing if no pull request runs `test:unit`. The task is
+/// invoked from three jobs, none of which has to exist: consolidating
+/// them into one `chore test` would look like a simplification —
+/// `test:native` runs `test:unit` too — and would leave the debug tier
+/// running only where the whole suite runs, which is the x86_64 job
+/// with the VM, and not at all on the two runners that have no KVM.
+///
+/// Asserted separately from the profile half because they fail
+/// separately and in different files: this one is about `ci.yml`, that
+/// one about `chores.yml`, and a single message covering both would
+/// send half its readers to the wrong one.
+#[test]
+fn the_pull_request_gate_still_runs_the_debug_unit_task() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
     if let Some(why) = not_a_pull_request_gate(&workflow) {
         panic!("{}: {why}", path.display());
     }
-    let proving = gating_runs_that_prove_the_build_traps(&workflow);
+    let wf = parse_workflow(&workflow);
     assert!(
-        !proving.is_empty(),
-        "no `cargo test` in {} runs without `--release` while setting \
-         EXPECT_OVERFLOW_CHECKS=1 in a step whose result gates a pull \
-         request, so nothing checks whether the profile \
-         the gate builds actually traps an arithmetic overflow. Reading \
-         Cargo.toml is not enough: the checks can also be turned off by a \
-         CARGO_PROFILE_TEST_OVERFLOW_CHECKS variable at step or job level, \
-         or by a .cargo/config.toml, neither of which is in any file this \
-         test reads. The handshake is what arms the one check that cannot \
-         be fooled by where the setting lives.",
+        !wf.jobs.is_empty(),
+        "control: {} must parse into at least one job",
         path.display()
+    );
+
+    let jobs = gating_jobs_running(&wf, "test:unit");
+    assert!(
+        !jobs.is_empty(),
+        "no job in {} runs `chore test:unit` IN A STEP WHOSE RESULT GATES A PULL \
+         REQUEST, so the debug, overflow-checks-trapping tier is not part of this \
+         repository's gate however carefully chores.yml defines it. A job or step \
+         carrying `if:` or `continue-on-error:` does not count: its result is not \
+         read. The jobs found were {:?}.",
+        path.display(),
+        wf.jobs.iter().map(|j| &j.id).collect::<Vec<_>>()
     );
 }
 
@@ -725,6 +1055,656 @@ fn ci_test_sh_still_supplies_release_itself() {
             path.display()
         );
     }
+}
+
+// ======================================================================
+// THE INDEPENDENT ORACLE GUARDS ITSELF (#208).
+//
+// Everything above is this crate marking its own homework: a profile,
+// a handshake, a test it wrote. What makes the suite worth anything is
+// the tier where something else grades it -- xfsprogs reading back
+// what the driver wrote, and the kernel mounting it -- and until #208
+// nothing failed if that tier stopped happening. The job could be
+// renamed, given an `if:`, given `continue-on-error:`, stop installing
+// its tool or stop running its suite, and the check would still report
+// green under a name that reads like cross-validation.
+//
+// The facts below are asserted ONE TEST APIECE because they fail
+// separately, and each message has to name which of them went: a
+// single "the oracle gate is broken" sends the reader to a 376-line
+// workflow with nothing to look for.
+// ======================================================================
+
+/// The tools the oracle tiers call, and the ones the kernel tiers need
+/// beside them.
+///
+/// Named here rather than derived, because that is the point: these
+/// are the programs whose ANSWERS the suite treats as truth, and the
+/// guards below hold both ends of them -- installed in the guest,
+/// where every host and every runner gets the same version, and
+/// unusable on the runner, where a stray call would be answered by
+/// whatever Ubuntu ships that month.
+const ORACLE_TOOLS: [&str; 5] = ["mkfs.xfs", "xfs_db", "xfs_repair", "xfs_logprint", "xfs_io"];
+
+/// A shell script's commands: comment lines dropped and backslash
+/// continuations joined.
+///
+/// Both matter for the files below. `vm-setup.sh` installs the oracle
+/// tools with an `apt-get install` spread over three lines, so a
+/// line-at-a-time scan sees the verb and the package list separately
+/// and can conclude neither; and both scripts explain themselves at
+/// length in comments that name every tool, so a scan counting those
+/// would still pass after the commands had gone. That is the same trap
+/// [`runs_with_overflow_checks`] documents for `ci.yml`.
+///
+/// Only WHOLE-LINE comments are dropped. A `#` mid-line can be inside
+/// a quoted string -- `printf '#!/bin/sh\n...'` is in the very step
+/// this reads -- and deciding where a shell comment starts is the
+/// heuristic this file has already paid for once.
+fn shell_lines(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pending: Option<String> = None;
+    for raw in script.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') || (line.is_empty() && pending.is_none()) {
+            continue;
+        }
+        let (text, continues) = match line.strip_suffix('\\') {
+            Some(head) => (head.trim_end(), true),
+            None => (line, false),
+        };
+        let mut joined = pending.take().unwrap_or_default();
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(text);
+        if continues {
+            pending = Some(joined);
+        } else {
+            out.push(joined);
+        }
+    }
+    out.extend(pending);
+    out
+}
+
+/// Whether `text` names `word` as a word, rather than inside a longer
+/// one.
+///
+/// `xfsprogs` is a substring of `xfsprogs-parent` and of
+/// `xfsprogs-6.13.0.tar.xz`, both of which `vm-setup.sh` mentions
+/// while installing neither, and `xfs_db` is a substring of
+/// `xfs_dbwrapper`. A substring test would report a package installed
+/// because its source tarball is downloaded. The word characters here
+/// include `.` and `-` because the tools are spelled with them.
+fn names_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+        .any(|found| found == word)
+}
+
+/// The programs a script looks up with `command -v`, whether directly
+/// or as a `for` loop's list.
+///
+/// Two scripts are read this way and both spell it as a loop: the
+/// guest's provisioning, which proves each tool present after
+/// installing it, and the workflow step that takes the runner's own
+/// copies away. Collecting the loop's LIST rather than searching the
+/// file's text is what makes dropping one tool from it a failure --
+/// `mkfs.xfs` and `xfs_db` are named elsewhere in both scripts, so a
+/// text search would still find them after the check that matters had
+/// stopped covering them.
+///
+/// The loop's body has to do the lookup for its list to count, which
+/// is what tells `for tool in ...; do command -v "$tool"; done` apart
+/// from any other loop over the same names.
+fn tools_resolved_with_command_v(script: &str) -> Vec<String> {
+    let lines = shell_lines(script);
+    let mut out: Vec<String> = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if line.contains("command -v") {
+            out.extend(line.split_whitespace().map(str::to_string));
+        }
+        let Some((_, list)) = line
+            .strip_prefix("for ")
+            .and_then(|rest| rest.split_once(" in "))
+        else {
+            continue;
+        };
+        let body_looks_them_up = lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.starts_with("done"))
+            .any(|l| l.contains("command -v"));
+        if body_looks_them_up {
+            out.extend(
+                list.split(|c: char| c.is_whitespace() || c == ';')
+                    .filter(|word| !word.is_empty() && *word != "do")
+                    .map(str::to_string),
+            );
+        }
+    }
+    out
+}
+
+/// The `[setup] script` the harness runs inside the guest, or `None`.
+///
+/// A four-line TOML reader rather than a dependency, and the same
+/// shape as `profiles_disabling_overflow_checks`: section, key, value,
+/// with the quoting stripped so `"script"` is `script`. What it has to
+/// tell apart is `script` under `[setup]` from `guest_command` under
+/// `[test]`, which is a different program run at a different time.
+fn harness_setup_script(config: &str) -> Option<String> {
+    let mut section = String::new();
+    for raw in config.lines() {
+        let line = raw.split('#').next().unwrap_or(raw).trim();
+        if line.starts_with('[') {
+            section = line
+                .trim_matches(|c| c == '[' || c == ']')
+                .trim()
+                .to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+        if section == "setup" && key == "script" {
+            return Some(
+                value
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// The check-run names `.github-guard` requires before main takes a
+/// merge.
+///
+/// git-config format, which is what github-guard reads: a `[checks]`
+/// section and one `required = <name>` per line. A name may contain
+/// spaces -- this repository required
+/// `validate against xfs_db + in-kernel XFS driver` until #207 -- so
+/// the value is taken whole and only a comma separates two of them.
+/// Comments are stripped unless the value is quoted, which is the rule
+/// the file's own header states.
+fn required_checks(guard: &str) -> Vec<String> {
+    let mut section = String::new();
+    let mut out = Vec::new();
+    for raw in guard.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            section = line
+                .trim_matches(|c| c == '[' || c == ']')
+                .trim()
+                .to_string();
+            continue;
+        }
+        let line = if line.starts_with('"') {
+            line
+        } else {
+            line.split(['#', ';']).next().unwrap_or(line).trim()
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if section != "checks" || key.trim() != "required" {
+            continue;
+        }
+        out.extend(
+            value
+                .split(',')
+                .map(|name| name.trim().trim_matches('"').trim().to_string())
+                .filter(|name| !name.is_empty()),
+        );
+    }
+    out
+}
+
+/// Whether a script compares a job's result against `success`.
+///
+/// Whitespace and quotes are removed first, so `!= "success"`,
+/// `!='success'` and `!=success` are one shape -- the same
+/// normalisation `profiles_disabling_overflow_checks` does for a TOML
+/// key, after three spellings of one setting defeated it.
+///
+/// What this refuses is the plausible rewrite: comparing against
+/// `failure` alone. A job that was skipped has the result `skipped`,
+/// which is neither, so such a script reports green for a run in which
+/// the job never happened. It is deliberately not a proof that the
+/// comparison is the right way round -- that cannot be read out of
+/// text -- and [`exits_non_zero`] is the other half of what can be.
+fn compares_against_success(script: &str) -> bool {
+    let compact: String = script
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+        .collect();
+    compact.contains("=success")
+}
+
+/// Whether a script has any path that exits non-zero.
+///
+/// A check that prints a verdict and returns 0 gates nothing, which is
+/// the other way `ci-ok` decays into a job that always reports green.
+fn exits_non_zero(script: &str) -> bool {
+    script.split("exit ").skip(1).any(|rest| {
+        rest.trim_start()
+            .starts_with(|c: char| c.is_ascii_digit() && c != '0')
+    })
+}
+
+/// Whether a step takes the runner's own oracle tools away.
+///
+/// It has to name every tool in [`ORACLE_TOOLS`], look each one up on
+/// the PATH, and move or remove what it finds. Each clause is one way
+/// the step decays into a no-op that still reads like a precaution:
+/// dropping a tool from the list leaves that one usable, and dropping
+/// the `mv` leaves a loop that prints paths.
+fn makes_the_runners_oracle_tools_unusable(run: &str) -> bool {
+    let resolved = tools_resolved_with_command_v(run);
+    let takes_them_away = shell_lines(run)
+        .iter()
+        .any(|line| line.contains("mv ") || line.contains("rm "));
+    takes_them_away
+        && ORACLE_TOOLS
+            .iter()
+            .all(|tool| resolved.iter().any(|found| found == tool))
+}
+
+/// The assumption every guard in this file rests on, asserted rather
+/// than assumed.
+///
+/// Without it each of them is vacuous in the same way and none says
+/// so: a workflow that stopped triggering on `pull_request` gates
+/// nothing however its jobs are written, and `gating_jobs_running`
+/// answers "none" for every task in the file -- which reads like six
+/// separate findings about six separate jobs. This is the one that
+/// names the cause (#153).
+#[test]
+fn the_ci_workflow_still_triggers_on_pull_request() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+    if let Some(why) = not_a_pull_request_gate(&workflow) {
+        panic!("{}: {why}", path.display());
+    }
+    assert!(
+        !parse_workflow(&workflow).jobs.is_empty(),
+        "control: {} has no jobs at all, so every scan over it is empty and every \
+         `all()` over one is true",
+        path.display()
+    );
+}
+
+/// THE FIXTURES ARE WHAT THE INDEPENDENT mkfs.xfs BUILDS, and a gate
+/// with no fixtures compares nothing.
+///
+/// What this hides when it is absent: `chore fixtures` is the only
+/// thing in the gate that runs the kernel's own formatter, in the
+/// harness VM, over every geometry the suite reads back. Drop the job
+/// -- or give it an `if:`, or rename the task out from under it -- and
+/// the tiers that read those images have nothing to read, so they
+/// select nothing and pass, while `ci-ok` still goes green. That is
+/// #208's shape, and rust-img-qcow2#97 is what it looks like once it
+/// has happened: a probe that returned early on every runner, in every
+/// job, on every push and pull request, while the test reported `ok`.
+#[test]
+fn the_pull_request_gate_still_builds_the_fixtures_in_the_harness_vm() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+    let wf = parse_workflow(&workflow);
+    assert!(
+        !wf.jobs.is_empty(),
+        "control: {} must parse into at least one job",
+        path.display()
+    );
+
+    let jobs = gating_jobs_running(&wf, "fixtures");
+    assert!(
+        !jobs.is_empty(),
+        "no job in {} runs `chore fixtures` IN A STEP WHOSE RESULT GATES A PULL \
+         REQUEST, so nothing in the gate builds the kernel-made images the oracle and \
+         kernel tiers read back. A job or step carrying `if:` or `continue-on-error:` \
+         does not count: its result is not read. The tiers that consume the fixtures \
+         do not fail without them in any way a required check can see -- they select \
+         nothing, pass, and report green (#208, rust-img-qcow2#97). The jobs found \
+         were {:?}.",
+        path.display(),
+        wf.jobs.iter().map(|j| &j.id).collect::<Vec<_>>()
+    );
+}
+
+/// THE WHOLE SUITE, INCLUDING THE TIERS THIS CRATE DOES NOT GRADE
+/// ITSELF.
+///
+/// What this hides when it is absent: `chore test` is what runs
+/// `test:oracle` and `test:kernel` -- xfsprogs reading back what the
+/// driver wrote, and Linux mounting it. A gate narrowed to
+/// `chore test:unit` and `chore test:images` still runs hundreds of
+/// tests and still reports green under the required name, while every
+/// assertion that something OTHER than this crate agrees with it has
+/// quietly stopped being made. That is the failure #208 was filed
+/// for, and the one a required check cannot see.
+#[test]
+fn the_pull_request_gate_still_runs_the_whole_suite_against_the_oracles() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+    let wf = parse_workflow(&workflow);
+    assert!(
+        !wf.jobs.is_empty(),
+        "control: {} must parse into at least one job",
+        path.display()
+    );
+
+    let jobs = gating_jobs_running(&wf, "test");
+    assert!(
+        !jobs.is_empty(),
+        "no job in {} runs `chore test` IN A STEP WHOSE RESULT GATES A PULL REQUEST. \
+         That task is the whole suite -- the oracle tier, where xfsprogs reads back \
+         what the driver wrote, and the kernel tier, where Linux mounts it -- and it \
+         is the only part of this gate that is not this crate grading itself. \
+         `chore test:unit` and `chore test:images` are not it and must not stand in \
+         for it. A job or step carrying `if:` or `continue-on-error:` does not count. \
+         See #208. The jobs found were {:?}.",
+        path.display(),
+        wf.jobs.iter().map(|j| &j.id).collect::<Vec<_>>()
+    );
+}
+
+/// THE ORACLE TOOLS ARE INSTALLED WHERE THE TESTS REACH THEM.
+///
+/// This is the direct successor of #208's "still installs its tool".
+/// The tool moved: it used to be an `apt-get install xfsprogs` step in
+/// the workflow, and it is now the guest's provisioning, because a
+/// tool on the runner is a different version from the one every
+/// developer has and the two answers are not comparable. So this is
+/// where the guard has to look -- `fs-linux-test-harness.toml`'s
+/// `[setup] script`, and what that script installs and proves present.
+///
+/// What it hides when it is absent: the tests never skip on a missing
+/// tool, so a provisioning that stopped installing xfsprogs fails the
+/// oracle tiers loudly -- ON A DAY WHEN SOMEBODY IS WATCHING. The
+/// quiet version is the one that matters: drop a single tool from the
+/// verification list and the tier that calls it is the only thing that
+/// notices, months later, in a run nobody connects to this edit.
+/// rust-img-qcow2#97 is the same defect with the tool present and the
+/// call gone.
+#[test]
+fn the_oracle_tools_are_still_installed_in_the_guest_the_tests_reach() {
+    let config_path = manifest_dir().join("fs-linux-test-harness.toml");
+    let config = read_or_panic(&config_path);
+    let named = harness_setup_script(&config).unwrap_or_else(|| {
+        panic!(
+            "{}: no `script` under `[setup]`, so nothing provisions the guest and the \
+             oracle tools are wherever the base box happens to leave them",
+            config_path.display()
+        )
+    });
+    assert_eq!(
+        named,
+        "scripts/vm-setup.sh",
+        "{}: the guest's provisioning is `{named}` now. That is where this \
+         repository's oracle tools are installed and proved present, so the guard \
+         below reads it; point it at the new file deliberately rather than leaving \
+         the old one guarded and the new one unread.",
+        config_path.display()
+    );
+
+    let script_path = manifest_dir().join(&named);
+    let setup = read_or_panic(&script_path);
+    let lines = shell_lines(&setup);
+    assert!(
+        !lines.is_empty(),
+        "control: {} has no commands at all",
+        script_path.display()
+    );
+
+    let installs_xfsprogs = lines
+        .iter()
+        .any(|line| line.contains("apt-get install") && names_word(line, "xfsprogs"));
+    assert!(
+        installs_xfsprogs,
+        "{} no longer installs the `xfsprogs` package in the guest. Every oracle call \
+         this suite makes is answered by that package -- mkfs.xfs builds the \
+         fixtures, xfs_repair grades consistency, xfs_db reads metadata back -- and \
+         the tests reach it in the VM and nowhere else (tests/test_contract.rs fails \
+         the suite if one runs on the host). See #208.",
+        script_path.display()
+    );
+
+    let resolved = tools_resolved_with_command_v(&setup);
+    let unverified: Vec<&str> = ORACLE_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| !resolved.iter().any(|found| found == tool))
+        .collect();
+    assert!(
+        unverified.is_empty(),
+        "{} installs the tools but no longer proves {unverified:?} present with \
+         `command -v`. The provision is the only useful place to find a tool missing: \
+         a test never skips on one, so the alternative is several hundred tests each \
+         failing on the same absence, none of them naming it.",
+        script_path.display()
+    );
+}
+
+/// THE CLAIM TURNED INTO EVIDENCE.
+///
+/// The workflow says every xfsprogs call happens in the guest. The
+/// step this guards is what makes that checkable rather than stated:
+/// the runner's own copies are moved aside and replaced with stubs
+/// that fail loudly, so a test reaching for a host tool turns the run
+/// red with a message saying so instead of passing on a version no
+/// other machine has.
+///
+/// It must be in the SAME JOB as the suite, which is why this asks for
+/// the job rather than for a step anywhere in the file. What it hides
+/// when it is absent: nothing, visibly. The suite goes green either
+/// way -- that is exactly the problem, because it also goes green when
+/// half the calls are being answered by Ubuntu's xfsprogs and the
+/// fixtures were built by Debian's. That fork is #211 and #212, and it
+/// is how the gate and a developer's run came to be graded by two
+/// different oracles. See #208 for the general shape.
+#[test]
+fn the_job_that_runs_the_suite_still_makes_the_runners_own_xfsprogs_unusable() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+    let wf = parse_workflow(&workflow);
+    let jobs = gating_jobs_running(&wf, "test");
+    assert!(
+        !jobs.is_empty(),
+        "control: {} must have a gating job running `chore test`, or this asserts \
+         nothing about any job at all. See \
+         the_pull_request_gate_still_runs_the_whole_suite_against_the_oracles.",
+        path.display()
+    );
+
+    for job in &jobs {
+        assert!(
+            job.steps
+                .iter()
+                .any(|step| makes_the_runners_oracle_tools_unusable(&step.run)),
+            "{}: the job `{}` runs the whole suite but no longer makes the runner's \
+             own {:?} unusable. That step is what turns \"every oracle call happens in \
+             the VM\" from a claim into evidence: without it a test that reached for a \
+             host tool would be answered by whatever xfsprogs the runner image ships, \
+             which is a different version from the one that built the fixtures and a \
+             different one again from every developer's -- and the run would still be \
+             green. See #208, and #211/#212 for what two oracles grading one suite \
+             cost here.",
+            path.display(),
+            job.id,
+            ORACLE_TOOLS
+        );
+    }
+}
+
+/// THE AGGREGATE IS THE REQUIRED CHECK, SO ITS WIRING IS THE GATE.
+///
+/// `ci-ok` is the only name branch protection requires (#207), which
+/// buys a gate that survives a rename and costs one thing: everything
+/// now depends on `needs:` being complete and on the script treating a
+/// job that did not run as a failure. Both are invisible when wrong.
+///
+/// What this hides when it is absent: add a job and forget to wire it
+/// into `needs:` and it gates nothing while looking exactly like the
+/// others -- the `needs:` set is computed from the parsed workflow
+/// here rather than listed, so that mistake is what fails. And a
+/// script comparing results against `failure` alone passes a SKIPPED
+/// job, which is the case the aggregate exists to catch: a job skipped
+/// because its `needs:` failed reports neither success nor failure,
+/// and #201 is this repository's own instance of a job that ran on
+/// every pull request and gated nothing.
+#[test]
+fn the_aggregate_check_still_needs_every_job_and_fails_on_a_skipped_one() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+    let wf = parse_workflow(&workflow);
+    assert!(
+        !wf.jobs.is_empty(),
+        "control: {} must parse into at least one job",
+        path.display()
+    );
+
+    let aggregate = wf
+        .jobs
+        .iter()
+        .find(|job| job.id == "ci-ok")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no job `ci-ok`. It is the one check .github-guard requires, so \
+             without it branch protection requires a context nothing produces -- \
+             which GitHub reports as permanently pending, with no failure to point \
+             at. The jobs found were {:?}.",
+                path.display(),
+                wf.jobs.iter().map(|j| &j.id).collect::<Vec<_>>()
+            )
+        });
+
+    let condition = aggregate.condition.as_deref().unwrap_or("");
+    assert!(
+        condition.contains("always()"),
+        "{}: `ci-ok` carries `if: {condition}`. It must be `always()`: a job that \
+         `needs:` every other one is SKIPPED when any of them fails, and a skipped \
+         required check is not a failed one -- the merge button would go green on a \
+         red run. This is the one place an `if:` is not only safe but required, which \
+         is also why NON_GATING_KEYS must not be special-cased to let it gate.",
+        path.display()
+    );
+
+    let mut expected: Vec<&str> = wf
+        .jobs
+        .iter()
+        .map(|job| job.id.as_str())
+        .filter(|id| *id != "ci-ok")
+        .collect();
+    expected.sort_unstable();
+    assert!(
+        !expected.is_empty(),
+        "control: {} must contain a job besides `ci-ok`",
+        path.display()
+    );
+    let mut needs: Vec<&str> = aggregate.needs.iter().map(String::as_str).collect();
+    needs.sort_unstable();
+    needs.dedup();
+    assert_eq!(
+        needs,
+        expected,
+        "{}: `ci-ok` does not `needs:` every other job in the file. The set is \
+         computed from the workflow rather than listed here on purpose: adding a job \
+         and forgetting to wire it in leaves it running on every pull request and \
+         gating nothing, which is #201 exactly, and the aggregate is the only thing \
+         that can notice.",
+        path.display()
+    );
+
+    let script = aggregate
+        .steps
+        .iter()
+        .map(|step| step.run.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !script.trim().is_empty(),
+        "{}: `ci-ok` runs nothing, so it reports success whatever its needs did",
+        path.display()
+    );
+    assert!(
+        compares_against_success(&script),
+        "{}: `ci-ok`'s script never compares a job's result against `success`. \
+         Comparing against `failure` alone is the defect this job exists to prevent: \
+         a job that was SKIPPED -- because it was cancelled, because its own `needs:` \
+         failed, or because somebody gave it an `if:` -- has the result `skipped`, \
+         which is not `failure`, and the aggregate would report green for a run in \
+         which it never happened. Anything that is not `success` is a failure here.",
+        path.display()
+    );
+    assert!(
+        exits_non_zero(&script),
+        "{}: `ci-ok`'s script never exits non-zero, so whatever it finds it reports \
+         success. A check that prints a verdict and returns 0 is a check that gates \
+         nothing.",
+        path.display()
+    );
+}
+
+/// THE LAST LINK: what branch protection actually requires.
+///
+/// The workflow can be perfect and gate nothing if `.github-guard`
+/// requires a name it does not produce -- GitHub reads that as
+/// permanently pending, with `enforce_admins` on and no failure to
+/// point at -- or if it stops requiring `ci-ok`, which leaves every
+/// job above advisory. Both had already happened in this
+/// constellation: #201 is a job that ran on every pull request and
+/// gated nothing, and this file's own header records the required
+/// context that no job produced.
+///
+/// The names are checked against what the workflow PRODUCES, which is
+/// a job's `name:` where it has one and its key where it does not --
+/// the same rule GitHub uses for the check-run name.
+#[test]
+fn branch_protection_requires_the_aggregate_and_nothing_the_workflow_cannot_produce() {
+    let guard_path = manifest_dir().join(".github-guard");
+    let guard = read_or_panic(&guard_path);
+    let required = required_checks(&guard);
+    assert!(
+        !required.is_empty(),
+        "{}: no `required =` under `[checks]`, so nothing gates a merge at all and \
+         every job in ci.yml is advisory",
+        guard_path.display()
+    );
+    assert!(
+        required.iter().any(|check| check == "ci-ok"),
+        "{}: `ci-ok` is not required. It is the one always-run job that `needs:` \
+         every other and fails on a failed, cancelled or SKIPPED one (#207); without \
+         it required, the whole gate is advisory. Required now: {required:?}.",
+        guard_path.display()
+    );
+
+    let workflow = read_or_panic(&ci_yml());
+    let wf = parse_workflow(&workflow);
+    let produced: Vec<String> = wf
+        .jobs
+        .iter()
+        .map(|job| job.name.clone().unwrap_or_else(|| job.id.clone()))
+        .collect();
+    assert!(
+        !produced.is_empty(),
+        "control: ci.yml must produce at least one check-run name"
+    );
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|check| !produced.contains(check))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} requires {missing:?}, which ci.yml does not produce. GitHub reports a \
+         required context nothing reports as permanently PENDING, not as failed: with \
+         enforce_admins on there is nothing to point at and no way to merge, and the \
+         usual fix is to drop the requirement, which silently removes a gate. The \
+         names ci.yml produces are {produced:?}.",
+        guard_path.display()
+    );
 }
 
 /// The profiles that switch overflow checks off for the run `cargo test`
@@ -1276,26 +2256,26 @@ jobs:
         );
     }
 
-    /// The real `ci.yml` gates, read through the same function the
-    /// guard uses. Distinct from the guard's own assertion: this one
-    /// proves the PARSER copes with the real file's shape -- matrix
-    /// strategies, `uses:`/`with:` mappings, comments between steps --
-    /// rather than only with the fixtures above.
+    /// The real `ci.yml` gates, read through the same walk the guards
+    /// use. Distinct from the guards' own assertions: this one proves
+    /// the PARSER copes with the real file's shape -- `uses:`/`with:`
+    /// mappings, block scalars, comments between steps, an `if:` on a
+    /// step in the middle of a gating job -- rather than only with the
+    /// fixtures above.
+    ///
+    /// It asks for `chore test:unit` rather than for a `cargo test`,
+    /// because that is what the real file now runs; the fixtures above
+    /// keep the cargo half of the walk pinned.
     #[test]
     fn the_real_ci_yml_still_parses_into_a_gating_step() {
-        let workflow = super::read_or_panic(
-            &super::manifest_dir()
-                .join(".github")
-                .join("workflows")
-                .join("ci.yml"),
-        );
+        let workflow = super::read_or_panic(&super::ci_yml());
         if let Some(why) = super::not_a_pull_request_gate(&workflow) {
             panic!("the real ci.yml: {why}");
         }
         assert!(
-            !gating(&workflow).is_empty(),
-            "the real ci.yml must parse into at least one gating step, or the guard is \
-             passing on a fixture and failing on the file it exists to read"
+            !super::gating_chore_runs(&workflow, "test:unit").is_empty(),
+            "the real ci.yml must parse into at least one gating step, or the guards \
+             are passing on fixtures and failing on the file they exist to read"
         );
     }
 }
@@ -1670,256 +2650,6 @@ mod handshake {
     }
 }
 
-// ---------------------------------------------------------------------
-// The kernel oracle's own job (#208)
-// ---------------------------------------------------------------------
-
-/// The job that grades this driver against the kernel and `xfs_db` is
-/// the only check here that is not this crate marking its own homework,
-/// and nothing asserted that it still exists.
-///
-/// Renamed, given an `if:`, given `continue-on-error:`, stripped of its
-/// `xfsprogs` install or of the suites it selects — any one of those
-/// leaves a green check whose name still reads like cross-validation
-/// while nothing is cross-validated. rust-img-qcow2#97 is what that
-/// looks like once it has happened: a probe that returned early on every
-/// runner, in every job, on every push, while the test reported `ok`.
-/// Neither an executed-test floor nor a required check can see it — an
-/// early return counts as passed, and the job still reports green under
-/// the required name.
-///
-/// The three facts are asserted separately because they fail separately.
-mod kernel_oracle_job {
-    use super::{manifest_dir, read_or_panic};
-
-    /// Every check `.github-guard` requires.
-    fn required_checks() -> Vec<String> {
-        read_or_panic(&manifest_dir().join(".github-guard"))
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with('#'))
-            .filter_map(|l| l.split_once("required ="))
-            .map(|(_, v)| v.trim().trim_matches('"').to_string())
-            .collect()
-    }
-
-    fn workflow() -> String {
-        read_or_panic(&manifest_dir().join(".github/workflows/ci.yml"))
-    }
-
-    /// Every job in the workflow, as (key, `name:`, its lines).
-    fn jobs(workflow: &str) -> Vec<(String, String, Vec<String>)> {
-        let lines: Vec<&str> = workflow.lines().collect();
-        let mut out = Vec::new();
-        let mut at = 0;
-        while at < lines.len() {
-            let line = lines[at];
-            let indent = line.len() - line.trim_start().len();
-            let is_job_key = indent == 2
-                && line.trim().ends_with(':')
-                && !line.trim_start().starts_with('#')
-                && !line.trim().contains(' ');
-            if !is_job_key {
-                at += 1;
-                continue;
-            }
-            let key = line.trim().trim_end_matches(':').to_string();
-            let mut body = Vec::new();
-            at += 1;
-            while at < lines.len() {
-                let l = lines[at];
-                let ind = l.len() - l.trim_start().len();
-                if ind <= 2 && !l.trim().is_empty() && !l.trim_start().starts_with('#') {
-                    break;
-                }
-                body.push(l.to_string());
-                at += 1;
-            }
-            let name = body
-                .iter()
-                .find_map(|l| {
-                    let t = l.trim();
-                    (l.len() - l.trim_start().len() == 4)
-                        .then(|| t.strip_prefix("name:"))
-                        .flatten()
-                        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
-                })
-                .unwrap_or_else(|| key.clone());
-            out.push((key, name, body));
-        }
-        out
-    }
-
-    /// THE KERNEL GATE IS THE JOB THAT INSTALLS THE ORACLE'S TOOLS.
-    ///
-    /// Found by what it does rather than by a name written down
-    /// somewhere else, because a name is the thing that drifts — and
-    /// since #207 the required check is the aggregate, so
-    /// `.github-guard` does not name this job at all.
-    fn kernel_gate(workflow: &str) -> (String, String, Vec<String>) {
-        let mut found: Vec<(String, String, Vec<String>)> = jobs(workflow)
-            .into_iter()
-            .filter(|(_, _, body)| {
-                body.iter()
-                    .filter(|l| !l.trim_start().starts_with('#'))
-                    .any(|l| l.contains("apt-get install") && l.contains("xfsprogs"))
-            })
-            .collect();
-        assert_eq!(
-            found.len(),
-            1,
-            "exactly one job should install xfsprogs and grade this driver against a \
-             real kernel, and {} do — if the gate was split or renamed, this test's \
-             idea of which job it is has to be updated with it",
-            found.len()
-        );
-        found.remove(0)
-    }
-
-    /// Whether `check` gates a merge: `.github-guard` requires it, or
-    /// requires an aggregate that `needs:` it (#207).
-    fn gates_a_merge(workflow: &str, key: &str, name: &str) -> bool {
-        let required = required_checks();
-        if required.iter().any(|r| r == name || r == key) {
-            return true;
-        }
-        jobs(workflow).iter().any(|(agg_key, agg_name, body)| {
-            let aggregate = required.iter().any(|r| r == agg_name || r == agg_key);
-            let waits_on = body
-                .iter()
-                .filter(|l| !l.trim_start().starts_with('#'))
-                .any(|l| l.contains("needs:") && l.contains(key));
-            aggregate && waits_on
-        })
-    }
-
-    /// It exists, it gates pull requests, and nothing lets it pass by
-    /// not running.
-    #[test]
-    fn the_kernel_gate_exists_and_cannot_opt_out() {
-        let workflow = workflow();
-        let (key, name, body) = kernel_gate(&workflow);
-        assert!(
-            gates_a_merge(&workflow, &key, &name),
-            "the {key} job grades this driver against a real kernel and nothing requires \
-             it: `.github-guard` names neither it nor an aggregate that waits on it, so \
-             a merge does not depend on what it found"
-        );
-
-        // The workflow has to report on a pull request at all.
-        assert!(
-            workflow.contains("  pull_request:"),
-            "ci.yml does not trigger on pull_request, so nothing it contains gates a merge"
-        );
-
-        // AT THE JOB LEVEL, indent 4: a condition there decides whether
-        // the gate runs at all.
-        for line in &body {
-            let indent = line.len() - line.trim_start().len();
-            let t = line.trim();
-            if indent != 4 || t.starts_with('#') {
-                continue;
-            }
-            assert!(
-                !t.starts_with("if:"),
-                "the {key} job carries `{t}` — a condition there is how an oracle stops \
-                 running while its check stays green"
-            );
-            assert!(
-                !t.starts_with("continue-on-error:"),
-                "the {key} job carries `{t}`, so it reports success whatever the kernel \
-                 said"
-            );
-        }
-
-        // AND ON THE STEPS THAT DO THE WORK. Not on every step: this job
-        // ends with an `if: failure()` step that keeps the volume a
-        // failing replay was judged on, and a step that runs only after
-        // something has already failed cannot hide anything.
-        for step in steps(&body) {
-            let load_bearing = step.iter().any(|l| {
-                l.contains("xfsprogs")
-                    || l.contains("build-fixtures-native.sh")
-                    || l.contains("ci-test.sh")
-            });
-            if !load_bearing {
-                continue;
-            }
-            for line in &step {
-                let t = line.trim().trim_start_matches("- ");
-                if t.starts_with('#') {
-                    continue;
-                }
-                assert!(
-                    !t.starts_with("if:") && !t.starts_with("continue-on-error:"),
-                    "a step of the {key} job that installs the oracle's tools, builds \
-                     its fixtures or runs its suites carries `{t}` — which is how the \
-                     work stops happening while the check stays green"
-                );
-            }
-        }
-    }
-
-    /// The job's steps, each as its own block of lines.
-    fn steps(body: &[String]) -> Vec<Vec<String>> {
-        let mut out: Vec<Vec<String>> = Vec::new();
-        for line in body {
-            let indent = line.len() - line.trim_start().len();
-            if indent == 6 && line.trim_start().starts_with("- ") {
-                out.push(vec![line.clone()]);
-            } else if let Some(last) = out.last_mut() {
-                last.push(line.clone());
-            }
-        }
-        out
-    }
-
-    /// It still installs the tools it grades with.
-    #[test]
-    fn the_kernel_gate_still_installs_xfsprogs() {
-        let workflow = workflow();
-        let (key, _, body) = kernel_gate(&workflow);
-        let installs = body
-            .iter()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .any(|l| l.contains("apt-get install") && l.contains("xfsprogs"));
-        assert!(
-            installs,
-            "the {key} job does not install xfsprogs, so mkfs.xfs and xfs_db are not \
-             there — every oracle in it skips, and a skip reads as a pass"
-        );
-    }
-
-    /// And it still builds fixtures and runs the suites that use them.
-    #[test]
-    fn the_kernel_gate_still_builds_fixtures_and_runs_the_oracles() {
-        let workflow = workflow();
-        let (key, _, body) = kernel_gate(&workflow);
-        let text: String = body
-            .iter()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains("build-fixtures-native.sh"),
-            "the {key} job does not build the fixture matrix, so the suites it runs \
-             have nothing to read and skip"
-        );
-        assert!(
-            text.contains("ci-test.sh"),
-            "the {key} job does not run anything through ci-test.sh, which is what \
-             turns a suite's skip into a failure — without it the job can pass while \
-             every oracle in it returns early"
-        );
-        assert!(
-            text.contains("--floor-check"),
-            "the {key} job does not check a floor on what it executed, so a selection \
-             that matched nothing reports the same green as a full run"
-        );
-    }
-}
-
 /// A pull request gets CI whatever it is based on (#241).
 ///
 /// `on: pull_request: branches: [main]` means a pull request based on
@@ -1977,36 +2707,450 @@ fn ci_runs_on_a_pull_request_against_any_base() {
     );
 }
 
-/// The `--ignored` run goes through the skip gate like every other run
-/// in its job (#200).
+/// The #208 guards, held to the mutations they exist to refuse.
 ///
-/// `scripts/ci-test.sh` is the thing that stops a skip reading as a pass
-/// here: it fails the job when a suite's output matches the skip
-/// wording. The xfsprogs-gated run — the one that covers
-/// `tests/oracle_mkfs.rs` and `tests/parent_exchrange_oracle.rs` — was a
-/// bare `cargo test -- --ignored`, so every skip it printed was a line
-/// of log and nothing else. Those are exactly the suites the script
-/// exists for: `oracle_mkfs` prints a note per field it could not
-/// compare against `xfs_db`, and that note is in the script's own
-/// `--self-test` corpus as a skip it must catch.
-#[test]
-fn the_ignored_run_is_not_a_bare_cargo_test() {
-    let workflow = read_or_panic(&manifest_dir().join(".github/workflows/ci.yml"));
-    let offending: Vec<&str> = workflow
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with('#'))
-        .filter(|l| l.contains("--ignored"))
-        .filter(|l| l.contains("cargo test") && !l.contains("ci-test.sh"))
-        .collect();
-    assert!(
-        offending.is_empty(),
-        "these run the ignored suites outside ci-test.sh, so a skip in them is a line \
-         of log rather than a failure: {offending:?}"
-    );
-    assert!(
-        workflow.contains("ci-test.sh --ignored"),
-        "nothing in ci.yml runs the xfsprogs-gated suites at all — they are \
-         `#[ignore]`d, so no other run selects them"
-    );
+/// Each fixture is the shape the real files have with ONE thing
+/// changed, and the changes are the ones #208 lists: the job renamed,
+/// given an `if:`, given `continue-on-error:`, no longer installing
+/// its tool, no longer running its suite. A control beside each proves
+/// the unmodified shape IS counted, so none of them can pass for the
+/// wrong reason -- which is the whole failure being guarded against,
+/// one level up.
+mod oracle_guard {
+    use super::{
+        chore_task_of, compares_against_success, exits_non_zero, gating_jobs_running,
+        harness_setup_script, makes_the_runners_oracle_tools_unusable, parse_workflow,
+        required_checks, runs_chore_task, shell_commands, task_commands,
+        tools_resolved_with_command_v,
+    };
+
+    /// The shape `ci.yml` has: a gating job that builds the fixtures,
+    /// a gating job that takes the runner's oracle tools away and runs
+    /// the suite, and the always-run aggregate over both.
+    const WORKFLOW: &str = r#"
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  fixtures:
+    name: fixtures (harness VM)
+    steps:
+      - run: chore fixtures
+  test:
+    name: test (x86_64, oracles in the VM)
+    needs: fixtures
+    steps:
+      - name: Make the runner's own xfsprogs unusable
+        run: |
+          for tool in mkfs.xfs xfs_db xfs_repair xfs_logprint xfs_io; do
+            path="$(command -v "$tool" || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+          done
+      - run: chore test
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [fixtures, test]
+    steps:
+      - run: |
+          bad="$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success")] | length')"
+          [ "$bad" = 0 ] || exit 1
+"#;
+
+    const SUITE_STEP: &str = "      - run: chore test\n";
+
+    fn gating(workflow: &str, task: &str) -> usize {
+        gating_jobs_running(&parse_workflow(workflow), task).len()
+    }
+
+    /// The control. Without it every refusal below could be the
+    /// fixture failing to parse rather than the mutation being caught.
+    #[test]
+    fn the_control_workflow_runs_both_oracle_tasks_in_gating_jobs() {
+        assert_eq!(gating(WORKFLOW, "fixtures"), 1, "the fixtures job gates");
+        assert_eq!(gating(WORKFLOW, "test"), 1, "the suite job gates");
+    }
+
+    /// THE RENAME. `chore test` and `chore test:unit` are different
+    /// tasks, and the second runs none of the oracle tiers -- so a
+    /// guard matching a prefix would report the gate cross-validating
+    /// when it had been narrowed to the tier this crate grades itself.
+    #[test]
+    fn a_task_whose_name_merely_starts_the_same_is_a_different_task() {
+        for (line, task) in [
+            ("      - run: chore test:unit\n", "test"),
+            ("      - run: chore testing\n", "test"),
+            ("      - run: chore fixtures:clean\n", "fixtures"),
+        ] {
+            let yaml = WORKFLOW
+                .replace(SUITE_STEP, line)
+                .replace("      - run: chore fixtures\n", line);
+            assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+            assert_eq!(
+                gating(&yaml, task),
+                0,
+                "{line:?} does not run `chore {task}`, and counting it as one would \
+                 let a narrowed gate pass"
+            );
+        }
+    }
+
+    /// THE `if:`, at either level. The job runs, or does not, and
+    /// nothing reads the answer -- #143's defect, which left all 27
+    /// guards green while the gate stopped gating.
+    #[test]
+    fn an_if_anywhere_above_the_oracle_step_stops_it_gating() {
+        for yaml in [
+            WORKFLOW.replace("  test:\n", "  test:\n    if: false\n"),
+            WORKFLOW.replace(
+                "  test:\n",
+                "  test:\n    if: github.event_name == 'push'\n",
+            ),
+            WORKFLOW.replace(SUITE_STEP, &format!("{SUITE_STEP}        if: false\n")),
+        ] {
+            assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+            assert_eq!(
+                gating(&yaml, "test"),
+                0,
+                "a job or step that may not run cannot be what cross-validates"
+            );
+            assert_eq!(
+                gating(&yaml, "fixtures"),
+                1,
+                "control: the untouched fixtures job still gates, so the refusal is \
+                 the mutation and not the fixture"
+            );
+        }
+    }
+
+    /// THE `continue-on-error:`. The job runs, the oracle disagrees,
+    /// and the run is green anyway.
+    #[test]
+    fn continue_on_error_anywhere_above_the_oracle_step_stops_it_gating() {
+        for yaml in [
+            WORKFLOW.replace("  test:\n", "  test:\n    continue-on-error: true\n"),
+            WORKFLOW.replace(
+                SUITE_STEP,
+                &format!("{SUITE_STEP}        continue-on-error: true\n"),
+            ),
+        ] {
+            assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+            assert_eq!(
+                gating(&yaml, "test"),
+                0,
+                "a result that is discarded is not a result the gate reads"
+            );
+        }
+    }
+
+    /// And the workflow-level version of the same: jobs that gate
+    /// nothing because nothing they belong to runs on a pull request.
+    #[test]
+    fn a_workflow_off_pull_requests_gates_no_oracle_job() {
+        let yaml = WORKFLOW.replace("  pull_request:\n", "  pull_request_review:\n");
+        assert_ne!(yaml, WORKFLOW, "the mutation must actually apply");
+        assert_eq!(gating(&yaml, "fixtures"), 0);
+        assert_eq!(gating(&yaml, "test"), 0);
+    }
+
+    /// `chore` by name or by path, after the assignments the shell
+    /// applies rather than runs, and the task is the first argument
+    /// that is not a flag. The negative cases are the ones that matter:
+    /// a task name after `--` belongs to the task, and in
+    /// `echo chore test` the program is `echo`.
+    #[test]
+    fn the_chore_invocation_is_read_the_way_chore_reads_it() {
+        for (command, task) in [
+            ("chore test", Some("test")),
+            ("/usr/local/bin/chore test", Some("test")),
+            ("CHORE_VERSION=0.11.0 chore test", Some("test")),
+            ("chore --verbose test", Some("test")),
+            ("chore test -- --verbose", Some("test")),
+            ("chore test:unit", Some("test:unit")),
+            ("echo chore test", None),
+            ("! chore vm:status", None),
+            ("cargo test", None),
+            ("chore -- test", None),
+        ] {
+            let words = shell_commands(command);
+            let found = words.iter().find_map(|w| chore_task_of(w));
+            assert_eq!(found, task, "{command:?}");
+        }
+    }
+
+    /// A TASK NAMED IN A COMMENT IS NOT A TASK. `ci.yml` names every
+    /// task it runs in the comment block at the top of the file, which
+    /// is where the word survives the step's deletion.
+    #[test]
+    fn a_chore_task_named_in_a_comment_is_not_a_run() {
+        for prose in [
+            "#   test   `chore lint` and `chore test`\n",
+            "    # the whole gate: chore test\n",
+            "set -eu\necho 'ready'  # then chore test\n",
+        ] {
+            assert!(
+                runs_chore_task(prose, "test").is_empty(),
+                "{prose:?}: the prose describing the gate is not the gate"
+            );
+        }
+        assert_eq!(
+            runs_chore_task("set -eu\nchore test\n", "test").len(),
+            1,
+            "control: the command itself is, wherever in the block it sits"
+        );
+    }
+
+    /// THE TOOL THAT STOPS BEING INSTALLED, and the subtler half: the
+    /// tool that stops being CHECKED. `mkfs.xfs` and `xfs_db` are
+    /// named all over both scripts -- in `apt-get install`, in a
+    /// `-V` banner, in a tarball name -- so a text search finds them
+    /// after the loop that proves them present has stopped covering
+    /// them. Only the loop's own list counts, and only when its body
+    /// does the lookup.
+    #[test]
+    fn a_tool_dropped_from_the_verification_is_no_longer_verified() {
+        let script = "\
+apt-get install -y -qq xfsprogs attr acl
+mkfs.xfs -V
+for tool in mkfs.xfs xfs_db xfs_repair; do
+    command -v \"$tool\" || exit 1
+done
+";
+        let found = tools_resolved_with_command_v(script);
+        for tool in ["mkfs.xfs", "xfs_db", "xfs_repair"] {
+            assert!(
+                found.iter().any(|f| f == tool),
+                "control: {tool} is checked"
+            );
+        }
+        let dropped = script.replace("mkfs.xfs xfs_db xfs_repair", "xfs_db xfs_repair");
+        assert_ne!(dropped, script, "the mutation must actually apply");
+        assert!(
+            !tools_resolved_with_command_v(&dropped)
+                .iter()
+                .any(|f| f == "mkfs.xfs"),
+            "mkfs.xfs is still installed and still printed, and is no longer proved \
+             present -- which is the half a text search cannot see"
+        );
+        let unchecked = script.replace(
+            "    command -v \"$tool\" || exit 1\n",
+            "    echo \"$tool\"\n",
+        );
+        assert_ne!(unchecked, script, "the mutation must actually apply");
+        assert!(
+            tools_resolved_with_command_v(&unchecked).is_empty(),
+            "a loop over the tools that does not look them up proves nothing about them"
+        );
+    }
+
+    /// THE STEP THAT MAKES THE RUNNER'S OWN TOOLS UNUSABLE, and the
+    /// two ways it decays into a no-op that still reads like a
+    /// precaution.
+    #[test]
+    fn the_poisoning_step_stops_counting_when_it_stops_working() {
+        let step = &parse_workflow(WORKFLOW)
+            .jobs
+            .iter()
+            .find(|job| job.id == "test")
+            .expect("control: the fixture has a test job")
+            .steps[0]
+            .run
+            .clone();
+        assert!(
+            makes_the_runners_oracle_tools_unusable(step),
+            "control: the unmodified step takes every oracle tool away"
+        );
+        for mutation in [
+            step.replace(" xfs_io;", ";"),
+            step.replace("sudo mv \"$path\" \"$path.host-copy\"", "echo \"$path\""),
+        ] {
+            assert_ne!(&mutation, step, "the mutation must actually apply");
+            assert!(
+                !makes_the_runners_oracle_tools_unusable(&mutation),
+                "a tool left usable, or a loop that only prints, is not evidence that \
+                 the oracle calls happened in the VM"
+            );
+        }
+    }
+
+    /// The aggregate's wiring, read in both spellings `needs:` takes.
+    #[test]
+    fn the_aggregate_is_read_with_its_condition_and_its_needs() {
+        let wf = parse_workflow(WORKFLOW);
+        let aggregate = wf
+            .jobs
+            .iter()
+            .find(|job| job.id == "ci-ok")
+            .expect("control: the fixture has a ci-ok job");
+        assert_eq!(aggregate.name.as_deref(), Some("ci-ok"));
+        assert_eq!(aggregate.condition.as_deref(), Some("always()"));
+        assert_eq!(aggregate.needs, ["fixtures", "test"]);
+
+        let scalar = WORKFLOW.replace("    needs: [fixtures, test]\n", "    needs: test\n");
+        assert_ne!(scalar, WORKFLOW, "the mutation must actually apply");
+        let wf = parse_workflow(&scalar);
+        let aggregate = wf.jobs.iter().find(|job| job.id == "ci-ok").unwrap();
+        assert_eq!(
+            aggregate.needs,
+            ["test"],
+            "a single job is a legal `needs:` and is one job, not a missing key -- \
+             reading it as nothing would report every job as unwired"
+        );
+    }
+
+    /// THE COMPARISON THE AGGREGATE EXISTS TO MAKE. A skipped job's
+    /// result is `skipped`, so a script that only knows about
+    /// `failure` reports green for a run in which the job never
+    /// happened -- which is the case `ci-ok` was added for (#207).
+    #[test]
+    fn a_script_that_only_knows_about_failure_is_refused() {
+        assert!(
+            compares_against_success(r#"select(.value.result != "success")"#),
+            "control: the real shape"
+        );
+        for spelling in [
+            "[ \"$r\" != success ]",
+            "[[ $r == \"success\" ]]",
+            "select(.value.result!='success')",
+        ] {
+            assert!(
+                compares_against_success(spelling),
+                "{spelling}: the quoting is not the point"
+            );
+        }
+        assert!(
+            !compares_against_success(r#"select(.value.result == "failure")"#),
+            "comparing against failure alone passes a job that was skipped"
+        );
+        assert!(
+            !compares_against_success("echo \"the jobs succeeded\""),
+            "a cheerful echo is not a comparison"
+        );
+    }
+
+    /// And the other way it decays: a verdict printed and a zero
+    /// returned.
+    #[test]
+    fn a_script_that_never_exits_non_zero_is_refused() {
+        assert!(exits_non_zero("[ -z \"$bad\" ] || exit 1"), "control");
+        assert!(
+            exits_non_zero("exit 65"),
+            "any non-zero status is a failure"
+        );
+        assert!(!exits_non_zero("echo \"::error::not green\"\nexit 0"));
+        assert!(!exits_non_zero("echo \"not green\""));
+    }
+
+    /// The `[setup] script`, which is the one the guest is provisioned
+    /// with. `[test] guest_command` is a different program at a
+    /// different time, and confusing the two would guard a file that
+    /// installs nothing.
+    #[test]
+    fn the_setup_script_is_read_from_the_right_section() {
+        let config = "\
+[project]
+script = \"not-this-one.sh\"
+
+[setup]
+# Runs as root INSIDE the VM.
+script = \"scripts/vm-setup.sh\"
+
+[test]
+guest_command = \"scripts/guest-suite.sh\"
+";
+        assert_eq!(
+            harness_setup_script(config).as_deref(),
+            Some("scripts/vm-setup.sh")
+        );
+        assert_eq!(
+            harness_setup_script(&config.replace("script = \"scripts/vm-setup.sh\"\n", "")),
+            None,
+            "a `[setup]` with no script provisions nothing, and that is a finding"
+        );
+        assert_eq!(
+            harness_setup_script(&config.replace(
+                "script = \"scripts/vm-setup.sh\"",
+                "'script' = 'scripts/vm-setup.sh'"
+            ))
+            .as_deref(),
+            Some("scripts/vm-setup.sh"),
+            "a quoted key is the same key -- the spelling that has defeated three \
+             other comparisons in this repository"
+        );
+    }
+
+    /// `.github-guard`, whose whole content is what a merge waits for.
+    /// The names it carries have contained spaces and `+`, so the
+    /// value is taken whole; a commented-out requirement is not a
+    /// requirement, which is the state a file arrives in when somebody
+    /// switches the gate off "for now".
+    #[test]
+    fn the_required_checks_are_read_from_the_checks_section_only() {
+        let guard = "\
+# ci-ok   ci.yml: the one always-run gate.
+[other]
+	required = not-a-check
+[checks]
+	required = ci-ok
+	# required = validate against xfs_db + in-kernel XFS driver
+";
+        assert_eq!(required_checks(guard), ["ci-ok"]);
+        let both = guard.replace("\trequired = ci-ok\n", "\trequired = ci-ok, test-darwin\n");
+        assert_ne!(both, guard, "the mutation must actually apply");
+        assert_eq!(required_checks(&both), ["ci-ok", "test-darwin"]);
+        let spaced = guard.replace(
+            "\trequired = ci-ok\n",
+            "\trequired = validate against xfs_db + in-kernel XFS driver\n",
+        );
+        assert_eq!(
+            required_checks(&spaced),
+            ["validate against xfs_db + in-kernel XFS driver"],
+            "a check-run name is whatever GitHub reports, spaces and all"
+        );
+        assert!(
+            required_checks(&guard.replace("\trequired = ci-ok\n", "")).is_empty(),
+            "nothing required is nothing gated, and it must be reported as that"
+        );
+    }
+
+    /// `chores.yml`'s side: the commands of a task, and the three
+    /// things that are not commands of it.
+    #[test]
+    fn a_tasks_commands_are_its_own() {
+        let manifest = "\
+version: \"3\"
+tasks:
+  test:unit:
+    # `--release` is deliberately absent here.
+    cmds:
+      - 'EXPECT_OVERFLOW_CHECKS=1 cargo test --locked'
+      - cmd: 'scripts/ci-test.sh --gate 290 tmp/logs/unit.log'
+  test:native:
+    cmds:
+      - task: test:unit
+      - 'scripts/ci-test.sh'
+";
+        assert_eq!(
+            task_commands(manifest, "test:unit"),
+            [
+                "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked",
+                "scripts/ci-test.sh --gate 290 tmp/logs/unit.log"
+            ],
+            "a scalar and a `cmd:` mapping are both commands; the comment above them \
+             is not one"
+        );
+        assert_eq!(
+            task_commands(manifest, "test:native"),
+            ["scripts/ci-test.sh"],
+            "a `task:` reference is not this task's command -- crediting `test:native` \
+             with `test:unit`'s cargo run would let the debug tier be defined \
+             anywhere and found here"
+        );
+        assert!(
+            task_commands(manifest, "unit").is_empty(),
+            "a task that does not exist has no commands, and the guard's own \
+             non-emptiness check is what turns that into a failure"
+        );
+    }
 }

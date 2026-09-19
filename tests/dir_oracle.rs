@@ -34,13 +34,11 @@
 //!   one superblock fact this module cannot get from
 //!   `Superblock::has_ftype`.
 //!
-//! Fixtures are gitignored and absent on a fresh clone, so these tests
-//! skip rather than fail when `.vm-share` is empty. Generate them with:
-//!
-//! ```sh
-//! ./scripts/vm.sh up
-//! ./scripts/vm-build-fixtures.sh
-//! ```
+//! The fixtures are gitignored and generated. `chore fixtures` builds
+//! every geometry in the harness guest, so an empty `.vm-share` is that
+//! build not having happened and these tests fail naming it: a parser
+//! compared against no image at all reported the same green as one
+//! compared against all of them.
 
 use fs_core::FileDevice;
 use fs_xfs::dir::{self, DirEntry};
@@ -52,26 +50,26 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Locate every `.img` in `.vm-share`, paired with its `.rootdump` when
-/// one exists. Images without a dump have an empty root directory.
+mod common;
+
+/// Every `.img` in `.vm-share`, paired with its `.rootdump` when one
+/// exists.
+///
+/// The dump is genuinely optional — an image whose root is empty has
+/// nothing for `xfs_db` to render — but the set is not:
+/// `common::fixtures_matching` fails when there are no images at all,
+/// because that is the fixture build having not run rather than a
+/// filesystem matrix with nothing in it.
 fn images() -> Vec<(String, PathBuf, Option<PathBuf>)> {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let Ok(entries) = std::fs::read_dir(&share) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("img") {
-            continue;
-        }
-        let name = p.file_stem().unwrap().to_string_lossy().into_owned();
-        let dump = p.with_extension("rootdump");
-        let dump = dump.exists().then_some(dump);
-        out.push((name, p, dump));
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    common::fixtures_matching("xfs", ".img")
+        .into_iter()
+        .map(|p| {
+            let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+            let dump = p.with_extension("rootdump");
+            let dump = dump.is_file().then_some(dump);
+            (name, p, dump)
+        })
+        .collect()
 }
 
 /// Byte offset of an inode within the image, derived from its number.
@@ -260,10 +258,6 @@ fn expect<T: PartialEq + std::fmt::Debug>(
 #[test]
 fn root_directory_agrees_with_xfs_db() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures in .vm-share — run ./scripts/vm-build-fixtures.sh; skipping");
-        return;
-    }
 
     let mut examined = 0usize;
     let mut total_fields = 0usize;
@@ -400,10 +394,6 @@ fn root_directory_agrees_with_xfs_db() {
 #[test]
 fn root_directory_parses_on_real_images() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures in .vm-share — skipping");
-        return;
-    }
 
     let mut examined = 0usize;
     let mut spilled = 0usize;
@@ -649,10 +639,6 @@ struct FoundBlock {
 #[test]
 fn directory_blocks_in_real_images_parse_and_verify() {
     let images = images();
-    if images.is_empty() {
-        eprintln!("no fixtures in .vm-share — skipping");
-        return;
-    }
 
     let mut total_blocks = 0usize;
     let mut total_entries = 0usize;
@@ -667,7 +653,11 @@ fn directory_blocks_in_real_images_parse_and_verify() {
         if !sb.is_v5() {
             // Without the self-describing header a scan cannot tell a
             // real directory block from four coincidental bytes.
-            eprintln!("  {label}: v4, not scannable without identity fields — skipping");
+            // NOT A TEST DECLINING TO RUN: a v4 filesystem has no
+            // self-describing header, so there is nothing for the scan
+            // to recognise. The count below is what says the scan found
+            // blocks somewhere.
+            eprintln!("  {label}: v4, so it carries no identity fields for a scan to match");
             continue;
         }
 
@@ -830,9 +820,10 @@ fn directory_blocks_in_real_images_parse_and_verify() {
 
     assert!(
         total_blocks > 0,
-        "no directory blocks were found in any image. Either the fixtures hold no \
-         directory large enough to leave its inode, or the scan is looking in the \
-         wrong place — both mean the block, leaf and node paths are unvalidated"
+        "no directory blocks were found in any image in .vm-share. Either the \
+         fixtures hold no directory large enough to leave its inode, or the scan is \
+         looking in the wrong place — both mean the block, leaf and node paths are \
+         unvalidated"
     );
     eprintln!("{total_blocks} directory blocks verified, {total_entries} entries parsed");
 }
@@ -845,11 +836,9 @@ fn directory_blocks_in_real_images_parse_and_verify() {
 /// fixture built to be refused.
 #[test]
 fn real_root_directory_rejects_wrong_claims() {
+    // `images` fails when the set is empty, so there is always a first.
     let images = images();
-    let Some((label, img, _)) = images.first() else {
-        eprintln!("no fixtures in .vm-share — skipping");
-        return;
-    };
+    let (label, img, _) = images.first().expect("at least one fixture image");
 
     let bytes = std::fs::read(img).expect("read image");
     let (sb, inode, range) = root_dir_fork(&bytes, label);
@@ -903,12 +892,7 @@ fn real_root_directory_rejects_wrong_claims() {
 /// and the assertions below say so rather than passing vacuously.
 #[test]
 fn v4_fixture_advertises_ftype_outside_the_incompat_mask() {
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let img = share.join("xfs-nocrc.img");
-    if !img.exists() {
-        eprintln!("no xfs-nocrc.img — skipping");
-        return;
-    }
+    let img = common::fixture("xfs-nocrc.img");
     let bytes = std::fs::read(&img).expect("read image");
     let sb = Superblock::parse(&bytes).expect("parse superblock");
 
@@ -952,12 +936,7 @@ fn renaming_refuses_a_v4_filesystem() {
     use fs_core::BlockDevice;
     use std::sync::Arc;
 
-    let share = Path::new(env!("CARGO_MANIFEST_DIR")).join(".vm-share");
-    let img = share.join("xfs-nocrc.img");
-    if !img.exists() {
-        eprintln!("no xfs-nocrc.img — skipping");
-        return;
-    }
+    let img = common::fixture("xfs-nocrc.img");
 
     // Work on a copy: mount_rw takes a writable device and this must not
     // disturb the shared fixture.

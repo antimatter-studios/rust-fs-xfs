@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
-# Run a command with an isolated test scratch directory. Raspberry Pi runs use
-# the checkout storage so write-heavy fixture work does not churn the SD card.
+# Run a command with an isolated test scratch directory.
+#
+# SCRATCH LIVES IN THE REPOSITORY, always: tmp/ (gitignored), and never
+# the system temporary directory or a runner-supplied one. The oracle
+# tools run inside the fs-linux-test-harness VM, which sees this
+# repository at the path the host knows it by and the shared directory,
+# and nothing else of the host — so an image under /tmp or $RUNNER_TEMP
+# is a path the tool asked to read it cannot open. It used to pick
+# whichever of those the machine offered, which is why the same test read
+# a different image depending on where it ran.
+#
+# FS_XFS_TEST_TMPDIR supplies an exact directory and FS_XFS_TEST_TMP_BASE
+# a parent to allocate one under; both must be inside the repository, and
+# an exact one is the caller's to delete.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,27 +44,29 @@ trap 'forward_signal HUP 1' HUP
 trap 'forward_signal INT 2' INT
 trap 'forward_signal TERM 15' TERM
 
+# Inside the repository, or the guest cannot see it. Refused here, where
+# the rule can be explained, rather than in the guest as a missing file.
+inside_repo() {
+    case "$1" in
+        "$REPO"/*) return 0 ;;
+        *)
+            echo "with-test-temp.sh: $2 is $1, which is outside $REPO." >&2
+            echo "         The oracle tools run in the harness VM, which sees this" >&2
+            echo "         repository and its shared directory and nothing else of the host." >&2
+            exit 1
+            ;;
+    esac
+}
+
 if [[ -n "${FS_XFS_TEST_TMPDIR:-}" ]]; then
+    inside_repo "$FS_XFS_TEST_TMPDIR" FS_XFS_TEST_TMPDIR
+    # An exact caller-supplied directory is not ours to delete.
     mkdir -p "$FS_XFS_TEST_TMPDIR"
-elif [[ -n "${FS_XFS_TEST_TMP_BASE:-}" ]]; then
-    mkdir -p "$FS_XFS_TEST_TMP_BASE"
-    RUN_DIR="$(mktemp -d "$FS_XFS_TEST_TMP_BASE/fs-xfs-tests.XXXXXX")"
-    export FS_XFS_TEST_TMPDIR="$RUN_DIR"
-elif [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${RUNNER_TEMP:-}" ]]; then
-    mkdir -p "$RUNNER_TEMP"
-    RUN_DIR="$(mktemp -d "$RUNNER_TEMP/fs-xfs-tests.XXXXXX")"
-    export FS_XFS_TEST_TMPDIR="$RUN_DIR"
-elif [[ -r /proc/device-tree/model ]] && grep -aq 'Raspberry Pi' /proc/device-tree/model; then
-    mkdir -p "$REPO/tmp"
-    RUN_DIR="$(mktemp -d "$REPO/tmp/fs-xfs-tests.XXXXXX")"
-    export FS_XFS_TEST_TMPDIR="$RUN_DIR"
 else
-    if [[ -n "${TMPDIR:-}" ]]; then
-        mkdir -p "$TMPDIR"
-        RUN_DIR="$(mktemp -d "$TMPDIR/fs-xfs-tests.XXXXXX")"
-    else
-        RUN_DIR="$(mktemp -d -t fs-xfs-tests.XXXXXX)"
-    fi
+    base="${FS_XFS_TEST_TMP_BASE:-$REPO/tmp}"
+    inside_repo "$base" FS_XFS_TEST_TMP_BASE
+    mkdir -p "$base"
+    RUN_DIR="$(mktemp -d "$base/fs-xfs-tests.XXXXXX")"
     export FS_XFS_TEST_TMPDIR="$RUN_DIR"
 fi
 
