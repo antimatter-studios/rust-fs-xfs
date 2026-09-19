@@ -1889,6 +1889,7 @@ mod kernel_oracle_job {
              that matched nothing reports the same green as a full run"
         );
     }
+}
 
 /// The `--ignored` run goes through the skip gate like every other run
 /// in its job (#200).
