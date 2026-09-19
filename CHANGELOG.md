@@ -8,6 +8,23 @@ never does.
 
 ### Added
 
+- **A volume with a dirty log mounts, replaying into memory.** A crash, a
+  panic or a yanked cable leaves the log holding committed transactions the
+  metadata has never been given, and such a volume was refused outright —
+  honest, and it meant the ordinary state after a crash was one this driver
+  could not open at all, where the kernel simply replays and mounts. A
+  read-only mount now reads the records from the tail to the head and
+  applies them: buffer items write their logged chunks, inode items their
+  core and forks, an icreate item initialises the chunk of inodes the record
+  did not carry, and a block that was cancelled takes nothing from before it
+  changed hands. The volume itself is **not written to** — the replay is
+  held in memory over an untouched device, which is what recovering data
+  from a disk one may not touch needs — and `Filesystem::was_replayed` says
+  which kind of mount this is. A read-write mount still refuses a dirty log.
+  Intent items are counted rather than finished, which leaves space
+  accounting unsettled and nothing a directory walk or a file read can see
+  (#90).
+
 - **A directory takes entries after it has outgrown the inode.** A
   short-form directory that would not hold one more name was moved into a
   block of its own, and the next entry was then refused: "has outgrown the
