@@ -27,6 +27,79 @@ SHARE="$REPO/.vm-share"
 # alone. Inside .vagrant/, which is already gitignored, and beside the
 # machine state it describes.
 HOLD="$VAGRANT_DIR/.vagrant/keep-running"
+# WHO IS USING THE MACHINE RIGHT NOW, which is a different question from
+# whether somebody means to keep it (#224).
+#
+# `reap` runs from `lifecycle: after_all`, so it fires on EVERY chore
+# invocation — including one started while another is in the middle of
+# using the VM. It used to stop that machine, and the first invocation
+# failed with whatever it was doing at the time: a provisioning run left
+# `dpkg` half way through a transaction, which then broke the next
+# provision too.
+#
+# A use is recorded two ways, because a use has two shapes:
+#
+#   - LEASES, one file per live `vm.sh` process that is talking to the
+#     guest. It covers a single long call — a fixture build inside one
+#     `vm.sh run` — and it is removed by a trap on every exit path. A
+#     lease whose process is gone is not a use, and the reaper clears
+#     it.
+#   - LAST USED, a timestamp. Between two calls of a suite that shells
+#     out to `vm.sh run` in a loop there is no process to hold a lease,
+#     and that gap is exactly where the reaper fires. Use within
+#     `IDLE_SECS` counts as use.
+#
+# Neither replaces `hold`, which says somebody wants the machine kept
+# across invocations. These say somebody is using it in this one.
+LEASES="$VAGRANT_DIR/.vagrant/leases"
+USED="$VAGRANT_DIR/.vagrant/last-used"
+IDLE_SECS="${AM_ORACLE_VM_IDLE:-600}"
+
+# Record that this process is using the machine, until it exits.
+take_lease() {
+    mkdir -p "$LEASES" 2>/dev/null || return 0
+    : > "$LEASES/$$" 2>/dev/null || return 0
+    trap 'rm -f "$LEASES/$$"' EXIT INT TERM
+    touch_used
+}
+
+touch_used() {
+    mkdir -p "$(dirname "$USED")" 2>/dev/null || return 0
+    date +%s > "$USED" 2>/dev/null || true
+}
+
+# Whether a live process holds a lease. Clears the leases of processes
+# that no longer exist, which is what a run killed outright leaves.
+leased() {
+    [ -d "$LEASES" ] || return 1
+    local held=1 file pid
+    for file in "$LEASES"/*; do
+        [ -e "$file" ] || continue
+        pid="${file##*/}"
+        case "$pid" in
+            ''|*[!0-9]*) rm -f "$file"; continue ;;
+        esac
+        if kill -0 "$pid" 2>/dev/null; then
+            held=0
+        else
+            rm -f "$file"
+        fi
+    done
+    return "$held"
+}
+
+# Whether the machine was used recently enough that a gap between two
+# calls is the likeliest explanation.
+recently_used() {
+    [ -f "$USED" ] || return 1
+    local when now
+    when="$(cat "$USED" 2>/dev/null || echo 0)"
+    case "$when" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    now="$(date +%s)"
+    [ $((now - when)) -lt "$IDLE_SECS" ]
+}
 # One oracle VM runs at a time, across every repository — see
 # scripts/vm-slot.sh for why. Absent (an older checkout, a partial
 # copy), everything below still works and the serialisation is simply
@@ -164,6 +237,7 @@ case "${1:-}" in
         ;;
     run)
         shift
+        take_lease
         vm_up
         # `vagrant ssh -c` mangles quoting for complex commands; feed the
         # command on stdin instead so the guest shell sees it verbatim.
@@ -283,6 +357,17 @@ case "${1:-}" in
         fi
         if [ -f "$HOLD" ]; then
             echo "[vm] left running: it was asked for with \`chore vm:up\`. \`chore vm:down\` stops it." >&2
+            exit 0
+        fi
+        # IN USE BY SOMETHING THAT IS STILL RUNNING (#224). Another chore
+        # invocation's after_all must not stop the machine this one is
+        # talking to.
+        if leased; then
+            echo "[vm] left running: in use by another invocation in this checkout." >&2
+            exit 0
+        fi
+        if recently_used; then
+            echo "[vm] left running: in use — last call was under $((IDLE_SECS / 60)) minutes ago." >&2
             exit 0
         fi
         echo "vm: a machine was left running by something that did not clean up — stopping it." >&2
