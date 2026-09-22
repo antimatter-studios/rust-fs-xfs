@@ -521,6 +521,8 @@ tasks:
   lint:
     desc: Formatting and clippy, exactly as CI runs them
     cmds:
+      - scripts/agents-core-check.sh
+      - scripts/ci-gate.sh
       - cargo fmt --check
       - cargo clippy --locked --all-targets -- -D warnings
 
@@ -556,3 +558,13 @@ tasks:
       - 'cd "{{.OUT}}" && pwd -P'
     vars:
       OUT: 'dist'
+
+  check:ci-gate:
+    desc: The one required check stands for every job in ci.yml
+    # A chore task naming a script, and nothing else -- the script is what can
+    # be tested, reviewed and run without chore at all. This was
+    # tests/ci_aggregate_gate.rs, which parsed a YAML file and compared
+    # strings, and as a cargo test counted towards the executed-test floor the
+    # gate itself enforces.
+    cmds:
+      - scripts/ci-gate.sh
