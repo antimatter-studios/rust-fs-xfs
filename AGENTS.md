@@ -168,3 +168,9 @@ reason they moved rather than being re-learned by the next repository:
 - Apple Silicon is the only target architecture for consumers of this crate; the crate
   itself is portable and CI runs on x86_64 Linux, which is fine because on-disk formats
   are endian-defined rather than host-defined.
+- **Never grow a shared tool to solve a problem in this repository.** `chore` is a
+  general-purpose task runner this project merely consumes; the same goes for
+  `github-guard` and the agent-skills hooks. If something needed here looks like it
+  belongs inside one of them, it does not. Solve it here, or ask first. The tell is a
+  release: if a shared tool needs a new version cut whose only purpose is to unblock
+  this project, the code is in the wrong repository.
