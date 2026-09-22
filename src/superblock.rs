@@ -605,7 +605,12 @@ impl Superblock {
                 self.blocksize
             ));
         }
-        if 1u32 << self.blocklog != self.blocksize {
+        // `checked_shl` rather than `<<`: a shift at or past the width
+        // of the type is masked in release, and `1u32 << 44` masks back
+        // to 4096 -- which is the very value this comparison is asking
+        // about. The same three lines below, and `inopblog`,
+        // `dirblklog` and `agblklog` further down, all for this reason.
+        if 1u32.checked_shl(u32::from(self.blocklog)) != Some(self.blocksize) {
             return bad(format!(
                 "blocklog {} does not describe blocksize {}",
                 self.blocklog, self.blocksize
@@ -617,7 +622,7 @@ impl Superblock {
                 self.sectsize
             ));
         }
-        if 1u16 << self.sectlog != self.sectsize {
+        if 1u16.checked_shl(u32::from(self.sectlog)) != Some(self.sectsize) {
             return bad(format!(
                 "sectlog {} does not describe sectsize {}",
                 self.sectlog, self.sectsize
@@ -629,7 +634,7 @@ impl Superblock {
                 self.inodesize
             ));
         }
-        if 1u16 << self.inodelog != self.inodesize {
+        if 1u16.checked_shl(u32::from(self.inodelog)) != Some(self.inodesize) {
             return bad(format!(
                 "inodelog {} does not describe inodesize {}",
                 self.inodelog, self.inodesize
@@ -1257,6 +1262,55 @@ mod tests {
         put_start(&mut b, 0);
         put_blocks(&mut b, 0xFFFF_FFFF);
         assert!(Superblock::parse(&b).is_ok());
+    }
+
+    /// Each `log2` field is checked against the value it describes,
+    /// and that check was itself the defect: `1u32 << self.blocklog`
+    /// where `blocklog` is a byte off the disk.
+    ///
+    /// A shift at or past the width of the type is masked in release,
+    /// where this crate ships with `overflow-checks` off. `1u32 << 44`
+    /// is `1u32 << 12`, which is 4096 -- so a superblock claiming a
+    /// `blocklog` of 44 for a 4096-byte block satisfied the comparison
+    /// written to reject exactly that disagreement, and every later
+    /// shift by `blocklog` then used 44. In a checked build the same
+    /// expression panics instead, which turns a crafted image into a
+    /// crash before anything has been validated at all.
+    ///
+    /// `inopblog`, `dirblklog` and `agblklog` were already given
+    /// `checked_shl` for this reason. These three were not, and they
+    /// are checked first.
+    ///
+    /// Found by the `superblock` fuzz target, thirty seconds into its
+    /// first run; the input it produced is in
+    /// `fuzz/corpus/superblock/`.
+    #[test]
+    fn a_log_field_wider_than_its_type_is_refused_rather_than_masked() {
+        // Each is the real value plus the width of the type it is
+        // shifted in, which is the value that masks back to the real
+        // one and so passes a comparison it should fail.
+        for (field, at, masked) in [
+            ("blocklog", 120usize, 12 + 32u8),
+            ("sectlog", 121, 9 + 16),
+            ("inodelog", 122, 9 + 16),
+        ] {
+            let mut b = v4_superblock();
+            b[at] = masked;
+            let result = Superblock::parse(&b);
+            let message = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!(
+                    "{field} {masked} was accepted: the shift masked back to the value it \
+                     was meant to be compared against, so the check passed on a superblock \
+                     it exists to reject"
+                ),
+            };
+            assert!(
+                message.contains(field),
+                "{field} {masked} was rejected, but the message does not say which field \
+                 was wrong: {message}"
+            );
+        }
     }
 
     /// `fsblock` is packed -- the top bits are the allocation group,
