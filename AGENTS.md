@@ -76,7 +76,8 @@ There is no hooks installer in this repository. `./scripts/install-hooks.sh` was
 removed by #165, when the guards moved outside the working tree so that no branch
 checkout could rewrite the hook about to run; this file went on naming it for far
 longer. The hooks come from the github-guard skill's own installer, once per clone —
-`~/.claude/skills/github-guard/install.sh .`, as README `## Building` says.
+`~/.claude/skills/github-guard/install.sh .`, which writes them into `.git/hooks`,
+as README `## Building` says.
 
 ## The oracle VM, and why everything Linux happens inside it
 
