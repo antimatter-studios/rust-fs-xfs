@@ -22,7 +22,7 @@ on:
 # `rust-deps-pinned` pre-commit hook refuses a lock that names a version
 # no workflow pins, which is what catches them being raised apart.
 env:
-  FS_CORE_REF: v0.2.11
+  FS_CORE_REF: v0.2.13
 
 jobs:
   # Cheap and release-specific: a tag that disagrees with Cargo.toml
