@@ -114,7 +114,7 @@ vars:
   # scripts/resolve-output-budget.sh resolves and verifies. v0.2.10 does not
   # contain it, so this pin cannot go back below v0.2.11 while the tiers read
   # the wrapper from core.
-  FS_CORE_REF: v0.2.11
+  FS_CORE_REF: v0.2.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.1.0
 
