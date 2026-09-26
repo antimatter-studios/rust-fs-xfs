@@ -15,21 +15,54 @@
 # bounds, and every one of them was MEASURED — see the table there. Raise one
 # deliberately when a tier grows; a budget nobody can breach measures nothing.
 #
-# VERBOSE. `FLTH_VERBOSE=1`, or `--verbose`/`-v` in the chore invocation's
+# VERBOSE. `OUTPUT_BUDGET_VERBOSE=1`, or `--verbose`/`-v` in the chore invocation's
 # CLI_ARGS (`chore test:oracle -- --verbose`), streams the run as it happens
 # as well as logging it. It does NOT lift the budget: the log is the same
 # size either way, and a tier that has outgrown its budget should say so
 # whether or not anybody was watching.
+#
+# THE VARIABLE WAS `FLTH_VERBOSE` until the wrapper moved to rust-fs-core. The
+# old name is not read by the canonical script, and setting it does nothing --
+# it does not error, the run simply stays quiet.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUDGET="$REPO/../fs-linux-test-harness/scripts/output-budget.sh"
 
-if [ ! -x "$BUDGET" ]; then
-    echo "tier.sh: ../fs-linux-test-harness/scripts/output-budget.sh is missing." >&2
-    echo "         The harness is a pinned sibling -- run 'chore siblings'." >&2
+# THE WRAPPER IS COPIED FROM rust-fs-core FOR THIS RUN, AND DELETED AFTER IT.
+#
+# It belongs to core, and it is deliberately NOT committed here. A committed
+# copy is a copy that drifts: measured on 2026-09-22 the family had three of
+# them, reached four different ways, each repository internally consistent
+# and nothing comparing them.
+#
+# CARGO IS ASKED WHERE CORE IS, rather than this script guessing. Cargo has
+# already resolved the dependency, and its answer is right in both shapes
+# this family uses: with `path = "../rust-fs-core"` it reports the developer's
+# own checkout, so work in progress on the wrapper is exercised here on the
+# next run; with a plain version requirement it reports the registry copy of
+# the pinned release. There is no sibling-versus-crate decision to make,
+# because cargo made it.
+#
+# tmp/ is gitignored and is where the tier logs already live.
+CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
+    2>/dev/null | python3 -c '
+import json, sys
+packages = json.load(sys.stdin)["packages"]
+print(next((p["manifest_path"].rsplit("/", 1)[0]
+            for p in packages if p["name"] == "am-fs-core"), ""))
+')"
+if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/scripts/output-budget.sh" ]; then
+    echo "tier.sh: cargo could not say where am-fs-core is, or its copy has no" >&2
+    echo "         scripts/output-budget.sh. The wrapper lives in rust-fs-core;" >&2
+    echo "         check the am-fs-core dependency resolves and is at a version" >&2
+    echo "         that ships it (v0.2.11 or later)." >&2
     exit 1
 fi
+
+BUDGET="$REPO/tmp/output-budget.$$.sh"
+mkdir -p "$REPO/tmp"
+cp "$CORE_DIR/scripts/output-budget.sh" "$BUDGET"
+trap 'rm -f "$BUDGET"' EXIT
 
 [ $# -ge 5 ] || { echo "tier.sh: usage: tier.sh LABEL LOG MAX-LINES MAX-BYTES -- CMD..." >&2; exit 2; }
 LABEL="$1"; LOG_NAME="$2"; MAX_LINES="$3"; MAX_BYTES="$4"; shift 4
@@ -37,10 +70,11 @@ LABEL="$1"; LOG_NAME="$2"; MAX_LINES="$3"; MAX_BYTES="$4"; shift 4
 [ $# -gt 0 ] || { echo "tier.sh: no command" >&2; exit 2; }
 
 # `chore test:oracle -- --verbose` arrives as CLI_ARGS. output-budget.sh reads
-# FLTH_VERBOSE itself, so mapping the flag onto it is all that is needed --
+# OUTPUT_BUDGET_VERBOSE itself, so mapping the flag onto it is all that is
+# needed --
 # and it means the environment variable and the flag cannot disagree.
 case " ${CLI_ARGS:-} " in
-    *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
+    *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
 esac
 
 # HOW MANY TESTS THIS TIER ACTUALLY EXECUTED, on the verdict line.
