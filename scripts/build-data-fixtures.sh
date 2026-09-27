@@ -98,6 +98,12 @@ for geom in "${GEOMETRIES[@]}"; do
     as_root ln -s "$(python3 -c 'print("d/"*80+"deep")')" "$mnt/link-long"
     as_root mkdir -p "$mnt/sub/nested"
     echo nested | as_root tee "$mnt/sub/nested/file.txt" > /dev/null
+    # link-long still fits a 512-byte inode's literal area, so both links
+    # above are stored inline. This one is too long for any inode these
+    # geometries make, so it goes to a block of its own — two on the 1k
+    # geometry, where the target outgrows one block's payload. It lives
+    # in sub/ so the root directory keeps the shape its dump describes.
+    as_root ln -s "$(python3 -c 'print("r/"*499+"x")')" "$mnt/sub/link-remote"
     # 400 entries pushes this directory out of short form.
     as_root mkdir "$mnt/manyfiles"
     for i in $(seq 1 400); do echo "$i" | as_root tee "$mnt/manyfiles/entry-$i.txt" > /dev/null; done
@@ -153,6 +159,17 @@ for geom in "${GEOMETRIES[@]}"; do
                sed -n 's/^core.format = //p')
         [ -n "$fmt" ] || continue
         printf '%s\t%s\n' "/$f" "$fmt" >> "xfsdata-$name.bmbt"
+    done
+
+    # The same for the symlinks: which storage form each one is in, from
+    # the reference debugger, so tests/capi.rs can require that its
+    # remote-link case really reads a remote link.
+    : > "xfsdata-$name.links"
+    for f in link-short link-long sub/link-remote; do
+        fmt=$(xfs_db -r -c "path /$f" -c "print core.format" "$img" 2>/dev/null | \
+               sed -n 's/^core.format = //p')
+        [ -n "$fmt" ] || continue
+        printf '%s\t%s\n' "/$f" "$fmt" >> "xfsdata-$name.links"
     done
 
     echo "BUILT $name ($(wc -l < "xfsdata-$name.manifest") entries, forks: $(tr '\n' ' ' < "xfsdata-$name.bmbt"))"

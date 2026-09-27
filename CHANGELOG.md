@@ -6,6 +6,22 @@ never does.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`fs_xfs_readlink` follows the readlink contract every driver in the
+  family now shares.** Success returns the target's length excluding the
+  NUL, as `readlink(2)` does, with the target and a NUL written into
+  `buf`; a caller still testing `== 0` for success must test `>= 0`. A
+  buffer smaller than length + 1 is -1 with `ERANGE`, a message naming the
+  size needed, and nothing written — never a truncated target. What
+  changed for a caller of 0.7.0: NULL `fs`, `path` or `buf` is now
+  `EINVAL` (was `EIO`, or `ENOENT` for `path`); a zero `bufsize` is
+  `ERANGE` like any other buffer too small (was `EIO`); and a path that
+  is not a symlink is `EINVAL`, as `readlink(2)` has it (was `EISDIR`).
+  The data fixtures gain a remote (block-stored) symlink, and
+  `tests/capi.rs` checks every fixture's links against the kernel's own
+  `readlink` (#259).
+
 ### Added
 
 - **The parsers are fuzzed, on two tiers.** Nothing in this crate had a

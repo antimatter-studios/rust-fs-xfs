@@ -178,13 +178,26 @@ int64_t fs_xfs_read_file(fs_xfs_fs_t *fs, const char *path,
                          void *buf, uint64_t offset, uint64_t length);
 
 /*
- * Target of a symbolic link, written NUL-terminated into `buf`.
- * Returns the length written excluding the terminator, or -1.
+ * Target of the symbolic link at `path`. The contract is shared by every
+ * driver in this family:
  *
- * A buffer too small for the target plus its terminator is REFUSED with
- * ERANGE rather than truncated: a truncated target is a path to
- * somewhere else, and a caller following it could not tell. Retry with a
- * buffer of at least the returned requirement.
+ *   Success: returns the target's length in bytes, EXCLUDING the NUL
+ *   terminator, as readlink(2) does, and writes the target followed by a
+ *   NUL into `buf`. Test for success with `>= 0`, not `== 0`.
+ *
+ *   Buffer too small (bufsize < length + 1, including bufsize == 0):
+ *   returns -1, fs_xfs_last_errno() is ERANGE, fs_xfs_last_error() names
+ *   the size needed, and NOTHING is written into `buf`. Never a silent
+ *   truncation -- deliberately unlike readlink(2), because a truncated
+ *   target is a path to somewhere else and a caller following it could
+ *   not tell. A target is at most 1024 bytes, so a 1025-byte buffer
+ *   always suffices.
+ *
+ *   NULL `fs`, `path` or `buf`: returns -1 with EINVAL.
+ *
+ *   Any other failure returns -1 with errno set: ENOENT when nothing is
+ *   at `path`, EINVAL when it is not a symbolic link (as readlink(2)),
+ *   EIO when the volume is damaged.
  */
 int fs_xfs_readlink(fs_xfs_fs_t *fs, const char *path,
                     char *buf, size_t bufsize);
