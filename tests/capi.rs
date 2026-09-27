@@ -34,6 +34,7 @@ const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
+const EINVAL: i32 = 22;
 const ERANGE: i32 = 34;
 
 /// The image every test here mounts. It holds the files these tests name
@@ -304,6 +305,276 @@ fn readlink_refuses_a_buffer_too_small_for_the_target() {
         "a refused readlink must not have written into the buffer"
     );
     unsafe { fs_xfs_umount(fs) };
+}
+
+// ---------------------------------------------------------------------
+// The readlink contract the driver family shares (#259)
+//
+//   success       the target length, excluding the NUL, and the target
+//                 plus a NUL written into `buf`
+//   too small     bufsize < length + 1: -1, ERANGE, a message naming the
+//                 size needed, and NOTHING written into `buf`
+//   NULL args     -1, EINVAL
+//   otherwise     -1 with errno set: ENOENT for a missing path, EINVAL
+//                 for something that is not a symlink, as readlink(2)
+// ---------------------------------------------------------------------
+
+/// What a buffer holds before the call, so a byte the call wrote is
+/// distinguishable from one it did not.
+const UNTOUCHED: c_char = 0x7F;
+
+/// One `fs_xfs_readlink` into a fresh `bufsize`-byte buffer filled with
+/// [`UNTOUCHED`]: the return value, the errno and message it left, and
+/// the buffer afterwards.
+fn readlink_with(fs: *mut fs_xfs_fs, path: &str, bufsize: usize) -> (i32, i32, String, Vec<u8>) {
+    let mut buf = vec![UNTOUCHED; bufsize.max(1)];
+    let n = unsafe { fs_xfs_readlink(fs, cstr(path).as_ptr(), buf.as_mut_ptr(), bufsize) };
+    // `u8::from_ne_bytes`, not `as u8`: `c_char` is signed on x86_64 and
+    // unsigned on aarch64, and clippy rejects the cast on one of them.
+    let bytes = buf.iter().map(|&c| c.to_ne_bytes()[0]).collect();
+    (n, fs_xfs_last_errno(), last_error(), bytes)
+}
+
+/// The kernel's own `readlink` of every symlink in a data fixture, from
+/// the manifest `scripts/build-data-fixtures.sh` generates inside Linux.
+fn kernel_links(image: &str) -> Vec<(String, String)> {
+    let manifest = common::fixture(image).with_extension("manifest");
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", manifest.display()));
+    let links: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.splitn(4, '\t').collect();
+            (f.len() == 4 && f[1] == "link").then(|| (f[0].to_string(), f[3].to_string()))
+        })
+        .collect();
+    assert!(
+        !links.is_empty(),
+        "{} lists no symlinks: rebuild the fixtures with `chore fixtures`",
+        manifest.display()
+    );
+    links
+}
+
+/// The kernel's target for one path in [`IMAGE`].
+fn kernel_target(path: &str) -> String {
+    kernel_links(IMAGE)
+        .into_iter()
+        .find(|(p, _)| p == path)
+        .unwrap_or_else(|| {
+            panic!(
+                "{path} is not a symlink in .vm-share/{IMAGE}'s manifest: the fixture \
+                 predates it. Rebuild with `chore fixtures`."
+            )
+        })
+        .1
+}
+
+/// Success returns the length and writes the target plus a NUL, for a
+/// link of each storage form. The expected target is the kernel's, not
+/// ours.
+fn assert_reads_whole_target(path: &str) {
+    let want = kernel_target(path);
+    let fs = mount();
+    let (n, _, msg, buf) = readlink_with(fs, path, 2048);
+    unsafe { fs_xfs_umount(fs) };
+    assert_eq!(
+        n,
+        i32::try_from(want.len()).unwrap(),
+        "{path}: readlink returns the target length, excluding the NUL ({msg})"
+    );
+    assert_eq!(&buf[..want.len()], want.as_bytes(), "{path}: target bytes");
+    assert_eq!(buf[want.len()], 0, "{path}: the target is NUL-terminated");
+    assert!(
+        buf[want.len() + 1..]
+            .iter()
+            .all(|&b| b == UNTOUCHED.to_ne_bytes()[0]),
+        "{path}: nothing is written past the terminator"
+    );
+}
+
+#[test]
+fn readlink_returns_the_length_of_an_inline_target() {
+    assert_reads_whole_target("/link-short");
+    assert_reads_whole_target("/link-long");
+}
+
+/// `/sub/link-remote` is too long for the inode, so its target is in a
+/// block of its own. The debugger's record of its format is what says
+/// so — without it this would silently be a second inline case.
+#[test]
+fn readlink_returns_the_length_of_a_remote_target() {
+    let forms = common::fixture(IMAGE).with_extension("links");
+    let text = std::fs::read_to_string(&forms).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}. The fixture predates the symlink-format record; rebuild it \
+             with `chore fixtures`.",
+            forms.display()
+        )
+    });
+    let remote = text
+        .lines()
+        .find_map(|l| l.strip_prefix("/sub/link-remote\t"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} does not list /sub/link-remote:\n{text}",
+                forms.display()
+            )
+        });
+    assert!(
+        remote.contains("extents") || remote.contains("btree"),
+        "/sub/link-remote must be a remote link to test the remote path; xfs_db \
+         reports core.format = {remote}"
+    );
+    assert_reads_whole_target("/sub/link-remote");
+}
+
+/// `bufsize == length + 1` is exactly enough: the target and its NUL.
+#[test]
+fn readlink_accepts_a_buffer_of_exactly_length_plus_one() {
+    for path in ["/link-short", "/link-long"] {
+        let want = kernel_target(path);
+        let fs = mount();
+        let (n, _, msg, buf) = readlink_with(fs, path, want.len() + 1);
+        unsafe { fs_xfs_umount(fs) };
+        assert_eq!(n, i32::try_from(want.len()).unwrap(), "{path}: {msg}");
+        assert_eq!(&buf[..want.len()], want.as_bytes());
+        assert_eq!(buf[want.len()], 0);
+    }
+}
+
+/// `bufsize == length` has no room for the NUL. That is ERANGE, the
+/// message names the size that would have worked, and the buffer is
+/// untouched — never a target missing its terminator, never a
+/// truncated one.
+#[test]
+fn readlink_refuses_a_buffer_of_exactly_the_length() {
+    for path in ["/link-short", "/link-long"] {
+        let want = kernel_target(path);
+        let fs = mount();
+        let (n, errno, msg, buf) = readlink_with(fs, path, want.len());
+        unsafe { fs_xfs_umount(fs) };
+        assert_eq!(
+            n, -1,
+            "{path}: a buffer with no room for the NUL is refused"
+        );
+        assert_eq!(errno, ERANGE, "{path}: {msg}");
+        assert!(
+            msg.contains(&(want.len() + 1).to_string()),
+            "{path}: the message names the {} bytes needed: {msg}",
+            want.len() + 1
+        );
+        assert!(
+            buf.iter().all(|&b| b == UNTOUCHED.to_ne_bytes()[0]),
+            "{path}: a refused readlink writes nothing"
+        );
+    }
+}
+
+/// A zero-byte buffer is the smallest too-small buffer, not a NULL
+/// argument: ERANGE, like every other size below length + 1.
+#[test]
+fn readlink_refuses_a_zero_byte_buffer_with_erange() {
+    let fs = mount();
+    let (n, errno, msg, buf) = readlink_with(fs, "/link-short", 0);
+    unsafe { fs_xfs_umount(fs) };
+    assert_eq!(n, -1);
+    assert_eq!(errno, ERANGE, "{msg}");
+    assert!(
+        msg.contains("10"),
+        "the message names the 10 bytes needed: {msg}"
+    );
+    assert_eq!(buf, [UNTOUCHED.to_ne_bytes()[0]], "nothing is written");
+}
+
+#[test]
+fn readlink_with_a_null_argument_is_einval() {
+    let fs = mount();
+    let mut buf = [0 as c_char; 64];
+    let path = cstr("/link-short");
+    unsafe {
+        for (what, rc) in [
+            (
+                "fs",
+                fs_xfs_readlink(std::ptr::null_mut(), path.as_ptr(), buf.as_mut_ptr(), 64),
+            ),
+            (
+                "path",
+                fs_xfs_readlink(fs, std::ptr::null(), buf.as_mut_ptr(), 64),
+            ),
+            (
+                "buf",
+                fs_xfs_readlink(fs, path.as_ptr(), std::ptr::null_mut(), 64),
+            ),
+        ] {
+            assert_eq!(rc, -1, "NULL {what}");
+            assert_eq!(
+                fs_xfs_last_errno(),
+                EINVAL,
+                "NULL {what} is EINVAL: {}",
+                last_error()
+            );
+        }
+        fs_xfs_umount(fs);
+    }
+}
+
+/// Every failure leaves an errno a caller can act on — and the one
+/// `readlink(2)` gives: ENOENT for nothing there, EINVAL for something
+/// that is not a symlink.
+#[test]
+fn readlink_failures_set_the_readlink_errno() {
+    for (path, want, name) in [
+        ("/definitely-not-here", ENOENT, "ENOENT"),
+        ("/small.txt", EINVAL, "EINVAL"),
+        ("/sub", EINVAL, "EINVAL"),
+    ] {
+        let fs = mount();
+        let (n, errno, msg, buf) = readlink_with(fs, path, 64);
+        unsafe { fs_xfs_umount(fs) };
+        assert_eq!(n, -1, "{path}");
+        assert_eq!(errno, want, "{path}: want {name}, got {errno} ({msg})");
+        assert!(
+            buf.iter().all(|&b| b == UNTOUCHED.to_ne_bytes()[0]),
+            "{path}: a failed readlink writes nothing"
+        );
+    }
+}
+
+/// THE ORACLE. Every symlink in every data fixture reads back through
+/// the C ABI as exactly what the Linux kernel's `readlink` reported for
+/// it when the fixture was built — three geometries, both storage forms.
+#[test]
+fn readlink_agrees_with_the_kernel_on_every_data_fixture() {
+    let mut checked = 0;
+    for manifest in common::fixtures_matching("xfsdata-", ".manifest") {
+        let image = manifest.with_extension("img");
+        let name = image.file_name().unwrap().to_str().unwrap().to_string();
+        let c = cstr(image.to_str().unwrap());
+        let fs = unsafe { fs_xfs_mount(c.as_ptr()) };
+        assert!(!fs.is_null(), "mounting {name}: {}", last_error());
+        for (path, want) in kernel_links(&name) {
+            let (n, _, msg, buf) = readlink_with(fs, &path, 2048);
+            assert_eq!(
+                n,
+                i32::try_from(want.len()).unwrap(),
+                "{name}{path}: the kernel reads a {}-byte target ({msg})",
+                want.len()
+            );
+            assert_eq!(
+                &buf[..want.len()],
+                want.as_bytes(),
+                "{name}{path}: target differs from the kernel's"
+            );
+            assert_eq!(buf[want.len()], 0, "{name}{path}: NUL-terminated");
+            checked += 1;
+        }
+        unsafe { fs_xfs_umount(fs) };
+    }
+    assert!(
+        checked >= 6,
+        "only {checked} symlinks compared with the kernel"
+    );
 }
 
 // ---------------------------------------------------------------------
