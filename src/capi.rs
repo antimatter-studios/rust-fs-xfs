@@ -95,6 +95,10 @@ const fn libc_enotdir() -> c_int {
 const fn libc_erofs() -> c_int {
     30
 }
+/// `EINVAL` — 22 on both Darwin and Linux.
+const fn libc_einval() -> c_int {
+    22
+}
 /// `ERANGE` — a result did not fit the caller's buffer.
 const ERANGE: c_int = 34;
 /// `ENOTSUP` is 45 on Darwin and 95 on Linux.
@@ -645,6 +649,14 @@ pub unsafe extern "C" fn fs_xfs_read_file(
     })
 }
 
+/// Target of the symlink at `path`, written NUL-terminated into `buf`.
+///
+/// Returns the target's length in bytes, excluding the NUL, as
+/// `readlink(2)` does. `bufsize < length + 1` is -1 with ERANGE and
+/// nothing written; NULL `fs`, `path` or `buf` is -1 with EINVAL; every
+/// other failure is -1 with errno set. The contract is the driver
+/// family's and `include/fs_xfs.h` states it in full.
+///
 /// # Safety
 ///
 /// `fs` must be a live handle; `path` NUL-terminated; `buf` writable for
@@ -657,8 +669,12 @@ pub unsafe extern "C" fn fs_xfs_readlink(
     bufsize: usize,
 ) -> c_int {
     guard(-1, || {
-        if fs.is_null() || buf.is_null() || bufsize == 0 {
-            set_error("fs or buf is NULL, or bufsize is zero".into(), libc_eio());
+        // NULL is a caller's mistake, not a missing file: EINVAL, for
+        // every pointer. A zero `bufsize` is not in this list — it is
+        // the smallest buffer too small for the target, and is refused
+        // below with ERANGE like every other.
+        if fs.is_null() || path.is_null() || buf.is_null() {
+            set_error("fs, path or buf is NULL".into(), libc_einval());
             return -1;
         }
         let Some(path) = (unsafe { borrow_str(path, "path") }) else {
@@ -680,6 +696,14 @@ pub unsafe extern "C" fn fs_xfs_readlink(
                 return -1;
             }
         };
+        // Not a symlink is EINVAL, as readlink(2) has it. The library's
+        // NotAFile maps to EISDIR, which is right for reading a directory
+        // as a file and wrong here: a caller told "is a directory" about
+        // a regular file goes looking for the wrong problem.
+        if !inode.is_symlink() {
+            set_error(format!("{path} is not a symbolic link"), libc_einval());
+            return -1;
+        }
         match fs.read_link(&inode, &raw) {
             Ok(target) => {
                 // Refuse rather than truncate. A truncated symlink target
