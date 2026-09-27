@@ -4,7 +4,7 @@ Notable changes to `am-fs-xfs`, newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
 
-## [Unreleased]
+## [0.8.0] — 2026-09-27
 
 ### Breaking
 
@@ -367,7 +367,8 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
-[Unreleased]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.6.0...HEAD
+[0.8.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.0...v0.5.1
