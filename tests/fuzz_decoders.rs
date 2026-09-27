@@ -20,7 +20,8 @@
 //!
 //! Every seed under `fuzz/corpus/` was cut out of an image `mkfs.xfs`
 //! wrote -- see `scripts/make-fuzz-corpus.sh`, which rebuilds the whole
-//! directory in about two seconds. Random bytes are rejected by the
+//! directory in about two seconds -- or derived from those seeds by
+//! code with its own oracle (`derived_seeds`, below). Random bytes are rejected by the
 //! magic-number check on the first line of every one of these decoders
 //! and never reach the arithmetic underneath. A real block with one
 //! field changed reaches all of it.
@@ -55,7 +56,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use fs_xfs::{ag, agfl, dir, extent, group_write, inode, log_write, refcount, rmap, Superblock};
+use fs_xfs::{
+    ag, agfl, dir, dir_block, extent, group_write, inode, log_write, refcount, rmap, Superblock,
+};
 
 /// Distinct starting points for the mutation stream. Fixed, so a
 /// failure reproduces from the message alone.
@@ -181,7 +184,7 @@ fn targets() -> Vec<Target> {
             },
         },
         Target {
-            corpus: "inode",
+            corpus: "log_dinode",
             name: "log_dinode",
             len: VARIABLE,
             run: |b| {
@@ -198,7 +201,7 @@ fn targets() -> Vec<Target> {
             },
         },
         Target {
-            corpus: "dir_data_block",
+            corpus: "dir_block_form",
             name: "dir_block_form",
             len: BLOCK,
             run: |b| {
@@ -260,7 +263,7 @@ fn targets() -> Vec<Target> {
             },
         },
         Target {
-            corpus: "bmbt",
+            corpus: "extent_list",
             name: "extent_list",
             len: VARIABLE,
             run: |b| {
@@ -571,6 +574,185 @@ fn the_gate_covers_every_explorer_target() {
             "fuzz/fuzz_targets/{name}.rs has no counterpart in this suite, so nothing replays \
              its corpus on the stable toolchain and anything it finds would only stay fixed \
              for as long as somebody keeps running the fuzzer by hand",
+        );
+    }
+}
+
+#[test]
+fn every_explorer_target_has_its_own_seed_corpus() {
+    // scripts/fuzz-all.sh hands `fuzz/corpus/<target>` to libFuzzer, by
+    // the target's own name. Three targets were added reading another
+    // target's directory here and with none of their own there, so this
+    // suite replayed them happily while the scheduled explorer exited on
+    // "No such file or directory" every night and called it a crash.
+    // Checking that the two halves name the same directory, and that it
+    // holds seeds, is what stops that from passing in silence again.
+    let manifest =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fuzz/Cargo.toml"))
+            .expect("reading fuzz/Cargo.toml");
+    let explorer: Vec<String> = manifest
+        .lines()
+        .filter_map(|line| line.strip_prefix("name = \""))
+        .filter_map(|rest| rest.strip_suffix('"'))
+        .map(str::to_owned)
+        .skip(1)
+        .collect();
+
+    let mut missing = Vec::new();
+    for name in &explorer {
+        let dir = corpus_root().join(name);
+        let seeded = std::fs::read_dir(&dir)
+            .map(|entries| entries.flatten().any(|e| e.path().is_file()))
+            .unwrap_or(false);
+        if !seeded {
+            missing.push(format!("fuzz/corpus/{name}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these fuzz targets have no seed corpus, so scripts/fuzz-all.sh cannot fuzz them: {}. \
+         Rebuild the corpus with scripts/make-fuzz-corpus.sh",
+        missing.join(", "),
+    );
+
+    for target in targets() {
+        assert_eq!(
+            target.corpus, target.name,
+            "the gate replays {} from fuzz/corpus/{}, but the explorer seeds it from \
+             fuzz/corpus/{} -- the two halves must read the same directory",
+            target.name, target.corpus, target.name,
+        );
+    }
+}
+
+// ---------------------------------------------------------------- derived seeds
+
+/// Set to write the derived seeds instead of checking them.
+/// `scripts/make-fuzz-corpus.sh` does, after it has cut the rest.
+const WRITE_DERIVED_SEEDS: &str = "XFS_FUZZ_WRITE_DERIVED_SEEDS";
+
+/// `XFS_BMBT_BLOCK_LEN` for v5: the long-form btree header in front of a
+/// bmbt leaf's records.
+const V5_BMBT_HEADER: usize = 72;
+
+/// The seeds three targets read that are not cut straight out of the
+/// image, each as (directory, file name, bytes).
+///
+/// They are derived from seeds that were: `mkfs.xfs` wrote every byte
+/// they start from, and what is done to those bytes is done by code that
+/// has its own oracle. Deriving them rather than cutting them keeps them
+/// from one filesystem -- the same UUID, the same inode numbers -- as
+/// the superblock every target is handed, which a block from another
+/// `mkfs.xfs` run would not be.
+fn derived_seeds() -> Vec<(&'static str, String, Vec<u8>)> {
+    let sb = superblock();
+    let mut out = Vec::new();
+
+    // log_dinode: what `log_dinode_from_disk` reads is an on-disk inode
+    // -- the core replay hands it before converting to the log's byte
+    // order -- so its seeds are the inodes mkfs.xfs wrote, one of each
+    // fork format.
+    for (name, bytes) in seeds("inode") {
+        out.push(("log_dinode", name, bytes));
+    }
+
+    // extent_list: the records of a real bmbt leaf -- the same 16-byte
+    // records an extents-format inode keeps in its fork, behind the
+    // leaf's header. The image's extents-format inode seed is an empty
+    // file with no records at all, so the leaf is the only real list it
+    // has. Twice: every record, and the first alone, the length an
+    // inode fork holding one extent has.
+    let bmbt = one_seed("bmbt");
+    let numrecs = group_write::leaf_numrecs(&bmbt, 16).expect("the bmbt seed's record count");
+    assert!(numrecs > 1, "the bmbt seed holds more than one record");
+    let records = bmbt[V5_BMBT_HEADER..V5_BMBT_HEADER + usize::from(numrecs) * 16].to_vec();
+    extent::parse_list(&records, u64::from(numrecs)).expect("the bmbt leaf's records parse");
+    out.push((
+        "extent_list",
+        "bmbt-leaf-first-record.bin".to_owned(),
+        records[..16].to_vec(),
+    ));
+    out.push(("extent_list", "bmbt-leaf-records.bin".to_owned(), records));
+
+    // dir_block_form: the image has no block-form directory -- 4000
+    // entries is what took its root to node form -- so one is built from
+    // the entries of the real data block, by `dir_block::build`, which
+    // tests/dir_block_oracle.rs holds to the kernel's own block byte for
+    // byte. The address, owner and LSN are the data block's, and the
+    // checksum is stamped, so the result is a block as it would sit on
+    // disk rather than as it would sit in a log record.
+    let data = one_seed("dir_data_block");
+    use dir::offsets::dir3_blk as h;
+    let owner = u64::from_be_bytes(data[h::OWNER..h::OWNER + 8].try_into().expect("8 bytes"));
+    // This data block is not the directory's first, so `.` and `..` are
+    // not in it. The directory is the root, whose parent is itself.
+    assert_eq!(
+        owner, sb.rootino,
+        "the data block seed belongs to the root directory"
+    );
+    let dot = |name: &[u8]| dir_block::Entry {
+        name: name.to_vec(),
+        ino: owner,
+        ftype: dir::ftype_to_raw(Some(inode::FileType::Directory)),
+    };
+    let mut entries = vec![dot(b"."), dot(b"..")];
+    entries.extend(
+        dir::parse_data_block(&data, sb)
+            .expect("the data block seed parses")
+            .into_iter()
+            .map(|e| dir_block::Entry {
+                name: e.name,
+                ino: e.ino,
+                ftype: dir::ftype_to_raw(e.ftype),
+            }),
+    );
+    assert!(entries.len() > 5, "the data block seed holds real entries");
+    let daddr = u64::from_be_bytes(data[h::BLKNO..h::BLKNO + 8].try_into().expect("8 bytes"));
+    let fsblock = daddr >> (sb.blocklog - 9);
+    let dirblocksize = sb.dirblocksize() as usize;
+
+    let fits = |n: usize| dir_block::space_needed(&entries[..n]) <= dirblocksize;
+    let full = (2..=entries.len())
+        .take_while(|&n| fits(n))
+        .last()
+        .expect("two entries fit");
+    for (name, n) in [("small.bin", 5usize), ("full.bin", full)] {
+        let mut block = dir_block::build(sb, fsblock, owner, &entries[..n])
+            .unwrap_or_else(|e| panic!("building the {n}-entry block: {e}"));
+        block[h::LSN..h::LSN + 8].copy_from_slice(&data[h::LSN..h::LSN + 8]);
+        group_write::restamp_crc(&mut block, h::CRC);
+        let read = dir::parse_block_form(&block, sb).expect("the built block reads back");
+        assert_eq!(read.entries.len(), n, "{name}: every entry reads back");
+        out.push(("dir_block_form", name.to_owned(), block));
+    }
+
+    out
+}
+
+#[test]
+fn the_derived_seeds_are_what_their_sources_derive() {
+    // A committed seed nobody can regenerate is a blob; one that has
+    // drifted from its source is a blob that looks like a structure.
+    // So every derived seed is rebuilt here and compared, byte for byte.
+    let write = std::env::var_os(WRITE_DERIVED_SEEDS).is_some();
+    for (dir, name, bytes) in derived_seeds() {
+        let path = corpus_root().join(dir).join(&name);
+        if write {
+            std::fs::create_dir_all(path.parent().expect("a parent"))
+                .expect("creating the corpus directory");
+            std::fs::write(&path, &bytes).expect("writing the derived seed");
+            continue;
+        }
+        let committed = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "fuzz/corpus/{dir}/{name} is not there ({e}); rebuild it with \
+                 {WRITE_DERIVED_SEEDS}=1 cargo test --test fuzz_decoders derived",
+            )
+        });
+        assert!(
+            committed == bytes,
+            "fuzz/corpus/{dir}/{name} is not what its source derives; rebuild it with \
+             {WRITE_DERIVED_SEEDS}=1 cargo test --test fuzz_decoders derived",
         );
     }
 }
