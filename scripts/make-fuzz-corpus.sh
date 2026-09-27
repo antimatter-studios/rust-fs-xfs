@@ -133,5 +133,14 @@ cut inode          dir-btree-format.bin         "$inode_dir"     1
 cut inode          file-extents-format.bin      "$inode_file"    1
 cut inode          symlink-local-format.bin     "$inode_symlink" 1
 
+# Three targets read seeds derived from the ones just cut rather than cut
+# themselves: log_dinode (the inodes), extent_list (the bmbt leaf's
+# records) and dir_block_form (a block built from the data block's
+# entries -- the image has no block-form directory). The derivation is
+# code, in tests/fuzz_decoders.rs, which also checks on every run that
+# the committed copies still match it.
+(cd "$here" && XFS_FUZZ_WRITE_DERIVED_SEEDS=1 \
+    cargo test --release --quiet --test fuzz_decoders the_derived_seeds_are_what_their_sources_derive)
+
 echo "corpus rebuilt under fuzz/corpus:"
 find "$here/fuzz/corpus" -type f | sort | sed "s#$here/##"
