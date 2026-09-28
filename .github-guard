@@ -36,7 +36,7 @@
 # job's `name:` rather than its key — `ci-ok` for both.
 #
 # WHY test-darwin GATES rather than advising. It builds the staticlib that
-# DiskJockey's XFS extension links against, for aarch64-apple-darwin, and runs
+# a macOS consumer's FSKit extension links against, for aarch64-apple-darwin, and runs
 # the suite on that target on an arm64 host. It is the only macOS/aarch64
 # coverage in this repository, and the failures it exists to catch are exactly
 # the ones no Linux job can see: the one target-conditional value in the C ABI

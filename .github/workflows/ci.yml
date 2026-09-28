@@ -374,7 +374,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share
           ls -1 .vm-share | wc -l | xargs echo "fixtures:"
           ./scripts/build-fixtures.sh --check
-      # What DiskJockey's XFS extension links against. A break here ships
+      # What a macOS consumer's FSKit extension links against. A break here ships
       # to the consumer, and every Linux job stays green through it.
       - name: Build the shipped staticlib for aarch64-apple-darwin
         run: cargo build --locked --release --lib --target aarch64-apple-darwin
