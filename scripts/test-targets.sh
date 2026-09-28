@@ -106,22 +106,28 @@ is_stress() {
     return 1
 }
 
+# NO PIPE INTO `grep -q`. This script runs under pipefail, and `grep -q`
+# exits at its first match: a writer still feeding it takes SIGPIPE, the
+# pipeline reports 141, and a suite that DOES call an oracle reads as one
+# that does not -- so it landed in the unit tier, on a runner with no VM,
+# only on the runs where the timing fell that way. A here-string has no
+# writer to kill. tests/scripts/test-targets-large-suite.sh pins it.
 for f in "$REPO"/tests/*.rs; do
     name="$(basename "$f" .rs)"
     text="$(uncommented "$f")"
-    calls="$(printf '%s\n' "$text" | sed 's/"[^"]*"//g')"
+    calls="$(sed 's/"[^"]*"//g' <<<"$text")"
     case "$tier" in
         unit)
             if ! is_stress "$name" &&
-               ! printf '%s\n' "$text" | grep -qE "$FIXTURE" &&
-               ! printf '%s\n' "$calls" | grep -qE "$TOOL|$KERNEL"; then
+               ! grep -qE "$FIXTURE" <<<"$text" &&
+               ! grep -qE "$TOOL|$KERNEL" <<<"$calls"; then
                 args+=(--test "$name")
             fi
             ;;
         images)
-            if printf '%s\n' "$text" | grep -qE "$FIXTURE" &&
+            if grep -qE "$FIXTURE" <<<"$text" &&
                ! is_stress "$name" &&
-               ! printf '%s\n' "$calls" | grep -qE "$TOOL|$KERNEL"; then
+               ! grep -qE "$TOOL|$KERNEL" <<<"$calls"; then
                 args+=(--test "$name")
             fi
             ;;
@@ -135,12 +141,12 @@ for f in "$REPO"/tests/*.rs; do
         # which is how a Mac reaches these tests at all.
         all) is_stress "$name" || args+=(--test "$name") ;;
         oracle)
-            if printf '%s\n' "$calls" | grep -qE "$TOOL" &&
-               ! printf '%s\n' "$calls" | grep -qE "$KERNEL"; then
+            if grep -qE "$TOOL" <<<"$calls" &&
+               ! grep -qE "$KERNEL" <<<"$calls"; then
                 args+=(--test "$name")
             fi
             ;;
-        kernel) printf '%s\n' "$calls" | grep -qE "$KERNEL" && args+=(--test "$name") ;;
+        kernel) grep -qE "$KERNEL" <<<"$calls" && args+=(--test "$name") ;;
         *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|all" >&2; exit 2 ;;
     esac
 done
