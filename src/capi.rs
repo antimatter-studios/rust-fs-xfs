@@ -246,6 +246,45 @@ pub extern "C" fn fs_xfs_last_errno() -> c_int {
 /// # Safety
 ///
 /// `p` must be NULL or point to a NUL-terminated string.
+/// The bytes of a NUL-terminated in-image path, not decoded.
+///
+/// EVERY IN-IMAGE NAME COMES THROUGH HERE. XFS directory entry names are
+/// raw bytes and the format has no field that could say what encoding
+/// they are in, so this ABI does not decide: it compares what the caller
+/// passed against what the image holds, byte for byte.
+///
+/// This is what `fs_xfs_dir_next` already did in the other direction —
+/// it fills the entry name from the raw bytes — and the asymmetry was
+/// the defect. The ABI reported a name it then refused to accept, so a
+/// caller that walked a directory and stat'd each entry failed on
+/// exactly the entries this same library had just handed it, with no
+/// byte-oriented entry point to work around it (#269).
+///
+/// Source-compatible for every caller passing UTF-8, because UTF-8 is a
+/// byte string too. NULL is still refused, because the argument is the
+/// problem.
+///
+/// # Safety
+///
+/// `p` must be NULL or point to a NUL-terminated string.
+unsafe fn borrow_bytes<'a>(p: *const c_char, what: &str) -> Option<&'a [u8]> {
+    if p.is_null() {
+        set_error(format!("{what} is NULL"), libc_enoent());
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(p) }.to_bytes())
+}
+
+/// A byte path as text, FOR A MESSAGE ONLY.
+///
+/// `from_utf8_lossy` is exactly wrong for a lookup — it maps distinct
+/// names onto one, so two files become indistinguishable — and exactly
+/// right for an error string, which a person reads and nothing compares.
+/// Never feed the result back into a lookup.
+fn shown(path: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(path)
+}
+
 unsafe fn borrow_str<'a>(p: *const c_char, what: &str) -> Option<&'a str> {
     if p.is_null() {
         set_error(format!("{what} is NULL"), libc_enoent());
@@ -476,10 +515,10 @@ pub unsafe extern "C" fn fs_xfs_stat(
             set_error("fs or out is NULL".into(), libc_eio());
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        match unsafe { &*fs }.fs.lookup_path(path) {
+        match unsafe { &*fs }.fs.lookup_path_bytes(path) {
             Ok(inode) => {
                 fill_attr(&inode, out);
                 0
@@ -539,10 +578,10 @@ pub unsafe extern "C" fn fs_xfs_dir_open(
             set_error("fs is NULL".into(), libc_eio());
             return std::ptr::null_mut();
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return std::ptr::null_mut();
         };
-        match unsafe { &*fs }.fs.list_path(path) {
+        match unsafe { &*fs }.fs.list_path_bytes(path) {
             Ok(entries) => Box::into_raw(Box::new(fs_xfs_dir_iter {
                 entries,
                 next: 0,
@@ -619,12 +658,12 @@ pub unsafe extern "C" fn fs_xfs_read_file(
             set_error("fs or buf is NULL".into(), libc_eio());
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
 
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -677,12 +716,12 @@ pub unsafe extern "C" fn fs_xfs_readlink(
             set_error("fs, path or buf is NULL".into(), libc_einval());
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
 
-        let found = match fs.lookup_path(path) {
+        let found = match fs.lookup_path_bytes(path) {
             Ok(i) => i,
             Err(e) => {
                 record(&e);
@@ -701,7 +740,10 @@ pub unsafe extern "C" fn fs_xfs_readlink(
         // as a file and wrong here: a caller told "is a directory" about
         // a regular file goes looking for the wrong problem.
         if !inode.is_symlink() {
-            set_error(format!("{path} is not a symbolic link"), libc_einval());
+            set_error(
+                format!("{} is not a symbolic link", shown(path)),
+                libc_einval(),
+            );
             return -1;
         }
         match fs.read_link(&inode, &raw) {
@@ -829,7 +871,7 @@ pub unsafe extern "C" fn fs_xfs_write_file(
             set_error("fs or buf is NULL".into(), libc_eio());
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
@@ -877,7 +919,7 @@ pub unsafe extern "C" fn fs_xfs_truncate(
             set_error("fs is NULL".into(), libc_eio());
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
@@ -976,7 +1018,7 @@ pub unsafe extern "C" fn fs_xfs_set_attributes(
             set_error("fs is NULL".into(), libc_eio());
             return -1;
         }
-        let Some(path) = (unsafe { borrow_str(path, "path") }) else {
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
         let fs = &unsafe { &*fs }.fs;
@@ -1005,8 +1047,8 @@ pub unsafe extern "C" fn fs_xfs_set_attributes(
 ///
 /// Shared by the write entry points so a failure to find the file is
 /// reported the same way whichever one a caller reached for.
-fn resolve_for_write(fs: &Filesystem, path: &str) -> Option<(Inode, Vec<u8>)> {
-    let found = match fs.lookup_path(path) {
+fn resolve_for_write(fs: &Filesystem, path: &[u8]) -> Option<(Inode, Vec<u8>)> {
+    let found = match fs.lookup_path_bytes(path) {
         Ok(i) => i,
         Err(e) => {
             record(&e);
