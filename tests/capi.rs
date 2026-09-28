@@ -850,9 +850,17 @@ fn last_error_is_never_null() {
     assert!(!s.is_empty(), "the initial message must still be printable");
 }
 
-/// A non-UTF-8 path is rejected rather than misinterpreted.
+/// A non-UTF-8 path is resolved rather than misinterpreted, and names
+/// nothing in this fixture.
+///
+/// It used to be REJECTED for its encoding, which is what the old name
+/// of this test said. Since #269 the bytes are looked up: `/\xff` is a
+/// perfectly well-formed request for a file called `\xff`, there is no
+/// such file here, and the answer is that it was not found. Either way
+/// the call fails and says something, which is what this pins; the test
+/// above is the one that pins WHY.
 #[test]
-fn a_non_utf8_path_is_rejected() {
+fn a_non_utf8_path_names_nothing_here_and_says_so() {
     let fs = mount();
     // 0xFF is not valid UTF-8 in any position.
     let bad = [b'/' as c_char, 0xFFu8 as c_char, 0];
@@ -1081,5 +1089,73 @@ fn a_mode_with_type_bits_is_refused_through_the_abi() {
     };
     assert_eq!(rc, -1);
     assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
+    unsafe { fs_xfs_umount(fs) };
+}
+
+// ---- paths are bytes (#269) --------------------------------------------
+
+/// `/caf\xe9.txt` — latin-1 for `café.txt`, which is what a name written
+/// on a Linux box with a non-UTF-8 locale looks like. `\xe9` alone is not
+/// a legal UTF-8 sequence.
+///
+/// `c_char` is `i8` on x86_64 and Apple targets and `u8` on
+/// aarch64-linux, so `from_ne_bytes` is the spelling that works on both.
+fn non_utf8_path() -> Vec<std::ffi::c_char> {
+    b"/caf\xe9.txt\0"
+        .iter()
+        .map(|&b| std::ffi::c_char::from_ne_bytes([b]))
+        .collect()
+}
+
+/// A name that is not valid UTF-8 is LOOKED UP, not refused for its
+/// encoding.
+///
+/// XFS directory entry names are raw bytes and the format has no field
+/// that could say what encoding they are in, so such names are ordinary
+/// rather than hostile: any image built on a box with a non-UTF-8 locale
+/// holds them.
+///
+/// This crate refused them at the ABI, which left the file listed and
+/// unopenable: `fs_xfs_dir_next` hands the caller the entry's name from
+/// the raw bytes, so the ABI reported a name it then refused to accept,
+/// and composing the path from those same bytes produced the same
+/// rejection (#269).
+///
+/// The fixture has no such file, so what is asserted is the shape of the
+/// answer: a path naming no file is reported as missing — the honest
+/// answer for bytes that name nothing — and NOT as a complaint about the
+/// argument's encoding, which would send a caller looking at its own
+/// string handling.
+#[test]
+fn a_non_utf8_path_is_taken_as_bytes_and_reported_as_missing() {
+    let fs = mount();
+    let path = non_utf8_path();
+    let mut attr = zeroed_attr();
+    let rc = unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut attr) };
+    assert_eq!(rc, -1, "a path naming no file was answered as a stat");
+    let msg = last_error();
+    assert!(
+        !msg.contains("not valid UTF-8"),
+        "the path was refused for its encoding rather than looked up: {msg}"
+    );
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// And the directory iterator, which is the entry point a caller reaches
+/// these names through in the first place.
+#[test]
+fn dir_open_takes_a_non_utf8_path_as_bytes() {
+    let fs = mount();
+    let path = non_utf8_path();
+    let iter = unsafe { fs_xfs_dir_open(fs, path.as_ptr()) };
+    assert!(
+        iter.is_null(),
+        "a path naming no directory opened an iterator"
+    );
+    let msg = last_error();
+    assert!(
+        !msg.contains("not valid UTF-8"),
+        "the path was refused for its encoding rather than looked up: {msg}"
+    );
     unsafe { fs_xfs_umount(fs) };
 }

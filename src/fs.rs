@@ -1422,9 +1422,27 @@ impl Filesystem {
     /// bytes a second time, which is what [`Self::lookup_path`] forces
     /// by handing back only the parsed inode.
     pub fn open(&self, path: &str) -> Result<File<'_>> {
+        self.open_bytes(path.as_bytes())
+    }
+
+    /// [`open`] with the path given as bytes.
+    ///
+    /// THIS IS THE REAL ONE, and the `&str` form above is the
+    /// convenience. XFS directory entry names are raw bytes and the
+    /// format has no field that could say what encoding they are in, so
+    /// a name is not text until somebody decides what to read it as, and
+    /// this crate never decides. Components are compared byte for byte
+    /// against the on-disk entry, so a name handed out by a listing
+    /// always resolves when handed back (#269).
+    ///
+    /// [`open`]: Self::open
+    pub fn open_bytes(&self, path: &[u8]) -> Result<File<'_>> {
         let (mut inode, mut raw) = self.read_inode_raw(self.sb.rootino)?;
-        for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
-            if component == ".." {
+        for component in path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty() && *c != b".")
+        {
+            if component == b".." {
                 return Err(Error::UnsupportedFeature(
                     "`..` in a path is not resolved by open".into(),
                 ));
@@ -1432,7 +1450,7 @@ impl Filesystem {
             if !inode.is_dir() {
                 return Err(Error::NotADirectory);
             }
-            let next = self.lookup(&inode, &raw, component.as_bytes())?;
+            let next = self.lookup(&inode, &raw, component)?;
             let (i, r) = self.read_inode_raw(next.ino)?;
             inode = i;
             raw = r;
@@ -1468,7 +1486,14 @@ impl Filesystem {
     /// Retained because it is public API and callers that only want to
     /// test existence or read metadata do not need the fork.
     pub fn lookup_path(&self, path: &str) -> Result<Inode> {
-        self.open(path).map(|f| f.inode)
+        self.open_bytes(path.as_bytes()).map(|f| f.inode)
+    }
+
+    /// [`lookup_path`] with the path given as bytes (#269).
+    ///
+    /// [`lookup_path`]: Self::lookup_path
+    pub fn lookup_path_bytes(&self, path: &[u8]) -> Result<Inode> {
+        self.open_bytes(path).map(|f| f.inode)
     }
 
     /// Read a whole file by path.
@@ -1476,12 +1501,26 @@ impl Filesystem {
     /// Went through `lookup_path` and then re-read the same inode; it
     /// now goes through [`Self::open`], which already holds the fork.
     pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
-        self.open(path)?.read_all()
+        self.open_bytes(path.as_bytes())?.read_all()
+    }
+
+    /// [`read_path`] with the path given as bytes (#269).
+    ///
+    /// [`read_path`]: Self::read_path
+    pub fn read_path_bytes(&self, path: &[u8]) -> Result<Vec<u8>> {
+        self.open_bytes(path)?.read_all()
     }
 
     /// List a directory by path.
     pub fn list_path(&self, path: &str) -> Result<Vec<DirEntry>> {
-        self.open(path)?.entries()
+        self.open_bytes(path.as_bytes())?.entries()
+    }
+
+    /// [`list_path`] with the path given as bytes (#269).
+    ///
+    /// [`list_path`]: Self::list_path
+    pub fn list_path_bytes(&self, path: &[u8]) -> Result<Vec<DirEntry>> {
+        self.open_bytes(path)?.entries()
     }
 }
 
