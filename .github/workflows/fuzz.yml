@@ -64,6 +64,14 @@ jobs:
         if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo +nightly install cargo-fuzz --locked
 
+      # cargo-fuzz has no --locked of its own, so every fuzz build would
+      # rewrite a stale fuzz/Cargo.lock in place and build something
+      # nobody committed -- which it did, with am-fs-core 0.2.10 locked
+      # while the crate needed 0.2.13 (#258). Resolving under --locked
+      # first turns that drift into a failure before anything is fuzzed.
+      - name: The fuzz workspace resolves from its committed lockfile
+        run: cargo +nightly metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+
       # The corpus is committed, so this is not seeding from scratch --
       # it is the same real mkfs.xfs blocks the gate mutates, which is
       # what gives libFuzzer somewhere to start other than random bytes.

@@ -15,6 +15,9 @@
 # directory past leaf form into node form, and past extents format into
 # btree format, so the corpus gets a dir node block and a bmbt block.
 #
+# It rewrites only the seeds it generates. Anything else under
+# fuzz/corpus -- a committed reproducer above all -- is left alone.
+#
 # Usage: scripts/make-fuzz-corpus.sh [image-size]
 set -euo pipefail
 
@@ -115,7 +118,14 @@ cut() {
     dd if="$img" of="$dir/$name" bs=512 skip="$sector" count="$sectors" status=none
 }
 
-rm -rf "$here/fuzz/corpus"
+# Each seed is overwritten in place; nothing else under fuzz/corpus is
+# touched. The corpus is not all generated: the reproducer for every
+# defect the fuzzer has found is committed beside these seeds (see
+# scripts/fuzz-all.sh), and this used to begin with `rm -rf fuzz/corpus`,
+# which threw every one of them away on each rebuild (#258).
+# tests/scripts/make-fuzz-corpus-keeps-reproducers.sh holds it to that.
+# A seed this script stops generating is therefore left behind, and has
+# to be removed by hand along with the line that cut it.
 cut superblock     mkfs-crc-rmapbt-reflink.bin  0           1
 cut agf            mkfs-ag0.bin                 1           1
 cut agi            mkfs-ag0.bin                 2           1

@@ -153,6 +153,15 @@ fn parse_root(fork: &[u8], ino: u64) -> Result<Node> {
     })
 }
 
+/// `XFS_BMBT_BLOCK_LEN`: where an on-disk node's body starts.
+fn header_len(v5: bool) -> usize {
+    if v5 {
+        V5_HEADER_LEN
+    } else {
+        V4_HEADER_LEN
+    }
+}
+
 /// Read and check an on-disk node's header.
 ///
 /// `expect_level` is the level the parent said this child sits at, and
@@ -168,11 +177,7 @@ fn parse_block(
     fsblock: u64,
     expect_level: u16,
 ) -> Result<Node> {
-    let header = if sb.is_v5() {
-        V5_HEADER_LEN
-    } else {
-        V4_HEADER_LEN
-    };
+    let header = header_len(sb.is_v5());
     if buf.len() < header {
         return Err(Error::BadSuperblock(format!(
             "inode {ino}: bmbt block {fsblock} is {} bytes, shorter than its {header}-byte header",
@@ -295,6 +300,48 @@ fn records(buf: &[u8], node: &Node, ino: u64, source: u64) -> Result<Vec<Extent>
         )));
     }
     extent::parse_list(&buf[node.body..end], u64::from(node.numrecs))
+}
+
+/// The extent records of one on-disk leaf block, taken from behind its
+/// header exactly as [`walk`] takes them -- but without first checking
+/// whose block it is.
+///
+/// [`walk`] reads a leaf's records only after its magic, CRC, UUID,
+/// owner, address and level have been checked against the tree that
+/// led to it. Those checks need a superblock, an inode and a parent,
+/// and a mutated block fails the CRC before anything else is read, so a
+/// fuzzer driving [`walk`] would never reach the record decoder. This is
+/// the part after them: the record count the header declares, bounded
+/// by what the block can hold, and the records that follow the
+/// `XFS_BMBT_BLOCK_LEN`-byte header (72 on v5, 24 on v4). The fuzz
+/// targets call it so that what they exercise is what the walk runs,
+/// and not [`extent::parse_list`] handed the header as if it were
+/// records (#258).
+///
+/// Nothing reading a filesystem should call this: it will decode a
+/// block that belongs to another file.
+pub fn leaf_records_unverified(buf: &[u8], v5: bool) -> Result<Vec<Extent>> {
+    let header = header_len(v5);
+    if buf.len() < header {
+        return Err(Error::BadSuperblock(format!(
+            "bmbt leaf is {} bytes, shorter than its {header}-byte header",
+            buf.len()
+        )));
+    }
+    let numrecs = be16(buf, offsets::NUMRECS);
+    let maxrecs = maxrecs(buf.len() - header);
+    if usize::from(numrecs) > maxrecs {
+        return Err(Error::BadSuperblock(format!(
+            "bmbt leaf claims {numrecs} records but has room for {maxrecs}"
+        )));
+    }
+    let node = Node {
+        level: 0,
+        numrecs,
+        body: header,
+        maxrecs,
+    };
+    records(buf, &node, 0, 0)
 }
 
 /// Collect every extent in an inode's block-map B+tree, in file order.

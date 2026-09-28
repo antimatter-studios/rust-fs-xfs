@@ -19,8 +19,9 @@
 //! # Why the corpus is real blocks and not random bytes
 //!
 //! Every seed under `fuzz/corpus/` was cut out of an image `mkfs.xfs`
-//! wrote -- see `scripts/make-fuzz-corpus.sh`, which rebuilds the whole
-//! directory in about two seconds -- or derived from those seeds by
+//! wrote -- see `scripts/make-fuzz-corpus.sh`, which regenerates those seeds
+//! in about two seconds and leaves the committed reproducers beside
+//! them alone -- or derived from those seeds by
 //! code with its own oracle (`derived_seeds`, below). Random bytes are rejected by the
 //! magic-number check on the first line of every one of these decoders
 //! and never reach the arithmetic underneath. A real block with one
@@ -57,7 +58,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use fs_xfs::{
-    ag, agfl, dir, dir_block, extent, group_write, inode, log_write, refcount, rmap, Superblock,
+    ag, agfl, bmbt, dir, dir_block, extent, group_write, inode, log_write, refcount, rmap,
+    Superblock,
 };
 
 /// Distinct starting points for the mutation stream. Fixed, so a
@@ -255,11 +257,7 @@ fn targets() -> Vec<Target> {
             name: "bmbt",
             len: BLOCK,
             run: |b| {
-                for record_bytes in [16usize] {
-                    if let Ok(numrecs) = group_write::leaf_numrecs(b, record_bytes) {
-                        let _ = extent::parse_list(b, u64::from(numrecs));
-                    }
-                }
+                let _ = bmbt_leaf_extents(b);
             },
         },
         Target {
@@ -277,6 +275,66 @@ fn targets() -> Vec<Target> {
             },
         },
     ]
+}
+
+/// What the `bmbt` target does with one block, here and in
+/// `fuzz/fuzz_targets/bmbt.rs`.
+fn bmbt_leaf_extents(b: &[u8]) -> fs_xfs::Result<Vec<extent::Extent>> {
+    bmbt::leaf_records_unverified(b, superblock().is_v5())
+}
+
+/// The `bmbt` target hands `parse_list` the records behind the leaf's
+/// header, not the header itself.
+///
+/// It used to pass the whole block, so the first 72 bytes -- magic,
+/// level, record count, siblings, address, LSN, UUID, owner, CRC -- were
+/// decoded as four and a half extent records, and every mutation the
+/// fuzzer spent on the real records landed after them (#258). The walk
+/// never does that: it slices from past the header. The oracle is the
+/// `extent_list` seed, whose records `derived_seeds` cuts from the same
+/// leaf at the header's documented length, so a target that reads the
+/// header as records cannot produce the same list.
+#[test]
+fn the_bmbt_target_reads_the_records_behind_the_header() {
+    let leaf = one_seed("bmbt");
+    let records = std::fs::read(corpus_root().join("extent_list/bmbt-leaf-records.bin"))
+        .expect("the extent_list seed derived from the bmbt leaf");
+    let expected = extent::parse_list(&records, (records.len() / 16) as u64)
+        .expect("the leaf's records parse on their own");
+
+    assert_eq!(
+        bmbt_leaf_extents(&leaf).ok(),
+        Some(expected),
+        "the bmbt target did not decode the leaf's own records, in order and in full"
+    );
+}
+
+/// The explorer's `bmbt` target decodes a leaf the same way the gate's
+/// does, through the library's own header handling.
+///
+/// `fuzz/` is a separate workspace built only by the nightly fuzz run,
+/// so nothing on a pull request compiles it; this is the check that it
+/// has not gone back to handing `parse_list` the raw block.
+#[test]
+fn the_explorer_bmbt_target_strips_the_header_through_the_library() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fuzz/fuzz_targets/bmbt.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let code: String = source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains("bmbt::leaf_records_unverified("),
+        "{} does not decode the leaf through bmbt::leaf_records_unverified",
+        path.display()
+    );
+    assert!(
+        !code.contains("parse_list"),
+        "{} calls parse_list itself, which is how the header came to be read as records",
+        path.display()
+    );
 }
 
 // ---------------------------------------------------------------- corpus
