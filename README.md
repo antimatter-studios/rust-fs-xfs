@@ -173,7 +173,10 @@ sparse file, several hundred directory entries — which is what the read path i
 over. `truncate`, `create`, `unlink`, `dirconv`, `crossag`, `deeptree` and
 `feature-matrix` are each the *before* state one suite of write tests needs the kernel
 to have produced, so that what this driver does to them is measured against a volume it
-did not make.
+did not make. `cli` is what the command-line tools are tested on: a v5 and a v4 image,
+each made by `mkfs.xfs -L` and filled by the kernel with a tree meant to reach every way
+XFS stores a file, a manifest of that tree written by the kernel's own driver, and the
+offsets `xfs_db` gives for the bytes the tier breaks in a copy.
 
 `stress` is the set whose contents nobody chose, and it is not in the default list: it
 runs the two stress generators from the filesystem test suite against a mounted
@@ -235,6 +238,50 @@ checkout can rewrite the hook that is about to run. They are per-clone
 rather than tracked: re-run the installer in a fresh clone, and after the
 guards are updated.
 
+## Command-line tools
+
+`fs.xfs` looks inside an XFS image or device directly: no mount, no kernel
+driver, no VM. It is an escape hatch for an errand, not a place to do real
+filesystem work.
+
+```sh
+fs.xfs disk.img get                  # the properties, as JSON
+fs.xfs disk.img get label --text     # one of them, for a person
+fs.xfs --offset 1048576 whole-disk.img info
+```
+
+The tools are one multi-call binary, `rust-fs-xfs`, and `fs.xfs` is a symlink
+to it; `rust-fs-xfs fs ...` is the same program under the one name nothing
+else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
+`PATH` resolves is this program and, if not, what wins and the fix.
+
+| verb | what |
+|---|---|
+| `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log held records nothing had applied), and `xfs.*` |
+| `set label <value>` | answers `not implemented` (exit 3): there is no label writer |
+| `resize <size>` | answers `not implemented` (exit 3) |
+
+Metadata is JSON on stdout by default, `--text` for people. A failure is
+`{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed,
+2 the command line was wrong, 3 the verb exists and this crate cannot do it.
+There is no `mkfs.xfs` and no `fsck.xfs`: this crate has no initial-layout
+builder and no checker, and a missing name is how a package says so.
+
+Build and stage them from a checkout, then test them as installed:
+
+```sh
+chore cli:install                          # tmp/cli/bin, and the PATH line to use
+export PATH="$(scripts/cli-install.sh --print-bin-dir):$PATH"
+chore test:cli                             # doctor first, then tests/cli/*.sh
+```
+
+The binary is behind the `cli` feature (`cargo build --release --features
+cli --bin rust-fs-xfs`), so the library a consumer links gains no
+dependency. Each release attaches `am-fs-xfs-<version>-<platform>.tar.gz`
+for `darwin-arm64` and `linux-x86_64`: an install prefix (`bin/rust-fs-xfs`,
+`bin/fs.xfs`, `share/rust-fs-xfs/CAVEATS`, `LICENSE`) with the same
+build-provenance attestation as the crate.
+
 ## Verifying a release
 
 From the next release onward, every version published to crates.io is
@@ -254,6 +301,15 @@ gh attestation verify am-fs-xfs-X.Y.Z.crate \
 The workflow refuses to attest a `.crate` whose sha256 differs from the
 checksum crates.io records for that version, so the file on the release
 page and the crates.io download are the same bytes.
+
+The command-line tarballs on the same release page are attested by the same
+workflow, and checked the same way:
+
+```sh
+gh attestation verify am-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
+  --repo antimatter-studios/rust-fs-xfs \
+  --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
+```
 
 ## License
 

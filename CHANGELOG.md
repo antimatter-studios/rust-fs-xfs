@@ -12,6 +12,18 @@ never does.
   attached to the GitHub release for its tag, checked first against the
   crates.io checksum, and verifiable with `gh attestation verify` (see the
   README, "Verifying a release").
+- **`fs.xfs`, a command-line tool over the library**, and `rust-fs-xfs
+  doctor`. One multi-call binary named for the repository, behind a new
+  `cli` feature so the static library gains no dependency; `fs.xfs` is a
+  symlink to it. `get`/`info` report the superblock as JSON (`--text` for
+  people), `set label` and `resize` answer `not implemented` with exit
+  status 3, every failure is a structured error on stderr, and `--offset`
+  reaches a filesystem inside a whole-disk image. Releases attach an
+  attested install-prefix tarball per platform (#271).
+- A `cli` test tier (`chore cli:install`, `chore test:cli`) tests the tools
+  as installed, doctor first, against a new `cli` fixture set: a v5 and a v4
+  image made by `mkfs.xfs -L` and filled by the kernel. `get` is held to
+  `xfs_db` and `xfs_info` in the oracle tier (#271).
 
 ## [0.8.0] — 2026-09-27
 

@@ -35,6 +35,17 @@ name: CI
 #                the guest. That is how a Mac runs the oracle and kernel
 #                tiers at all, and this job is what keeps that path
 #                working.
+#   cli          `chore cli:install` then `chore test:cli`: the command-line
+#                tools built in release mode, staged under every name first
+#                on PATH, and tested AS INSTALLED -- `rust-fs-xfs doctor`
+#                first, then tests/cli/*.sh against the kernel-made `cli`
+#                fixtures. Then the release tarball is built and its layout
+#                checked (scripts/package-cli.sh), so a change that breaks a
+#                tool or the tarball fails the pull request, not the
+#                release. No VM: what xfsprogs and the kernel make of the
+#                tools is judged in the oracle and kernel tiers
+#                (tests/cli_*.rs), which the `test` job runs. test-darwin
+#                runs the same tier against the darwin binary.
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails
 #                it). #207.
@@ -393,6 +404,15 @@ jobs:
       # runs that path on Linux instead, so it cannot rot.
       - name: chore test:images
         run: chore test:images
+      # The command-line tools on the platform they ship to first, as
+      # installed: the same tier the `cli` job runs on Linux, against the
+      # darwin binary. No VM is needed for it.
+      - name: chore cli:install
+        run: chore cli:install
+      - name: The staged tools first on PATH
+        run: scripts/cli-install.sh --print-bin-dir >> "$GITHUB_PATH"
+      - name: chore test:cli
+        run: chore test:cli
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
@@ -455,6 +475,71 @@ jobs:
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
 
+  cli:
+    name: cli (the installed tools, on PATH)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: ${{ runner.temp }}
+      - name: Unpack the fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p .vm-share
+          tar -xzf "$RUNNER_TEMP/fixtures.tar.gz" -C .vm-share
+          ls -1 .vm-share | wc -l | xargs echo "fixtures:"
+          ./scripts/build-fixtures.sh --check cli
+      - name: chore cli:install
+        run: chore cli:install
+      # FIRST on PATH, so the tier tests these and not anything the runner
+      # happens to have under the same names; doctor proves it.
+      - name: The staged tools first on PATH
+        run: scripts/cli-install.sh --print-bin-dir >> "$GITHUB_PATH"
+      - name: chore test:cli
+        id: tier
+        run: chore test:cli
+      # THE TARBALL, ON EVERY PULL REQUEST. The release job runs this same
+      # script on each platform it publishes; running it here means the
+      # layout -- the binary, each dotted name a relative symlink to it,
+      # CAVEATS of at most four lines, LICENSE, and every name answering
+      # --version as this crate -- is checked before a tag is pushed, not
+      # after.
+      - name: Package the release tarball and check its layout
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          tarball="$(scripts/package-cli.sh "$version" linux-x86_64)"
+          tar -tvzf "$tarball"
+      - name: Keep the tier logs
+        # Not before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-cli
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
   ci-ok:
     name: ci-ok
     # THE ONE REQUIRED CHECK (#207). Requiring the gate rather than each
@@ -463,7 +548,7 @@ jobs:
     # permanently pending, with nothing to point at. It is also the only
     # shape in which a job-level `if:` is safe.
     if: always()
-    needs: [unit, fixtures, test, test-arm64, test-darwin, suite-in-vm]
+    needs: [unit, fixtures, test, test-arm64, test-darwin, suite-in-vm, cli]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded

@@ -213,6 +213,11 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     exit "$fail"
 fi
 
+# `--features cli` BUILDS THE COMMAND-LINE TOOLS TOO. The `rust-fs-xfs`
+# target requires it, and without it cargo leaves the target out without a
+# word: the tests that run the tools (tests/cli_*.rs) would then fail
+# naming the flag, and the tools' own unit tests would not run at all.
+#
 # THROUGH with-test-temp.sh, always. The oracle tools run inside the
 # fs-linux-test-harness VM, which sees this repository and nothing else
 # of the host, so a scratch directory under /tmp or $RUNNER_TEMP is a
@@ -220,7 +225,7 @@ fi
 # puts TMPDIR inside the checkout, and this used to call cargo directly —
 # which worked only for as long as the tools ran on the host.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-out=$("$REPO/scripts/with-test-temp.sh" cargo test --locked --release "$@" -- --nocapture 2>&1) &&
+out=$("$REPO/scripts/with-test-temp.sh" cargo test --locked --release --features cli "$@" -- --nocapture 2>&1) &&
     status=0 || status=$?
 echo "$out"
 

@@ -14,12 +14,34 @@ exclude = ["fuzz"]
 name = "fs_xfs"
 crate-type = ["staticlib", "rlib"]
 
+# The command-line tools: one multi-call binary, named for the repository,
+# which answers to each dotted name (`fs.xfs`) it is linked as. Cargo
+# refuses a dot in a target name, so the dotted names are symlinks made
+# when the tools are staged (scripts/cli-install.sh) or packaged
+# (scripts/package-cli.sh), never targets of their own.
+#
+# REQUIRED-FEATURES, so a build of the library -- the static library a
+# consumer links -- compiles none of it and gains no dependency: the
+# argument parser is optional and only the `cli` feature turns it on.
+[[bin]]
+name = "rust-fs-xfs"
+path = "src/cli/main.rs"
+required-features = ["cli"]
+
+[features]
+# The command-line tools and nothing else. clap is MIT/Apache-2.0.
+cli = ["dep:clap"]
+
 [dependencies]
 # CRC32C (Castagnoli) protects every v5 metadata block. Apache-2.0.
 crc32c = "0.6"
 # Block-device trait surface shared with the sister fs-* drivers and the
 # img-* disk-image readers.
 am-fs-core = { path = "../rust-fs-core", version = "0.2.13" }
+# The command-line tools' argument parser, behind `cli` (see the
+# `rust-fs-xfs` target above). No derive: the builder API keeps each
+# tool's command a function the man pages and completions can be made from.
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
 
 [dev-dependencies]
 # Test-only. The write oracle compares a whole file against the hash the
