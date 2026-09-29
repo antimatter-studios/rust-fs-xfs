@@ -59,6 +59,12 @@ never does.
   is refused after it had created its file unlinks it again. The kernel in
   the guest replays every write, reads each file back by SHA-256, and
   `xfs_repair -n` accepts the result (#271).
+- The tools write their own man pages and shell completions (`rust-fs-xfs
+  generate man|completions SHARE`): a section-1 page per name and per
+  `fs.xfs` subcommand, and zsh, bash and fish completions, which
+  `chore cli:install` stages and the release tarball carries under
+  `share/`. `clap_complete` and `clap_mangen` (MIT/Apache-2.0) join clap
+  behind the `cli` feature (#271).
 
 ## [0.8.0] — 2026-09-27
 
