@@ -125,3 +125,42 @@ pub fn json_field(json: &str, key: &str) -> String {
             .to_string()
     }
 }
+
+/// Bytes nobody would type: a fixed LCG, so a failure reproduces.
+pub fn pattern(len: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (x >> 16) as u8
+        })
+        .collect()
+}
+
+/// `fs.xfs <image> write <path>` with `bytes` on stdin; the output.
+pub fn fs_write(image: &str, path: &str, bytes: &[u8]) -> Output {
+    use std::io::Write;
+    let mut child = tool("fs.xfs")
+        .args([image, "write", path])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fs.xfs write");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(bytes)
+        .expect("feed stdin");
+    child.wait_with_output().expect("wait for fs.xfs write")
+}
+
+/// The SHA-256 of `bytes`, in the lowercase hex `sha256sum` prints.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

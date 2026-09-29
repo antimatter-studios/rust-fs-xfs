@@ -20,7 +20,7 @@ pub const TOOL: Tool = Tool {
     verb: "fs",
     section: 1,
     usage_exit: crate::common::output::EXIT_USAGE,
-    about: "List, read and inspect an XFS image or device without mounting it",
+    about: "List, read, write and inspect an XFS image or device without mounting it",
     command,
     run,
 };
@@ -39,15 +39,21 @@ pub const KEYS: &[&str] = &[
 
 fn command() -> Cmd {
     Cmd::new("fs.xfs")
-        .about("List, read and inspect an XFS image or device without mounting it")
+        .about("List, read, write and inspect an XFS image or device without mounting it")
         .long_about(
             "Work inside an XFS image or device directly: no mount, no kernel driver.\n\n\
              An escape hatch for an errand (get a file out, read the label, check whether \
              the log needs replaying), not a place to do real filesystem work: for that, \
              mount it.\n\n\
              Metadata is JSON on stdout (--text for people); `read` writes the file's raw \
-             bytes. A failure is {\"error\": \"...\", \"code\": N} on stderr, N being \
-             the exit status: 1 failed, 2 wrong command line, 3 not implemented.",
+             bytes and `write` reads them from stdin. A failure is \
+             {\"error\": \"...\", \"code\": N} on stderr, N being the exit status: \
+             1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
+             Writing is partial, and every other shape is refused by name rather than \
+             attempted: a new file (v5, one extent), an empty file given contents, a \
+             same-length overwrite in place, and mkdir (v5). A journalled write leaves \
+             its change in the log, and the next write waits until Linux has mounted \
+             the volume once to replay it.",
         )
         .arg(
             Arg::new("target")
@@ -106,6 +112,42 @@ fn command() -> Cmd {
                      fs.xfs disk.img read /backup.tar -o backup.tar",
                 ),
         )
+        .subcommand(
+            Cmd::new("write")
+                .about(
+                    "Create a file, or overwrite one of the same length, with the bytes on stdin",
+                )
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img write /notes.txt < notes.txt\n  \
+                     fs.xfs src.img read /f | fs.xfs dst.img write /f\n\n\
+                     A new path becomes a file in one extent (v5 only). An empty file is \
+                     given its contents. An existing file of exactly the same length is \
+                     overwritten in place. Anything else -- appending, shortening, a v4 \
+                     volume, a file too large for one free run -- is refused with the \
+                     reason (exit 3), and the volume is left as it was.",
+                ),
+        )
+        .subcommand(
+            Cmd::new("mkdir")
+                .about("Create a directory (its parent must exist; v5 only)")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img mkdir /backup\n\n\
+                     The change is a log record: mount the volume with Linux once \
+                     before the next write (`mkdir /backup/2026` is refused until then).",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -143,6 +185,7 @@ fn command() -> Cmd {
         .after_help(
             "Examples:\n  fs.xfs disk.img ls /\n  \
              fs.xfs disk.img read /etc/fstab > fstab\n  \
+             fs.xfs disk.img write /notes.txt < notes.txt\n  \
              fs.xfs disk.img get label --text\n  \
              fs.xfs --offset 1048576 whole-disk.img info",
         )
@@ -180,6 +223,8 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        "write" => write(target, offset, path_arg(sub)),
+        "mkdir" => mkdir(target, offset, path_arg(sub)),
         "get" | "info" => get(
             &super::device::mount(target, offset)?,
             sub.get_one::<String>("key").map(String::as_str),
@@ -420,6 +465,173 @@ fn read(fs: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outco
     Ok(Outcome::done())
 }
 
+/// What a new file and a new directory are made with. The library takes
+/// the whole `di_mode`, type bits included: a bare `0o644` makes an inode
+/// of no type at all, which the kernel and xfs_repair reject.
+const FILE_MODE: u16 = 0o100_644;
+const DIR_MODE: u16 = 0o040_755;
+
+/// A driver error from a write verb: a shape the driver refuses is exit 3
+/// with the driver's own reason, anything else a failure.
+fn write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+    match e {
+        fs_xfs::Error::UnsupportedFeature(_) | fs_xfs::Error::ReadOnly => {
+            CliError::refused(format!("{}: {e}", show(what)))
+        }
+        other => xfs_error(what, other),
+    }
+}
+
+/// `path` split into its parent directory and its last component, which
+/// must be a name: not empty, `.` or `..`.
+fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), CliError> {
+    let trimmed = {
+        let mut end = path.len();
+        while end > 1 && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        &path[..end]
+    };
+    let (parent, name) = match trimmed.iter().rposition(|b| *b == b'/') {
+        Some(at) => (&trimmed[..at.max(1)], &trimmed[at + 1..]),
+        None => (&b"/"[..], trimmed),
+    };
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(CliError::usage(format!(
+            "{}: names no file to create",
+            show(path)
+        )));
+    }
+    Ok((parent, name))
+}
+
+/// Replace a file's contents, or make it, with everything on stdin, in
+/// one of the shapes the driver can write -- and refuse the rest, naming
+/// why, before the volume is touched.
+///
+/// The whole input is read before the image is opened, so a failing
+/// producer (`false | fs.xfs img write /f`) leaves the image as it was.
+///
+/// - **A new path**: `create_file`, then `write_into_empty_file` (both
+///   journalled, v5 only). If the second is refused -- no single free run
+///   long enough, a file too large for one extent -- the new file is
+///   unlinked again in the same mount, so a refused write leaves no file
+///   behind.
+/// - **An existing empty file**: `write_into_empty_file`.
+/// - **An existing file of the same length**: `write_at` in place, which
+///   changes no metadata and needs no journal.
+/// - **Longer**: `write_at` is asked, and refuses (it would grow the file);
+///   its reason is the error.
+/// - **Shorter**: refused here. Replacing means truncating and
+///   reallocating, which the driver does not do as one operation.
+fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
+    let (parent_path, name) = split_path(path)?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut data)
+        .map_err(|e| CliError::failed(format!("read stdin: {e}")))?;
+
+    let fs = super::device::mount_rw(target, offset)?;
+    let parent = fs
+        .open_bytes(parent_path)
+        .map_err(|e| xfs_error(parent_path, e))?;
+    if !parent.is_dir() {
+        return Err(xfs_error(parent_path, fs_xfs::Error::NotADirectory));
+    }
+    let parent_ino = parent.inode().ino;
+    let existing = match parent.open_child(name) {
+        Ok(file) => Some(file),
+        Err(fs_xfs::Error::NotFound) => None,
+        Err(e) => return Err(xfs_error(path, e)),
+    };
+
+    let (how, bytes) = match existing {
+        None => {
+            let (ino, _) = fs
+                .create_file(parent_ino, name, FILE_MODE)
+                .map_err(|e| write_error(path, e))?;
+            if !data.is_empty() {
+                if let Err(e) = fs.write_into_empty_file(ino, &data) {
+                    let refused = write_error(path, e);
+                    return Err(match fs.unlink_file(parent_ino, name) {
+                        Ok(_) => refused,
+                        Err(undo) => CliError::failed(format!(
+                            "{} (and removing the file it had created failed too: {undo})",
+                            refused.message
+                        )),
+                    });
+                }
+            }
+            ("created", data.len())
+        }
+        Some(file) => {
+            if file.is_dir() {
+                return Err(CliError::failed(format!("{}: is a directory", show(path))));
+            }
+            if !file.is_regular_file() {
+                return Err(xfs_error(path, fs_xfs::Error::NotAFile));
+            }
+            let size = file.len();
+            let want = data.len() as u64;
+            if want == size {
+                if !data.is_empty() {
+                    fs.write_at(file.inode(), file.raw(), 0, &data)
+                        .map_err(|e| write_error(path, e))?;
+                }
+                ("overwritten", data.len())
+            } else if size == 0 {
+                fs.write_into_empty_file(file.inode().ino, &data)
+                    .map_err(|e| write_error(path, e))?;
+                ("filled", data.len())
+            } else if want > size {
+                // The driver's own refusal is the answer: it names why a
+                // longer write is a metadata change it will not make.
+                fs.write_at(file.inode(), file.raw(), 0, &data)
+                    .map_err(|e| write_error(path, e))?;
+                return Err(CliError::failed(format!(
+                    "{}: the driver accepted a write past the end of the file, which it \
+                     documents as refused",
+                    show(path)
+                )));
+            } else {
+                return Err(CliError::not_implemented(format!(
+                    "write: {} holds {size} bytes and stdin {want}; replacing a file with \
+                     a shorter one means truncating it and allocating again, which this \
+                     driver does not do as one operation. A new path, an empty file, or \
+                     exactly {size} bytes can be written",
+                    show(path)
+                )));
+            }
+        }
+    };
+    let report = Json::object([
+        ("path", Json::from(show(path))),
+        ("bytes", Json::from(bytes as u64)),
+        ("result", Json::from(how)),
+        ("created", Json::from(how == "created")),
+        ("journalled", Json::from(how != "overwritten")),
+    ]);
+    let text = format!("{how} {} ({bytes} bytes)", show(path));
+    Ok(Outcome::report(report).with_text(text))
+}
+
+/// Create one directory, mode 0755. Its parent must exist, and nothing
+/// may be at the path yet.
+fn mkdir(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
+    let (parent_path, name) = split_path(path)?;
+    let fs = super::device::mount_rw(target, offset)?;
+    let parent = fs
+        .open_bytes(parent_path)
+        .map_err(|e| xfs_error(parent_path, e))?;
+    if !parent.is_dir() {
+        return Err(xfs_error(parent_path, fs_xfs::Error::NotADirectory));
+    }
+    let (ino, _) = fs
+        .create_directory(parent.inode().ino, name, DIR_MODE)
+        .map_err(|e| write_error(path, e))?;
+    let report = Json::object([("path", Json::from(show(path))), ("inode", Json::from(ino))]);
+    Ok(Outcome::report(report).with_text(format!("created {}", show(path))))
+}
+
 /// The UUID in its standard 8-4-4-4-12 form.
 fn uuid_text(u: &[u8; 16]) -> String {
     let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
@@ -522,6 +734,22 @@ fn set(sub: &ArgMatches) -> Result<Outcome, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_splits_into_its_parent_and_its_name() {
+        let split = |p: &str| {
+            split_path(p.as_bytes())
+                .map(|(a, b)| (show(a), show(b)))
+                .map_err(|e| e.code)
+        };
+        assert_eq!(split("/f"), Ok(("/".into(), "f".into())));
+        assert_eq!(split("/d/e/f"), Ok(("/d/e".into(), "f".into())));
+        assert_eq!(split("/d/e/"), Ok(("/d".into(), "e".into())));
+        assert_eq!(split("f"), Ok(("/".into(), "f".into())));
+        for bad in ["/", "", "/d/..", "/d/."] {
+            assert_eq!(split(bad), Err(2), "{bad:?}");
+        }
+    }
 
     #[test]
     fn a_uuid_is_written_in_its_standard_groups() {

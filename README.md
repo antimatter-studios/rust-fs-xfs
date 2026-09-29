@@ -240,13 +240,14 @@ guards are updated.
 
 ## Command-line tools
 
-`fs.xfs` looks inside an XFS image or device directly: no mount, no kernel
-driver, no VM. It is an escape hatch for an errand, not a place to do real
-filesystem work.
+`fs.xfs` looks inside an XFS image or device directly, and within the limits
+below writes to it: no mount, no kernel driver, no VM. It is an escape hatch
+for an errand, not a place to do real filesystem work.
 
 ```sh
 fs.xfs disk.img ls /etc              # a directory, as JSON
 fs.xfs disk.img read /etc/fstab > fstab
+fs.xfs disk.img write /notes.txt < notes.txt
 fs.xfs disk.img get                  # the properties, as JSON
 fs.xfs disk.img get label --text     # one of them, for a person
 fs.xfs --offset 1048576 whole-disk.img info
@@ -261,6 +262,8 @@ else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
 |---|---|
 | `ls [path]` | entries with `name`, `type`, `size`, `mode`, `mtime`, `inode`, and a symlink's `target`; v4 and v5 |
 | `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
+| `write <path>` | the bytes on stdin. A new path is a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Every other shape -- appending, shortening, a v4 create, a file larger than any free run -- is refused with the driver's reason (exit 3) and the volume is left as it was |
+| `mkdir <path>` | a directory, mode 0755 (v5) |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log held records nothing had applied), and `xfs.*` |
 | `set label <value>` | answers `not implemented` (exit 3): there is no label writer |
 | `resize <size>` | answers `not implemented` (exit 3) |
@@ -270,6 +273,13 @@ Metadata is JSON on stdout by default, `--text` for people. A failure is
 2 the command line was wrong, 3 the verb exists and this crate cannot do it.
 There is no `mkfs.xfs` and no `fsck.xfs`: this crate has no initial-layout
 builder and no checker, and a missing name is how a package says so.
+
+A journalled write -- a new file, a filled empty file, a directory -- lands as
+a record in the log, as the driver's writes always do: the kernel applies it
+the next time Linux mounts the volume, and `get dirty` says `true` until
+then. The driver writes only to a volume whose log is clean, so the next
+journalled write on the same image is refused until it has been mounted once.
+Reading needs no such wait: `ls` and `read` replay the log in memory.
 
 Build and stage them from a checkout, then test them as installed:
 
