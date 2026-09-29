@@ -235,6 +235,26 @@ checkout can rewrite the hook that is about to run. They are per-clone
 rather than tracked: re-run the installer in a fresh clone, and after the
 guards are updated.
 
+## Verifying a release
+
+From the next release onward, every version published to crates.io is
+also attached to the GitHub release for its tag, with a build-provenance
+attestation signed by this repository's release workflow. It proves the
+crate was built by `.github/workflows/release.yml` from a commit in this
+repository, not uploaded from someone's machine. To check the crates.io
+download of version `X.Y.Z`:
+
+```sh
+curl -sSfLo am-fs-xfs-X.Y.Z.crate https://static.crates.io/crates/am-fs-xfs/am-fs-xfs-X.Y.Z.crate
+gh attestation verify am-fs-xfs-X.Y.Z.crate \
+  --repo antimatter-studios/rust-fs-xfs \
+  --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
+```
+
+The workflow refuses to attest a `.crate` whose sha256 differs from the
+checksum crates.io records for that version, so the file on the release
+page and the crates.io download are the same bytes.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
