@@ -18,7 +18,8 @@ for spec in v5:CLIV5:5 v4:CLIV4:4; do
     img="$SHARE/xfscli-$name.img"
 
     fs.xfs "$img" get >"$SANDBOX/get.json" 2>"$SANDBOX/get.err"
-    check "$name: get exits 0 ($(cat "$SANDBOX/get.err"))" test $? -eq 0
+    rc=$?
+    check "$name: get exits 0 ($(cat "$SANDBOX/get.err"))" test "$rc" -eq 0
     jq_check "$name: get carries every canonical key with its type" \
         '(.fs=="xfs") and (.label|type)=="string" and (.total_bytes|type)=="number" and (.free_bytes|type)=="number" and (.block_size|type)=="number" and (.dirty|type)=="boolean" and (.xfs|type)=="object"' \
         "$SANDBOX/get.json"
