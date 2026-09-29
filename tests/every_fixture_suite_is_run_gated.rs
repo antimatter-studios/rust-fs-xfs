@@ -234,21 +234,25 @@ fn every_tier_runs_through_the_skip_and_floor_gate() {
             ungated.push(format!("{tier}: {}", line.trim()));
         }
     }
-    // The unit tier cannot use ci-test.sh's run mode — that mode pins
-    // `--release` and the unit tier is the debug one — so it hands the
-    // log tier.sh wrote to `ci-test.sh --gate`, which applies the same
-    // pattern and the same floor.
-    let unit: Vec<&str> = chores
-        .lines()
-        .filter(|line| line.contains("scripts/ci-test.sh --gate"))
-        .collect();
-    assert_eq!(
-        unit.len(),
-        1,
-        "chores.yml must gate the debug unit tier with `ci-test.sh --gate`, which \
-         applies the skip pattern and the executed-test floor to the log tier.sh \
-         already wrote. Found: {unit:?}"
-    );
+    // Two tiers cannot use ci-test.sh's run mode, and each hands the log
+    // tier.sh wrote to `ci-test.sh --gate`, which applies the same pattern
+    // and the same floor: the unit tier, because that mode pins `--release`
+    // and the unit tier is the debug one, and the cli tier, because what it
+    // runs is the installed tools rather than cargo. Each is gated exactly
+    // once, on its own log.
+    for (tier, log) in [("unit", "tmp/logs/unit.log"), ("cli", "tmp/logs/cli.log")] {
+        let gated: Vec<&str> = chores
+            .lines()
+            .filter(|line| line.contains("scripts/ci-test.sh --gate") && line.contains(log))
+            .collect();
+        assert_eq!(
+            gated.len(),
+            1,
+            "chores.yml must gate the {tier} tier with `ci-test.sh --gate` on {log}, \
+             which applies the skip pattern and the executed-test floor to the log \
+             tier.sh already wrote. Found: {gated:?}"
+        );
+    }
     assert!(
         ungated.is_empty(),
         "these tiers do not go through scripts/ci-test.sh, so a suite in them can \
