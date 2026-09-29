@@ -44,13 +44,14 @@ dirconv:xfsdirconv-exact-before.img
 crossag:xfscrossag-plain.img
 deeptree:xfsdeep-bno2.img
 feature-matrix:xfsfeat-base.img
+cli:xfscli-v5.img
 stress:xfsstress-fsx.img"
 
 # `all` is every set but `stress`, which takes tens of minutes and builds
 # fsstress and fsx from source first. Saying so out loud because a set
 # quietly dropped by a catch-all is the same shape of problem as an
 # oracle that skips: `all` that is not all should say which.
-ALL="geometry data log truncate create unlink dirconv crossag deeptree feature-matrix"
+ALL="geometry data log truncate create unlink dirconv crossag deeptree feature-matrix cli"
 
 set_names() { printf '%s\n' "$SENTINELS" | cut -d: -f1; }
 sentinel_for() { printf '%s\n' "$SENTINELS" | awk -F: -v s="$1" '$1 == s { print $2 }'; }

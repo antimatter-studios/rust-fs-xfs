@@ -279,6 +279,7 @@ tasks:
       - .vm-share/xfscrossag-plain.img
       - .vm-share/xfsdeep-bno2.img
       - .vm-share/xfsfeat-base.img
+      - .vm-share/xfscli-v5.img
     # A hung boot must not hold the VM and the machine-wide slot for ever.
     timeout: 90m
     on_timeout:
@@ -315,7 +316,7 @@ tasks:
     # The floor is 380: 427 executed in run 35435470063 on 2026-09-19
     # (job 105877256028), less the usual margin. Raise it deliberately.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked $(scripts/test-targets.sh unit) -- --nocapture'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
       - 'scripts/ci-test.sh --gate 380 tmp/logs/unit.log "the debug unit tier"'
 
   test:images:
@@ -466,6 +467,10 @@ tasks:
     # across five shell tests. The budget is double that — a shell test
     # prints about four lines, so it is room for five more before anybody
     # has to think about it.
+    #
+    # 34 lines / 1,896 bytes across twelve on 2026-09-29 (arm64 macOS), with
+    # the packaging and cli-tier guards (#271): inside the budget, which is
+    # not raised, and nearer it than it was.
     cmds:
       - |
         set -eu
@@ -526,8 +531,49 @@ tasks:
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
       - 'CI_TEST_FLOOR=525 scripts/tier.sh "test:native (whole suite, release)" suite 2400 180000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
       - task: test:scripts
+      # The command-line tools, built and staged the way an install lays
+      # them out, then tested as installed: found on PATH, doctor first.
+      # A separate invocation because test:cli reads PATH, and the staged
+      # directory has to be first on it.
+      - task: cli:install
+      - 'PATH="$(scripts/cli-install.sh --print-bin-dir):$PATH" "{{.CHORE_EXE}}" test:cli'
       # THE LAST LINE: one number across the tiers, and where the detail is.
-      - scripts/test-verdict.sh unit oracle kernel suite
+      - scripts/test-verdict.sh unit oracle kernel suite cli
+
+  cli:install:
+    desc: 'Build the command-line tools (release, --features cli) and stage them under every name in tmp/cli/bin'
+    # The layout an install has: the multi-call binary as rust-fs-xfs and
+    # each dotted name a relative symlink to it. It prints the PATH line;
+    # `test:cli` tests whatever PATH finds, so that directory goes first.
+    cmds: ['scripts/cli-install.sh']
+
+  test:cli:
+    desc: 'The command-line tools AS INSTALLED, found on PATH: doctor first, then every tests/cli/test-*.sh'
+    # Tests the installed artifact, not a cargo target: the same suite
+    # checks `chore cli:install`'s staging (test:native puts it first on
+    # PATH) and a Homebrew install. `rust-fs-xfs doctor` runs before any
+    # tool is tested and fails the tier if a name is missing or shadowed,
+    # naming the fix. See scripts/test-cli.sh.
+    #
+    # NO VM. The images are kernel-made fixtures (the `cli` set), read
+    # from .vm-share; what xfsprogs and the kernel make of the tools'
+    # output is judged in the oracle and kernel tiers
+    # (tests/cli_*_oracle.rs, tests/cli_*_kernel.rs). So this tier runs
+    # anywhere the fixtures are, a Mac included.
+    #
+    # THE FLOOR: each file prints a `test result: ok. N passed` line, which
+    # `ci-test.sh --gate` sums as it does cargo's, and the same gate fails
+    # a log that says anything skipped. 83 checks executed when the tier
+    # was added (#271, arm64 macOS); the floor is 79, about 95% of that.
+    #
+    # MEASURED on the same run: 11 lines / 390 bytes. Every file is three
+    # lines when it passes and every tool a doctor line, so a new file is a
+    # visible step. Budget half as much again, with room in the bytes for
+    # a runner's longer checkout path in the doctor lines.
+    cmds:
+      - 'scripts/build-fixtures.sh --check cli'
+      - 'scripts/tier.sh test:cli cli 17 700 -- scripts/test-cli.sh'
+      - 'scripts/ci-test.sh --gate 79 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
@@ -583,7 +629,9 @@ tasks:
       - scripts/agents-core-check.sh
       - scripts/ci-gate.sh
       - cargo fmt --check
-      - cargo clippy --locked --all-targets -- -D warnings
+      # `--features cli`: the command-line tools' target requires it, and
+      # clippy silently leaves out a target whose features are off.
+      - cargo clippy --locked --all-targets --features cli -- -D warnings
 
   build:
     desc: Debug build
