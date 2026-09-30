@@ -24,6 +24,13 @@ never does.
   as installed, doctor first, against a new `cli` fixture set: a v5 and a v4
   image made by `mkfs.xfs -L` and filled by the kernel. `get` is held to
   `xfs_db` and `xfs_info` in the oracle tier (#271).
+- `fs.xfs ls` and `fs.xfs read`, on v4 and v5: typed JSON entries (name,
+  type, size, mode, mtime, inode, a symlink's target) and a file's raw bytes
+  on stdout or `-o FILE`. The tier holds every listing and every file's
+  SHA-256 to the manifest the kernel wrote, and a copy with an inode that
+  fails its CRC or an AGI with a bad magic is refused with a structured
+  error and nothing on stdout -- a refusal `xfs_repair -n` in the guest
+  agrees with (#271).
 
 ## [0.8.0] — 2026-09-27
 
