@@ -12,6 +12,47 @@ Each pass is one entry, newest first. An entry names:
 - each finding with its issue;
 - what it didn't reach, so the next pass knows where to start.
 
+## 2026-09-30, fourth pass: block-form insert, many records per mount, the B+tree-fork free
+
+Read at `0043d26` (#92). This pass covers the write paths that arrived after the third pass read `c6c0b26`, or that no pass had reached: adding an entry to a directory already in block form (#220), a mount that writes several checkpoints and reuses the ring (#205, #209), a checkpoint written as several records (#216), and freeing a B+tree extent fork's own blocks (#222).
+
+| Module | Result |
+|---|---|
+| `src/create.rs`: `add_to_block_form` | #287 |
+| `src/dir.rs` / `src/fs.rs`: every directory block read (`read_dir`, `lookup_by_hash`, `read_dir_block`) | #287 |
+| `src/fs.rs`: `commit_record`, `sync`, the pad before a wrap, `logged_inode` | none found |
+| `src/overlay.rs`: `push` | none found |
+| `src/log_write.rs`: `split_into_records`, `blocks_for_records` | none found |
+| `src/truncate.rs` with `bmbt::walk_with_blocks`: freeing a B+tree fork's own blocks | none found |
+| `src/unlink.rs`: the short-form width after a removal | none found |
+
+**Finding:**
+- **#287.** A v5 directory block's CRC, `blkno`, UUID and owner are never checked on any path, because `dir::verify_data_block` and `verify_da_block` have no caller outside the tests. `add_to_block_form` reads the block, takes its entries and rebuilds it with `dir_block::build(.., parent, ..)`. That stamps this directory's owner and address on it, and recovery gives it a valid CRC. So a foreign or damaged block becomes a sound-looking block of this directory. Reproduced on a kernel-built volume by setting one block's `owner` to 999:
+  - the kernel refuses it: `Structure needs cleaning`, `metadata I/O error ... error 74`;
+  - `xfs_repair -n` reports `Metadata CRC error ... xfs_dir3_block`;
+  - this driver lists all 30 entries, resolves a name through the hash index, and journals `create_file` into the block.
+
+**Looked at and not a finding:**
+- `commit_record` places a whole checkpoint before writing any of it. When it will not fit, it pushes first, pads to the end of the ring with an empty record in the old cycle, then wraps. So the tail never passes the checkpoint's own first record.
+- `sync` clears `oldest_record` only after `Overlay::push` has written and flushed every buffer. The pad's tail is then its own LSN.
+- `Overlay::push` writes images whose CRC `BufferItem::image_as_written` has already stamped, for every buffer type this driver logs: AGF, AGI, AGFL, the short-form AG B+tree blocks and the block-form directory block. It never writes a logged buffer's stale checksum in place.
+  - A new chunk's 64 inodes go into the overlay as recovery would initialise them, so after a push and a wrap past its icreate record the chunk is still on disk.
+- `logged_inode` starts from the full on-disk inode record and replaces only the core and the data fork. It keeps the attribute fork, as recovery does for an item without `XFS_ILOG_ADATA`.
+- `split_into_records` divides only at operation boundaries. An operation larger than a record is refused by name. Examples are a fully dirty directory block on `-n size=65536` against a 32 KiB `h_size`. That is a refusal, not a torn record.
+- Freeing a B+tree fork:
+  - The map blocks come from `bmbt::walk_with_blocks`, and `parse_block` checks each one's CRC, owner, address and level before it is freed.
+  - A block listed twice cannot be freed twice: `alloc_btree::free_extent` refuses an extent that overlaps free space.
+  - `rmap::remove` requires an exact record, so a map that disagrees with the reverse map stops the free.
+- `unlink`'s short-form rewrite recomputes `i8count` from the remaining inode numbers (#235). Removing the last wide entry narrows the directory, as `xfs_dir2_sf_toino4` does.
+
+**Related, not a misread:** #284. A create in a directory with a default ACL does not inherit it, and it is filed separately.
+
+**Still not reached:**
+- Attribute writes: none exist, so there is nothing to audit.
+- `src/dir_block.rs`'s leaf and node forms: no write path reaches them.
+- The C ABI's write entry points (`src/capi.rs`), read only for how they map errors.
+- What a failed device write part-way through a multi-record checkpoint leaves behind. `next_head` is not advanced, so the next checkpoint overwrites the partial one. If the new checkpoint is shorter, blocks of the uncommitted one remain past the new head. Recovery skips an uncommitted transaction. This was reasoned about but not probed.
+
 ## 2026-09-19, third pass: rename, the superblock writer, and relaid group trees
 
 Read at `c6c0b26` (#92), taking the three modules the second pass listed as not reached.
