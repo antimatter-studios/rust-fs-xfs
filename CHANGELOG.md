@@ -23,6 +23,11 @@ never does.
   refused. A new inode's atime, mtime, ctime and crtime are the time of the
   create, where they were the free slot's own, which is 1970 on a fresh
   volume (#276).
+- A v5 directory block's CRC, block number, UUID and owner are verified
+  when it is read — by a listing, a lookup and a create — so a damaged or
+  foreign block is refused as the kernel refuses it. Before, nothing
+  checked them, and `add_to_block_form` would rebuild such a block as a
+  checksum-valid block of the directory it was adding to (#287).
 
 ## [0.9.0] — 2026-09-30
 
