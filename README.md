@@ -31,7 +31,7 @@ corrupt.
 | Symlinks | inline and remote (`XSLM`), across multiple extents |
 | Extended attributes | read (`list_xattrs`, `get_xattr`): short form, leaf, node and remote values; POSIX ACLs also as `system.posix_acl_*` in the VFS format; not written, not in the C ABI |
 | Log replay | read-only: a dirty volume is replayed into memory and reads as the kernel reads it; the device is not written |
-| Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir, directory conversion |
+| Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir, directory conversion; a create in a directory with a default ACL is refused, since the ACL the new inode would inherit is not written |
 | Write path | overwrite in place, plus the journalled operations above |
 
 ### What the write path can do
