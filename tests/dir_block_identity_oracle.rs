@@ -48,7 +48,7 @@ mod data_hdr {
 /// Offsets in `xfs_da3_blkinfo` (leaf and node blocks).
 mod da_hdr {
     pub const CRC: usize = 12;
-    pub const OWNER: usize = 48;
+    pub const BLKNO: usize = 16;
 }
 
 /// One damage to one block: which directory, which of its blocks, what is
@@ -114,11 +114,16 @@ const DAMAGES: [Damage; 6] = [
         break_crc: false,
         listing_reads_it: true,
     },
+    // The hash index's ADDRESS, not its owner. The guest's kernel (6.1)
+    // does not check a leaf block's owner -- that check arrived in 6.10 --
+    // and resolved a name through a leaf with a foreign owner, so that
+    // damage is not corruption to this oracle. Every kernel checks the
+    // address in the leaf's verifier. The driver refuses both.
     Damage {
-        what: "a leaf-form directory's hash index's owner",
+        what: "a leaf-form directory's hash index's address",
         dir: "l",
         file_offset: LEAF_OFFSET,
-        field: da_hdr::OWNER + 7,
+        field: da_hdr::BLKNO + 7,
         crc_at: da_hdr::CRC,
         break_crc: false,
         listing_reads_it: false,
