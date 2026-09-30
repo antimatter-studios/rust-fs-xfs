@@ -183,7 +183,7 @@ impl Timestamp {
     /// `bigtime` selects the representation: a 64-bit nanosecond counter
     /// from the 1901 epoch, or the legacy pair of 32-bit seconds and
     /// nanoseconds.
-    fn parse(buf: &[u8], off: usize, bigtime: bool) -> Self {
+    pub(crate) fn parse(buf: &[u8], off: usize, bigtime: bool) -> Self {
         if bigtime {
             let ns = be64(buf, off);
             Timestamp {
