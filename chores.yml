@@ -111,7 +111,7 @@ vars:
   # does not exist for exactly the ones that are not.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
   # v0.2.11 is the release that packages scripts/output-budget.sh, which
-  # scripts/resolve-output-budget.sh resolves and verifies. v0.2.10 does not
+  # scripts/tier.sh resolves and verifies. v0.2.10 does not
   # contain it, so this pin cannot go back below v0.2.11 while the tiers read
   # the wrapper from core.
   FS_CORE_REF: v0.2.13

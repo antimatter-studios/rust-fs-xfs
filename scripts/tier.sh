@@ -43,19 +43,54 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # the pinned release. There is no sibling-versus-crate decision to make,
 # because cargo made it.
 #
+# FS_CORE_ROOT NAMES CORE OUTRIGHT, and when it is set cargo is not asked:
+# you have said where core is, so its absence there is an answer, not a
+# reason to go looking. It exists so that tests/scripts/test-tier-resolver.sh
+# can drive both refusals below -- a resolver whose failure path nobody
+# executes has never been shown to refuse anything, which is the same defect
+# as a test that skips.
+#
+# WHAT IS VERIFIED IS `--version`, NOT MERELY THAT A FILE EXISTS (#254).
+# Existence is not identity: a stale vendor directory, a half-written file or
+# a package that gutted the script all leave a path that exists and does not
+# behave, and a wrapper that ignores its arguments and runs the command makes
+# the tier "pass" with no budget, no log and no verdict. Nor is it a digest:
+# the same SHA-256 pinned in every consumer is the lockstep
+# antimatter-studios/rust-fs-core#153 removed, where a comment added in core
+# breaks every consumer until the digest is chased. `--version` is the
+# contract.
+#
+# A WRONG COPY IS FATAL, NOT A REASON TO LOOK ELSEWHERE. "Core is broken"
+# reported as "core is missing" is the quieter and more confusing failure.
+#
 # tmp/ is gitignored and is where the tier logs already live.
-CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
-    2>/dev/null | python3 -c '
+EXPECTED_API="rust-fs-core-output-budget 1"
+
+if [ -n "${FS_CORE_ROOT:-}" ]; then
+    CORE_DIR="$FS_CORE_ROOT"
+    WHO="FS_CORE_ROOT names $CORE_DIR, which"
+else
+    CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
+        2>/dev/null | python3 -c '
 import json, sys
 packages = json.load(sys.stdin)["packages"]
 print(next((p["manifest_path"].rsplit("/", 1)[0]
             for p in packages if p["name"] == "am-fs-core"), ""))
 ')"
+    WHO="cargo could not say where am-fs-core is, or its copy"
+fi
 if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/scripts/output-budget.sh" ]; then
-    echo "tier.sh: cargo could not say where am-fs-core is, or its copy has no" >&2
+    echo "tier.sh: $WHO has no" >&2
     echo "         scripts/output-budget.sh. The wrapper lives in rust-fs-core;" >&2
     echo "         check the am-fs-core dependency resolves and is at a version" >&2
     echo "         that ships it (v0.2.11 or later)." >&2
+    exit 1
+fi
+if [ "$(bash "$CORE_DIR/scripts/output-budget.sh" --version 2>/dev/null || true)" != "$EXPECTED_API" ]; then
+    echo "tier.sh: $CORE_DIR/scripts/output-budget.sh is there, but does not" >&2
+    echo "         answer --version with '$EXPECTED_API'. That is a broken or" >&2
+    echo "         far too old rust-fs-core, not an absent one, so this stops" >&2
+    echo "         here rather than running a wrapper that has not said what it is." >&2
     exit 1
 fi
 
@@ -93,7 +128,7 @@ esac
 # which print no harness summary, and "0 tests executed" would read as a
 # tier that had stopped running rather than one that never counted this
 # way.
-"$BUDGET" \
+bash "$BUDGET" \
     --log "$REPO/tmp/logs/$LOG_NAME.log" \
     --max-lines "$MAX_LINES" \
     --max-bytes "$MAX_BYTES" \
