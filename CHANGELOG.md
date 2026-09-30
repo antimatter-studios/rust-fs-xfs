@@ -8,6 +8,45 @@ never does.
 
 ### Added
 
+- The tools write their own man pages and shell completions (`rust-fs-xfs
+  generate man|completions SHARE`): a section-1 page per name and per
+  `fs.xfs` subcommand, and zsh, bash and fish completions, which
+  `chore cli:install` stages and the release tarball carries under
+  `share/`. `clap_complete` and `clap_mangen` (MIT/Apache-2.0) join clap
+  behind the `cli` feature (#271).
+
+### Fixed
+
+- `create_file` and `create_directory` write the kind's type bits into
+  `di_mode` when given a mode of permissions only, where `0o644` used to
+  make an inode of no type; a mode whose type bits name another kind is
+  refused. A new inode's atime, mtime, ctime and crtime are the time of the
+  create, where they were the free slot's own, which is 1970 on a fresh
+  volume (#276).
+
+## [0.9.0] — 2026-09-30
+
+### Breaking
+
+- **In-image paths cross the C ABI as bytes, not UTF-8 (#269).**
+  `fs_xfs_stat`, `_dir_open`, `_read_file`, `_readlink`, `_write_file`,
+  `_truncate` and `_set_attributes` read their `const char *` as the bytes
+  up to the NUL and compare them byte for byte against the names in the
+  image; they no longer decode it. `fs_xfs_dir_next` already reported names
+  as raw bytes, so the library handed out names it then refused with "not
+  valid UTF-8". A path naming no file is now reported as missing
+  (`ENOENT`), not as a bad argument, and the write entry points name the
+  same files the read ones do.
+
+  **Source-compatible for every caller passing UTF-8**, because UTF-8 is a
+  byte string too. `open_bytes`, `lookup_path_bytes`, `read_path_bytes` and
+  `list_path_bytes` carry the resolution and the `&str` forms wrap them, so
+  the Rust API is unchanged. `fs_xfs_mount` and `fs_xfs_mount_rw` keep
+  their UTF-8 decode: their argument is a path on the host filesystem, not
+  an in-image name.
+
+### Added
+
 - Releases carry a build-provenance attestation: the published `.crate` is
   attached to the GitHub release for its tag, checked first against the
   crates.io checksum, and verifiable with `gh attestation verify` (see the
@@ -410,6 +449,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.9.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.2...v0.6.0

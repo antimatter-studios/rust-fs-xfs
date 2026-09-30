@@ -614,3 +614,130 @@ fn a_default_volume_still_mounts_for_writing() {
         Err(other) => panic!("a default volume must be writable, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// What a create is given, and what it makes of it (#276)
+// ---------------------------------------------------------------------
+
+/// A writable view of an empty default volume, held in memory.
+///
+/// `xfs-default.img` rather than the data fixture: a create needs nothing
+/// in the root, and this is the smallest volume the fixture set has.
+fn mount_rw_empty() -> Filesystem {
+    let img = common::fixture("xfs-default.img");
+    Filesystem::mount_rw(Arc::new(ScratchOverlay::over(&img))).expect("mount read-write")
+}
+
+/// A mode of permissions only makes the kind of inode that was asked for.
+///
+/// `di_mode` carries the file-type bits as well as the permissions, and
+/// the create wrote whatever it was given into it. A caller passing
+/// `0o644`, which is the ordinary reading of "mode", got an inode of no
+/// type at all — and the driver's own write path then refused it as not
+/// a regular file, as the kernel and `xfs_repair` would.
+#[test]
+fn a_mode_of_permissions_only_is_not_an_inode_of_no_type() {
+    let fs = mount_rw_empty();
+    let root = fs.superblock().rootino;
+
+    let (file, _) = fs
+        .create_file(root, b"perms-only", 0o644)
+        .expect("create a file with a permissions-only mode");
+    let inode = fs.read_inode(file).expect("read the new file");
+    assert_eq!(
+        inode.mode, 0o100644,
+        "the new file's di_mode must carry S_IFREG as well as the permissions"
+    );
+    fs.write_into_empty_file(file, b"written")
+        .expect("a file this driver created must be one its own write path accepts");
+
+    let (dir, _) = fs
+        .create_directory(root, b"perms-only-dir", 0o755)
+        .expect("create a directory with a permissions-only mode");
+    let inode = fs.read_inode(dir).expect("read the new directory");
+    assert_eq!(
+        inode.mode, 0o040755,
+        "the new directory's di_mode must carry S_IFDIR as well as the permissions"
+    );
+    assert!(inode.is_dir());
+}
+
+/// A mode whose type bits name a different kind is refused, not written.
+///
+/// A symlink's or a directory's type in a `create_file` is a caller that
+/// has confused two things, and either answer other than a refusal — the
+/// bits as given, or the bits quietly replaced — hides that from them.
+#[test]
+fn a_mode_whose_type_disagrees_with_the_create_is_refused() {
+    let fs = mount_rw_empty();
+    let root = fs.superblock().rootino;
+
+    for (what, result) in [
+        (
+            "create_file with a directory's type",
+            fs.create_file(root, b"wrong-a", 0o040755),
+        ),
+        (
+            "create_file with a symlink's type",
+            fs.create_file(root, b"wrong-b", 0o120777),
+        ),
+        (
+            "create_directory with a regular file's type",
+            fs.create_directory(root, b"wrong-c", 0o100644),
+        ),
+    ] {
+        assert!(result.is_err(), "{what} was accepted: {result:?}");
+    }
+    assert!(
+        matches!(fs.lookup_path("/wrong-a"), Err(Error::NotFound))
+            && matches!(fs.lookup_path("/wrong-b"), Err(Error::NotFound))
+            && matches!(fs.lookup_path("/wrong-c"), Err(Error::NotFound)),
+        "a refused create must leave no name behind"
+    );
+
+    // The refusals spent nothing: the matching type still goes through.
+    fs.create_file(root, b"right", 0o100644)
+        .expect("a mode whose type bits agree is accepted");
+}
+
+/// A new inode is stamped with the time it was made, not left at 1970.
+///
+/// The core is copied from the free inode's slot, and on a fresh volume
+/// that slot's times are zero. The kernel's `xfs_init_new_inode` sets
+/// atime, mtime and ctime to the current time, and on v5 crtime too.
+#[test]
+fn a_created_inode_is_stamped_with_the_time_it_was_made() {
+    let fs = mount_rw_empty();
+    let root = fs.superblock().rootino;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after 1970")
+            .as_secs() as i64
+    };
+
+    let before = now();
+    let (file, _) = fs
+        .create_file(root, b"stamped", 0o100644)
+        .expect("create a file");
+    let (dir, _) = fs
+        .create_directory(root, b"stamped-dir", 0o040755)
+        .expect("create a directory");
+    let after = now();
+
+    for (what, ino) in [("file", file), ("directory", dir)] {
+        let inode = fs.read_inode(ino).expect("read the new inode");
+        for (field, t) in [
+            ("atime", inode.atime),
+            ("mtime", inode.mtime),
+            ("ctime", inode.ctime),
+            ("crtime", inode.crtime),
+        ] {
+            assert!(
+                (before..=after).contains(&t.sec),
+                "the new {what}'s {field} is {t:?}, not the time it was made \
+                 ({before}..={after})"
+            );
+        }
+    }
+}

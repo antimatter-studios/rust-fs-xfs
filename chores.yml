@@ -116,7 +116,7 @@ vars:
   # the wrapper from core.
   FS_CORE_REF: v0.2.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
-  LINUX_HARNESS_REF: v0.1.0
+  LINUX_HARNESS_REF: v0.2.0
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
@@ -541,7 +541,7 @@ tasks:
       - scripts/test-verdict.sh unit oracle kernel suite cli
 
   cli:install:
-    desc: 'Build the command-line tools (release, --features cli) and stage them under every name in tmp/cli/bin'
+    desc: 'Build the command-line tools (release, --features cli) and stage them as an install prefix: tmp/cli/bin under every name, tmp/cli/share the man pages and completions'
     # The layout an install has: the multi-call binary as rust-fs-xfs and
     # each dotted name a relative symlink to it. It prints the PATH line;
     # `test:cli` tests whatever PATH finds, so that directory goes first.
@@ -565,17 +565,18 @@ tasks:
     # `ci-test.sh --gate` sums as it does cargo's, and the same gate fails
     # a log that says anything skipped. 83 checks executed when the tier
     # was added (#271, arm64 macOS), 588 with fs.xfs's read verbs, 692 with
-    # the write verbs; the floor is about 95% of that.
+    # the write verbs, 721 with the man pages and completions; the floor is
+    # about 95% of that.
     #
     # MEASURED on the same runs: 11 lines / 390 bytes, then 14 / 470, then
-    # 17 / 552. Every
+    # 17 / 552, then 20 / 631. Every
     # file is three lines when it passes and every tool a doctor line, so a
     # new file is a visible step. Budget half as much again, with room in
     # the bytes for a runner's longer checkout path in the doctor lines.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - 'scripts/tier.sh test:cli cli 26 900 -- scripts/test-cli.sh'
-      - 'scripts/ci-test.sh --gate 657 tmp/logs/cli.log "the cli tier"'
+      - 'scripts/tier.sh test:cli cli 30 1000 -- scripts/test-cli.sh'
+      - 'scripts/ci-test.sh --gate 685 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/

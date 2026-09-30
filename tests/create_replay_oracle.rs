@@ -62,14 +62,18 @@ fn create_and_replay(case: &str, names: &[&str]) {
     let img = scratch.path();
 
     let mut created = Vec::new();
+    let before = unix_now();
     {
         let dev = FileDevice::open_rw(img).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
         let root = fs.superblock().rootino;
 
         let name = names[0];
+        // PERMISSIONS ONLY (#276). `di_mode` carries the type too, and a
+        // caller's `0o644` has to come out a regular file, which the
+        // kernel is asked about below.
         let (ino, lsn) = fs
-            .create_file(root, name.as_bytes(), 0o100644)
+            .create_file(root, name.as_bytes(), 0o644)
             .unwrap_or_else(|e| panic!("{case}: creating {name} must be accepted: {e}"));
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         created.push((name, ino));
@@ -90,6 +94,7 @@ fn create_and_replay(case: &str, names: &[&str]) {
         // number, and the guest's checks below are written for the names
         // the fixture's own list names.
     }
+    let after = unix_now();
 
     // NOTHING ON DISK HOLDS ANY OF THIS; the records do. A read-only
     // mount replays them in memory (#90), so every name created above
@@ -117,7 +122,13 @@ fn create_and_replay(case: &str, names: &[&str]) {
                 r#"
             if [ -f "$m/{n}" ]; then
                 echo "INO_{n} $(stat -c %i "$m/{n}")"
-                echo "MODE_{n} $(stat -c %a "$m/{n})")"
+                echo "MODE_{n} $(stat -c %a "$m/{n}")"
+                # The raw st_mode in hex: type and permissions in one
+                # number, where `%F` says "regular empty file" for a file
+                # of no size.
+                echo "TYPE_{n} $(stat -c %f "$m/{n}")"
+                # Before the write below, which would move them itself.
+                echo "TIMES_{n} $(stat -c '%X %Y %Z %W' "$m/{n}")"
                 echo "SIZE_{n} $(stat -c %s "$m/{n}")"
                 # A created file has to be usable, not merely present.
                 echo "hello" > "$m/{n}" 2>/dev/null && echo "WRITE_{n} ok" \
@@ -209,6 +220,40 @@ fn create_and_replay(case: &str, names: &[&str]) {
             ino.to_string(),
             "{case}: {n} came back as a different inode than was logged\n{out}"
         );
+        let field = |key: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}_{n} ")))
+                .unwrap_or_else(|| panic!("{case}: the VM did not report {key} for {n}:\n{out}"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            field("TYPE"),
+            "81a4",
+            "{case}: {n} was created with mode 0o644 and the kernel does not see \
+             S_IFREG | 0644 (0x81a4)\n{out}"
+        );
+        assert_eq!(field("MODE"), "644", "{case}: {n}'s permissions\n{out}");
+        // The kernel's reading of the times the record gave the inode:
+        // atime, mtime, ctime and birth, each the moment of the create.
+        for (what, t) in ["atime", "mtime", "ctime", "crtime"]
+            .iter()
+            .zip(field("TIMES").split_whitespace())
+        {
+            let t: i64 = t.parse().unwrap_or_else(|_| {
+                panic!("{case}: the kernel's {what} for {n} is {t:?}, not a number\n{out}")
+            });
+            assert!(
+                (before..=after).contains(&t),
+                "{case}: {n}'s {what} is {t}, not the time it was created \
+                 ({before}..={after})\n{out}"
+            );
+        }
+        assert_eq!(
+            field("TIMES").split_whitespace().count(),
+            4,
+            "{case}: the VM did not report all four times for {n}\n{out}"
+        );
         assert!(
             out.contains(&format!("WRITE_{n} ok")),
             "{case}: {n} exists but cannot be written to, so the inode it names is not \
@@ -226,6 +271,15 @@ fn create_and_replay(case: &str, names: &[&str]) {
         repair.contains("REPAIR_RC=0"),
         "{case}: xfs_repair found something wrong after the replay:\n{repair}"
     );
+}
+
+/// Seconds since 1970 on this side's clock, which is the one the driver
+/// stamps a new inode with.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .as_secs() as i64
 }
 
 /// A file created by this driver, used by the kernel.
@@ -449,7 +503,8 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         let root = fs.superblock().rootino;
         let before = fs.read_inode(root).expect("read the root").nlink;
         let (ino, lsn) = fs
-            .create_directory(root, b"newdir", 0o040755)
+            // Permissions only, as for the file above (#276).
+            .create_directory(root, b"newdir", 0o755)
             .expect("the mkdir must be accepted");
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         (ino, before)
@@ -464,6 +519,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         if mount -o loop,nouuid "$img" "$m"; then
             if [ -d "$m/newdir" ]; then echo "IS_DIR"; else echo "NOT_DIR"; fi
             echo "DIR_INO $(stat -c %i "$m/newdir")"
+            echo "DIR_MODE $(stat -c '%F %a' "$m/newdir")"
             echo "DIR_LINKS $(stat -c %h "$m/newdir")"
             echo "PARENT_LINKS $(stat -c %h "$m")"
             echo "DOTDOT $(stat -c %i "$m/newdir/..")"
@@ -543,6 +599,12 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         field("DIR_INO"),
         made.to_string(),
         "the directory came back as a different inode than was logged\n{out}"
+    );
+    assert_eq!(
+        field("DIR_MODE"),
+        "directory 755",
+        "the directory was made with a permissions-only mode, and the kernel reads back \
+         a different type or permissions\n{out}"
     );
     assert_eq!(
         field("EMPTY"),

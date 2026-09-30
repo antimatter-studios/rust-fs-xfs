@@ -293,8 +293,12 @@ The binary is behind the `cli` feature (`cargo build --release --features
 cli --bin rust-fs-xfs`), so the library a consumer links gains no
 dependency. Each release attaches `am-fs-xfs-<version>-<platform>.tar.gz`
 for `darwin-arm64` and `linux-x86_64`: an install prefix (`bin/rust-fs-xfs`,
-`bin/fs.xfs`, `share/rust-fs-xfs/CAVEATS`, `LICENSE`) with the same
-build-provenance attestation as the crate.
+`bin/fs.xfs`, section-1 man pages and zsh, bash and fish completions under
+`share/`, `share/rust-fs-xfs/CAVEATS`, `LICENSE`) with the same
+build-provenance attestation as the crate. The pages and completions are
+written by the binary itself (`rust-fs-xfs generate man|completions SHARE`)
+from the argument definitions it parses with, so they cannot describe a flag
+it does not take.
 
 ## Verifying a release
 
