@@ -27,13 +27,32 @@
 //! filesystem was left: an unmount record means everything before it was
 //! applied, and anything else means it was not.
 //!
-//! Finding the newest record is done by scanning the whole ring for
-//! record headers and taking the greatest sequence number, rather than
-//! by locating the head through the cycle-number discontinuity the way
-//! the kernel does. The kernel is looking for somewhere to write and
-//! needs the exact boundary; this only needs to know which record is
-//! last, and a scan gets there without a wrap-point search that would be
-//! considerably easier to get subtly wrong.
+//! # Finding the newest record
+//!
+//! Every basic block in the ring begins with the cycle it was written in:
+//! a record header carries it in `h_cycle`, and every other block has its
+//! first word replaced by it (the displaced word is kept in the header).
+//! Blocks never written carry cycle zero. So the ring reads as one run of
+//! the current cycle followed by one run of the cycle before it (or of
+//! zeros), and the head of the log is the one place the cycle changes.
+//!
+//! This finds that place the way the kernel's `xlog_find_head` does: the
+//! cycles of the first and last blocks say which case the ring is in, a
+//! binary search finds the change, and the window of
+//! [`HEAD_WINDOW_BLOCKS`] before it is read to confirm that it holds only
+//! the cycle it should. The newest record is then the last header in that
+//! window, and it has to end exactly at the head.
+//!
+//! It used to scan the whole ring for record headers and take the greatest
+//! sequence number, on the reasoning that this needs only to know which
+//! record is last. Every mount paid for that. It was 179 MiB on the volume
+//! #251 measured, read twice by a read-only mount. The scan is still here,
+//! and it is still the answer whenever the search cannot establish one:
+//! a log whose first block was never written, cycles that are not the
+//! shape described above, a window holding a block of the wrong cycle, or
+//! a last record that does not end at the head. Each of those falls back
+//! to the scan rather than trusting a guess, so a log that is not what the
+//! kernel writes costs what it always did and answers as it always did.
 
 use crate::endian::{be32, be64, uuid_at};
 use crate::error::{Error, Result};
@@ -490,9 +509,171 @@ pub fn head(device: &dyn BlockRead, sb: &Superblock) -> Result<Head> {
     })
 }
 
+/// The record with the greatest sequence number in the ring, or `None`
+/// if it holds no records at all.
+///
+/// Found by the cycle search in [`newest_record_by_cycle`] where that can
+/// establish an answer, and by reading the whole ring where it cannot. See
+/// the module documentation.
+pub(crate) fn scan_for_newest_record(
+    device: &dyn BlockRead,
+    sb: &Superblock,
+    log_start: u64,
+    log_bytes: u64,
+) -> Result<Option<Record>> {
+    if let Some(found) = newest_record_by_cycle(device, sb, log_start, log_bytes)? {
+        return Ok(Some(found));
+    }
+    scan_whole_ring(device, sb, log_start, log_bytes)
+}
+
+/// How far back from the head the cycle search confirms the ring, in basic
+/// blocks: the kernel's `XLOG_TOTAL_REC_SHIFT`, eight in-core logs of the
+/// largest record size, 256 KiB. That is 2 MiB.
+///
+/// The kernel writes up to eight in-core logs at once, and they can land
+/// out of order. So a crash can leave a block of the previous cycle a
+/// little before the point where the cycle appears to change. A window
+/// that contains such a block is not a head this module will trust, and
+/// the whole ring is scanned instead. The window is also where the last
+/// record header is looked for, and a record is at most 256 KiB.
+pub const HEAD_WINDOW_BLOCKS: u64 = (8 * 256 * 1024 / BBSIZE) as u64;
+
+/// The cycle a basic block was written in.
+///
+/// A record header carries it in `h_cycle`, since its first word is the
+/// magic number. Every other block has its first word replaced by it.
+fn cycle_of(block: &[u8]) -> u32 {
+    if be32(block, offsets::MAGICNO) == XLOG_HEADER_MAGIC {
+        be32(block, offsets::CYCLE)
+    } else {
+        be32(block, 0)
+    }
+}
+
+/// The newest record, found from the cycle numbers rather than by reading
+/// the whole ring. It returns `None` whenever the log does not have the
+/// shape the search relies on, and the caller then scans the ring.
+///
+/// Never returns "the log is empty". A log whose first block carries cycle
+/// zero goes to the scan, which is the only thing that can say no header
+/// is anywhere in it.
+fn newest_record_by_cycle(
+    device: &dyn BlockRead,
+    sb: &Superblock,
+    log_start: u64,
+    log_bytes: u64,
+) -> Result<Option<Record>> {
+    let total = log_bytes / BBSIZE as u64;
+    if total < 2 {
+        return Ok(None);
+    }
+    let mut one = vec![0u8; BBSIZE];
+    let mut cycle_at = |bb: u64| -> Result<u32> {
+        device.read_at(log_start + bb * BBSIZE as u64, &mut one)?;
+        Ok(cycle_of(&one))
+    };
+
+    let first = cycle_at(0)?;
+    if first == 0 {
+        return Ok(None);
+    }
+    let last = cycle_at(total - 1)?;
+
+    // WHERE THE CYCLE CHANGES, and what the blocks before the window's
+    // start (if the window wraps) must carry.
+    //
+    // - `last == first`: the whole ring is one cycle, and the head is at
+    //   its end. The next record starts over at block 0.
+    // - `last == 0`: the ring has not wrapped yet. The head is the first
+    //   block never written.
+    // - `last == first - 1`: it has wrapped. The head is the first block
+    //   still carrying the previous cycle.
+    //
+    // Anything else is not a ring the kernel wrote.
+    let (head, older) = if last == first {
+        (total, None)
+    } else if last == 0 || first.checked_sub(1) == Some(last) {
+        // Binary search between a block known to be `first` and one known
+        // to be `last`. A block that is neither is not this shape.
+        let (mut lo, mut hi) = (0u64, total - 1);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            let c = cycle_at(mid)?;
+            if c == last {
+                hi = mid;
+            } else if c == first {
+                lo = mid;
+            } else {
+                return Ok(None);
+            }
+        }
+        (hi, (last != 0).then_some(last))
+    } else {
+        return Ok(None);
+    };
+
+    // THE WINDOW BEFORE THE HEAD, in the order it was written. When the
+    // head is nearer the start than the window is long and the ring has
+    // wrapped, the window continues from the end of the ring, and those
+    // blocks belong to the previous cycle.
+    let window = HEAD_WINDOW_BLOCKS.min(total);
+    let mut blocks: Vec<(u64, u32, Vec<u8>)> = Vec::new();
+    let mut read_run = |from: u64, count: u64, expect: u32| -> Result<bool> {
+        let mut buf = vec![0u8; (count as usize) * BBSIZE];
+        device.read_at(log_start + from * BBSIZE as u64, &mut buf)?;
+        for (i, block) in buf.chunks_exact(BBSIZE).enumerate() {
+            if cycle_of(block) != expect {
+                return Ok(false);
+            }
+            blocks.push((from + i as u64, expect, block.to_vec()));
+        }
+        Ok(true)
+    };
+    if head < window {
+        if let Some(older) = older {
+            let wrapped = window - head;
+            if !read_run(total - wrapped, wrapped, older)? {
+                return Ok(None);
+            }
+        }
+        if !read_run(0, head, first)? {
+            return Ok(None);
+        }
+    } else if !read_run(head - window, window, first)? {
+        return Ok(None);
+    }
+
+    // THE LAST RECORD HEADER BEFORE THE HEAD, which has to end exactly at
+    // it. One that ends short or long means a record the head search does
+    // not account for, and the scan decides instead.
+    let Some((bb, _, header)) = blocks.iter().rev().find(|(_, _, b)| {
+        be32(b, offsets::MAGICNO) == XLOG_HEADER_MAGIC && uuid_at(b, offsets::FS_UUID) == sb.uuid
+    }) else {
+        return Ok(None);
+    };
+    let header_blocks = header_blocks(header);
+    let len = be32(header, offsets::LEN);
+    let mut end = bb + header_blocks + u64::from(len).div_ceil(BBSIZE as u64);
+    if end > total {
+        end -= total;
+    }
+    if end != head {
+        return Ok(None);
+    }
+    Ok(Some(Record {
+        bb: *bb,
+        lsn: be64(header, offsets::LSN),
+        num_logops: be32(header, offsets::NUM_LOGOPS),
+        len,
+        header_blocks,
+        header: header.clone(),
+    }))
+}
+
 /// Walk the ring and return the record with the greatest sequence
 /// number, or `None` if it holds no records at all.
-pub(crate) fn scan_for_newest_record(
+fn scan_whole_ring(
     device: &dyn BlockRead,
     sb: &Superblock,
     log_start: u64,
@@ -1142,5 +1323,212 @@ mod tests {
         h[offsets::SIZE..offsets::SIZE + 4]
             .copy_from_slice(&(XLOG_HEADER_CYCLE_SIZE * 4).to_be_bytes());
         assert_eq!(header_blocks(&h), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // The head search (#251)
+    // -----------------------------------------------------------------
+
+    /// A log big enough that the head window is a fraction of it: 1000
+    /// blocks of 4 KiB, 8000 basic blocks, against a window of 4096.
+    const BIG_LOGBLOCKS: u32 = 1000;
+
+    /// Stamp `cycle` into the first word of every basic block in `bbs`,
+    /// as the kernel does to every block of a record it writes.
+    fn stamp(dev: &MemDev, log_at: u64, bbs: std::ops::Range<u64>, cycle: u32) {
+        let mut b = dev.0.lock().unwrap();
+        for bb in bbs {
+            let at = (log_at + bb * BBSIZE as u64) as usize;
+            b[at..at + 4].copy_from_slice(&cycle.to_be_bytes());
+        }
+    }
+
+    /// A record as the kernel lays one down: a header at `bb` in `cycle`,
+    /// `data` basic blocks of payload after it, and every block stamped.
+    /// The payload may run past the end of the ring, and the part that
+    /// wraps is stamped with the next cycle, as the kernel's
+    /// `xlog_split_iclog` does.
+    fn kernel_record(dev: &MemDev, log_at: u64, bb: u64, cycle: u32, data: u64, ops: u32) {
+        let total = u64::from(ring_blocks_of(dev, log_at));
+        put_record(dev, log_at, bb, cycle, bb as u32, ops);
+        set_len(dev, log_at, bb, (data * BBSIZE as u64) as u32);
+        for k in 1..=data {
+            let at = bb + k;
+            if at < total {
+                stamp(dev, log_at, at..at + 1, cycle);
+            } else {
+                stamp(dev, log_at, at - total..at - total + 1, cycle + 1);
+            }
+        }
+    }
+
+    /// The ring's length in basic blocks, from the device the helpers
+    /// above built for it.
+    fn ring_blocks_of(dev: &MemDev, log_at: u64) -> u32 {
+        ((dev.0.lock().unwrap().len() as u64 - log_at) / BBSIZE as u64) as u32
+    }
+
+    /// Fill `bbs` with one-block records of `cycle`, back to back, the
+    /// last of them an unmount record when `clean`.
+    fn fill(dev: &MemDev, log_at: u64, bbs: std::ops::Range<u64>, cycle: u32, clean: bool) {
+        let last = bbs.end - 2;
+        for bb in bbs.step_by(2) {
+            let ops = if bb == last && clean { 1 } else { 3 };
+            kernel_record(dev, log_at, bb, cycle, 1, ops);
+            if bb == last && clean {
+                put_op_flags(dev, log_at, bb, XLOG_UNMOUNT_TRANS);
+            }
+        }
+    }
+
+    /// A record found, as its basic block and sequence number.
+    type Found = Option<(u64, u64)>;
+
+    /// What the cycle search and the whole-ring scan each find, and how
+    /// many bytes the search read.
+    fn both(sb: &Superblock, dev: MemDev) -> (Found, Found, u64) {
+        let (log_start, log_bytes) = extent(sb).unwrap();
+        let dev: std::sync::Arc<dyn BlockRead> = std::sync::Arc::new(dev);
+        let counting = fs_core::CountingDevice::new(dev.clone());
+        let fast = newest_record_by_cycle(&counting, sb, log_start, log_bytes)
+            .unwrap()
+            .map(|r| (r.bb, r.lsn));
+        let read = counting.bytes();
+        let full = scan_whole_ring(dev.as_ref(), sb, log_start, log_bytes)
+            .unwrap()
+            .map(|r| (r.bb, r.lsn));
+        (fast, full, read)
+    }
+
+    /// The most the search may read: the window, the two ends, and one
+    /// basic block per step of a binary search over the ring.
+    fn search_bound(sb: &Superblock) -> u64 {
+        let total = u64::from(sb.logblocks) * u64::from(sb.blocksize) / BBSIZE as u64;
+        (HEAD_WINDOW_BLOCKS + 2 + u64::from(64 - total.leading_zeros())) * BBSIZE as u64
+    }
+
+    /// A log as `mkfs.xfs` leaves it: one unmount record at block 0 and
+    /// nothing after it. The head is the first block never written.
+    #[test]
+    fn the_head_of_a_log_that_has_not_wrapped_is_found_without_the_scan() {
+        let sb = sb_with_logblocks(BIG_LOGBLOCKS);
+        let (dev, log_at) = device(&sb);
+        kernel_record(&dev, log_at, 0, 1, 1, 1);
+        put_op_flags(&dev, log_at, 0, XLOG_UNMOUNT_TRANS);
+        let (fast, full, read) = both(&sb, dev);
+        assert_eq!(fast, Some((0, 1 << 32)), "the search found the record");
+        assert_eq!(fast, full, "and it is the one the scan finds");
+        assert!(read <= search_bound(&sb), "the search read {read} bytes");
+    }
+
+    /// A ring well into its first cycle, and one that has wrapped: every
+    /// block written, the current cycle up to the head and the previous one
+    /// after it. Both states, and a head far from the start and near it,
+    /// where the window wraps back to the end of the ring.
+    #[test]
+    fn the_head_of_a_wrapped_log_is_the_newest_record_the_scan_finds() {
+        let sb = sb_with_logblocks(BIG_LOGBLOCKS);
+        let total = u64::from(BIG_LOGBLOCKS) * u64::from(BLOCKSIZE) / BBSIZE as u64;
+        for head in [6u64, 2000, 6000, total - 2] {
+            for clean in [true, false] {
+                let (dev, log_at) = device(&sb);
+                fill(&dev, log_at, 0..total, 4, false);
+                fill(&dev, log_at, 0..head, 5, clean);
+                let (fast, full, read) = both(&sb, dev);
+                let want = Some((head - 2, (5u64 << 32) | (head - 2)));
+                assert_eq!(fast, want, "head {head}: the search found the last record");
+                assert_eq!(fast, full, "head {head}: and it is the one the scan finds");
+                assert!(read <= search_bound(&sb), "head {head}: read {read} bytes");
+            }
+        }
+
+        // A first cycle, not yet wrapped, and one that ends exactly at the
+        // end of the ring.
+        for head in [2000u64, total] {
+            let (dev, log_at) = device(&sb);
+            fill(&dev, log_at, 0..head, 1, true);
+            let (fast, full, read) = both(&sb, dev);
+            assert_eq!(fast, Some((head - 2, (1u64 << 32) | (head - 2))));
+            assert_eq!(fast, full, "head {head}");
+            assert!(read <= search_bound(&sb), "head {head}: read {read} bytes");
+        }
+    }
+
+    /// A record the kernel split across the end of the ring: its header is
+    /// in the last block and its payload continues at block 0, stamped with
+    /// the next cycle.
+    #[test]
+    fn a_record_that_wraps_the_ring_is_found_from_its_header_at_the_end() {
+        let sb = sb_with_logblocks(BIG_LOGBLOCKS);
+        let total = u64::from(BIG_LOGBLOCKS) * u64::from(BLOCKSIZE) / BBSIZE as u64;
+        let (dev, log_at) = device(&sb);
+        fill(&dev, log_at, 0..total - 2, 4, false);
+        stamp(&dev, log_at, total - 2..total - 1, 4);
+        kernel_record(&dev, log_at, total - 1, 4, 3, 1);
+        let (fast, full, _) = both(&sb, dev);
+        assert_eq!(fast, Some((total - 1, (4u64 << 32) | (total - 1))));
+        assert_eq!(fast, full);
+    }
+
+    /// Whatever the search cannot account for goes to the scan, and so
+    /// answers as the scan always did: a block of the previous cycle
+    /// inside the window (the kernel's out-of-order in-core log writes), a
+    /// last record that ends short of the head, and a first block that was
+    /// never written.
+    #[test]
+    fn a_log_the_search_cannot_account_for_is_left_to_the_scan() {
+        let sb = sb_with_logblocks(BIG_LOGBLOCKS);
+        let total = u64::from(BIG_LOGBLOCKS) * u64::from(BLOCKSIZE) / BBSIZE as u64;
+
+        // A hole of the previous cycle just before the head.
+        let (dev, log_at) = device(&sb);
+        fill(&dev, log_at, 0..total, 4, false);
+        fill(&dev, log_at, 0..3000, 5, true);
+        stamp(&dev, log_at, 2991..2992, 4);
+        let (fast, full, _) = both(&sb, dev);
+        assert_eq!(fast, None, "a hole in the window is not a head to trust");
+        assert!(full.is_some());
+
+        // A last record claiming more payload than lies before the head.
+        let (dev, log_at) = device(&sb);
+        fill(&dev, log_at, 0..3000, 1, true);
+        set_len(&dev, log_at, 2998, 4 * BBSIZE as u32);
+        let (fast, _, _) = both(&sb, dev);
+        assert_eq!(fast, None, "a record that does not end at the head");
+
+        // A header in the middle of a ring whose first block is zero.
+        let (dev, log_at) = device(&sb);
+        kernel_record(&dev, log_at, 100, 1, 1, 1);
+        let (fast, full, _) = both(&sb, dev);
+        assert_eq!(fast, None, "a first block never written goes to the scan");
+        assert_eq!(full.map(|(bb, _)| bb), Some(100));
+
+        // Cycles that are neither one apart nor zero.
+        let (dev, log_at) = device(&sb);
+        fill(&dev, log_at, 0..total, 2, false);
+        fill(&dev, log_at, 0..3000, 5, true);
+        let (fast, _, _) = both(&sb, dev);
+        assert_eq!(fast, None, "cycles 5 and 2 are not one ring");
+    }
+
+    /// `inspect` and `head` give the answers they gave before, through the
+    /// search, on a wrapped ring.
+    #[test]
+    fn inspect_and_head_answer_through_the_search() {
+        let sb = sb_with_logblocks(BIG_LOGBLOCKS);
+        let total = u64::from(BIG_LOGBLOCKS) * u64::from(BLOCKSIZE) / BBSIZE as u64;
+        for clean in [true, false] {
+            let (dev, log_at) = device(&sb);
+            fill(&dev, log_at, 0..total, 4, false);
+            fill(&dev, log_at, 0..3000, 5, clean);
+            let want = if clean {
+                LogState::CleanlyUnmounted
+            } else {
+                LogState::NeedsReplay
+            };
+            assert_eq!(inspect(&dev, &sb).unwrap(), want);
+            let h = head(&dev, &sb).unwrap();
+            assert_eq!((h.block, h.cycle, h.prev_block), (3000, 5, 2998));
+        }
     }
 }
