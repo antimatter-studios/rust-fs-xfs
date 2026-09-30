@@ -11,10 +11,10 @@
  * calling thread and fs_xfs_last_errno() a POSIX errno suitable for
  * returning to a filesystem client.
  *
- * The driver is read-only. It refuses rather than guesses: a volume
- * whose log needs replaying, an inode on the real-time device, or a
- * B+tree-format fork all produce an error rather than partial data,
- * because silently wrong file contents cannot be detected by a caller.
+ * It refuses rather than guesses. A realtime file's data, for example,
+ * is on a second device this interface does not take, so reading it
+ * fails with ENXIO rather than returning partial data. Silently wrong
+ * file contents cannot be detected by a caller.
  */
 
 #ifndef FS_XFS_H

@@ -78,6 +78,19 @@ pub enum Error {
     /// read-only or the driver has no write path for this structure.
     ReadOnly,
 
+    /// The inode keeps its data on the volume's realtime device, and this
+    /// mount was not given one (#98).
+    ///
+    /// Distinct from [`Error::UnsupportedFeature`] on purpose. Nothing is
+    /// unsupported: the data is on another device, and a caller that has
+    /// it can mount again with [`crate::fs::Filesystem::mount_with_realtime`].
+    /// A layer above can say exactly that, which it cannot do with a
+    /// refusal that means a dozen different things.
+    RealtimeDeviceAbsent {
+        /// The inode whose data is on the realtime device.
+        ino: u64,
+    },
+
     /// An invariant of this driver's own layout arithmetic did not hold.
     ///
     /// Not a property of the volume: the caller did nothing wrong and
@@ -119,6 +132,11 @@ impl fmt::Display for Error {
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
+            Error::RealtimeDeviceAbsent { ino } => write!(
+                f,
+                "inode {ino} keeps its data on the realtime device, and this mount was \
+                 not given one"
+            ),
             Error::Internal(m) => write!(f, "internal consistency check failed: {m}"),
         }
     }
