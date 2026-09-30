@@ -6,6 +6,14 @@ never does.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`Error` gains `RealtimeDeviceAbsent { ino }`.** Reading a realtime
+  file's data on a mount that was not given the realtime device returns it,
+  where it used to be `UnsupportedFeature`, and the C ABI reports it as
+  ENXIO rather than ENOTSUP. `Error` is not `#[non_exhaustive]`, so an
+  exhaustive `match` on it needs a new arm (#98).
+
 ### Added
 
 - The tools write their own man pages and shell completions (`rust-fs-xfs
@@ -14,6 +22,10 @@ never does.
   `chore cli:install` stages and the release tarball carries under
   `share/`. `clap_complete` and `clap_mangen` (MIT/Apache-2.0) join clap
   behind the `cli` feature (#271).
+- `Filesystem::mount_with_realtime(data, realtime)` reads the files on a
+  volume's realtime section from its realtime device, byte for byte as the
+  kernel reads them; `mount` alone still mounts such a volume and reads
+  everything else (#98).
 
 ### Fixed
 

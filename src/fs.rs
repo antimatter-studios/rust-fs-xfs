@@ -108,6 +108,12 @@ pub struct Filesystem {
     /// an in-place write has since put there. So the in-place fence looks
     /// at this, and nothing clears it.
     pub(crate) logged_anything: std::sync::atomic::AtomicBool,
+    /// The realtime device, when the volume has a realtime section and the
+    /// caller supplied it (#98). A realtime inode's extents are addressed
+    /// there, in filesystem blocks from its start; everything else,
+    /// including the B+tree blocks of a realtime inode's map, is on
+    /// `device`.
+    pub(crate) realtime: Option<Arc<dyn BlockRead>>,
 }
 
 /// How many filesystem blocks a mount caches by default.
@@ -503,6 +509,7 @@ impl Filesystem {
             next_head: Mutex::new(None),
             wraps: std::sync::atomic::AtomicUsize::new(0),
             logged_anything: std::sync::atomic::AtomicBool::new(false),
+            realtime: None,
         };
         // THE UNLINKED LIST IS ONLY CHECKED ON A VOLUME NOTHING
         // REPLAYED. An inode left on it is one that was open when it was
@@ -518,6 +525,50 @@ impl Filesystem {
         if !replayed {
             fs.refuse_unlinked_inodes()?;
         }
+        Ok(fs)
+    }
+
+    /// Open a volume with a realtime section for reading, given both of
+    /// its devices (#98).
+    ///
+    /// A realtime inode's file data is on `realtime`, addressed in
+    /// filesystem blocks from its start. Everything else is on `device`,
+    /// including the directories, the inodes, and the B+tree blocks of a
+    /// realtime file's map. [`Filesystem::mount`] alone still mounts such a
+    /// volume and reads everything but realtime file data, which it refuses
+    /// with [`Error::RealtimeDeviceAbsent`].
+    ///
+    /// Read-only. Allocating on the realtime device needs the realtime
+    /// bitmap and summary inodes, which nothing here maintains, and
+    /// [`Filesystem::mount_rw`] does not take a realtime device.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Filesystem::mount`] can return, and
+    /// [`Error::BadSuperblock`] when the volume has no realtime section or
+    /// `realtime` is smaller than the section the superblock describes.
+    pub fn mount_with_realtime(
+        device: Arc<dyn BlockRead>,
+        realtime: Arc<dyn BlockRead>,
+    ) -> Result<Self> {
+        let mut fs = Self::mount(device)?;
+        if fs.sb.rblocks == 0 {
+            return Err(Error::BadSuperblock(
+                "a realtime device was supplied, and the superblock describes no realtime \
+                 section (sb_rblocks is 0)"
+                    .into(),
+            ));
+        }
+        let needed = fs.sb.rblocks.saturating_mul(u64::from(fs.sb.blocksize));
+        let have = realtime.size_bytes();
+        if have < needed {
+            return Err(Error::BadSuperblock(format!(
+                "the superblock describes a realtime section of {} blocks ({needed} bytes), \
+                 and the realtime device supplied holds {have}",
+                fs.sb.rblocks
+            )));
+        }
+        fs.realtime = Some(realtime);
         Ok(fs)
     }
 
@@ -565,6 +616,7 @@ impl Filesystem {
             next_head: Mutex::new(None),
             wraps: std::sync::atomic::AtomicUsize::new(0),
             logged_anything: std::sync::atomic::AtomicBool::new(false),
+            realtime: None,
         };
         fs.refuse_unmaintained_features()?;
         fs.check_log_is_clean()?;
@@ -911,6 +963,15 @@ impl Filesystem {
                 inode.ino
             )));
         }
+        self.fork_extents(inode, raw)
+    }
+
+    /// The data fork's extents whatever device they address: filesystem
+    /// blocks on the data device, or on the realtime device for a realtime
+    /// inode. Kept private so no caller can take a realtime inode's
+    /// extents for data-device blocks, which is what the refusal in
+    /// [`Filesystem::data_extents`] exists to prevent.
+    fn fork_extents(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
         let (start, end) = inode.data_fork_range(usize::from(self.sb.inodesize));
         match inode.format {
             Format::Extents => extent::parse_list(&raw[start..end], inode.nextents),
@@ -960,7 +1021,16 @@ impl Filesystem {
             return Ok(n);
         }
 
-        let extents = self.data_extents(inode, raw)?;
+        // A REALTIME INODE'S DATA IS ON THE REALTIME DEVICE (#98), in
+        // filesystem blocks from its start. Its map is read like any other.
+        let (extents, data_device): (Vec<Extent>, &dyn BlockRead) = if inode.is_realtime() {
+            let Some(realtime) = self.realtime.as_deref() else {
+                return Err(Error::RealtimeDeviceAbsent { ino: inode.ino });
+            };
+            (self.fork_extents(inode, raw)?, realtime)
+        } else {
+            (self.data_extents(inode, raw)?, self.device.as_ref())
+        };
         let block_size = u64::from(self.sb.blocksize);
         let want = buf.len().min((inode.size - offset) as usize);
 
@@ -980,8 +1050,22 @@ impl Filesystem {
                     let phys = e
                         .map(file_block)
                         .expect("lookup returned a covering extent");
-                    let at = self.block_offset(phys) + within as u64;
-                    self.device.read_at(at, &mut buf[done..done + chunk])?;
+                    let at = if inode.is_realtime() {
+                        // Not packed by group: the realtime section is one
+                        // linear run of blocks. One past its end is a map
+                        // that is wrong, not a read to attempt.
+                        if phys >= self.sb.rblocks {
+                            return Err(Error::BadSuperblock(format!(
+                                "inode {} maps file block {file_block} to realtime block \
+                                 {phys}, past the {}-block realtime section",
+                                inode.ino, self.sb.rblocks
+                            )));
+                        }
+                        phys * block_size + within as u64
+                    } else {
+                        self.block_offset(phys) + within as u64
+                    };
+                    data_device.read_at(at, &mut buf[done..done + chunk])?;
                 }
                 // An unwritten extent has blocks allocated but never
                 // written. Returning what they hold would leak the
@@ -1003,7 +1087,13 @@ impl Filesystem {
     /// this allocation as "capacity overflow", and merely large values
     /// reached it as an abort.
     pub fn read_file(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<u8>> {
-        let filesystem_bytes = self.sb.dblocks.saturating_mul(u64::from(self.sb.blocksize));
+        // The data section and the realtime section together: a realtime
+        // file can be as large as the second.
+        let filesystem_bytes = self
+            .sb
+            .dblocks
+            .saturating_add(self.sb.rblocks)
+            .saturating_mul(u64::from(self.sb.blocksize));
         if inode.size > filesystem_bytes {
             return Err(Error::BadSuperblock(format!(
                 "inode {} says it is {} bytes, and reading it whole would need more \

@@ -56,6 +56,9 @@ fn errno_for(e: &Error) -> c_int {
         Error::NotAFile => libc_eisdir(),
         Error::ReadOnly => libc_erofs(),
         Error::UnsupportedFeature(_) => libc_enotsup(),
+        // The data is on a device this mount was not given: "no such
+        // device", which a client can tell apart from a feature it lacks.
+        Error::RealtimeDeviceAbsent { .. } => libc_enxio(),
         // A volume that is not XFS, is malformed, fails a checksum, or
         // holds an unreplayed log is not something the caller can work
         // around; EIO is the honest answer.
@@ -81,6 +84,10 @@ const fn libc_enoent() -> c_int {
 }
 const fn libc_eio() -> c_int {
     5
+}
+/// `ENXIO` — 6 on both Darwin and Linux.
+const fn libc_enxio() -> c_int {
+    6
 }
 /// `EEXIST` — 17 on both Darwin and Linux.
 const fn libc_eexist() -> c_int {
