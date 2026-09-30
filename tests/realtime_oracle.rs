@@ -193,4 +193,171 @@ fn files_on_a_realtime_section_read_back_as_the_kernel_reads_them() {
         "a 1 MiB realtime device for a 64 MiB section was accepted: {:?}",
         refused.map(|_| ())
     );
+
+    // THE C ABI (#291): the same reads, through both of its realtime
+    // mounts, and the same refusals, as a C caller sees them.
+    let digests: Vec<(&str, String)> = FILES.iter().map(|(f, _)| (*f, report("SHA", f))).collect();
+    capi::reads_through_both_realtime_mounts(data.path(), rt.path(), &digests);
+    capi::refuses_as_the_rust_api_does(data.path(), small_rt.path(), &digests);
+}
+
+/// The realtime volume read through the C ABI (#291).
+mod capi {
+    use super::{sha256_hex, FILES};
+    use fs_xfs::capi::*;
+    use std::ffi::{c_int, c_void, CStr, CString};
+    use std::os::unix::fs::FileExt;
+    use std::path::Path;
+
+    /// Errno values the header documents, spelled out rather than taken
+    /// from the source so the test asserts the contract.
+    const EIO: i32 = 5;
+    const ENXIO: i32 = 6;
+
+    fn cstr(path: &Path) -> CString {
+        CString::new(path.to_str().expect("a UTF-8 scratch path")).expect("no NUL")
+    }
+
+    fn last_error() -> String {
+        unsafe { CStr::from_ptr(fs_xfs_last_error()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A caller-supplied reader over a file, as a C caller would write it.
+    struct Reader {
+        file: std::fs::File,
+    }
+
+    unsafe extern "C" fn read_cb(
+        ctx: *mut c_void,
+        buf: *mut c_void,
+        offset: u64,
+        length: u64,
+    ) -> c_int {
+        let reader = unsafe { &*(ctx as *const Reader) };
+        let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), length as usize) };
+        match reader.file.read_exact_at(out, offset) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }
+
+    /// A callback configuration over `path`, and the reader it points at,
+    /// which the caller frees once the handle is released.
+    fn callbacks(path: &Path) -> (fs_xfs_blockdev_cfg_t, *mut Reader) {
+        let file = std::fs::File::open(path).expect("open a scratch volume");
+        let size = file.metadata().expect("its size").len();
+        let reader = Box::into_raw(Box::new(Reader { file }));
+        let cfg = fs_xfs_blockdev_cfg_t {
+            read: Some(read_cb),
+            context: reader.cast::<c_void>(),
+            size_bytes: size,
+            block_size: 512,
+        };
+        (cfg, reader)
+    }
+
+    /// Every byte of `path` through `fs_xfs_read_file`, or the errno it
+    /// failed with.
+    fn read_all(fs: *mut fs_xfs_fs, path: &str) -> Result<Vec<u8>, i32> {
+        let c = CString::new(path).expect("no NUL");
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = unsafe {
+                fs_xfs_read_file(
+                    fs,
+                    c.as_ptr(),
+                    buf.as_mut_ptr().cast::<c_void>(),
+                    out.len() as u64,
+                    buf.len() as u64,
+                )
+            };
+            match n {
+                -1 => return Err(fs_xfs_last_errno()),
+                0 => return Ok(out),
+                n => out.extend_from_slice(&buf[..n as usize]),
+            }
+        }
+    }
+
+    fn assert_reads_every_file(fs: *mut fs_xfs_fs, how: &str, digests: &[(&str, String)]) {
+        assert!(!fs.is_null(), "{how}: the mount failed: {}", last_error());
+        for (f, digest) in digests {
+            let bytes = read_all(fs, &format!("/{f}"))
+                .unwrap_or_else(|errno| panic!("{how}: /{f}: errno {errno}: {}", last_error()));
+            assert_eq!(
+                &sha256_hex(&bytes),
+                digest,
+                "{how}: /{f}: {} bytes read, and they are not the bytes the kernel reads",
+                bytes.len()
+            );
+        }
+        unsafe { fs_xfs_umount(fs) };
+    }
+
+    pub fn reads_through_both_realtime_mounts(data: &Path, rt: &Path, digests: &[(&str, String)]) {
+        let (data_c, rt_c) = (cstr(data), cstr(rt));
+        let fs = unsafe { fs_xfs_mount_with_realtime(data_c.as_ptr(), rt_c.as_ptr()) };
+        assert_reads_every_file(fs, "fs_xfs_mount_with_realtime", digests);
+
+        let (data_cfg, data_reader) = callbacks(data);
+        let (rt_cfg, rt_reader) = callbacks(rt);
+        let fs = unsafe { fs_xfs_mount_with_realtime_callbacks(&data_cfg, &rt_cfg) };
+        assert_reads_every_file(fs, "fs_xfs_mount_with_realtime_callbacks", digests);
+        drop(unsafe { Box::from_raw(data_reader) });
+        drop(unsafe { Box::from_raw(rt_reader) });
+    }
+
+    pub fn refuses_as_the_rust_api_does(data: &Path, small_rt: &Path, digests: &[(&str, String)]) {
+        let data_c = cstr(data);
+
+        // Without the realtime device: realtime data is ENXIO, which a
+        // client can tell apart from a feature the driver lacks, and the
+        // file on the data device still reads.
+        let fs = unsafe { fs_xfs_mount(data_c.as_ptr()) };
+        assert!(!fs.is_null(), "fs_xfs_mount: {}", last_error());
+        for ((f, realtime), (_, digest)) in FILES.iter().zip(digests) {
+            match read_all(fs, &format!("/{f}")) {
+                Err(errno) if *realtime => assert_eq!(errno, ENXIO, "/{f}: {}", last_error()),
+                Ok(bytes) if !*realtime => assert_eq!(&sha256_hex(&bytes), digest, "/{f}"),
+                other => panic!(
+                    "/{f} (realtime: {realtime}) through fs_xfs_mount: {:?}",
+                    other.map(|b| b.len())
+                ),
+            }
+        }
+        unsafe { fs_xfs_umount(fs) };
+
+        // A realtime device smaller than the section is not the volume's,
+        // through either entry point.
+        let small_c = cstr(small_rt);
+        let fs = unsafe { fs_xfs_mount_with_realtime(data_c.as_ptr(), small_c.as_ptr()) };
+        assert!(
+            fs.is_null(),
+            "fs_xfs_mount_with_realtime took a 1 MiB realtime device"
+        );
+        assert_eq!(fs_xfs_last_errno(), EIO, "{}", last_error());
+
+        let (data_cfg, data_reader) = callbacks(data);
+        let (small_cfg, small_reader) = callbacks(small_rt);
+        let fs = unsafe { fs_xfs_mount_with_realtime_callbacks(&data_cfg, &small_cfg) };
+        assert!(
+            fs.is_null(),
+            "fs_xfs_mount_with_realtime_callbacks took a 1 MiB realtime device"
+        );
+        assert_eq!(fs_xfs_last_errno(), EIO, "{}", last_error());
+        drop(unsafe { Box::from_raw(data_reader) });
+        drop(unsafe { Box::from_raw(small_reader) });
+
+        // No realtime device named at all is a caller's mistake, not a
+        // request for fs_xfs_mount.
+        let fs = unsafe { fs_xfs_mount_with_realtime(data_c.as_ptr(), std::ptr::null()) };
+        assert!(fs.is_null(), "a NULL realtime path mounted");
+        let (data_cfg, data_reader) = callbacks(data);
+        let fs = unsafe { fs_xfs_mount_with_realtime_callbacks(&data_cfg, std::ptr::null()) };
+        assert!(fs.is_null(), "a NULL realtime configuration mounted");
+        drop(unsafe { Box::from_raw(data_reader) });
+    }
 }
