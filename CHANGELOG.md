@@ -41,6 +41,13 @@ never does.
   checked them, and `add_to_block_form` would rebuild such a block as a
   checksum-valid block of the directory it was adding to (#287).
 
+- `fs_xfs_last_errno` is 0 after a successful call. Every entry point
+  resets it on entry, so a clean end of directory reads as errno 0 even
+  on a thread where an earlier lookup failed; before, the errno of the
+  thread's last failure stayed until the next one, and a caller following
+  the header read every later end of directory as a failure. The message
+  is kept until the next failure, as the header already promised (#281).
+
 ## [0.9.0] — 2026-09-30
 
 ### Breaking

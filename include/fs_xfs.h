@@ -9,7 +9,9 @@
  * on failure. Functions returning a pointer return NULL on failure. In
  * either case fs_xfs_last_error() gives a human-readable message for the
  * calling thread and fs_xfs_last_errno() a POSIX errno suitable for
- * returning to a filesystem client.
+ * returning to a filesystem client. Every call resets the errno to 0 on
+ * entry, so after a successful call it is 0 however an earlier call on
+ * the thread ended; the message is kept until the next failure.
  *
  * It refuses rather than guesses. A realtime file's data, for example,
  * is on a second device this interface does not take, so reading it
@@ -112,7 +114,10 @@ typedef struct {
  */
 const char *fs_xfs_last_error(void);
 
-/* POSIX errno for the most recent failure on the calling thread. */
+/*
+ * POSIX errno for the most recent call on the calling thread: 0 when it
+ * succeeded, what went wrong when it failed. Not sticky, unlike errno(3).
+ */
 int fs_xfs_last_errno(void);
 
 /* ---- mounting ---- */

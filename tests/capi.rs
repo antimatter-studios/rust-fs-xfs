@@ -188,6 +188,73 @@ fn iterates_a_directory_to_completion() {
     unsafe { fs_xfs_umount(fs) };
 }
 
+/// The header promises `fs_xfs_last_errno` is 0 at a clean end of
+/// directory, which is how a caller tells the end from a failure. That
+/// has to hold on a thread that failed earlier: a lookup of a name that
+/// is not there is routine, and it must not make every later end of
+/// directory read as an error (#281).
+#[test]
+fn a_clean_end_of_directory_is_errno_zero_after_an_earlier_failure() {
+    let fs = mount();
+    let mut a = zeroed_attr();
+    assert_eq!(
+        unsafe { fs_xfs_stat(fs, cstr("/no-such-file").as_ptr(), &mut a) },
+        -1
+    );
+    assert_eq!(
+        fs_xfs_last_errno(),
+        ENOENT,
+        "the setup failure must be ENOENT"
+    );
+
+    let iter = unsafe { fs_xfs_dir_open(fs, cstr("/").as_ptr()) };
+    assert!(!iter.is_null(), "opening the root failed: {}", last_error());
+    let mut entries = 0;
+    while !unsafe { fs_xfs_dir_next(iter) }.is_null() {
+        entries += 1;
+    }
+    assert!(entries > 0, "the root listed nothing");
+    assert_eq!(
+        fs_xfs_last_errno(),
+        0,
+        "a clean end of directory must read as errno 0, not the earlier failure's"
+    );
+    unsafe { fs_xfs_dir_close(iter) };
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// A success reports errno 0 on every entry point, not only the
+/// iterator, so a caller that checks the errno after a call it cannot
+/// judge by the return value alone is never handed a stale one.
+#[test]
+fn a_successful_call_resets_the_errno_to_zero() {
+    let fs = mount();
+    let mut a = zeroed_attr();
+    assert_eq!(
+        unsafe { fs_xfs_stat(fs, cstr("/no-such-file").as_ptr(), &mut a) },
+        -1
+    );
+    assert_eq!(fs_xfs_last_errno(), ENOENT);
+    let message = last_error();
+    assert_eq!(
+        unsafe { fs_xfs_stat(fs, cstr("/small.txt").as_ptr(), &mut a) },
+        0,
+        "stat of /small.txt failed: {}",
+        last_error()
+    );
+    assert_eq!(
+        fs_xfs_last_errno(),
+        0,
+        "a successful stat must reset the errno"
+    );
+    assert_eq!(
+        last_error(),
+        message,
+        "the message describes the most recent failure and is kept until the next one"
+    );
+    unsafe { fs_xfs_umount(fs) };
+}
+
 /// The 400-entry directory is the one that is not in short form, so it
 /// exercises the block/leaf path through the ABI.
 #[test]
