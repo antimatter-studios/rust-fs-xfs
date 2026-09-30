@@ -222,6 +222,32 @@ impl Timestamp {
     }
 }
 
+/// Which of an inode's times a change moves: the kernel's
+/// `xfs_trans_ichgtime` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Changed {
+    /// `XFS_ICHGTIME_CHG` alone: what the inode says about itself changed
+    /// and its contents did not, as for a file that is renamed.
+    Status,
+    /// `XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG`: its contents changed, as a
+    /// directory's do when an entry is added, removed or renamed.
+    Contents,
+}
+
+/// Stamp an inode core with the time of a change to it (#279).
+///
+/// ctime always, and mtime too when the contents changed, in whichever
+/// encoding the core uses. A directory whose entries changed and kept its
+/// old mtime is one every tool that decides from the mtime whether to
+/// rescan — `make`, `rsync --update`, a backup — never looks at again.
+pub(crate) fn stamp_change(core: &mut [u8], when: Timestamp, changed: Changed) {
+    let bigtime = core[offsets::VERSION] >= 3 && be64(core, offsets::FLAGS2) & flags2::BIGTIME != 0;
+    when.encode(core, offsets::CTIME, bigtime);
+    if changed == Changed::Contents {
+        when.encode(core, offsets::MTIME, bigtime);
+    }
+}
+
 /// Inode flags (`di_flags`) this driver acts on.
 pub mod flags {
     /// The inode's extents are on the real-time device.
@@ -726,5 +752,38 @@ mod tests {
         let inode = Inode::parse(&buf, &sb, 128).unwrap();
         assert_eq!(inode.atime.sec, BIGTIME_EPOCH_OFFSET_SECS + 1);
         assert_eq!(inode.atime.nsec, 0);
+    }
+
+    /// A contents change moves mtime and ctime, a status change ctime
+    /// alone, and neither touches atime, in either encoding (#279). The
+    /// kernel's reading of the result is `tests/*_oracle.rs`'s to check.
+    #[test]
+    fn a_change_stamps_the_times_it_moves() {
+        let when = Timestamp {
+            sec: 1_790_000_000,
+            nsec: 5,
+        };
+        let old = Timestamp {
+            sec: 1_000,
+            nsec: 0,
+        };
+        for bigtime in [false, true] {
+            for (changed, mtime) in [(Changed::Contents, when), (Changed::Status, old)] {
+                let mut core = vec![0u8; XFS_DINODE_V3_SIZE];
+                core[offsets::VERSION] = 3;
+                if bigtime {
+                    core[offsets::FLAGS2..offsets::FLAGS2 + 8]
+                        .copy_from_slice(&flags2::BIGTIME.to_be_bytes());
+                }
+                for at in [offsets::ATIME, offsets::MTIME, offsets::CTIME] {
+                    old.encode(&mut core, at, bigtime);
+                }
+                stamp_change(&mut core, when, changed);
+                let at = |off| Timestamp::parse(&core, off, bigtime);
+                assert_eq!(at(offsets::CTIME), when, "{changed:?} bigtime={bigtime}");
+                assert_eq!(at(offsets::MTIME), mtime, "{changed:?} bigtime={bigtime}");
+                assert_eq!(at(offsets::ATIME), old, "{changed:?} bigtime={bigtime}");
+            }
+        }
     }
 }

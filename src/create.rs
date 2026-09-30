@@ -62,14 +62,15 @@
 //! of the create, which is what the kernel's `xfs_init_new_inode` does. The
 //! free slot's own were left in place until #276, and on a fresh volume
 //! that is zero: every file this driver made was dated 1970. The parent's
-//! times are still left alone, as [`crate::dir_write`] leaves them.
+//! mtime and ctime are the same moment, because its entries changed then
+//! and the kernel's `xfs_create` stamps them with it (#279).
 
 use crate::dir;
 use crate::dir_block;
 use crate::error::{Error, Result};
 use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
-use crate::inode::{offsets as inode_offsets, Format, Timestamp};
+use crate::inode::{offsets as inode_offsets, stamp_change, Changed, Format, Timestamp};
 use crate::inode_btree::{choose_free_inode, InodeChunk, Taken};
 use crate::log_write::{
     inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
@@ -188,7 +189,7 @@ fn typed_mode(mode: u16, kind: Kind) -> Result<u16> {
 /// A clock before 1970 is a clock that is wrong, and is represented as the
 /// negative time it says rather than refused: a create is no place to
 /// fail over the host's clock, and the kernel does not either.
-fn clock_now() -> Timestamp {
+pub(crate) fn clock_now() -> Timestamp {
     use std::time::{SystemTime, UNIX_EPOCH};
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => Timestamp {
@@ -934,6 +935,11 @@ impl Filesystem {
         let at = core_at::CHANGECOUNT;
         let now = u64::from_be_bytes(dir_core[at..at + 8].try_into().expect("8 bytes"));
         dir_core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+        // ONE CLOCK READING FOR BOTH (#279): the parent's entries changed at
+        // the moment the child was made, and the kernel's `xfs_create` stamps
+        // the parent's mtime and ctime with the time it gives the child.
+        let when = clock_now();
+        stamp_change(&mut dir_core, when, Changed::Contents);
 
         // The new inode, read rather than built — see the note at the
         // top on why the identity fields make that the safer of the two.
@@ -965,7 +971,7 @@ impl Filesystem {
             Kind::File => Vec::new(),
             Kind::Directory => empty_short_form_dir(parent),
         };
-        let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64, clock_now());
+        let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64, when);
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;

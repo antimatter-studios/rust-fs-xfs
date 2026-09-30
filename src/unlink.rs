@@ -48,11 +48,12 @@
 //!   the chunk this may put back;
 //! - a v4 filesystem.
 
+use crate::create::clock_now;
 use crate::dir;
 use crate::error::{Error, Result};
 use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
-use crate::inode::Format;
+use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
     inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
     Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
@@ -225,6 +226,9 @@ impl Filesystem {
         let at = core_at::CHANGECOUNT;
         let now = u64::from_be_bytes(dir_core[at..at + 8].try_into().expect("8 bytes"));
         dir_core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+        // The directory lost an entry, and the kernel's `xfs_remove` stamps
+        // its mtime and ctime with the moment it did (#279).
+        stamp_change(&mut dir_core, clock_now(), Changed::Contents);
 
         let victim_core = emptied_core(&victim_raw);
 
