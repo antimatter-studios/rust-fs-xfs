@@ -50,20 +50,26 @@
 //!   list previously promised a guard `create` does not have;
 //! - a v4 filesystem.
 //!
-//! # What is deliberately left alone
+//! # What it is given, and what it makes of it
 //!
-//! **The timestamps.** There is no clock here, and the driver would have
-//! to invent one. A created file gets whatever the free inode carried,
-//! which is the epoch. That is visibly wrong rather than subtly wrong,
-//! which is the better failure of the two, and it is what
-//! [`crate::dir_write`] already does for the same reason.
+//! **The mode.** `di_mode` holds the file type as well as the permissions,
+//! and a caller asking for a file with mode `0o644` means a regular file
+//! with those permissions, not an inode of no type. So a mode with no type
+//! bits gets the kind's own, and a mode whose type bits name a different
+//! kind is refused rather than written or quietly replaced (#276).
+//!
+//! **The timestamps.** atime, mtime, ctime and crtime are all the moment
+//! of the create, which is what the kernel's `xfs_init_new_inode` does. The
+//! free slot's own were left in place until #276, and on a fresh volume
+//! that is zero: every file this driver made was dated 1970. The parent's
+//! times are still left alone, as [`crate::dir_write`] leaves them.
 
 use crate::dir;
 use crate::dir_block;
 use crate::error::{Error, Result};
 use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
-use crate::inode::Format;
+use crate::inode::{offsets as inode_offsets, Format, Timestamp};
 use crate::inode_btree::{choose_free_inode, InodeChunk, Taken};
 use crate::log_write::{
     inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
@@ -126,6 +132,14 @@ impl Kind {
         }
     }
 
+    /// The `S_IFMT` bits of `di_mode` for this kind.
+    fn type_bits(self) -> u16 {
+        match self {
+            Kind::File => S_IFREG,
+            Kind::Directory => S_IFDIR,
+        }
+    }
+
     /// The file type recorded in the directory entry.
     fn ftype(self) -> u8 {
         dir::ftype_to_raw(Some(match self {
@@ -135,9 +149,66 @@ impl Kind {
     }
 }
 
+/// `S_IFMT`: the bits of `di_mode` that say what kind of inode it is.
+const S_IFMT: u16 = 0o170000;
+/// `S_IFREG`, a regular file.
+const S_IFREG: u16 = 0o100000;
+/// `S_IFDIR`, a directory.
+const S_IFDIR: u16 = 0o040000;
+
+/// The `di_mode` a create of `kind` writes, given the mode it was asked for.
+///
+/// A mode of permissions only is the ordinary reading of "mode", and it
+/// gets the kind's type bits. A mode that already carries them is taken
+/// as it is. A mode whose type bits name something else — a directory's
+/// in a file create, a symlink's in either — is a caller that has confused
+/// two things, and writing it, or replacing it, would hide that.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for type bits that are not the kind's.
+fn typed_mode(mode: u16, kind: Kind) -> Result<u16> {
+    match mode & S_IFMT {
+        0 => Ok(mode | kind.type_bits()),
+        bits if bits == kind.type_bits() => Ok(mode),
+        bits => Err(Error::UnsupportedFeature(format!(
+            "mode {mode:#o} has type bits {bits:#o}, and creating {} makes type {:#o}; \
+             pass the permissions alone, or with the matching type",
+            match kind {
+                Kind::File => "a regular file",
+                Kind::Directory => "a directory",
+            },
+            kind.type_bits()
+        ))),
+    }
+}
+
+/// The time now, as an inode timestamp.
+///
+/// A clock before 1970 is a clock that is wrong, and is represented as the
+/// negative time it says rather than refused: a create is no place to
+/// fail over the host's clock, and the kernel does not either.
+fn clock_now() -> Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => Timestamp {
+            sec: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            nsec: d.subsec_nanos(),
+        },
+        Err(before) => {
+            let d = before.duration();
+            Timestamp {
+                sec: -i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                nsec: 0,
+            }
+        }
+    }
+}
+
 /// Offsets within the on-disk inode core that a create sets.
 mod core_at {
     pub const MODE: usize = 2;
+    pub const VERSION: usize = 4;
     pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
     pub const NBLOCKS: usize = 64;
@@ -163,8 +234,9 @@ const AFORMAT_EXTENTS: u8 = 2;
 /// The inode core of a newly created file or directory.
 ///
 /// Read from the free inode rather than built, so the identity fields
-/// that are already correct stay correct.
-fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
+/// that are already correct stay correct. `mode` is already typed — see
+/// [`typed_mode`] — and `when` is the time the inode is stamped with.
+fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64, when: Timestamp) -> Vec<u8> {
     let mut core = raw.to_vec();
     core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&mode.to_be_bytes());
     core[core_at::FORMAT] = kind.format() as u8;
@@ -210,8 +282,30 @@ fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
     // only BIGTIME and NREXT64 describe the filesystem rather than the file,
     // and the timestamps and extent counts are encoded by them.
     reset_flags(&mut core);
+
+    // THE TIME IT WAS MADE (#276). The slot's own times are its previous
+    // life's, or zero on a fresh volume, and zero is 1970. The kernel
+    // stamps all four with the current time (`xfs_init_new_inode`); crtime
+    // exists only in the v3 core. Encoded after the flags are reset,
+    // because BIGTIME in `di_flags2` is what says how they are stored.
+    let bigtime = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"))
+        & crate::format::log_items::log_dinode::flags2::DI_FLAGS2_BIGTIME
+        != 0;
+    for at in [
+        inode_offsets::ATIME,
+        inode_offsets::MTIME,
+        inode_offsets::CTIME,
+    ] {
+        when.encode(&mut core, at, bigtime);
+    }
+    if core[core_at::VERSION] >= 3 {
+        when.encode(&mut core, inode_offsets::CRTIME, bigtime);
+    }
     core
 }
+
+/// `di_flags2`, in the v3 core.
+const FLAGS2: usize = 120;
 
 /// `di_flags` cleared, and `di_flags2` down to the bits that describe the
 /// filesystem's encoding: what the kernel's `xfs_ifree` leaves in a free
@@ -219,7 +313,6 @@ fn created_core(raw: &[u8], mode: u16, kind: Kind, size: u64) -> Vec<u8> {
 pub(crate) fn reset_flags(core: &mut [u8]) {
     use crate::format::log_items::log_dinode::flags2::{DI_FLAGS2_BIGTIME, DI_FLAGS2_NREXT64};
     const FLAGS: usize = 90;
-    const FLAGS2: usize = 120;
     core[FLAGS..FLAGS + 2].copy_from_slice(&0u16.to_be_bytes());
     let flags2 = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"));
     core[FLAGS2..FLAGS2 + 8]
@@ -559,6 +652,8 @@ impl Filesystem {
                 String::from_utf8_lossy(name)
             )));
         }
+        // Before anything is read: a refused mode must cost nothing.
+        let mode = typed_mode(mode, kind)?;
 
         let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
         if !dir_inode.is_dir() {
@@ -864,7 +959,7 @@ impl Filesystem {
             Kind::File => Vec::new(),
             Kind::Directory => empty_short_form_dir(parent),
         };
-        let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64);
+        let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64, clock_now());
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;
@@ -1047,6 +1142,73 @@ fn empty_short_form_dir(parent: u64) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A time the tests below do not care about.
+    const EPOCH: Timestamp = Timestamp { sec: 0, nsec: 0 };
+
+    /// Permissions alone get the kind's type; the kind's own type is kept;
+    /// anything else is refused (#276).
+    #[test]
+    fn a_mode_is_typed_by_what_is_being_made() {
+        assert_eq!(typed_mode(0o644, Kind::File), Ok(0o100644));
+        assert_eq!(typed_mode(0o755, Kind::Directory), Ok(0o040755));
+        assert_eq!(typed_mode(0o100600, Kind::File), Ok(0o100600));
+        assert_eq!(typed_mode(0o041777, Kind::Directory), Ok(0o041777));
+        // The set-id and sticky bits are permissions, not type.
+        assert_eq!(typed_mode(0o6755, Kind::File), Ok(0o106755));
+        for (mode, kind) in [
+            (0o040755, Kind::File),
+            (0o120777, Kind::File),
+            (0o100644, Kind::Directory),
+            (0o020644, Kind::Directory),
+        ] {
+            assert!(
+                matches!(typed_mode(mode, kind), Err(Error::UnsupportedFeature(_))),
+                "{mode:#o} for {kind:?} was not refused"
+            );
+        }
+    }
+
+    /// All four times are the moment of the create, in whichever encoding
+    /// the inode uses, and crtime only where the core has one (#276).
+    #[test]
+    fn a_created_core_is_stamped_with_the_time_given() {
+        use crate::format::log_items::log_dinode::flags2::DI_FLAGS2_BIGTIME;
+        let when = Timestamp {
+            sec: 1_790_000_000,
+            nsec: 123_456_789,
+        };
+        for bigtime in [false, true] {
+            let mut raw = vec![0u8; 176];
+            raw[core_at::VERSION] = 3;
+            if bigtime {
+                raw[FLAGS2..FLAGS2 + 8].copy_from_slice(&DI_FLAGS2_BIGTIME.to_be_bytes());
+            }
+            let core = created_core(&raw, 0o100644, Kind::File, 0, when);
+            for (field, at) in [
+                ("atime", inode_offsets::ATIME),
+                ("mtime", inode_offsets::MTIME),
+                ("ctime", inode_offsets::CTIME),
+                ("crtime", inode_offsets::CRTIME),
+            ] {
+                assert_eq!(
+                    Timestamp::parse(&core, at, bigtime),
+                    when,
+                    "bigtime={bigtime}: {field}"
+                );
+            }
+        }
+
+        // A v2 core ends before crtime, and nothing is written past it.
+        let mut raw = vec![0u8; 176];
+        raw[core_at::VERSION] = 2;
+        let core = created_core(&raw, 0o100644, Kind::File, 0, when);
+        assert_eq!(
+            &core[inode_offsets::CRTIME..inode_offsets::CRTIME + 8],
+            &[0u8; 8],
+            "a v2 core has no crtime to stamp"
+        );
+    }
+
     /// A created file inherits none of its free inode's flags (#189).
     ///
     /// The kernel's `xfs_ifree` zeroes `di_flags` and resets `di_flags2` to
@@ -1067,7 +1229,7 @@ mod tests {
         raw[FLAGS2..FLAGS2 + 8]
             .copy_from_slice(&(REFLINK | DI_FLAGS2_BIGTIME | DI_FLAGS2_NREXT64).to_be_bytes());
 
-        let core = created_core(&raw, 0o100644, Kind::File, 0);
+        let core = created_core(&raw, 0o100644, Kind::File, 0, EPOCH);
         assert_eq!(
             u16::from_be_bytes(core[FLAGS..FLAGS + 2].try_into().unwrap()),
             0,
@@ -1088,7 +1250,7 @@ mod tests {
         let mut raw = vec![0u8; 176];
         raw[core_at::GEN..core_at::GEN + 4].copy_from_slice(&7u32.to_be_bytes());
 
-        let core = created_core(&raw, 0o100644, Kind::File, 0);
+        let core = created_core(&raw, 0o100644, Kind::File, 0, EPOCH);
         assert_eq!(
             u16::from_be_bytes(core[core_at::MODE..core_at::MODE + 2].try_into().unwrap()),
             0o100644
@@ -1124,7 +1286,7 @@ mod tests {
         raw[DI_INO..DI_INO + 8].copy_from_slice(&186u64.to_be_bytes());
         raw[DI_UUID..DI_UUID + 16].copy_from_slice(&[0xab; 16]);
 
-        let core = created_core(&raw, 0o100644, Kind::File, 0);
+        let core = created_core(&raw, 0o100644, Kind::File, 0, EPOCH);
         assert_eq!(&core[0..2], &0x494eu16.to_be_bytes(), "di_magic");
         assert_eq!(core[4], 3, "di_version");
         assert_eq!(

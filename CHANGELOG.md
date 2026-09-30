@@ -15,6 +15,15 @@ never does.
   `share/`. `clap_complete` and `clap_mangen` (MIT/Apache-2.0) join clap
   behind the `cli` feature (#271).
 
+### Fixed
+
+- `create_file` and `create_directory` write the kind's type bits into
+  `di_mode` when given a mode of permissions only, where `0o644` used to
+  make an inode of no type; a mode whose type bits name another kind is
+  refused. A new inode's atime, mtime, ctime and crtime are the time of the
+  create, where they were the free slot's own, which is 1970 on a fresh
+  volume (#276).
+
 ## [0.9.0] — 2026-09-30
 
 ### Breaking
