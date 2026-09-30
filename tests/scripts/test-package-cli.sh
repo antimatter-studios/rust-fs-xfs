@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # The release tarball is an install prefix -- bin/rust-fs-xfs, each dotted
-# name a relative symlink to it, share/rust-fs-xfs/CAVEATS and LICENSE,
-# nothing else -- and every name in it runs and identifies itself.
+# name a relative symlink to it, a man page and zsh, bash and fish
+# completions per name under share/, share/rust-fs-xfs/CAVEATS and
+# LICENSE, nothing else -- and every name in it runs and identifies itself.
 #
 # This runs the real packaging script against stand-in binaries in a
 # sandbox: one that behaves, and one for each way a build can be wrong
 # (missing, --help failing, reporting a version other than the tag's,
-# listing no names, a CAVEATS too long for an installer to print). The
+# listing no names, writing no man pages, a CAVEATS too long for an
+# installer to print). The
 # release workflow and the `cli` CI job run the same script against the
 # real binary, so the checks here are the checks a release makes.
 set -uo pipefail
@@ -29,7 +31,8 @@ crate="$(sed -n 's/^name = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -n 1)"
 # A stand-in for the built multi-call binary: it answers under whatever
 # name it was started as, like the real one. $1 is the version it
 # reports, $2 the exit status of --help, $3 the names it lists, $4 where
-# to put it (a directory named for the case).
+# to put it (a directory named for the case), and $5 `noman` for one that
+# writes no man pages.
 stub() {
     local dir="$sandbox/$4"
     mkdir -p "$dir"
@@ -39,7 +42,21 @@ me="\$(basename "\$0")"
 case "\$1" in
     --help)    echo "Usage: \$me [options]"; exit $2 ;;
     --version) echo "\$me ($crate) $1" ;;
-    generate)  [ -z "$3" ] || printf '%s\n' $3 ;;
+    generate)
+        case "\$2" in
+            names) [ -z "$3" ] || printf '%s\n' $3 ;;
+            man)
+                [ "${5:-}" = noman ] && exit 0
+                mkdir -p "\$3/man/man1"
+                for n in rust-fs-xfs $3; do echo ".TH \$n 1" > "\$3/man/man1/\$n.1"; done ;;
+            completions)
+                mkdir -p "\$3/zsh/site-functions" "\$3/bash-completion/completions" "\$3/fish/vendor_completions.d"
+                for n in rust-fs-xfs $3; do
+                    echo "#compdef \$n" > "\$3/zsh/site-functions/_\$n"
+                    echo "complete -F _\$n \$n" > "\$3/bash-completion/completions/\$n"
+                    echo "complete -c \$n" > "\$3/fish/vendor_completions.d/\$n.fish"
+                done ;;
+        esac ;;
     *)         exit 2 ;;
 esac
 STUB
@@ -95,8 +112,9 @@ esac
 [ -f "$tarball" ] && ok || bad "the packaged tarball exists at '$tarball'"
 if [ -f "$tarball" ]; then
     files="$(tar -tzf "$tarball" | sed 's|^\./||' | grep -v '/$' | sort | tr '\n' ' ')"
-    [ "$files" = "LICENSE bin/fs.xfs bin/rust-fs-xfs share/rust-fs-xfs/CAVEATS " ] && ok \
-        || bad "tarball holds exactly the binary, its link, the CAVEATS and the licence, got: $files"
+    want="LICENSE bin/fs.xfs bin/rust-fs-xfs share/bash-completion/completions/fs.xfs share/bash-completion/completions/rust-fs-xfs share/fish/vendor_completions.d/fs.xfs.fish share/fish/vendor_completions.d/rust-fs-xfs.fish share/man/man1/fs.xfs.1 share/man/man1/rust-fs-xfs.1 share/rust-fs-xfs/CAVEATS share/zsh/site-functions/_fs.xfs share/zsh/site-functions/_rust-fs-xfs "
+    [ "$files" = "$want" ] && ok \
+        || bad "tarball holds exactly the binary, its link, the pages, the completions, the CAVEATS and the licence, got: $files"
     unpacked="$sandbox/unpacked"
     mkdir -p "$unpacked"
     tar -xzf "$tarball" -C "$unpacked"
@@ -131,6 +149,7 @@ refused "a missing binary" 9.9.9 darwin-arm64 "$sandbox/nowhere"
 refused "a binary whose --help fails" 9.9.9 darwin-arm64 "$(stub 9.9.9 1 fs.xfs helpfails)"
 refused "a binary reporting a version other than the tag's" 9.9.9 darwin-arm64 "$(stub 1.0.0 0 fs.xfs wrongver)"
 refused "a binary that lists no dotted names" 9.9.9 darwin-arm64 "$(stub 9.9.9 0 "" nonames)"
+refused "a binary that writes no man pages" 9.9.9 darwin-arm64 "$(stub 9.9.9 0 fs.xfs noman noman)"
 refused "a missing label" 9.9.9 "" "$good"
 refused "a missing version" "" darwin-arm64 "$good"
 printf 'one\ntwo\nthree\nfour\nfive\n' > "$sandbox/long-caveats"
