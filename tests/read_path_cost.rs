@@ -321,3 +321,67 @@ fn measure_one(img: &Path, blocks: usize) -> Pass {
         read_returned: returned,
     }
 }
+
+/// Deciding whether the log is clean does not read the whole log (#251).
+///
+/// `log::inspect` and `log::head` found the newest record by reading every
+/// block of the ring. A mount inspects the log to decide whether to replay
+/// it, so every mount paid that cost: 179 MiB, as roughly 200 reads, on the
+/// volume #251 measured. The kernel does not do this. Every basic block
+/// starts with the cycle it was written in, so `xlog_find_head` finds the
+/// point where the cycle changes by binary search, checks a window before
+/// it, and steps back from there to the last record header.
+///
+/// `xfs-default.img` is a fresh `mkfs.xfs` volume with a clean log. The
+/// bound is 4 MiB: the 2 MiB window the kernel also checks, plus room for
+/// the search itself. The log has to be well over that size, or a full scan
+/// would pass too.
+#[test]
+fn deciding_the_log_is_clean_does_not_read_the_whole_log() {
+    let img = common::fixture("xfs-default.img");
+    const BOUND: u64 = 4 << 20;
+
+    let file = FileDevice::open(&img).expect("open the fixture");
+    let counting = Arc::new(CountingDevice::new(Arc::new(file)));
+    let fs = Filesystem::mount(counting.clone()).expect("mount");
+    let mounted = counting.bytes();
+    let sb = fs.superblock().clone();
+    let log_bytes = u64::from(sb.logblocks) * u64::from(sb.blocksize);
+    assert!(
+        log_bytes > 2 * BOUND,
+        "{}'s log is {log_bytes} bytes, too small to tell a bounded search from a \
+         full scan",
+        img.display()
+    );
+    assert!(!fs.was_replayed(), "a fresh mkfs.xfs volume's log is clean");
+
+    counting.reset();
+    let state = fs_xfs::log::inspect(counting.as_ref(), &sb).expect("inspect the log");
+    let inspected = counting.bytes();
+
+    counting.reset();
+    let head = fs_xfs::log::head(counting.as_ref(), &sb).expect("find the head");
+    let headed = counting.bytes();
+
+    eprintln!(
+        "log {log_bytes} bytes: mount read {mounted}, inspect {inspected}, head {headed} \
+         ({state:?}, head at block {} cycle {})",
+        head.block, head.cycle
+    );
+    assert_ne!(
+        state,
+        fs_xfs::log::LogState::NeedsReplay,
+        "a fresh volume's log does not need replaying"
+    );
+    for (what, bytes) in [
+        ("the mount", mounted),
+        ("log::inspect", inspected),
+        ("log::head", headed),
+    ] {
+        assert!(
+            bytes <= BOUND,
+            "{what} read {bytes} bytes of a volume whose log is {log_bytes}: the log \
+             was scanned whole rather than searched"
+        );
+    }
+}

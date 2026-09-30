@@ -511,8 +511,12 @@ impl Filesystem {
         // freeing is a write. It changes nothing this mount reports —
         // such an inode is in no directory, so no walk reaches it —
         // beyond the space it holds still being counted.
+        //
+        // THE LOG IS NOT ASKED TWICE (#251). `inspect` above has already
+        // said it is clean, and asking again through `check_log_is_clean`
+        // read it a second time for the same answer.
         if !replayed {
-            fs.check_log_is_clean()?;
+            fs.refuse_unlinked_inodes()?;
         }
         Ok(fs)
     }
@@ -768,6 +772,13 @@ impl Filesystem {
             log::LogState::Empty | log::LogState::CleanlyUnmounted => {}
             log::LogState::NeedsReplay => return Err(Error::DirtyLog),
         }
+        self.refuse_unlinked_inodes()
+    }
+
+    /// Refuse a volume with an inode on an AGI unlinked list: one deleted
+    /// while still open, which the kernel frees as it mounts and this
+    /// driver cannot, because freeing is a write.
+    fn refuse_unlinked_inodes(&self) -> Result<()> {
         for ag in 0..self.sb.agcount {
             let agi = self.read_agi(ag)?;
             if agi.has_unlinked_inodes() {
