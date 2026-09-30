@@ -1234,7 +1234,13 @@ impl Filesystem {
                 // A block in the data region may still be free space
                 // rather than entries. parse_data_block rejects those by
                 // magic, and that rejection is not fatal to the listing.
+                //
+                // ONE WHOSE MAGIC SAYS IT HOLDS ENTRIES IS VERIFIED FIRST
+                // (#287): its checksum, the address it records, the UUID
+                // and the directory that owns it. Listing it unchecked
+                // reported a directory the kernel refuses as corrupt.
                 if let Ok(entries) = dir::parse_data_block(&block, &self.sb) {
+                    self.verify_dir_block(&block, phys, inode.ino)?;
                     // Block and leaf formats store `.` and `..` as real
                     // entries; short form keeps the parent in its header
                     // and never materialises either. Filtering here keeps
@@ -1297,7 +1303,7 @@ impl Filesystem {
         let hash = crate::dir_block::hash_for(&self.sb, name);
         let extents = self.data_extents(dir_inode, raw)?;
         let dir_block_size = u64::from(self.sb.dirblocksize());
-        let Some(first) = self.read_dir_block(&extents, 0)? else {
+        let Some(first) = self.read_dir_block(&extents, 0, dir_inode.ino)? else {
             return Ok(None);
         };
 
@@ -1328,12 +1334,14 @@ impl Filesystem {
         // Leaf or node form: the index starts at the leaf offset.
         let leaf_start = DIR_LEAF_FILE_OFFSET / dir_block_size;
         let mut at = leaf_start;
-        let mut block = self.read_dir_block(&extents, at)?.ok_or_else(|| {
-            Error::BadSuperblock(format!(
-                "directory inode {} has data blocks and no hash index",
-                dir_inode.ino
-            ))
-        })?;
+        let mut block = self
+            .read_dir_block(&extents, at, dir_inode.ino)?
+            .ok_or_else(|| {
+                Error::BadSuperblock(format!(
+                    "directory inode {} has data blocks and no hash index",
+                    dir_inode.ino
+                ))
+            })?;
         // Down the node B-tree to the leaf covering the hash. A node sits
         // more than MAX_SUPPORTED_NODE_LEVEL above the leaves is refused by
         // parse_node, so this is bounded.
@@ -1346,12 +1354,14 @@ impl Filesystem {
                 return Ok(None);
             };
             at = u64::from(child);
-            block = self.read_dir_block(&extents, at)?.ok_or_else(|| {
-                Error::BadSuperblock(format!(
-                    "directory inode {}: node names block {at}, which is a hole",
-                    dir_inode.ino
-                ))
-            })?;
+            block = self
+                .read_dir_block(&extents, at, dir_inode.ino)?
+                .ok_or_else(|| {
+                    Error::BadSuperblock(format!(
+                        "directory inode {}: node names block {at}, which is a hole",
+                        dir_inode.ino
+                    ))
+                })?;
         }
 
         // Every record with the hash, following the leaf chain while the
@@ -1372,7 +1382,7 @@ impl Filesystem {
                 break;
             }
             at = u64::from(leaf.forw);
-            block = match self.read_dir_block(&extents, at)? {
+            block = match self.read_dir_block(&extents, at, dir_inode.ino)? {
                 Some(b) => b,
                 None => break,
             };
@@ -1380,7 +1390,7 @@ impl Filesystem {
 
         for address in addresses {
             let (db, offset) = entry_at(address);
-            let Some(data) = self.read_dir_block(&extents, db)? else {
+            let Some(data) = self.read_dir_block(&extents, db, dir_inode.ino)? else {
                 continue;
             };
             if let Some(e) = dir::parse_data_block(&data, &self.sb)?
@@ -1396,11 +1406,17 @@ impl Filesystem {
     /// Directory block `dir_block` (in the directory's own block numbers),
     /// read whole through the extent list, or `None` where any of it is a
     /// hole or unwritten.
-    fn read_dir_block(&self, extents: &[Extent], dir_block: u64) -> Result<Option<Vec<u8>>> {
+    fn read_dir_block(
+        &self,
+        extents: &[Extent],
+        dir_block: u64,
+        owner: u64,
+    ) -> Result<Option<Vec<u8>>> {
         let block_size = u64::from(self.sb.blocksize);
         let dir_block_size = self.sb.dirblocksize() as usize;
         let per = dir_block_size as u64 / block_size;
         let mut out = vec![0u8; dir_block_size];
+        let mut first = None;
         for i in 0..per {
             let file_block = dir_block * per + i;
             let Some(e) = extent::lookup(extents, file_block) else {
@@ -1410,13 +1426,60 @@ impl Filesystem {
                 return Ok(None);
             }
             let phys = e.map(file_block).expect("block inside its own extent");
+            first.get_or_insert(phys);
             let at = (i * block_size) as usize;
             self.device.read_at(
                 self.block_offset(phys),
                 &mut out[at..at + block_size as usize],
             )?;
         }
+        // Verified before anything reads it (#287). A block that is not a
+        // directory block at all is left to the parser, which refuses it
+        // by its magic.
+        if let Some(phys) = first {
+            self.verify_dir_block(&out, phys, owner)?;
+        }
         Ok(Some(out))
+    }
+
+    /// Check a v5 directory block's checksum, recorded address, UUID and
+    /// owner, choosing the header layout by its magic (#287).
+    ///
+    /// Data, block-form and free-index blocks start with
+    /// `xfs_dir3_blk_hdr`; leaf and node blocks with `xfs_da3_blkinfo`.
+    /// A block whose magic is neither is not checked here: nothing will
+    /// take it for a directory block, because every parser refuses it by
+    /// that same magic. On v4 there is no header to check.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ChecksumMismatch`] and [`Error::BlockIdentityMismatch`],
+    /// as [`dir::verify_data_block`] and [`dir::verify_da_block`].
+    pub(crate) fn verify_dir_block(&self, block: &[u8], fsblock: u64, owner: u64) -> Result<()> {
+        use crate::format::dir::offsets::{da_blk, dir3_blk};
+        use crate::format::dir::{
+            XFS_DA3_NODE_MAGIC, XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_MAGIC, XFS_DIR3_FREE_MAGIC,
+            XFS_DIR3_LEAF1_MAGIC, XFS_DIR3_LEAFN_MAGIC,
+        };
+        if !self.sb.is_v5() {
+            return Ok(());
+        }
+        let daddr = crate::alloc_btree::blkno_of_fsbno(&self.sb, fsblock);
+        let data_magic = be32(block, dir3_blk::MAGIC);
+        if matches!(
+            data_magic,
+            XFS_DIR3_BLOCK_MAGIC | XFS_DIR3_DATA_MAGIC | XFS_DIR3_FREE_MAGIC
+        ) {
+            return dir::verify_data_block(block, &self.sb, daddr, owner);
+        }
+        let da_magic = crate::endian::be16(block, da_blk::MAGIC);
+        if matches!(
+            da_magic,
+            XFS_DIR3_LEAF1_MAGIC | XFS_DIR3_LEAFN_MAGIC | XFS_DA3_NODE_MAGIC
+        ) {
+            return dir::verify_da_block(block, &self.sb, daddr, owner);
+        }
+        Ok(())
     }
 
     /// Resolve an absolute path to its inode.
