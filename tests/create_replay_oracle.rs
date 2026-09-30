@@ -123,7 +123,10 @@ fn create_and_replay(case: &str, names: &[&str]) {
             if [ -f "$m/{n}" ]; then
                 echo "INO_{n} $(stat -c %i "$m/{n}")"
                 echo "MODE_{n} $(stat -c %a "$m/{n}")"
-                echo "TYPE_{n} $(stat -c %F "$m/{n}")"
+                # The raw st_mode in hex: type and permissions in one
+                # number, where `%F` says "regular empty file" for a file
+                # of no size.
+                echo "TYPE_{n} $(stat -c %f "$m/{n}")"
                 # Before the write below, which would move them itself.
                 echo "TIMES_{n} $(stat -c '%X %Y %Z %W' "$m/{n}")"
                 echo "SIZE_{n} $(stat -c %s "$m/{n}")"
@@ -226,9 +229,9 @@ fn create_and_replay(case: &str, names: &[&str]) {
         };
         assert_eq!(
             field("TYPE"),
-            "regular file",
-            "{case}: {n} was created with a permissions-only mode and the kernel does not \
-             see a regular file\n{out}"
+            "81a4",
+            "{case}: {n} was created with mode 0o644 and the kernel does not see \
+             S_IFREG | 0644 (0x81a4)\n{out}"
         );
         assert_eq!(field("MODE"), "644", "{case}: {n}'s permissions\n{out}");
         // The kernel's reading of the times the record gave the inode:
