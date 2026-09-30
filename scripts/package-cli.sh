@@ -15,8 +15,19 @@
 #
 #   bin/rust-fs-xfs             the multi-call binary (the real file)
 #   bin/<dotted name>           -> rust-fs-xfs, a relative symlink, per tool
+#   share/man/man1/<name>.1     a page per name, and per subcommand
+#                               (section 8 is for mkfs.* and fsck.*, and
+#                               this crate ships neither)
+#   share/zsh/site-functions/_<name>
+#   share/bash-completion/completions/<name>
+#   share/fish/vendor_completions.d/<name>.fish
 #   share/rust-fs-xfs/CAVEATS   at most four lines an installer shows
 #   LICENSE
+#
+# THE PAGES AND COMPLETIONS COME FROM THE BINARY (`rust-fs-xfs generate man
+# SHARE`, `generate completions SHARE`), from the same clap commands it
+# parses with, so they cannot describe a flag it does not take -- and the
+# release needs no second build to make them.
 #
 # <repo> is the repository's name, from Cargo.toml's `repository`, and the
 # tarball is named for the crate: am-fs-xfs-<version>-<label>.tar.gz.
@@ -87,6 +98,22 @@ for name in $names; do
     ln -s "$repo" "$stage/bin/$name"
     want+=("bin/$name")
 done
+
+"$stage/bin/$repo" generate man "$stage/share" > /dev/null || die "$repo generate man failed"
+"$stage/bin/$repo" generate completions "$stage/share" > /dev/null || die "$repo generate completions failed"
+# Every name has its page and its three completions, where Homebrew links
+# them from. Named here rather than read from what was generated, which
+# would agree with itself whatever it wrote.
+for name in $repo $names; do
+    for doc in "man/man1/$name.1" "zsh/site-functions/_$name" \
+        "bash-completion/completions/$name" "fish/vendor_completions.d/$name.fish"; do
+        [ -s "$stage/share/$doc" ] || die "$repo generated no share/$doc"
+    done
+done
+[ ! -e "$stage/share/man/man8" ] || die "$repo wrote section-8 pages, and this crate ships no mkfs.* or fsck.*"
+while IFS= read -r doc; do
+    want+=("${doc#"$stage/"}")
+done < <(find "$stage/share" -type f ! -path "$stage/share/$repo/*" | sort)
 
 caveats="$root/packaging/CAVEATS"
 [ -s "$caveats" ] || die "packaging/CAVEATS is missing or empty"

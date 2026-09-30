@@ -6,6 +6,15 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- The tools write their own man pages and shell completions (`rust-fs-xfs
+  generate man|completions SHARE`): a section-1 page per name and per
+  `fs.xfs` subcommand, and zsh, bash and fish completions, which
+  `chore cli:install` stages and the release tarball carries under
+  `share/`. `clap_complete` and `clap_mangen` (MIT/Apache-2.0) join clap
+  behind the `cli` feature (#271).
+
 ## [0.9.0] — 2026-09-30
 
 ### Breaking
