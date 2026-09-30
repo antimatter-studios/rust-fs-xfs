@@ -31,6 +31,13 @@ never does.
   fails its CRC or an AGI with a bad magic is refused with a structured
   error and nothing on stdout -- a refusal `xfs_repair -n` in the guest
   agrees with (#271).
+- `fs.xfs write` and `fs.xfs mkdir`, within the driver's measured shapes: a
+  new file in one extent (v5), an empty file given contents, a same-length
+  overwrite in place (v4 and v5), and a directory (v5). Every other shape is
+  refused with the driver's own reason and exit status 3, and a write that
+  is refused after it had created its file unlinks it again. The kernel in
+  the guest replays every write, reads each file back by SHA-256, and
+  `xfs_repair -n` accepts the result (#271).
 
 ## [0.8.0] — 2026-09-27
 
