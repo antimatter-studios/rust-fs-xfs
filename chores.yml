@@ -564,17 +564,18 @@ tasks:
     # THE FLOOR: each file prints a `test result: ok. N passed` line, which
     # `ci-test.sh --gate` sums as it does cargo's, and the same gate fails
     # a log that says anything skipped. 83 checks executed when the tier
-    # was added (#271, arm64 macOS), 588 with fs.xfs's read verbs; the
-    # floor is about 95% of that.
+    # was added (#271, arm64 macOS), 588 with fs.xfs's read verbs, 692 with
+    # the write verbs; the floor is about 95% of that.
     #
-    # MEASURED on the same runs: 11 lines / 390 bytes, then 14 / 470. Every
+    # MEASURED on the same runs: 11 lines / 390 bytes, then 14 / 470, then
+    # 17 / 552. Every
     # file is three lines when it passes and every tool a doctor line, so a
     # new file is a visible step. Budget half as much again, with room in
     # the bytes for a runner's longer checkout path in the doctor lines.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - 'scripts/tier.sh test:cli cli 21 800 -- scripts/test-cli.sh'
-      - 'scripts/ci-test.sh --gate 558 tmp/logs/cli.log "the cli tier"'
+      - 'scripts/tier.sh test:cli cli 26 900 -- scripts/test-cli.sh'
+      - 'scripts/ci-test.sh --gate 657 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
