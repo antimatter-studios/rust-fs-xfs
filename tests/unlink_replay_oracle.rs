@@ -36,7 +36,7 @@ use fs_xfs::Filesystem;
 use std::sync::Arc;
 
 mod common;
-use common::{fixture, kernel_run, repair, scratch};
+use common::{fixture, kernel_run, repair, scratch, times};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -54,6 +54,7 @@ fn unlink_and_replay(case: &str) {
     let image = scratch.guest();
     let img = scratch.path();
 
+    let before = times::unix_now();
     let removed = {
         let dev = FileDevice::open_rw(img).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
@@ -64,6 +65,7 @@ fn unlink_and_replay(case: &str) {
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         ino
     };
+    let after = times::unix_now();
 
     // NOTHING ON DISK HAS CHANGED; the record is the whole of it. A
     // read-only mount replays it in memory (#90), so the name should
@@ -79,6 +81,7 @@ fn unlink_and_replay(case: &str) {
         );
     }
 
+    let parent_times = times::stat_line("PARENT_TIMES", r#""$m""#);
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
@@ -86,6 +89,8 @@ fn unlink_and_replay(case: &str) {
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
+            # Before the create below, which would move them itself (#279).
+            {parent_times}
             if [ -e "$m/victim" ]; then echo "STILL_THERE"; else echo "GONE"; fi
             echo "NAMES $(ls -A "$m" | sort | tr '\n' ' ')"
             [ -d "$m/fill" ] && echo "FILL $(ls "$m/fill" | wc -l)"
@@ -135,6 +140,14 @@ fn unlink_and_replay(case: &str) {
     assert!(
         out.contains("GONE"),
         "{case}: the file is still there after the replay\n{out}"
+    );
+    // THE PARENT MOVED TOO (#279), as the kernel's `xfs_remove` has it.
+    times::assert_changed_between(
+        &out,
+        "PARENT_TIMES",
+        before,
+        after,
+        &format!("{case}: the directory a file was removed from"),
     );
     assert!(
         !out.contains("REUSE_FAILED"),
