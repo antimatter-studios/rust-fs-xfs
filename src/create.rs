@@ -565,6 +565,12 @@ impl Filesystem {
         let at = self.sb.fsblock_offset(only.startblock);
         let mut before = vec![0u8; dirblocksize];
         self.device().read_at(at, &mut before)?;
+        // VERIFIED BEFORE IT IS REBUILT (#287). The rebuild stamps this
+        // directory's owner and the block's address on whatever it read,
+        // and recovery gives it a fresh checksum, so a foreign or damaged
+        // block would come out of it looking sound. This is the last point
+        // at which it can be told apart.
+        self.verify_dir_block(&before, only.startblock, parent)?;
         let parsed = crate::dir::parse_block_form(&before, &self.sb)?;
 
         let mut entries: Vec<dir_block::Entry> = parsed
