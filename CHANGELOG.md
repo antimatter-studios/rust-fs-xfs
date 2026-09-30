@@ -6,6 +6,27 @@ never does.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-09-30
+
+### Breaking
+
+- **In-image paths cross the C ABI as bytes, not UTF-8 (#269).**
+  `fs_xfs_stat`, `_dir_open`, `_read_file`, `_readlink`, `_write_file`,
+  `_truncate` and `_set_attributes` read their `const char *` as the bytes
+  up to the NUL and compare them byte for byte against the names in the
+  image; they no longer decode it. `fs_xfs_dir_next` already reported names
+  as raw bytes, so the library handed out names it then refused with "not
+  valid UTF-8". A path naming no file is now reported as missing
+  (`ENOENT`), not as a bad argument, and the write entry points name the
+  same files the read ones do.
+
+  **Source-compatible for every caller passing UTF-8**, because UTF-8 is a
+  byte string too. `open_bytes`, `lookup_path_bytes`, `read_path_bytes` and
+  `list_path_bytes` carry the resolution and the `&str` forms wrap them, so
+  the Rust API is unchanged. `fs_xfs_mount` and `fs_xfs_mount_rw` keep
+  their UTF-8 decode: their argument is a path on the host filesystem, not
+  an in-image name.
+
 ### Added
 
 - Releases carry a build-provenance attestation: the published `.crate` is
@@ -395,6 +416,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.9.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.5.2...v0.6.0
