@@ -344,12 +344,9 @@ pub unsafe extern "C" fn fs_xfs_mount(device_path: *const c_char) -> *mut fs_xfs
         let Some(path) = (unsafe { borrow_str(device_path, "device_path") }) else {
             return std::ptr::null_mut();
         };
-        match FileDevice::open(path) {
-            Ok(dev) => mount_device(Arc::new(dev)),
-            Err(e) => {
-                set_error(format!("opening {path} failed: {e}"), libc_eio());
-                std::ptr::null_mut()
-            }
+        match open_path(path) {
+            Some(dev) => mount_device(dev),
+            None => std::ptr::null_mut(),
         }
     })
 }
@@ -406,20 +403,10 @@ pub unsafe extern "C" fn fs_xfs_mount_with_callbacks(
     cfg: *const fs_xfs_blockdev_cfg_t,
 ) -> *mut fs_xfs_fs {
     guard(std::ptr::null_mut(), || {
-        if cfg.is_null() {
-            set_error("cfg is NULL".into(), libc_eio());
-            return std::ptr::null_mut();
+        match unsafe { callback_device(cfg, "cfg") } {
+            Some(dev) => mount_device(dev),
+            None => std::ptr::null_mut(),
         }
-        let cfg = unsafe { &*cfg };
-        let Some(read) = cfg.read else {
-            set_error("cfg.read is NULL".into(), libc_eio());
-            return std::ptr::null_mut();
-        };
-        mount_device(Arc::new(CallbackDevice {
-            read,
-            context: cfg.context,
-            size: cfg.size_bytes,
-        }))
     })
 }
 
@@ -447,6 +434,103 @@ pub unsafe extern "C" fn fs_xfs_mount_with_fs_core_device(
         let dev: std::sync::Arc<dyn fs_core::BlockDevice> = unsafe { (*handle).inner().clone() };
         let read: std::sync::Arc<dyn BlockRead> = dev;
         mount_device(read)
+    })
+}
+
+fn mount_devices(device: Arc<dyn BlockRead>, realtime: Arc<dyn BlockRead>) -> *mut fs_xfs_fs {
+    match Filesystem::mount_with_realtime(device, realtime) {
+        Ok(fs) => Box::into_raw(Box::new(fs_xfs_fs { fs })),
+        Err(e) => {
+            record(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open the file at `path` as a device, or record why not.
+fn open_path(path: &str) -> Option<Arc<dyn BlockRead>> {
+    match FileDevice::open(path) {
+        Ok(dev) => Some(Arc::new(dev)),
+        Err(e) => {
+            set_error(format!("opening {path} failed: {e}"), libc_eio());
+            None
+        }
+    }
+}
+
+/// A callback device from `cfg`, or NULL with the reason recorded.
+///
+/// # Safety
+///
+/// `cfg` must be NULL or point to a valid configuration.
+unsafe fn callback_device(
+    cfg: *const fs_xfs_blockdev_cfg_t,
+    what: &str,
+) -> Option<Arc<dyn BlockRead>> {
+    if cfg.is_null() {
+        set_error(format!("{what} is NULL"), libc_eio());
+        return None;
+    }
+    let cfg = unsafe { &*cfg };
+    let Some(read) = cfg.read else {
+        set_error(format!("{what}.read is NULL"), libc_eio());
+        return None;
+    };
+    Some(Arc::new(CallbackDevice {
+        read,
+        context: cfg.context,
+        size: cfg.size_bytes,
+    }))
+}
+
+/// Mount a volume with a realtime section, given the image or device at
+/// `device_path` and its realtime device at `realtime_path` (#291).
+///
+/// Read-only, like every mount but `fs_xfs_mount_rw`. A realtime file's
+/// data is read from the realtime device; through `fs_xfs_mount` it is
+/// refused with ENXIO.
+///
+/// # Safety
+///
+/// Each path must be NULL or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_mount_with_realtime(
+    device_path: *const c_char,
+    realtime_path: *const c_char,
+) -> *mut fs_xfs_fs {
+    guard(std::ptr::null_mut(), || {
+        let Some(path) = (unsafe { borrow_str(device_path, "device_path") }) else {
+            return std::ptr::null_mut();
+        };
+        let Some(rt_path) = (unsafe { borrow_str(realtime_path, "realtime_path") }) else {
+            return std::ptr::null_mut();
+        };
+        let (Some(device), Some(realtime)) = (open_path(path), open_path(rt_path)) else {
+            return std::ptr::null_mut();
+        };
+        mount_devices(device, realtime)
+    })
+}
+
+/// [`fs_xfs_mount_with_realtime`] over two caller-supplied readers.
+///
+/// # Safety
+///
+/// Each configuration must be NULL or valid, as for
+/// [`fs_xfs_mount_with_callbacks`].
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_mount_with_realtime_callbacks(
+    cfg: *const fs_xfs_blockdev_cfg_t,
+    realtime: *const fs_xfs_blockdev_cfg_t,
+) -> *mut fs_xfs_fs {
+    guard(std::ptr::null_mut(), || {
+        let Some(device) = (unsafe { callback_device(cfg, "cfg") }) else {
+            return std::ptr::null_mut();
+        };
+        let Some(realtime) = (unsafe { callback_device(realtime, "realtime") }) else {
+            return std::ptr::null_mut();
+        };
+        mount_devices(device, realtime)
     })
 }
 
