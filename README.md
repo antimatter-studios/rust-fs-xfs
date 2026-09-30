@@ -245,6 +245,8 @@ driver, no VM. It is an escape hatch for an errand, not a place to do real
 filesystem work.
 
 ```sh
+fs.xfs disk.img ls /etc              # a directory, as JSON
+fs.xfs disk.img read /etc/fstab > fstab
 fs.xfs disk.img get                  # the properties, as JSON
 fs.xfs disk.img get label --text     # one of them, for a person
 fs.xfs --offset 1048576 whole-disk.img info
@@ -257,6 +259,8 @@ else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
 
 | verb | what |
 |---|---|
+| `ls [path]` | entries with `name`, `type`, `size`, `mode`, `mtime`, `inode`, and a symlink's `target`; v4 and v5 |
+| `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log held records nothing had applied), and `xfs.*` |
 | `set label <value>` | answers `not implemented` (exit 3): there is no label writer |
 | `resize <size>` | answers `not implemented` (exit 3) |
