@@ -39,6 +39,14 @@ never does.
   the guest replays every write, reads each file back by SHA-256, and
   `xfs_repair -n` accepts the result (#271).
 
+### Changed
+
+- `Filesystem::mount` finds the log's newest record from its cycle numbers,
+  as the kernel's `xlog_find_head` does, rather than reading the whole ring,
+  and reads it once rather than twice: a clean mount of a volume with a
+  64 MiB log read 128 MiB and now reads 80 KiB. A log the search cannot
+  settle falls back to the whole-ring scan, with the same answer (#251).
+
 ## [0.8.0] — 2026-09-27
 
 ### Breaking
