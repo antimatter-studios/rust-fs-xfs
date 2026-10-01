@@ -603,6 +603,63 @@ pub fn fixtures_matching(prefix: &str, suffix: &str) -> Vec<PathBuf> {
     found
 }
 // ---------------------------------------------------------------------
+// The times the kernel reports (#279)
+// ---------------------------------------------------------------------
+
+/// Reading the times a guest's `stat` printed, against this side's clock.
+pub mod times {
+    /// Seconds since 1970 on this side's clock, which is the one the
+    /// driver stamps a change with.
+    pub fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after 1970")
+            .as_secs() as i64
+    }
+
+    /// The shell line that prints `KEY <mtime> <ctime>` for `path` in the
+    /// guest, in whole seconds as `stat -c '%Y %Z'` gives them.
+    pub fn stat_line(key: &str, path: &str) -> String {
+        format!(r#"echo "{key} $(stat -c '%Y %Z' {path})""#)
+    }
+
+    /// The mtime and ctime a [`stat_line`] printed under `key`.
+    #[track_caller]
+    pub fn reported(out: &str, key: &str) -> (i64, i64) {
+        let line = out
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key} ")))
+            .unwrap_or_else(|| panic!("the VM did not report {key}:\n{out}"));
+        let t: Vec<i64> = line
+            .split_whitespace()
+            .map(|t| {
+                t.parse()
+                    .unwrap_or_else(|_| panic!("{key}: {t:?} is not a time\n{out}"))
+            })
+            .collect();
+        assert_eq!(t.len(), 2, "{key}: expected an mtime and a ctime\n{out}");
+        (t[0], t[1])
+    }
+
+    /// Both of a directory's times, as the kernel reads them, are the
+    /// moment its entries changed: the kernel's own `xfs_create`,
+    /// `xfs_remove` and `xfs_rename` stamp `XFS_ICHGTIME_MOD |
+    /// XFS_ICHGTIME_CHG` on it, and a tool that rescans a directory whose
+    /// mtime moved misses the change when it does not.
+    #[track_caller]
+    pub fn assert_changed_between(out: &str, key: &str, before: i64, after: i64, what: &str) {
+        let (mtime, ctime) = reported(out, key);
+        for (field, t) in [("mtime", mtime), ("ctime", ctime)] {
+            assert!(
+                (before..=after).contains(&t),
+                "{what}: the kernel reads its {field} as {t}, not the time of the change \
+                 ({before}..={after})\n{out}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Reading an xfs_repair report (#124)
 // ---------------------------------------------------------------------
 

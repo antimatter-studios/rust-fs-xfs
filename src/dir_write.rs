@@ -33,6 +33,7 @@
 //! Those offsets are readdir cookies rather than positions in the fork,
 //! so reusing one would hand the same cookie to a different entry.
 
+use crate::create::clock_now;
 use crate::dir;
 use crate::error::{Error, Result};
 use crate::format::dir::{
@@ -40,7 +41,7 @@ use crate::format::dir::{
 };
 use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
 use crate::fs::Filesystem;
-use crate::inode::Format;
+use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
     inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
     Op, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
@@ -131,17 +132,22 @@ impl Filesystem {
 
         // The directory's core changes: its size follows the fork, and
         // its timestamps follow the change.
+        // One clock reading for both, as the kernel's `xfs_rename` stamps
+        // both with one (#279).
+        let when = clock_now();
         let mut dir_core = dir_raw[..].to_vec();
         set_size(&mut dir_core, fork.len() as u64);
         bump_changecount(&mut dir_core, self.sb.is_v5());
+        stamp_change(&mut dir_core, when, Changed::Contents);
 
-        // The renamed inode's core changes only in its timestamps — a
-        // rename alters the entry naming it, not the inode. It is logged
-        // all the same, because the kernel logs it and a replay that
-        // found only one of the two items would leave the pair
-        // disagreeing about when the change happened.
+        // The renamed inode's core changes only in its ctime — a rename
+        // alters the entry naming it, not the inode's contents, so its
+        // mtime stays. It is logged all the same, because the kernel logs
+        // it and a replay that found only one of the two items would leave
+        // the pair disagreeing about when the change happened.
         let (_, mut moved_core) = self.read_inode_raw(moved_ino)?;
         bump_changecount(&mut moved_core, self.sb.is_v5());
+        stamp_change(&mut moved_core, when, Changed::Status);
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {dir_ino}: {why}")))?;
@@ -528,10 +534,10 @@ fn set_size(raw: &mut [u8], size: u64) {
 /// from a conversion fault. Leaving it still would make a rename look,
 /// to that test, like a record that had already been applied.
 ///
-/// The timestamps are deliberately left alone. There is no clock here
-/// that agrees with the one the filesystem was last written by, an old
-/// time is less wrong than an invented one, and nothing in the replay
-/// depends on them.
+/// The timestamps are [`stamp_change`]'s. They were left alone here once,
+/// on the reasoning that an old time is less wrong than an invented one;
+/// the kernel stamps them, and a directory whose mtime did not move is
+/// one no tool rescans (#279).
 fn bump_changecount(raw: &mut [u8], v5: bool) {
     /// `di_changecount` in the v3 core, immediately after `di_crc`.
     const DI_CHANGECOUNT: usize = 104;

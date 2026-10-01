@@ -36,7 +36,7 @@ use fs_xfs::Filesystem;
 use std::sync::Arc;
 
 mod common;
-use common::{kernel_run, scratch, share};
+use common::{kernel_run, scratch, share, times};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -62,7 +62,7 @@ fn create_and_replay(case: &str, names: &[&str]) {
     let img = scratch.path();
 
     let mut created = Vec::new();
-    let before = unix_now();
+    let before = times::unix_now();
     {
         let dev = FileDevice::open_rw(img).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
@@ -94,7 +94,7 @@ fn create_and_replay(case: &str, names: &[&str]) {
         // number, and the guest's checks below are written for the names
         // the fixture's own list names.
     }
-    let after = unix_now();
+    let after = times::unix_now();
 
     // NOTHING ON DISK HOLDS ANY OF THIS; the records do. A read-only
     // mount replays them in memory (#90), so every name created above
@@ -140,6 +140,7 @@ fn create_and_replay(case: &str, names: &[&str]) {
         })
         .collect();
 
+    let parent_times = times::stat_line("PARENT_TIMES", r#""$m""#);
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
@@ -147,6 +148,8 @@ fn create_and_replay(case: &str, names: &[&str]) {
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
+            # Before anything below writes into it (#279).
+            {parent_times}
             echo "NAMES $(ls -A "$m" | sort | tr '\n' ' ')"
             {checks}
             # The directory's other entries must still resolve.
@@ -203,6 +206,16 @@ fn create_and_replay(case: &str, names: &[&str]) {
          written back to it. `xfs_repair` reports `sb_fdblocks N, counted N-1` for \
          exactly that -- the free-block count it disagrees about is the one the \
          unmount never wrote, not one this driver got wrong:\n{out}"
+    );
+
+    // THE PARENT MOVED TOO (#279). Its entries changed, so the kernel's
+    // `xfs_create` stamps its mtime and ctime with the moment of the change.
+    times::assert_changed_between(
+        &out,
+        "PARENT_TIMES",
+        before,
+        after,
+        &format!("{case}: the directory a file was created in"),
     );
 
     for (n, ino) in &created {
@@ -271,15 +284,6 @@ fn create_and_replay(case: &str, names: &[&str]) {
         repair.contains("REPAIR_RC=0"),
         "{case}: xfs_repair found something wrong after the replay:\n{repair}"
     );
-}
-
-/// Seconds since 1970 on this side's clock, which is the one the driver
-/// stamps a new inode with.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs() as i64
 }
 
 /// A file created by this driver, used by the kernel.
@@ -497,6 +501,7 @@ fn the_kernel_uses_a_directory_this_driver_made() {
     let image = scratch.guest();
     let img = scratch.path();
 
+    let started = times::unix_now();
     let (made, parent_nlink_before) = {
         let dev = FileDevice::open_rw(img).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
@@ -509,7 +514,9 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         assert_ne!(lsn, 0, "a record must be given a sequence number");
         (ino, before)
     };
+    let finished = times::unix_now();
 
+    let parent_times = times::stat_line("PARENT_TIMES", r#""$m""#);
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
@@ -517,6 +524,8 @@ fn the_kernel_uses_a_directory_this_driver_made() {
         dmesg -C >/dev/null 2>&1
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
+            # Before anything below writes into it (#279).
+            {parent_times}
             if [ -d "$m/newdir" ]; then echo "IS_DIR"; else echo "NOT_DIR"; fi
             echo "DIR_INO $(stat -c %i "$m/newdir")"
             echo "DIR_MODE $(stat -c '%F %a' "$m/newdir")"
@@ -582,6 +591,13 @@ fn the_kernel_uses_a_directory_this_driver_made() {
          unmount never wrote, not one this driver got wrong:\n{out}"
     );
     assert!(out.contains("IS_DIR"), "newdir is not a directory\n{out}");
+    times::assert_changed_between(
+        &out,
+        "PARENT_TIMES",
+        started,
+        finished,
+        "the directory a directory was made in",
+    );
     assert!(
         out.contains("USABLE ok"),
         "nothing could be created inside the new directory\n{out}"

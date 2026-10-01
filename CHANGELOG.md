@@ -47,6 +47,13 @@ never does.
   thread's last failure stayed until the next one, and a caller following
   the header read every later end of directory as a failure. The message
   is kept until the next failure, as the header already promised (#281).
+- `create_file`, `create_directory`, `unlink_file` and
+  `rename_in_directory` stamp the directory whose entries they change with
+  the time of the change, mtime and ctime both, and a rename moves the
+  renamed inode's ctime, as the kernel's `xfs_create`, `xfs_remove` and
+  `xfs_rename` do. They left them as they were, so a tool deciding from a
+  directory's mtime whether to rescan it did not see the change. The
+  kernel oracles read the times back after replaying the record (#279).
 
 ## [0.9.0] — 2026-09-30
 

@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 mod common;
-use common::{fixture, kernel_run, repair, scratch};
+use common::{fixture, kernel_run, repair, scratch, times};
 
 /// Where this suite's scratch volumes live: under
 /// `.vm-share/scratch/`, not beside the fixtures another suite is
@@ -59,7 +59,13 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
     let img = scratch.path();
 
     let (dir_ino, moved_ino) = inodes_of(img, "aaaa");
+    // The moved file's contents do not change, so neither does its mtime.
+    let moved_mtime = {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(img).expect("open"))).expect("mount");
+        fs.read_inode(moved_ino).expect("the file").mtime.sec
+    };
 
+    let before = times::unix_now();
     {
         let dev = FileDevice::open_rw(img).expect("open read-write");
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
@@ -68,6 +74,7 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
             .expect("the rename must be accepted");
         assert_ne!(lsn, 0, "a record must be given a sequence number");
     }
+    let after = times::unix_now();
 
     // NOTHING BUT THE LOG HAS CHANGED, and a read-only mount replays it
     // in memory (#90): the new name is there and the old one is not,
@@ -98,6 +105,8 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         if mount -o loop,nouuid "$img" "$m"; then
             echo "NAMES $(ls "$m/sf" | sort | tr '\n' ' ')"
             echo "INO $(stat -c %i "$m/sf/cccc" 2>/dev/null || echo none)"
+            {dir_times}
+            {moved_times}
             # RETRIED ONCE. A busy unmount under a loaded runner is
             # ordinary and clears in a moment; one that does not is the
             # failure worth reporting, because the kernel writes the
@@ -116,6 +125,8 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         echo DONE
         "#,
         source = scratch.guest(),
+        dir_times = times::stat_line("DIR_TIMES", r#""$m/sf""#),
+        moved_times = times::stat_line("MOVED_TIMES", r#""$m/sf/cccc""#),
     );
     // The replay always happens in the harness guest, so the rename is
     // always put to the kernel.
@@ -154,6 +165,26 @@ fn the_kernel_carries_out_a_rename_this_driver_logged() {
         ino,
         moved_ino.to_string(),
         "the new name should resolve to the inode the old name did\n{out}"
+    );
+
+    // THE TIMES MOVED AS THE KERNEL'S `xfs_rename` MOVES THEM (#279): the
+    // directory's mtime and ctime, and the renamed inode's ctime alone.
+    times::assert_changed_between(
+        &out,
+        "DIR_TIMES",
+        before,
+        after,
+        "the directory an entry was renamed in",
+    );
+    let (mtime, ctime) = times::reported(&out, "MOVED_TIMES");
+    assert!(
+        (before..=after).contains(&ctime),
+        "the renamed file's ctime is {ctime}, not the time of the rename \
+         ({before}..={after})\n{out}"
+    );
+    assert_eq!(
+        mtime, moved_mtime,
+        "a rename does not change a file's contents, so its mtime must not move\n{out}"
     );
 
     repair::assert_agreed(&out, "the filesystem after the rename");
