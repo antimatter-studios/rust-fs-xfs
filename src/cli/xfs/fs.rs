@@ -11,7 +11,7 @@ use std::io::Write;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
-use crate::common::{CliError, Json, Outcome, Tool};
+use fs_core::cli::{CliError, Json, Outcome, Tool};
 use fs_xfs::inode::{FileType, Inode};
 use fs_xfs::Filesystem;
 
@@ -19,7 +19,7 @@ pub const TOOL: Tool = Tool {
     name: "fs.xfs",
     verb: "fs",
     section: 1,
-    usage_exit: crate::common::output::EXIT_USAGE,
+    usage_exit: fs_core::cli::output::EXIT_USAGE,
     about: "List, read, write and inspect an XFS image or device without mounting it",
     command,
     run,
@@ -72,7 +72,7 @@ fn command() -> Cmd {
                 .value_parser(value_parser!(u64))
                 .global(true),
         )
-        .args(crate::common::format_args().map(|a| a.global(true)))
+        .args(fs_core::cli::format_args().map(|a| a.global(true)))
         .subcommand_required(true)
         .subcommand(
             Cmd::new("ls")

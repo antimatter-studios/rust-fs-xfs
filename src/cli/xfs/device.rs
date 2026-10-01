@@ -4,7 +4,7 @@
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use crate::common::CliError;
+use fs_core::cli::CliError;
 use fs_core::{BlockDevice, BlockRead, FileDevice, OwnedRwSlice, OwnedSlice};
 use fs_xfs::Filesystem;
 
