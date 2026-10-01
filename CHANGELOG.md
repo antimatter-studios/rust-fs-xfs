@@ -54,6 +54,14 @@ never does.
   `xfs_rename` do. They left them as they were, so a tool deciding from a
   directory's mtime whether to rescan it did not see the change. The
   kernel oracles read the times back after replaying the record (#279).
+- **A create in a directory with a default ACL is refused.** The kernel
+  gives an inode made there an access ACL from the directory's
+  `SGI_ACL_DEFAULT` (and a new directory a copy of it); this driver writes
+  no attributes, so `create_file` and `create_directory` now refuse such a
+  parent by name, before anything is logged, rather than make an inode
+  without the ACL its directory promises. An oracle suite has the kernel
+  set the ACLs, shows its own create there inheriting one, and replays the
+  creates the driver did make elsewhere under `xfs_repair -n` (#284).
 
 - **A POSIX ACL is listed as root lists it through the kernel.**
   `list_xattrs` and `get_xattr` report `system.posix_acl_access` and

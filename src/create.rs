@@ -45,6 +45,8 @@
 //!   (see `convert_to_block_form`), which is a feature of this module
 //!   rather than a limit of it;
 //! - a name that is already in the directory;
+//! - a parent carrying a default ACL (`SGI_ACL_DEFAULT`), which the new
+//!   inode would inherit as attributes this driver cannot write (#284);
 //! - inode trees more than one level deep. A root with no room is not
 //!   checked here — the capacity refusal lives in `unlink`, and this
 //!   list previously promised a guard `create` does not have;
@@ -68,6 +70,7 @@
 use crate::dir;
 use crate::dir_block;
 use crate::error::{Error, Result};
+use crate::format::acl::POSIX_ACL_DEFAULT;
 use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
 use crate::inode::{offsets as inode_offsets, stamp_change, Changed, Format, Timestamp};
@@ -665,6 +668,24 @@ impl Filesystem {
         let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
         if !dir_inode.is_dir() {
             return Err(Error::NotADirectory);
+        }
+        // A DEFAULT ACL IS A PROMISE ABOUT THE DIRECTORY'S CONTENTS (#284).
+        // The kernel gives an inode made here an access ACL derived from
+        // it, a directory a copy of it as its own default, and group bits
+        // from its mask rather than the umask (`posix_acl_create`). This
+        // driver writes no attributes, so it would make an inode without
+        // them. An attribute fork that cannot be read is refused too: it
+        // cannot say there is no default ACL.
+        let has_default_acl = self
+            .list_xattrs(&dir_inode, &dir_raw)?
+            .iter()
+            .any(|a| a.name == POSIX_ACL_DEFAULT);
+        if has_default_acl {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {parent} carries a default ACL (SGI_ACL_DEFAULT), which a new \
+                 inode inherits; this driver writes no attributes, so it cannot give \
+                 the new inode the ACL it would inherit"
+            )));
         }
         // BLOCK FORM IS ADDED TO IN PLACE (#215); anything past it is not
         // implemented and is refused below by `add_to_block_form`.
