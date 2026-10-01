@@ -15,10 +15,22 @@
 //! `security.` -- which the disk does not store. An entry still flagged
 //! incomplete (its value never finished writing) is not returned, and
 //! neither is one whose flags claim a namespace this format does not define.
+//!
+//! A POSIX ACL is listed twice, as root lists it through the kernel
+//! (#285): under the VFS name, `system.posix_acl_access` or
+//! `system.posix_acl_default`, in the VFS's format, and then under the
+//! name it is stored as, `trusted.SGI_ACL_FILE` or
+//! `trusted.SGI_ACL_DEFAULT`, with the bytes as stored.
+//! [`crate::format::acl`] has both formats.
 
 use crate::endian::{be16, be32};
 use crate::error::{Error, Result};
 use crate::extent::{self, Extent};
+use crate::format::acl::{
+    self, entry, tag, ACL_UNDEFINED_ID, POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT,
+    POSIX_ACL_XATTR_ENTRY_SIZE, POSIX_ACL_XATTR_VERSION, SGI_ACL_DEFAULT, SGI_ACL_FILE,
+    XFS_ACL_ENTRY_SIZE, XFS_ACL_HDR_SIZE,
+};
 use crate::format::attr::{
     flags, leaf_hdr_size, node_hdr_size, offsets, rmt_blocks, XFS_ATTR3_LEAF_MAGIC,
     XFS_ATTR3_RMT_HDR_SIZE, XFS_ATTR_LEAF_ENTRY_SIZE, XFS_ATTR_LEAF_MAGIC,
@@ -59,13 +71,16 @@ fn full_name(ino: u64, entry_flags: u8, name: &[u8]) -> Result<Option<Vec<u8>>> 
 }
 
 impl Filesystem {
-    /// Every extended attribute on an inode, in on-disk order.
+    /// Every extended attribute on an inode, in on-disk order, as root
+    /// lists them through the kernel: a POSIX ACL is also reported under
+    /// its VFS name, in the VFS's format, just before the name it is
+    /// stored under.
     ///
     /// # Errors
     ///
     /// [`Error::BadSuperblock`] for an attribute fork whose structures do
-    /// not fit where they claim to be, and whatever reading its blocks
-    /// returns.
+    /// not fit where they claim to be, or a stored ACL the kernel would
+    /// refuse to read, and whatever reading its blocks returns.
     pub fn list_xattrs(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Xattr>> {
         let isize = usize::from(self.sb.inodesize);
         let Some((start, end)) = inode.attr_fork_range(isize) else {
@@ -74,17 +89,20 @@ impl Filesystem {
         let fork = raw
             .get(start..end)
             .ok_or_else(|| corrupt(inode.ino, "fork past the inode record"))?;
-        match inode.aformat {
-            Format::Local => shortform(inode.ino, fork),
+        let stored = match inode.aformat {
+            Format::Local => shortform(inode.ino, fork)?,
             Format::Extents | Format::Btree => {
                 let extents = self.attr_extents(inode, fork)?;
-                self.leaf_attrs(inode.ino, &extents)
+                self.leaf_attrs(inode.ino, &extents)?
             }
-            other => Err(corrupt(
-                inode.ino,
-                &format!("a {other:?}-format attribute fork"),
-            )),
-        }
+            other => {
+                return Err(corrupt(
+                    inode.ino,
+                    &format!("a {other:?}-format attribute fork"),
+                ))
+            }
+        };
+        with_acl_views(inode.ino, stored, self.sb.is_v5())
     }
 
     /// One attribute's value by its full name (`user.colour`), or `None`
@@ -262,6 +280,64 @@ impl Filesystem {
     }
 }
 
+/// `stored`, with each POSIX ACL also listed under its VFS name, where
+/// `xfs_xattr_put_listent` lists it: just before the stored name.
+fn with_acl_views(ino: u64, stored: Vec<Xattr>, is_v5: bool) -> Result<Vec<Xattr>> {
+    let mut out = Vec::with_capacity(stored.len());
+    for attr in stored {
+        let view = attr
+            .name
+            .strip_prefix(b"trusted.")
+            .and_then(|name| match name {
+                SGI_ACL_FILE => Some(POSIX_ACL_ACCESS),
+                SGI_ACL_DEFAULT => Some(POSIX_ACL_DEFAULT),
+                _ => None,
+            });
+        if let Some(view) = view {
+            out.push(Xattr {
+                name: view.to_vec(),
+                value: vfs_acl(ino, &attr.value, is_v5)?,
+            });
+        }
+        out.push(attr);
+    }
+    Ok(out)
+}
+
+/// A stored `struct xfs_acl` in the VFS's `posix_acl_xattr_header`
+/// format, refused where `xfs_acl_from_disk` refuses it: too many
+/// entries, a length that is not the count's, or a tag POSIX does not
+/// define.
+fn vfs_acl(ino: u64, stored: &[u8], is_v5: bool) -> Result<Vec<u8>> {
+    let bad = |what: String| corrupt(ino, &format!("a stored ACL {what}"));
+    if stored.len() < XFS_ACL_HDR_SIZE {
+        return Err(bad(format!("of {} bytes", stored.len())));
+    }
+    let count = be32(stored, 0) as usize;
+    let max = acl::xfs_acl_max_entries(is_v5);
+    if count > max {
+        return Err(bad(format!("of {count} entries, past the {max} allowed")));
+    }
+    if stored.len() != XFS_ACL_HDR_SIZE + count * XFS_ACL_ENTRY_SIZE {
+        return Err(bad(format!("of {count} entries in {} bytes", stored.len())));
+    }
+    let mut out = Vec::with_capacity(4 + count * POSIX_ACL_XATTR_ENTRY_SIZE);
+    out.extend_from_slice(&POSIX_ACL_XATTR_VERSION.to_le_bytes());
+    for e in stored[XFS_ACL_HDR_SIZE..].chunks_exact(XFS_ACL_ENTRY_SIZE) {
+        let entry_tag = be32(e, entry::TAG);
+        let id = match entry_tag {
+            tag::USER | tag::GROUP => be32(e, entry::ID),
+            tag::USER_OBJ | tag::GROUP_OBJ | tag::MASK | tag::OTHER => ACL_UNDEFINED_ID,
+            other => return Err(bad(format!("with the tag {other:#x}"))),
+        };
+        // Every defined tag fits in the VFS's 16 bits.
+        out.extend_from_slice(&(entry_tag as u16).to_le_bytes());
+        out.extend_from_slice(&be16(e, entry::PERM).to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    Ok(out)
+}
+
 /// `xfs_attr_shortform`: a four-byte header, then packed entries.
 fn shortform(ino: u64, fork: &[u8]) -> Result<Vec<Xattr>> {
     if fork.len() < XFS_ATTR_SF_HDR_SIZE {
@@ -323,6 +399,81 @@ mod tests {
         assert_eq!(full_name(1, flags::INCOMPLETE, b"a").unwrap(), None);
         assert_eq!(full_name(1, 0x08, b"a").unwrap(), None, "an undefined bit");
         assert!(full_name(1, flags::ROOT | flags::SECURE, b"a").is_err());
+    }
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// `u::rw,u:1001:rw,g::r,g:1002:r,m::rw,o::r`, as the guest's kernel
+    /// stored it and as it showed it to root, both copied from
+    /// `getfattr -d -m - -e hex` (tests/posix_acl_view_oracle.rs).
+    const STORED: &str = "0000000600000001ffffffff0006000000000002000003e9000600000000\
+                          0004ffffffff0004000000000008000003ea0004000000000010ffffffff\
+                          0006000000000020ffffffff00040000";
+    const SHOWN: &str = "0200000001000600ffffffff02000600e903000004000400ffffffff\
+                         08000400ea03000010000600ffffffff20000400ffffffff";
+
+    #[test]
+    fn a_stored_acl_is_shown_as_the_kernel_shows_it() {
+        assert_eq!(vfs_acl(1, &unhex(STORED), true).unwrap(), unhex(SHOWN));
+        assert_eq!(vfs_acl(1, &unhex(STORED), false).unwrap(), unhex(SHOWN));
+    }
+
+    /// Where `xfs_acl_from_disk` refuses, so does this.
+    #[test]
+    fn a_stored_acl_the_kernel_refuses_is_refused() {
+        let stored = unhex(STORED);
+        assert!(vfs_acl(1, &stored[..2], true).is_err(), "no count");
+        assert!(
+            vfs_acl(1, &stored[..stored.len() - 1], true).is_err(),
+            "short"
+        );
+        let mut bad_tag = stored.clone();
+        bad_tag[4 + 3] = 0x40;
+        assert!(vfs_acl(1, &bad_tag, true).is_err(), "an undefined tag");
+        // 26 entries: a v5 filesystem allows them, a v4 one does not.
+        let mut many = 26u32.to_be_bytes().to_vec();
+        for _ in 0..26 {
+            many.extend_from_slice(&stored[4..16]);
+        }
+        assert!(vfs_acl(1, &many, true).is_ok());
+        assert!(vfs_acl(1, &many, false).is_err(), "past v4's 25");
+    }
+
+    /// The VFS name goes just before the stored one, and nothing else is
+    /// given one.
+    #[test]
+    fn each_acl_is_listed_under_both_names() {
+        let attr = |name: &[u8], value: &str| Xattr {
+            name: name.to_vec(),
+            value: unhex(value),
+        };
+        let stored = vec![
+            attr(b"user.SGI_ACL_FILE", "00"),
+            attr(b"trusted.SGI_ACL_FILE", STORED),
+            attr(b"trusted.SGI_ACL_DEFAULT", STORED),
+            attr(b"security.SGI_ACL_DEFAULT", "00"),
+        ];
+        let names: Vec<Vec<u8>> = with_acl_views(1, stored, true)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                &b"user.SGI_ACL_FILE"[..],
+                b"system.posix_acl_access",
+                b"trusted.SGI_ACL_FILE",
+                b"system.posix_acl_default",
+                b"trusted.SGI_ACL_DEFAULT",
+                b"security.SGI_ACL_DEFAULT",
+            ]
+        );
     }
 
     /// A short-form fork: header, two entries, and a lie about the size.

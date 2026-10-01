@@ -55,6 +55,18 @@ never does.
   directory's mtime whether to rescan it did not see the change. The
   kernel oracles read the times back after replaying the record (#279).
 
+- **A POSIX ACL is listed as root lists it through the kernel.**
+  `list_xattrs` and `get_xattr` report `system.posix_acl_access` and
+  `system.posix_acl_default` in the VFS's `posix_acl_xattr_header` format,
+  translated from the stored `struct xfs_acl` as `fs/xfs/xfs_acl.c` does.
+  Before this, a file with an ACL answered `None` to the portable name. The
+  stored `trusted.SGI_ACL_FILE` / `trusted.SGI_ACL_DEFAULT` stay listed
+  right after it with their stored bytes, as the kernel lists them to root.
+  A stored ACL the kernel would refuse (a length that disagrees with its
+  count, an undefined tag, more than 25 entries on v4) fails the listing as
+  corrupt. The listing is held, byte for byte, to `getfattr -d -m - -e hex`
+  run as root in the guest, on v5 and v4 (#285).
+
 ## [0.9.0] — 2026-09-30
 
 ### Breaking

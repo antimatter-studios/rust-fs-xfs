@@ -67,6 +67,7 @@
 //! layout can be checked in isolation, and so that a mistake here cannot
 //! break anything that compiles today.
 
+pub mod acl;
 pub mod attr;
 pub mod dir;
 pub mod log_items;
