@@ -6,6 +6,8 @@ never does.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-01
+
 ### Breaking
 
 - **`Error` gains `RealtimeDeviceAbsent { ino }`.** Reading a realtime
@@ -504,6 +506,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.10.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.6.0...v0.7.0
