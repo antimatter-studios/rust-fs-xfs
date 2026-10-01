@@ -126,6 +126,21 @@ fn record(e: &Error) {
     set_error(e.to_string(), errno_for(e));
 }
 
+/// Reset this thread's errno to 0, keeping the message.
+///
+/// Every entry point does this on entry, through [`guard`], so the errno
+/// describes the most recent call rather than the most recent failure:
+/// a clean end of directory is a NULL `fs_xfs_dir_next` with errno 0,
+/// and that cannot hold if a lookup that failed earlier on the thread
+/// is still what the errno says (#281).
+///
+/// The message is left alone because the header promises the pointer
+/// `fs_xfs_last_error` returned stays valid until the next *failing*
+/// call; replacing it here would free it under a caller still reading it.
+fn reset_errno() {
+    LAST_ERROR.with(|e| e.borrow_mut().1 = 0);
+}
+
 /// Run `f`, converting a panic into a recorded error and `fallback`.
 ///
 /// A panic here means a bug in this crate, not a malformed filesystem —
@@ -133,6 +148,7 @@ fn record(e: &Error) {
 /// into C is undefined behaviour and taking the process down is a worse
 /// outcome than an EIO the caller can report.
 fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    reset_errno();
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => {
@@ -241,7 +257,8 @@ pub extern "C" fn fs_xfs_last_error() -> *const c_char {
     LAST_ERROR.with(|e| e.borrow().0.as_ptr())
 }
 
-/// POSIX errno for the most recent failure on this thread.
+/// POSIX errno for the most recent call on this thread: 0 when it
+/// succeeded, what went wrong when it failed.
 #[no_mangle]
 pub extern "C" fn fs_xfs_last_errno() -> c_int {
     LAST_ERROR.with(|e| e.borrow().1)
