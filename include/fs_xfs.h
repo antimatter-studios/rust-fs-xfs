@@ -14,9 +14,10 @@
  * the thread ended; the message is kept until the next failure.
  *
  * It refuses rather than guesses. A realtime file's data, for example,
- * is on a second device this interface does not take, so reading it
- * fails with ENXIO rather than returning partial data. Silently wrong
- * file contents cannot be detected by a caller.
+ * is on a second device, so through a mount that was not given it
+ * (every one but fs_xfs_mount_with_realtime*) reading it fails with
+ * ENXIO rather than returning partial data. Silently wrong file
+ * contents cannot be detected by a caller.
  */
 
 #ifndef FS_XFS_H
@@ -134,6 +135,22 @@ fs_xfs_fs_t *fs_xfs_mount_with_callbacks(const fs_xfs_blockdev_cfg_t *cfg);
  * as an FsCoreDevice, slice the partition out, and pass the slice.
  */
 fs_xfs_fs_t *fs_xfs_mount_with_fs_core_device(struct FsCoreDevice *handle);
+
+/*
+ * Mount a volume with a realtime section: the image or device at
+ * `device_path`, and its realtime device at `realtime_path`. A realtime
+ * file's data is read from the second; through fs_xfs_mount it fails
+ * with ENXIO. Read-only. NULL on failure, including a NULL
+ * `realtime_path`, a volume with no realtime section, and a realtime
+ * device smaller than the section the superblock describes (EIO).
+ */
+fs_xfs_fs_t *fs_xfs_mount_with_realtime(const char *device_path,
+                                        const char *realtime_path);
+
+/* fs_xfs_mount_with_realtime over two caller-supplied readers. */
+fs_xfs_fs_t *fs_xfs_mount_with_realtime_callbacks(
+    const fs_xfs_blockdev_cfg_t *cfg,
+    const fs_xfs_blockdev_cfg_t *realtime);
 
 /* Release a handle. Safe to call with NULL. */
 void fs_xfs_umount(fs_xfs_fs_t *fs);

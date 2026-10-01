@@ -740,6 +740,8 @@ fn null_pointers_fail_instead_of_crashing() {
     unsafe {
         assert!(fs_xfs_mount(std::ptr::null()).is_null());
         assert!(fs_xfs_mount_with_callbacks(std::ptr::null()).is_null());
+        assert!(fs_xfs_mount_with_realtime(std::ptr::null(), std::ptr::null()).is_null());
+        assert!(fs_xfs_mount_with_realtime_callbacks(std::ptr::null(), std::ptr::null()).is_null());
 
         assert_eq!(fs_xfs_get_volume_info(std::ptr::null_mut(), &mut info), -1);
         assert_eq!(fs_xfs_stat(std::ptr::null_mut(), p.as_ptr(), &mut attr), -1);

@@ -26,6 +26,10 @@ never does.
   volume's realtime section from its realtime device, byte for byte as the
   kernel reads them; `mount` alone still mounts such a volume and reads
   everything else (#98).
+- The C ABI reaches it: `fs_xfs_mount_with_realtime(device_path,
+  realtime_path)` and `fs_xfs_mount_with_realtime_callbacks(cfg,
+  realtime)`, read-only. A test holds `include/fs_xfs.h` to declare exactly
+  the functions the library exports (#291).
 
 ### Fixed
 
