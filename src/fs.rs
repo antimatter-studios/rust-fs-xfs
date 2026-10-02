@@ -963,7 +963,30 @@ impl Filesystem {
                 inode.ino
             )));
         }
-        self.fork_extents(inode, raw)
+        let extents = self.fork_extents(inode, raw)?;
+        self.check_extents_in_bounds(inode.ino, &extents)?;
+        Ok(extents)
+    }
+
+    /// Refuse a data-device extent that is not inside one allocation group,
+    /// past its headers (#92).
+    ///
+    /// The kernel checks every extent as it reads a fork
+    /// (`xfs_bmap_validate_extent`). Without this, an extent the kernel
+    /// calls corrupt was used as it stood: a read returned another group's
+    /// headers as file data, `write_at` wrote the file's bytes over them,
+    /// and `truncate_to_zero` gave them to free space.
+    pub(crate) fn check_extents_in_bounds(&self, ino: u64, extents: &[Extent]) -> Result<()> {
+        for (i, e) in extents.iter().enumerate() {
+            if !self.sb.extent_in_bounds(e.startblock, e.blockcount) {
+                return Err(Error::BadSuperblock(format!(
+                    "inode {ino}: extent {i} maps {} blocks at block {}, which is not inside \
+                     one allocation group past its headers",
+                    e.blockcount, e.startblock
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The data fork's extents whatever device they address: filesystem
