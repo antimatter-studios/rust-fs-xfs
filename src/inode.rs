@@ -352,35 +352,7 @@ impl Inode {
         // v3 inodes are CRC32C protected over the whole inode record.
         // Verify before trusting any other field, as with the superblock.
         if is_v3 {
-            let stored = le32(buf, DI_CRC_OFFSET);
-            let computed = crc32c_with_zeroed_crc(&buf[..isize], DI_CRC_OFFSET);
-            if stored != computed {
-                return Err(Error::ChecksumMismatch {
-                    what: "inode",
-                    block: ino,
-                });
-            }
-            // A v3 inode records its own number and its filesystem's
-            // UUID. Both catch an inode read from the wrong offset, or
-            // one left behind by a previous filesystem — neither of
-            // which the checksum can detect, since such a block is
-            // internally perfect.
-            let self_ino = be64(buf, offsets::INO);
-            if self_ino != ino {
-                return Err(Error::BlockIdentityMismatch {
-                    what: "inode",
-                    expected: ino,
-                    found: self_ino,
-                });
-            }
-            let uuid = uuid_at(buf, offsets::UUID);
-            if uuid != sb.meta_uuid {
-                return Err(Error::BlockIdentityMismatch {
-                    what: "inode",
-                    expected: ino,
-                    found: u64::MAX,
-                });
-            }
+            verify_v3_integrity(buf, sb, ino, "inode")?;
         }
 
         let flags2 = if is_v3 { be64(buf, offsets::FLAGS2) } else { 0 };
@@ -554,6 +526,88 @@ impl Inode {
     }
 }
 
+/// The checks a v3 inode's own header makes possible: its CRC32C, the
+/// inode number it records, and its filesystem's UUID.
+///
+/// The checksum catches damaged bits. The other two catch an intact record
+/// read from the wrong offset, or one left behind by a previous filesystem
+/// — neither of which the checksum can detect, since such a record is
+/// internally perfect.
+fn verify_v3_integrity(buf: &[u8], sb: &Superblock, ino: u64, what: &'static str) -> Result<()> {
+    let isize = usize::from(sb.inodesize);
+    let stored = le32(buf, DI_CRC_OFFSET);
+    let computed = crc32c_with_zeroed_crc(&buf[..isize], DI_CRC_OFFSET);
+    if stored != computed {
+        return Err(Error::ChecksumMismatch { what, block: ino });
+    }
+    let self_ino = be64(buf, offsets::INO);
+    if self_ino != ino {
+        return Err(Error::BlockIdentityMismatch {
+            what,
+            expected: ino,
+            found: self_ino,
+        });
+    }
+    if uuid_at(buf, offsets::UUID) != sb.meta_uuid {
+        return Err(Error::BlockIdentityMismatch {
+            what,
+            expected: ino,
+            found: u64::MAX,
+        });
+    }
+    Ok(())
+}
+
+/// Check that `buf` is the free v3 inode `ino`, before a create builds a
+/// file on it (#92).
+///
+/// A create keeps the slot's identity fields rather than writing its own,
+/// so the slot is the one record whose word is taken for where it is and
+/// whose it is. And the inode trees' free bit is the only thing saying
+/// it holds no file. The kernel checks both before it hands one out: the
+/// inode verifier checks the record, and `xfs_iget` with `XFS_IGET_CREATE`
+/// refuses a slot whose `di_mode` is not zero ("Free inode ... not marked
+/// free on disk"). Without that check, a free bit that is stale or misread
+/// gives out a live file's inode, the create's record replaces it, and
+/// recovery stamps a fresh checksum on the result.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] for a record that is not an inode, is not v3,
+/// or holds a file; [`Error::ChecksumMismatch`] and
+/// [`Error::BlockIdentityMismatch`] for one that is damaged or belongs
+/// somewhere else.
+pub(crate) fn verify_free_slot(buf: &[u8], sb: &Superblock, ino: u64) -> Result<()> {
+    let isize = usize::from(sb.inodesize);
+    if buf.len() < isize {
+        return Err(Error::BadSuperblock(format!(
+            "free inode {ino}: need {isize} bytes, got {}",
+            buf.len()
+        )));
+    }
+    let magic = be16(buf, offsets::MAGIC);
+    if magic != XFS_DINODE_MAGIC {
+        return Err(Error::BadSuperblock(format!(
+            "free inode {ino}: magic {magic:#06x}, expected {XFS_DINODE_MAGIC:#06x}"
+        )));
+    }
+    let version = buf[offsets::VERSION];
+    if version != 3 {
+        return Err(Error::BadSuperblock(format!(
+            "free inode {ino}: version {version}, where a v5 filesystem's inodes are version 3"
+        )));
+    }
+    verify_v3_integrity(buf, sb, ino, "free inode")?;
+    let mode = be16(buf, offsets::MODE);
+    if mode != 0 {
+        return Err(Error::BadSuperblock(format!(
+            "inode {ino}: the inode trees say it is free, but its slot holds mode {mode:#o}; \
+             creating over it would replace a file that is still there"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! These fixtures are built in-process, so they prove the parser is
@@ -613,6 +667,83 @@ mod tests {
         let crc = crc32c_with_zeroed_crc(&b, DI_CRC_OFFSET);
         b[DI_CRC_OFFSET..DI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+
+    /// A free slot as `mkfs.xfs` and `xfs_ifree` leave one: the identity
+    /// fields and the checksum, and mode zero.
+    fn free_slot(sb: &Superblock, ino: u64) -> Vec<u8> {
+        let mut b = v3_inode(sb, ino);
+        b[2..4].copy_from_slice(&0u16.to_be_bytes());
+        b[5] = 2;
+        b[16..20].copy_from_slice(&0u32.to_be_bytes());
+        b[56..64].copy_from_slice(&0u64.to_be_bytes());
+        let crc = crc32c_with_zeroed_crc(&b, DI_CRC_OFFSET);
+        b[DI_CRC_OFFSET..DI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    /// The slot a create builds on is checked as the kernel checks it
+    /// (#92): a sound free slot passes, and each way of not being one is
+    /// refused -- a live file, a damaged record, another inode's record,
+    /// another filesystem's, a record that is not an inode, and a v2 core
+    /// on a v5 filesystem.
+    #[test]
+    fn a_free_slot_is_verified_before_a_create_builds_on_it() {
+        let sb = sb_v5();
+        let good = free_slot(&sb, 131);
+        verify_free_slot(&good, &sb, 131).expect("a sound free slot is accepted");
+
+        let restamp = |mut b: Vec<u8>| {
+            let crc = crc32c_with_zeroed_crc(&b, DI_CRC_OFFSET);
+            b[DI_CRC_OFFSET..DI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+            b
+        };
+        let damaged: [(&str, Vec<u8>, u64); 6] = [
+            ("a live file", v3_inode(&sb, 131), 131),
+            (
+                "a bad checksum",
+                {
+                    let mut b = good.clone();
+                    b[92] ^= 0x5a;
+                    b
+                },
+                131,
+            ),
+            ("another inode's record", good.clone(), 132),
+            (
+                "another filesystem's UUID",
+                restamp({
+                    let mut b = good.clone();
+                    b[160] ^= 0xff;
+                    b
+                }),
+                131,
+            ),
+            (
+                "not an inode",
+                restamp({
+                    let mut b = good.clone();
+                    b[0] ^= 0xff;
+                    b
+                }),
+                131,
+            ),
+            (
+                "a v2 core",
+                restamp({
+                    let mut b = good.clone();
+                    b[4] = 2;
+                    b
+                }),
+                131,
+            ),
+        ];
+        for (what, buf, ino) in damaged {
+            assert!(
+                verify_free_slot(&buf, &sb, ino).is_err(),
+                "a free slot that is {what} was accepted"
+            );
+        }
     }
 
     #[test]

@@ -76,6 +76,13 @@ never does.
   decrement through zero. `Trees::open` also no longer replaces a record
   it refuses with an all-zero chunk, which laying the trees out again
   would have written over the real one (#314).
+- **A create no longer builds a file on an inode slot it has not
+  verified.** The free inode's slot was read straight off the device and
+  its magic, version, number and UUID kept, with no check of its checksum,
+  its identity or that it was free at all. A stale or misread free bit
+  therefore handed out a live file's inode and journalled a new file over
+  it. The slot is now checked as the kernel checks it, `di_mode == 0`
+  included, and a create refuses one that fails (#92).
 
 ## [0.10.0] — 2026-10-01
 
