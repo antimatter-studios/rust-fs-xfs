@@ -59,6 +59,14 @@ never does.
   leaves a VM held with `chore vm:up` alone, and runs cargo as it is in the
   guest and on a host that cannot run the VM. The harness moves to v0.3.0,
   the release that provides it (fs-linux-test-harness#37, #36).
+- **An extent outside its allocation group is refused, not used.** A data
+  fork's extents were taken as they stood. An XFS block number is packed,
+  and its group part rounds up to a power of two, so an extent past its
+  group's length addressed the next group's superblock, AGF, AGI and free
+  list. `write_at` wrote the file's bytes there, and `truncate_to_zero`
+  journalled a free of them. Every extent is now checked as the kernel's
+  `xfs_verify_fsbext` checks it: the group exists, the extent starts past
+  the group's headers, and it ends inside the group (#92).
 
 ## [0.10.0] — 2026-10-01
 

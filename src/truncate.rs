@@ -199,6 +199,9 @@ impl Filesystem {
             }
             _ => (self.data_extents(&file, &raw)?, Vec::new()),
         };
+        // `data_extents` checks its own; the B+tree branch above reads the
+        // fork itself, for the map blocks, so it is checked here (#92).
+        self.check_extents_in_bounds(ino, &extents)?;
         if extents.is_empty() {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {ino} has no extents to free"
