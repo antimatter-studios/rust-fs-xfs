@@ -816,6 +816,14 @@ pub mod scratch {
     impl Volume {
         /// A copy of `source` to write to.
         pub fn copy_of(suite: &str, source: &Path, name: &str) -> Volume {
+            // A missing fixture is named as one, not folded into an
+            // ENOENT that reads the same as a missing destination.
+            assert!(
+                source.is_file(),
+                "the fixture {} is not there. `chore fixtures` builds the set; \
+                 a run without it fails rather than skips.",
+                source.display()
+            );
             let path = dir(suite).join(name);
             std::fs::copy(source, &path).unwrap_or_else(|e| {
                 panic!("copying {} to {}: {e}", source.display(), path.display())
@@ -868,9 +876,14 @@ pub mod scratch {
 
     impl Drop for Volume {
         fn drop(&mut self) {
+            // THE FILE ONLY, NOT THE SUITE'S DIRECTORY (#319). A suite's
+            // tests run on several threads, and `copy_of` makes the
+            // directory and then copies into it: removing it here
+            // whenever it happened to be empty took it from a test
+            // between those two steps, whose copy then failed with
+            // ENOENT. An empty directory under `scratch/` is invisible
+            // to every scanner, so leaving it costs nothing.
             let _ = std::fs::remove_file(&self.path);
-            // Empty afterwards or not; a suite still running keeps its own.
-            let _ = std::fs::remove_dir(self.path.parent().expect("a parent"));
         }
     }
 }
