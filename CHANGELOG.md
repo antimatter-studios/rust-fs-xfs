@@ -83,6 +83,14 @@ never does.
   therefore handed out a live file's inode and journalled a new file over
   it. The slot is now checked as the kernel checks it, `di_mode == 0`
   included, and a create refuses one that fails (#92).
+- **An inode's version is checked against the filesystem's.** `Inode::parse`
+  accepted versions 1, 2 and 3 on any filesystem, and checked the CRC,
+  `di_ino` and `di_uuid` only when the record itself claimed version 3. On
+  a v5 filesystem one flipped bit (3 to 2) switched those checks off and
+  moved the data fork 76 bytes into the v3 core, whose checksum and LSN
+  were then decoded as extents for a write to act on. A v5 filesystem's
+  inodes must now be version 3, and a v4 filesystem's version 1 or 2, as
+  the kernel's `xfs_dinode_good_version` requires (#92).
 
 ## [0.10.0] — 2026-10-01
 
