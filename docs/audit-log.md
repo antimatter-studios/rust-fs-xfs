@@ -21,7 +21,7 @@ Read at `c8dab2e` (#92). The earlier passes asked whether each edit's logic is r
 | `src/create.rs`: the free inode slot a create builds on | #310 |
 | `src/fs.rs` / `src/extent.rs`: a data fork's extents (`data_extents`, `truncate_to_zero`'s B+tree branch) | #311 |
 | `src/inode.rs`: `Inode::parse`'s version | #313 |
-| `src/group_write.rs`, `src/agfl.rs`, `src/inode_btree.rs`: free-space, AGFL-entry and inode-chunk records | #314 |
+| `src/group_write.rs`, `src/agfl.rs`, `src/inode_btree.rs`: free-space, AGFL-entry and inode-chunk records | #314 (#317, #318) |
 | `src/superblock.rs`: `Superblock::parse` | none found |
 | `src/ag.rs`: AGF and AGI | none found |
 | `src/ag_btree.rs`: `parse_block` and the walk | none found |
@@ -38,7 +38,7 @@ Read at `c8dab2e` (#92). The earlier passes asked whether each edit's logic is r
   - `write_at` wrote 64 blocks of file data over AG 1's superblock, AGF, AGI and AGFL. The next mount failed with `AGI for ag 1 has magic 0xabababab`.
   - `truncate_to_zero` journalled a free of AG 1's headers and tree roots. The free-space overlap check could not stop it, because headers are never free.
 - **#313.** `Inode::parse` took the version from the record, and checked CRC and identity only for version 3. On v5, one bit (3 to 2) switched those checks off and moved the data fork 76 bytes into the v3 core. `xfs_repair -n` reports `bad version number`.
-- **#314, filed and not fixed.** Group-tree records are not checked as `xfs_alloc_check_irec`, `xfs_inobt_check_irec` and `xfs_agfl_verify` check them. `take` hands out the first free run long enough, an AGFL entry is not bounded, and `InodeChunk::take`'s `freecount -= 1` on a `u8` wraps in release. Every such record sits in a CRC-checked v5 block, so reaching one takes a block with wrong contents rather than a damaged one.
+- **#314, filed, with its first two slices in #317 (free-space records) and #318 (inode-chunk records, including a refused record that `Trees::open` replaced with an all-zero chunk).** Group-tree records are not checked as `xfs_alloc_check_irec`, `xfs_inobt_check_irec` and `xfs_agfl_verify` check them. `take` hands out the first free run long enough, an AGFL entry is not bounded, and `InodeChunk::take`'s `freecount -= 1` on a `u8` wraps in release. Every such record sits in a CRC-checked v5 block, so reaching one takes a block with wrong contents rather than a damaged one.
 
 **Looked at and not a finding:**
 - Every group B+tree block is checked for magic, CRC, UUID, owner, `blkno`, level against the parent, and `numrecs` before its records are read. The walk is bounded by the group's size.
