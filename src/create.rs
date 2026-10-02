@@ -982,6 +982,13 @@ impl Filesystem {
         } else {
             self.device()
                 .read_at(self.inode_offset(ino)?, &mut new_raw)?;
+            // VERIFIED BEFORE IT IS BUILT ON (#92). The create keeps this
+            // slot's magic, version, number and UUID, and the record it
+            // writes replaces the rest, so a slot that is damaged, belongs
+            // elsewhere, or still holds a file would come out of recovery as
+            // a sound-looking new inode. This is the last point at which it
+            // can be told apart.
+            crate::inode::verify_free_slot(&new_raw, &self.sb, ino)?;
         }
         // A new directory's fork is the short-form header alone: no
         // entries, and the parent it belongs to. `.` and `..` are not
