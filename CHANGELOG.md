@@ -6,6 +6,17 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An allocation checks the free-space records it takes from.** The
+  by-block tree's blocks were verified, but its records were handed out as
+  they stood. A record naming the group's headers gave a new file block 0,
+  the primary superblock, and `write_into_empty_file` wrote the file's
+  bytes there. A record past the group's end or overlapping its neighbour
+  was taken the same way. Every record is now checked when the group is
+  opened, as the kernel's `xfs_alloc_check_irec` checks it, and in
+  ascending order (#314).
+
 ## [0.10.0] — 2026-10-01
 
 ### Breaking
