@@ -540,6 +540,39 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  semver:
+    # `chore check:semver`: this tree's public API against the newest
+    # version on crates.io, refusing a break the version in Cargo.toml does
+    # not declare. Why, and what it cannot see, is at the top of
+    # scripts/semver-check.sh.
+    name: semver (public API against crates.io)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The version scripts/semver-check.sh expects. A prebuilt binary,
+      # checksum-verified by the action, rather than a ten-minute build.
+      CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
+      # A failing tier prints only its verdict by default. Here the tail IS
+      # the answer -- which items broke -- so it is printed in full.
+      OUTPUT_BUDGET_FAIL_TAIL: "200"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core, the path dependency the current tree builds against.
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@${{ env.CARGO_SEMVER_CHECKS_VERSION }}
+      - name: chore check:semver
+        shell: bash
+        run: chore check:semver
+
   ci-ok:
     name: ci-ok
     # THE ONE REQUIRED CHECK (#207). Requiring the gate rather than each
@@ -548,7 +581,7 @@ jobs:
     # permanently pending, with nothing to point at. It is also the only
     # shape in which a job-level `if:` is safe.
     if: always()
-    needs: [unit, fixtures, test, test-arm64, test-darwin, suite-in-vm, cli]
+    needs: [unit, fixtures, test, test-arm64, test-darwin, suite-in-vm, cli, semver]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded
