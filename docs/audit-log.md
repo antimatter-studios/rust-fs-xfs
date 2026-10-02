@@ -12,6 +12,45 @@ Each pass is one entry, newest first. An entry names:
 - each finding with its issue;
 - what it didn't reach, so the next pass knows where to start.
 
+## 2026-10-02, fifth pass: is every read a write depends on verified first?
+
+Read at `c8dab2e` (#92). The earlier passes asked whether each edit's logic is right. This one asks, for every write entry point in the Rust API and the C ABI, whether each structure the write reads is verified before anything is written. "Verified" means the checks the kernel's own verifier makes for that structure: magic, CRC, identity (UUID, owner or `di_ino`, `blkno`), and range. The full per-entry-point table is in the #92 comment of the same date.
+
+| Read | Result |
+|---|---|
+| `src/create.rs`: the free inode slot a create builds on | #310 |
+| `src/fs.rs` / `src/extent.rs`: a data fork's extents (`data_extents`, `truncate_to_zero`'s B+tree branch) | #311 |
+| `src/inode.rs`: `Inode::parse`'s version | #313 |
+| `src/group_write.rs`, `src/agfl.rs`, `src/inode_btree.rs`: free-space, AGFL-entry and inode-chunk records | #314 |
+| `src/superblock.rs`: `Superblock::parse` | none found |
+| `src/ag.rs`: AGF and AGI | none found |
+| `src/ag_btree.rs`: `parse_block` and the walk | none found |
+| `src/bmbt.rs`: map blocks | none found |
+| `src/create.rs` / `src/fs.rs`: directory blocks (`verify_dir_block`, since #290) | none found |
+| `src/unlink.rs`: the victim against the inode tree (`give_back`) | none found |
+| `src/dir_write.rs`: the moved inode | none found |
+| `src/write.rs`: `update_inode` | none found beyond #313 |
+| `src/capi.rs`: `fs_xfs_mount_rw`, `fs_xfs_write_file`, `fs_xfs_truncate`, `fs_xfs_set_attributes`, `fs_xfs_umount` | each re-reads the inode, so they inherit #311 and #313 and add nothing of their own |
+
+**Findings:**
+- **#310.** A create read the free slot straight off the device and kept its magic, version, `di_ino` and UUID. It checked none of them, nor the CRC, nor that `di_mode` was zero. So a stale or misread free bit handed out a live inode, and the create journalled a new file over it. All five damages were accepted: a live file, a bad CRC, a wrong `di_ino`, a wrong UUID and a wrong magic. `xfs_repair -n` reports each, e.g. `imap claims in-use inode 131 is free`.
+- **#311.** No extent was checked against the geometry. `agblklog` rounds the group up to a power of two, so an extent past its group's length addressed the next group's headers.
+  - `write_at` wrote 64 blocks of file data over AG 1's superblock, AGF, AGI and AGFL. The next mount failed with `AGI for ag 1 has magic 0xabababab`.
+  - `truncate_to_zero` journalled a free of AG 1's headers and tree roots. The free-space overlap check could not stop it, because headers are never free.
+- **#313.** `Inode::parse` took the version from the record, and checked CRC and identity only for version 3. On v5, one bit (3 to 2) switched those checks off and moved the data fork 76 bytes into the v3 core. `xfs_repair -n` reports `bad version number`.
+- **#314, filed and not fixed.** Group-tree records are not checked as `xfs_alloc_check_irec`, `xfs_inobt_check_irec` and `xfs_agfl_verify` check them. `take` hands out the first free run long enough, an AGFL entry is not bounded, and `InodeChunk::take`'s `freecount -= 1` on a `u8` wraps in release. Every such record sits in a CRC-checked v5 block, so reaching one takes a block with wrong contents rather than a damaged one.
+
+**Looked at and not a finding:**
+- Every group B+tree block is checked for magic, CRC, UUID, owner, `blkno`, level against the parent, and `numrecs` before its records are read. The walk is bounded by the group's size.
+- The AGF's roots and levels are not range-checked in `Agf::parse`. The walk refuses a block at the wrong address, owner or depth, so a misread root fails before anything is built.
+- `unlink`'s `give_back` refuses a victim the inode tree already calls free. `rmap::remove` and the refcount release require exact matches.
+- `sync` writes only the images the mount logged, CRC-stamped; it reads nothing from disk to decide.
+
+**Still not reached:**
+- `write_at` and `truncate` take the caller's `&Inode` and raw bytes and do not re-read them. `set_attributes` and the C ABI do re-read. Whether the Rust API should is a contract question, not a misread.
+- `refcount::release`'s records, which are part of #314's class.
+- The fourth pass's torn checkpoint: a record written and its flush then failing.
+
 ## 2026-09-30, fourth pass: block-form insert, many records per mount, the B+tree-fork free
 
 Read at `0043d26` (#92). This pass covers the write paths that arrived after the third pass read `c6c0b26`, or that no pass had reached: adding an entry to a directory already in block form (#220), a mount that writes several checkpoints and reuses the ring (#205, #209), a checkpoint written as several records (#216), and freeing a B+tree extent fork's own blocks (#222).
