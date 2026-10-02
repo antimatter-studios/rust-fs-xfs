@@ -26,11 +26,15 @@
 # It goes in its own prefix so every other oracle keeps the
 # distribution's mkfs.xfs, whose defaults the fixtures were built with.
 #
-# AND A RUST TOOLCHAIN, for `chore test:vm` — the whole suite compiled
-# and run in here, which is how a macOS host runs a Linux test suite at
-# all. It is pinned to the repository's rust-toolchain.toml, installed
-# under /var/lib (the VM's own disk, which outlives a `vm:down`), and the
-# build directory lives there too so the second run is incremental.
+# AND WHAT A RUST BUILD NEEDS FROM THE DISTRIBUTION (curl, gcc, libc6-dev,
+# pkg-config), for `chore test:vm`: the whole suite compiled and run in
+# here, which is how a macOS host runs a Linux test suite at all. NOT THE
+# TOOLCHAIN ITSELF: scripts/guest-suite.sh installs that through
+# `scripts/core.sh guest-rust-toolchain`, rust-fs-core's one copy of the
+# install, which every driver runs and which recovers from an install a
+# reaper or a deadline interrupted. It cannot run from here: the harness
+# ships this one file into the guest, before `test:vm` has staged the core
+# sibling on the share (rust-fs-core#190).
 #
 # WHAT IS NOT HERE: fsstress and fsx. They are built from fstests, which
 # takes minutes, and only `chore fixtures -- stress` wants them —
@@ -41,9 +45,6 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 REPO=/repo
-RUST_ROOT=/var/lib/fs-xfs-rust
-export RUSTUP_HOME="$RUST_ROOT/rustup"
-export CARGO_HOME="$RUST_ROOT/cargo"
 
 # The pinned build's prefix. tests/common/mod.rs names this same path, so
 # THE TWO MUST AGREE; it is checked at the end of this script.
@@ -105,47 +106,9 @@ if ! "$PARENT_PREFIX/sbin/mkfs.xfs" -V 2>/dev/null | grep -q "version $PARENT_VE
 fi
 "$PARENT_PREFIX/sbin/mkfs.xfs" -V
 
-# The toolchain the repository pins, and only that one: a guest that
-# silently built with a different compiler than CI is a guest whose
-# result means nothing.
-toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$REPO/rust-toolchain.toml" | head -1)"
-[ -n "$toolchain" ] || { echo "vm-setup: no channel in $REPO/rust-toolchain.toml" >&2; exit 1; }
-
-mkdir -p "$RUST_ROOT"
-# A PROVISION THAT WAS INTERRUPTED leaves rustup's download directory
-# holding a `.partial` whose final name it then cannot produce —
-# "could not rename 'downloaded' file ... No such file or directory" —
-# and every later run fails the same way, because the wreckage lives on
-# the VM's own disk and outlives a `vm:down`. Measured on this guest
-# after a reaper stopped it mid-install. The directory is a cache: it
-# costs a re-download and nothing else.
-rm -rf "$RUSTUP_HOME/downloads" "$RUSTUP_HOME/tmp"
-if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-        sh -s -- -y --no-modify-path --default-toolchain none >/dev/null
-fi
-# INSTALLED, OR REINSTALLED FROM SCRATCH. An install that was
-# interrupted leaves a toolchain directory half populated, and rustup
-# will not finish it: it refuses with "detected conflict: 'bin/rust-gdb'"
-# or "could not rename 'component' file ... Directory not empty", on
-# every later run, because the wreckage is on the VM's own disk and
-# outlives a `vm:down`. Measured on this guest after a reaper stopped it
-# mid-install. rustup is idempotent and quick when the toolchain is
-# whole, so the retry costs nothing in the ordinary case and a
-# re-download in the one case it is for.
-if ! "$CARGO_HOME/bin/rustup" toolchain install "$toolchain" \
-    --component rustfmt --component clippy --profile minimal >/dev/null 2>&1; then
-    echo "vm-setup: the pinned toolchain is half installed; removing it and trying once more"
-    rm -rf "$RUSTUP_HOME/toolchains/$toolchain"* "$RUSTUP_HOME/tmp" "$RUSTUP_HOME/downloads"
-    "$CARGO_HOME/bin/rustup" toolchain install "$toolchain" \
-        --component rustfmt --component clippy --profile minimal >/dev/null
-fi
-"$CARGO_HOME/bin/rustup" default "$toolchain" >/dev/null
-"$CARGO_HOME/bin/cargo" --version
-
 # THE PREFIX AND THE TEST MUST AGREE, and nothing else checks that they
 # do: tests/common/mod.rs hands the guest this exact path.
 grep -q "$PARENT_PREFIX" "$REPO/tests/common/mod.rs" ||
     { echo "vm-setup: tests/common/mod.rs no longer names $PARENT_PREFIX" >&2; exit 1; }
 
-echo "vm-setup: the oracle tools and the pinned toolchain are installed in the guest"
+echo "vm-setup: the oracle tools are installed in the guest"
