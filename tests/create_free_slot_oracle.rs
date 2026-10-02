@@ -145,9 +145,12 @@ fn write_bytes(path: &Path, at: u64, bytes: &[u8]) {
 /// The slot a create takes on this volume, and where it is.
 ///
 /// Asked of the driver on a throwaway copy rather than worked out here,
-/// so the test damages the inode the create really reads.
-fn the_slot_a_create_takes() -> (u64, u64, usize) {
-    let probe = fresh_copy("probe");
+/// so the test damages the inode the create really reads. `tag` names the
+/// copy for the test asking: the tests in this file run in parallel in one
+/// process, and a shared name let one test's probe create dirty the log of
+/// the copy the other was mounting.
+fn the_slot_a_create_takes(tag: &str) -> (u64, u64, usize) {
+    let probe = fresh_copy(&format!("probe-{tag}"));
     let dev = Arc::new(FileDevice::open_rw(probe.path()).expect("open the probe copy"));
     let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount the probe copy");
     let root = fs.superblock().rootino;
@@ -200,7 +203,7 @@ fn try_create(image: &Path) -> (Result<(u64, u64), fs_xfs::Error>, usize) {
 /// the VM can run.
 #[test]
 fn a_create_refuses_a_slot_that_is_not_a_verified_free_inode() {
-    let (ino, at, isize) = the_slot_a_create_takes();
+    let (ino, at, isize) = the_slot_a_create_takes("driver");
 
     // A FRESH COPY FOR EACH DAMAGE. A create that is wrongly accepted
     // writes a log record, and the next mount would then refuse the
@@ -238,7 +241,7 @@ fn a_create_refuses_a_slot_that_is_not_a_verified_free_inode() {
 /// the checker accepted would be a refusal of a sound volume, not a guard.
 #[test]
 fn every_damaged_slot_is_corruption_to_xfs_repair_and_refused_here() {
-    let (ino, at, isize) = the_slot_a_create_takes();
+    let (ino, at, isize) = the_slot_a_create_takes("oracle");
 
     let clean = fresh_copy("oracle-undamaged");
     let judged = oracle("xfs_repair").args(["-n", &clean.guest()]).output();
