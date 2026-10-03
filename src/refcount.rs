@@ -602,6 +602,108 @@ mod tests {
         );
     }
 
+    /// A record set the kernel would refuse is not edited (#92).
+    ///
+    /// `xfs_refcount_check_irec` refuses an empty record, a shared one
+    /// with fewer than two owners and a staging one with other than one,
+    /// and the tree keeps its keys ascending: every shared record, then
+    /// every staging one (the flag is the key's top bit), none
+    /// overlapping. `release` took the records as they stood, so a
+    /// misread tree was rewritten by the same transaction that freed
+    /// blocks on its word, and two records out of order made it splice
+    /// one index and then reach past the end of the list.
+    #[test]
+    fn a_record_set_the_kernel_would_refuse_is_not_edited() {
+        let rec = |startblock, blockcount, refcount, cow| Refcount {
+            startblock,
+            blockcount,
+            refcount,
+            cow,
+        };
+        for (what, records, start, count) in [
+            (
+                "two records out of order",
+                vec![rec(100, 10, 2, false), rec(50, 10, 2, false)],
+                50,
+                60,
+            ),
+            (
+                "two overlapping records",
+                vec![rec(24, 8, 2, false), rec(28, 8, 2, false)],
+                24,
+                12,
+            ),
+            (
+                "an empty record",
+                vec![rec(24, 8, 2, false), rec(40, 0, 2, false)],
+                24,
+                8,
+            ),
+            (
+                "a shared record with one owner, away from the extent",
+                vec![rec(24, 8, 2, false), rec(64, 8, 1, false)],
+                24,
+                8,
+            ),
+            (
+                "a staging record with two owners",
+                vec![rec(24, 8, 2, false), rec(64, 8, 2, true)],
+                24,
+                8,
+            ),
+            (
+                "a staging record ahead of a shared one",
+                vec![rec(64, 8, 1, true), rec(24, 8, 2, false)],
+                24,
+                8,
+            ),
+        ] {
+            let mut edited = records.clone();
+            let outcome = std::panic::catch_unwind(move || {
+                let r = release(&mut edited, start, count);
+                (r, edited)
+            });
+            match outcome {
+                Ok((Err(_), edited)) => {
+                    assert_eq!(edited, records, "{what}: refused, but edited first");
+                }
+                Ok((Ok(freed), edited)) => {
+                    panic!("{what} was edited: {records:?} became {edited:?}, freeing {freed:?}")
+                }
+                Err(_) => panic!("{what} panicked rather than being refused: {records:?}"),
+            }
+        }
+    }
+
+    /// A staging record elsewhere in the group stays behind every shared
+    /// one after an edit, where its key puts it in the tree.
+    #[test]
+    fn an_edit_keeps_staging_records_after_shared_ones() {
+        let mut records = vec![
+            Refcount {
+                startblock: 24,
+                blockcount: 16,
+                refcount: 2,
+                cow: false,
+            },
+            Refcount {
+                startblock: 8,
+                blockcount: 4,
+                refcount: 1,
+                cow: true,
+            },
+        ];
+        release(&mut records, 30, 4).expect("release");
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.startblock, r.cow))
+                .collect::<Vec<_>>(),
+            [(24, false), (34, false), (8, true)],
+            "tree order is the raw key, flag included"
+        );
+    }
+
     #[test]
     fn what_is_not_implemented_is_refused_rather_than_guessed() {
         // A staging extent means copy-on-write, which this does not do.
