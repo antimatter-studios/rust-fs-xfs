@@ -40,7 +40,7 @@ name: CI
 #                on PATH, and tested AS INSTALLED -- `rust-fs-xfs doctor`
 #                first, then tests/cli/*.sh against the kernel-made `cli`
 #                fixtures. Then the release tarball is built and its layout
-#                checked (scripts/package-cli.sh), so a change that breaks a
+#                checked (`scripts/core.sh package-cli`), so a change that breaks a
 #                tool or the tarball fails the pull request, not the
 #                release. No VM: what xfsprogs and the kernel make of the
 #                tools is judged in the oracle and kernel tiers
@@ -518,8 +518,9 @@ jobs:
       - name: chore test:cli
         id: tier
         run: chore test:cli
-      # THE TARBALL, ON EVERY PULL REQUEST. The release job runs this same
-      # script on each platform it publishes; running it here means the
+      # THE TARBALL, ON EVERY PULL REQUEST. rust-fs-core's release-cli
+      # workflow, which release.yml calls, runs this same script from core
+      # on each platform it publishes; running it here means the
       # layout -- the binary, each dotted name a relative symlink to it,
       # CAVEATS of at most four lines, LICENSE, and every name answering
       # --version as this crate -- is checked before a tag is pushed, not
@@ -528,7 +529,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          tarball="$(scripts/package-cli.sh "$version" linux-x86_64)"
+          tarball="$(bash scripts/core.sh package-cli "$version" linux-x86_64 | tail -n 1)"
           tar -tvzf "$tarball"
       - name: Keep the tier logs
         # Not before the tier ran: there is no log then, and this step's red
