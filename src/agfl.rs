@@ -52,6 +52,16 @@ pub fn capacity(sb: &Superblock) -> usize {
     (usize::from(sb.sectsize) - header) / ENTRY_LEN
 }
 
+/// `XFS_AGFL_BLOCK`: the block holding the group's last header sector,
+/// the free list. Nothing at or below it is ever free space, a free-list
+/// entry or the start of an inode chunk.
+pub fn last_header_block(sb: &Superblock) -> u32 {
+    (3 * u64::from(sb.sectsize) / u64::from(sb.blocksize)) as u32
+}
+
+/// `NULLAGBLOCK`: an empty free-list slot.
+pub const NULLAGBLOCK: u32 = u32::MAX;
+
 /// The free list of one group, read and checked.
 #[derive(Debug, Clone)]
 pub struct Agfl {
@@ -65,6 +75,9 @@ pub struct Agfl {
     /// How many entries are live.
     count: u32,
     capacity: usize,
+    /// The group's length in blocks, from its AGF: no entry is at or past
+    /// it.
+    length: u32,
 }
 
 impl Agfl {
@@ -163,6 +176,7 @@ impl Agfl {
             last: agf.fllast,
             count: agf.flcount,
             capacity,
+            length: agf.length,
         })
     }
 
@@ -198,6 +212,13 @@ impl Agfl {
     /// [`Error::UnsupportedFeature`] when the list is empty. Refilling
     /// it means taking blocks out of the free-space trees, which is the
     /// edit that wanted a block in the first place.
+    ///
+    /// [`Error::BadSuperblock`] for an entry that is not a block of this
+    /// group past its headers (#314), as `xfs_alloc_get_freelist` refuses
+    /// it: `NULLAGBLOCK`, or outside `xfs_verify_agbno`'s range. The block
+    /// taken becomes a tree block written at `agblock * blocksize` into the
+    /// group, so such an entry would be written into another group, past
+    /// the device, or over the headers. The list is left as it was.
     pub fn take(&mut self, sb: &Superblock, agno: u32) -> Result<u32> {
         if self.count == 0 {
             return Err(Error::UnsupportedFeature(format!(
@@ -207,6 +228,13 @@ impl Agfl {
         }
         let at = self.entry_at(sb, self.first);
         let block = be32(&self.raw, at);
+        if block == NULLAGBLOCK || block <= last_header_block(sb) || block >= self.length {
+            return Err(Error::BadSuperblock(format!(
+                "AG {agno}: free-list entry {} names block {block:#x}, which is not a block \
+                 of a {}-block group past its headers",
+                self.first, self.length
+            )));
+        }
         self.first = (self.first + 1) % self.capacity as u32;
         self.count -= 1;
         Ok(block)

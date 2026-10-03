@@ -6,6 +6,17 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A write checks the group-tree records it consumes, as the kernel does.**
+  A free-list entry that is `NULLAGBLOCK`, past the group or on its headers
+  is refused by `Agfl::take` instead of becoming a tree block written there.
+  The by-length free-space tree's records are compared with the by-block
+  tree's, and a group where they differ is refused instead of having both
+  trees rewritten from one of them. An inode chunk that does not start on a
+  chunk boundary inside its group, past its headers, is refused before a
+  create builds a file on it (#314).
+
 ### Changed
 
 - **A test run gives the harness VM and its machine-wide slot back when it

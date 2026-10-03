@@ -376,10 +376,10 @@ impl<'a> GroupAlloc<'a> {
             crate::alloc_btree::decode_free_extent,
         )?;
         // The by-length tree holds the same records in another order, so
-        // only its blocks are wanted -- but they have to be read to be
-        // known, and their contents are what the new tree is diffed
-        // against.
-        let (_, cnt_blocks) = crate::ag_btree::walk_blocks(
+        // both are laid out again from the by-block records below. Its
+        // blocks have to be read to be known, and their contents are
+        // what the new tree is diffed against.
+        let (by_length, cnt_blocks) = crate::ag_btree::walk_blocks(
             sb,
             crate::alloc_btree::Order::ByCount.shape(),
             agno,
@@ -388,6 +388,12 @@ impl<'a> GroupAlloc<'a> {
             &mut read,
             crate::alloc_btree::decode_free_extent,
         )?;
+        // THE SAME RECORDS, OR THE GROUP IS REFUSED (#314). Laying both
+        // trees out again from the by-block records would overwrite the
+        // by-length tree's disagreement, and with it the only sign that
+        // one of the two misstates free space. `xfs_repair` reports such
+        // a run as "only seen by one free space btree".
+        same_free_space(agno, &by_block, by_length)?;
 
         // A FILESYSTEM CAN HAVE THE FEATURE AND A GROUP NO TREE.
         //
@@ -936,9 +942,88 @@ impl<'a> Allocations<'a> {
     }
 }
 
+/// Refuse a group whose by-length free-space records are not the
+/// by-block tree's records (#314).
+///
+/// The two trees index the same free space in two orders, so as multisets
+/// they are equal. Compared whole rather than by count and total: a run
+/// moved by one block keeps both.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] naming the first record the two disagree on.
+fn same_free_space(
+    agno: u32,
+    by_block: &[FreeExtent],
+    mut by_length: Vec<FreeExtent>,
+) -> Result<()> {
+    let mut by_block = by_block.to_vec();
+    by_block.sort_unstable();
+    by_length.sort_unstable();
+    if by_block == by_length {
+        return Ok(());
+    }
+    let differ = by_block
+        .iter()
+        .zip(&by_length)
+        .find(|(a, b)| a != b)
+        .map_or_else(
+            || {
+                format!(
+                    "the by-block tree has {} records and the by-length tree {}",
+                    by_block.len(),
+                    by_length.len()
+                )
+            },
+            |(a, b)| {
+                format!(
+                    "the by-block tree has {} blocks at {} where the by-length tree has {} \
+                     blocks at {}",
+                    a.blockcount, a.startblock, b.blockcount, b.startblock
+                )
+            },
+        );
+    Err(Error::BadSuperblock(format!(
+        "AG {agno}: the two free-space trees describe different free space: {differ}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The by-length tree holds the by-block tree's records in another
+    /// order, and anything else is refused (#314).
+    #[test]
+    fn the_two_free_space_trees_must_hold_the_same_runs() {
+        let run = |startblock, blockcount| FreeExtent {
+            startblock,
+            blockcount,
+        };
+        let by_block = [run(10, 6), run(24, 2), run(40, 6)];
+        same_free_space(0, &by_block, vec![run(24, 2), run(10, 6), run(40, 6)])
+            .expect("the same runs in length order");
+        for (what, by_length) in [
+            (
+                "a run one block shorter",
+                vec![run(24, 2), run(10, 6), run(40, 5)],
+            ),
+            (
+                "a run moved by one block",
+                vec![run(24, 2), run(11, 6), run(40, 6)],
+            ),
+            ("a run missing", vec![run(24, 2), run(10, 6)]),
+            (
+                "a run too many",
+                vec![run(24, 2), run(10, 6), run(40, 6), run(60, 1)],
+            ),
+        ] {
+            assert!(
+                same_free_space(0, &by_block, by_length).is_err(),
+                "{what} was accepted"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------
     // The invariants run in the build that ships
