@@ -51,14 +51,11 @@ REPO=/repo
 PARENT_PREFIX=/usr/local/xfsprogs-parent
 PARENT_VERSION=6.13.0
 
-# A GUEST WHOSE PROVISION WAS INTERRUPTED comes back with dpkg half way
-# through a transaction, and every later apt-get refuses with "dpkg was
-# interrupted, you must manually run 'sudo dpkg --configure -a'". The VM
-# outlives a `vm:down`, so that state outlives the run that caused it —
-# and the run that caused it is the ordinary one: a reaper stopping a VM
-# in the middle of an install, a deadline firing, a laptop closing. It
-# costs nothing when there is nothing to finish.
-dpkg --configure -a >/dev/null 2>&1 || true
+# NO dpkg RECOVERY HERE: a guest whose provision was interrupted comes
+# back with dpkg half way through a transaction, and the harness's
+# per-boot apt-ready.sh finishes it before this script runs (v0.3.0,
+# fs-linux-test-harness#33). A copy here is how the drivers' setup
+# scripts drifted apart (#132); tests/ci_profile.rs refuses one.
 
 apt-get update -qq
 apt-get install -y -qq \
