@@ -83,11 +83,31 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 export FS_XFS_TEST_TEMP_ACTIVE=1
+
+# THE RUN OWNS THE VM ITS TESTS USE. The tiers bring the harness VM up
+# before cargo starts, and every test process brings it up if it is down;
+# either boot takes the machine-wide slot, ONE for every repository on the
+# machine. Left to chore's `after_all` reaper, which runs only inside a
+# chore invocation of this repository, a run that reached cargo any other
+# way (scripts/test.sh by hand, scripts/tier.sh) exited with the VM idle
+# and the slot held, and every other repository's VM work queued behind it
+# until the guest's idle deadline. `vm.sh session` runs the command inside
+# a harness session: the VM comes down and the slot is released when the
+# run ends, passed, failed or killed, and a VM held with `chore vm:up` is
+# left up. In the guest, and on a host that cannot run the VM, it runs the
+# command as it is. Without the harness sibling no test can boot a VM, so
+# there is none to own.
+session=()
+HARNESS_VM="$REPO/../fs-linux-test-harness/scripts/vm.sh"
+[[ -x "$HARNESS_VM" ]] && session=("$HARNESS_VM" session)
+
 # Job control gives the command and every descendant its own process group.
 # This is portable to the older Bash shipped by macOS, where `setsid` is not
 # available by default.
 set -m
-"$@" <&0 &
+# The `+` form because an empty array is an unbound variable to bash
+# before 4.4, which is what macOS ships.
+${session[@]+"${session[@]}"} "$@" <&0 &
 CHILD_PID=$!
 CHILD_PGID=$CHILD_PID
 set +m

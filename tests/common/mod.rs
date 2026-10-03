@@ -56,10 +56,10 @@
 //!
 //! # Why it is not slow
 //!
-//! The VM is booted once for a tier (`chore test:oracle` brings it up
-//! and the reaper stops it) and every call rides one multiplexed SSH
-//! connection: about 30 ms of overhead per call against 700 ms for a
-//! fresh handshake. Nothing is copied.
+//! The VM is booted once for a tier (`chore test:oracle` brings it up,
+//! and the harness session the tier runs in brings it down) and every
+//! call rides one multiplexed SSH connection: about 30 ms of overhead per
+//! call against 700 ms for a fresh handshake. Nothing is copied.
 
 // EVERY TEST BINARY COMPILES THE WHOLE MODULE and uses part of it, so
 // an item only the oracle tiers call is dead code in the unit tier's
@@ -133,8 +133,11 @@ fn vm(command: &str, argument: &str) -> io::Result<Output> {
 /// `vm.sh up` is idempotent and costs milliseconds when the VM is
 /// already running, which is the normal case: the tier task brings it up
 /// for the whole run. A test process that finds it down boots it rather
-/// than failing, so a suite run by hand with a bare `cargo test` still
-/// works, and the chore reaper stops what it left behind.
+/// than failing, so a suite run by hand still works. Run through
+/// `scripts/with-test-temp.sh` (every tier is, and so is
+/// `scripts/test.sh`), the run is a harness session, so the VM comes down
+/// and the machine-wide slot is released when it ends; a bare `cargo test`
+/// leaves that to the chore reaper.
 fn session() {
     static SESSION: OnceLock<()> = OnceLock::new();
     SESSION.get_or_init(|| {
