@@ -6,6 +6,23 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A free checks the reference-count records before it edits the tree on
+  their word (#92).** The tree's blocks were verified, but the records
+  inside them were used as they stood: an empty record, a shared record
+  with fewer than two owners, a staging record with other than one, a
+  record on the group's headers or past its end, or two out of order or
+  overlapping were all accepted, and the truncate that consulted them
+  rewrote the tree in the same transaction. Two records out of order made
+  `release` splice one index and then index past the end of the list. Each
+  is now refused as `xfs_refcount_check_irec` and the tree's key order
+  refuse it, before anything is built.
+- **An edit keeps staging records after shared ones.** `merge_adjacent`
+  sorted by block and then by the copy-on-write flag, which put a staging
+  record among the shared ones; the tree's key carries the flag in its top
+  bit, so the kernel keeps every staging record after every shared one.
+
 ### Changed
 
 - **A test run gives the harness VM and its machine-wide slot back when it
