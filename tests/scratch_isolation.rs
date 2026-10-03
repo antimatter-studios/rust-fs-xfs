@@ -89,4 +89,55 @@ fn a_scratch_volume_is_invisible_to_a_suite_that_scans_the_fixtures() {
         !listed.iter().any(|n| n == "probe.img"),
         "a scratch volume turned up beside the fixtures: {listed:?}"
     );
+
+    // A volume leaves its suite's directory behind (#319); this suite is
+    // named for the process, so it removes its own.
+    let dir = volume.path().parent().expect("a parent").to_path_buf();
+    drop(volume);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// A test that finishes does not take the scratch directory away from a
+/// test in the same suite that is about to copy into it (#319).
+///
+/// `Volume::copy_of` is two steps: make `.vm-share/scratch/<suite>/`,
+/// then copy the fixture into it. Cargo runs a suite's tests on several
+/// threads, and a volume dropped between those two steps used to remove
+/// the directory whenever it was the last file in it — so the copy
+/// failed with ENOENT, and the panic named the *fixture* as the thing
+/// missing. That is how `create_replay_oracle` went red in the guest on
+/// some runs and not others, with every fixture present in the artifact.
+///
+/// The two steps are spelled out here with the other test's drop between
+/// them, which is the interleaving that failed, made deterministic.
+#[test]
+fn a_finished_volume_leaves_the_suite_directory_to_the_tests_still_running() {
+    assert!(
+        share().is_dir(),
+        "{} is not there: `chore fixtures` builds the set and makes the directory. \
+         Tests never skip on a missing fixture.",
+        share().display()
+    );
+    let suite = format!("scratch-shared-{}", std::process::id());
+    let source = scratch::Volume::empty(&format!("{suite}-source"), "source.img", 4096);
+
+    // One test has its directory and is about to copy into it...
+    let waiting = scratch::dir(&suite);
+    // ...when another test in the same suite finishes with its volume.
+    drop(scratch::Volume::empty(&suite, "finished.img", 4096));
+
+    let target = waiting.join("copy.img");
+    let copied = std::fs::copy(source.path(), &target);
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_dir(&waiting);
+    let source_dir = source.path().parent().expect("a parent").to_path_buf();
+    drop(source);
+    let _ = std::fs::remove_dir(&source_dir);
+    copied.unwrap_or_else(|e| {
+        panic!(
+            "copying into {} after another test in the suite dropped its volume: {e}. \
+             The drop removed the directory out from under a test still using it.",
+            waiting.display()
+        )
+    });
 }
