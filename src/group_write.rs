@@ -375,6 +375,10 @@ impl<'a> GroupAlloc<'a> {
             &mut read,
             crate::alloc_btree::decode_free_extent,
         )?;
+        // THE RECORDS, NOT ONLY THEIR BLOCKS (#314). `take` hands out the
+        // first run long enough, so a record that names the group's
+        // headers or another structure's blocks would be written over.
+        crate::alloc_btree::check_records(sb, agno, agf.length, &by_block)?;
         // The by-length tree holds the same records in another order, so
         // only its blocks are wanted -- but they have to be read to be
         // known, and their contents are what the new tree is diffed

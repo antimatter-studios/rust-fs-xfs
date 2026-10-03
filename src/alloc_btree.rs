@@ -90,6 +90,61 @@ pub fn decode_free_extent(buf: &[u8], at: usize) -> FreeExtent {
     }
 }
 
+/// Refuse a by-block free-space tree whose records do not describe free
+/// space inside the group (#314).
+///
+/// The blocks the records came from are verified as they are read; the
+/// records are what an allocation hands out, so they are checked as the
+/// kernel checks them before one is: `xfs_alloc_check_irec` requires a
+/// nonzero length, a start past `XFS_AGFL_BLOCK` and an end inside the
+/// group (`xfs_verify_agbext`), and the tree keeps them in ascending order.
+/// Ascending and not overlapping is checked as one rule: each run starts at
+/// or after the end of the one before.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] naming the first record that fails.
+pub(crate) fn check_records(
+    sb: &Superblock,
+    agno: u32,
+    length: u32,
+    records: &[FreeExtent],
+) -> Result<()> {
+    // XFS_AGFL_BLOCK: the block holding the group's last header sector.
+    let headers = 3 * u64::from(sb.sectsize) / u64::from(sb.blocksize);
+    check_runs(agno, length, headers, records)
+}
+
+/// [`check_records`] with the group's last header block given as a number,
+/// so the rule can be tested without a superblock.
+fn check_runs(agno: u32, length: u32, headers: u64, records: &[FreeExtent]) -> Result<()> {
+    let mut previous_end = 0u64;
+    for (i, r) in records.iter().enumerate() {
+        let start = u64::from(r.startblock);
+        let end = start + u64::from(r.blockcount);
+        let why = if r.blockcount == 0 {
+            Some("is empty")
+        } else if start <= headers {
+            Some("starts on the group's headers")
+        } else if end > u64::from(length) {
+            Some("runs past the end of the group")
+        } else if start < previous_end {
+            Some("starts before the run before it ends")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(Error::BadSuperblock(format!(
+                "AG {agno}: free-space record {i} ({} blocks at {}) {why}, so it does not \
+                 describe free space in a group of {length} blocks",
+                r.blockcount, r.startblock
+            )));
+        }
+        previous_end = end;
+    }
+    Ok(())
+}
+
 /// One free-space record written at `at` bytes into `buf`.
 ///
 /// Also the key: a free-space key is the record, in both trees -- the
@@ -258,6 +313,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A free-space record is free space inside its group, after the one
+    /// before it, or the tree is refused (#314), as `xfs_alloc_check_irec`
+    /// and the tree's ordering decide. A group of 1000 blocks whose headers
+    /// end at block 0.
+    #[test]
+    fn a_free_space_record_must_be_free_space_inside_its_group() {
+        let run = |startblock, blockcount| FreeExtent {
+            startblock,
+            blockcount,
+        };
+        check_runs(0, 1000, 0, &[run(10, 6), run(24, 976)])
+            .expect("two ordered runs inside the group are free space");
+        check_runs(0, 1000, 0, &[run(10, 6), run(16, 10)])
+            .expect("adjacent runs are ordered, if unmerged");
+        for (what, records) in [
+            ("an empty run", vec![run(10, 0)]),
+            ("a run on the group's headers", vec![run(0, 16)]),
+            ("a run past the group's end", vec![run(999, 6)]),
+            (
+                "a run before the one ahead of it",
+                vec![run(24, 6), run(10, 6)],
+            ),
+            ("two overlapping runs", vec![run(10, 6), run(13, 6)]),
+            (
+                "a run whose end does not fit a u32",
+                vec![run(u32::MAX - 1, 4)],
+            ),
+        ] {
+            assert!(
+                check_runs(0, 1000, 0, &records).is_err(),
+                "{what} was accepted: {records:?}"
+            );
+        }
+    }
 
     /// A run ending at the last block of a full group must not wrap.
     ///
