@@ -408,6 +408,42 @@ mod tests {
         );
     }
 
+    /// A FREE-LIST ENTRY IS A BLOCK OF THIS GROUP, PAST ITS HEADERS (#314).
+    ///
+    /// The block taken becomes a new B+tree block, written at
+    /// `ag_start + agblock * blocksize`. The kernel checks every entry as
+    /// `xfs_agfl_verify` and `xfs_alloc_get_freelist` do: not `NULLAGBLOCK`,
+    /// and inside the group past `XFS_AGFL_BLOCK` (`xfs_verify_agbno`). An
+    /// entry this driver took on trust lands in another group, past the
+    /// device, or on the group's own headers. The fixture's group is 2048
+    /// blocks of 1 KiB with 512-byte sectors, so its headers end at block 1.
+    #[test]
+    fn a_free_list_entry_that_is_not_a_block_of_the_group_is_refused() {
+        let sb = sb();
+        for (what, block) in [
+            ("NULLAGBLOCK", u32::MAX),
+            ("the first block past the group", 2048),
+            ("a block in the next group", 3000),
+            ("the superblock's block", 0),
+            ("the free list's own block", 1),
+        ] {
+            let (raw, agf) = list(&sb, 7, &[block, 960]);
+            let mut fl = Agfl::parse(&raw, &sb, &agf, 0).expect("the header is sound");
+            assert!(
+                fl.take(&sb, 0).is_err(),
+                "an entry naming {what} ({block}) was handed out"
+            );
+            assert_eq!(fl.count(), 2, "a refused take left the list as it was");
+        }
+        let (raw, agf) = list(&sb, 7, &[2, 2047]);
+        let mut fl = Agfl::parse(&raw, &sb, &agf, 0).expect("the header is sound");
+        assert_eq!(
+            fl.take(&sb, 0).expect("the first block past the headers"),
+            2
+        );
+        assert_eq!(fl.take(&sb, 0).expect("the group's last block"), 2047);
+    }
+
     /// The measured shape: 512-byte sectors hold 119 entries.
     #[test]
     fn a_sector_holds_a_hundred_and_nineteen_blocks() {
@@ -424,10 +460,10 @@ mod tests {
         assert_eq!(fl.take(&sb, 0).expect("take"), 960);
         assert_eq!(fl.take(&sb, 0).expect("take"), 961);
         assert_eq!(fl.count(), 1);
-        fl.put(&sb, 0, 4242).expect("put");
+        fl.put(&sb, 0, 1242).expect("put");
         assert_eq!(fl.count(), 2);
         assert_eq!(fl.take(&sb, 0).expect("take"), 962, "962 was there first");
-        assert_eq!(fl.take(&sb, 0).expect("take"), 4242);
+        assert_eq!(fl.take(&sb, 0).expect("take"), 1242);
         assert_eq!(fl.count(), 0);
     }
 
