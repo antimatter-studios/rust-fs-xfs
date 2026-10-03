@@ -6,6 +6,18 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An inode-chunk record whose counts disagree with its masks is refused.**
+  A create chose an inode by the record's free mask and then decremented
+  the record's `u8` free count. A count above the mask's was written back
+  into both inode trees, and a count of zero beside free bits panicked in
+  a debug build and wrapped to 255 in release. Every record is now checked
+  as the kernel's `xfs_inobt_check_irec` checks it, and `take` cannot
+  decrement through zero. `Trees::open` also no longer replaces a record
+  it refuses with an all-zero chunk, which laying the trees out again
+  would have written over the real one (#314).
+
 ## [0.10.0] — 2026-10-01
 
 ### Breaking
