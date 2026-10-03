@@ -49,9 +49,8 @@ const BT_HEADER: usize = 56;
 const BT_LEVEL: usize = 4;
 const BT_NUMRECS: usize = 6;
 
-/// A free-space record and an inode-chunk record.
+/// A free-space record.
 const FREE_RECORD: usize = 8;
-const CHUNK_RECORD: usize = 16;
 
 /// `agi_root` in the AGI.
 const AGI_ROOT: usize = 20;
