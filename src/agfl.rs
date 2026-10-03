@@ -52,6 +52,16 @@ pub fn capacity(sb: &Superblock) -> usize {
     (usize::from(sb.sectsize) - header) / ENTRY_LEN
 }
 
+/// `XFS_AGFL_BLOCK`: the block holding the group's last header sector,
+/// the free list. Nothing at or below it is ever free space, a free-list
+/// entry or the start of an inode chunk.
+pub fn last_header_block(sb: &Superblock) -> u32 {
+    (3 * u64::from(sb.sectsize) / u64::from(sb.blocksize)) as u32
+}
+
+/// `NULLAGBLOCK`: an empty free-list slot.
+pub const NULLAGBLOCK: u32 = u32::MAX;
+
 /// The free list of one group, read and checked.
 #[derive(Debug, Clone)]
 pub struct Agfl {
@@ -65,6 +75,9 @@ pub struct Agfl {
     /// How many entries are live.
     count: u32,
     capacity: usize,
+    /// The group's length in blocks, from its AGF: no entry is at or past
+    /// it.
+    length: u32,
 }
 
 impl Agfl {
@@ -163,6 +176,7 @@ impl Agfl {
             last: agf.fllast,
             count: agf.flcount,
             capacity,
+            length: agf.length,
         })
     }
 
@@ -198,6 +212,13 @@ impl Agfl {
     /// [`Error::UnsupportedFeature`] when the list is empty. Refilling
     /// it means taking blocks out of the free-space trees, which is the
     /// edit that wanted a block in the first place.
+    ///
+    /// [`Error::BadSuperblock`] for an entry that is not a block of this
+    /// group past its headers (#314), as `xfs_alloc_get_freelist` refuses
+    /// it: `NULLAGBLOCK`, or outside `xfs_verify_agbno`'s range. The block
+    /// taken becomes a tree block written at `agblock * blocksize` into the
+    /// group, so such an entry would be written into another group, past
+    /// the device, or over the headers. The list is left as it was.
     pub fn take(&mut self, sb: &Superblock, agno: u32) -> Result<u32> {
         if self.count == 0 {
             return Err(Error::UnsupportedFeature(format!(
@@ -207,6 +228,13 @@ impl Agfl {
         }
         let at = self.entry_at(sb, self.first);
         let block = be32(&self.raw, at);
+        if block == NULLAGBLOCK || block <= last_header_block(sb) || block >= self.length {
+            return Err(Error::BadSuperblock(format!(
+                "AG {agno}: free-list entry {} names block {block:#x}, which is not a block \
+                 of a {}-block group past its headers",
+                self.first, self.length
+            )));
+        }
         self.first = (self.first + 1) % self.capacity as u32;
         self.count -= 1;
         Ok(block)
@@ -408,6 +436,42 @@ mod tests {
         );
     }
 
+    /// A FREE-LIST ENTRY IS A BLOCK OF THIS GROUP, PAST ITS HEADERS (#314).
+    ///
+    /// The block taken becomes a new B+tree block, written at
+    /// `ag_start + agblock * blocksize`. The kernel checks every entry as
+    /// `xfs_agfl_verify` and `xfs_alloc_get_freelist` do: not `NULLAGBLOCK`,
+    /// and inside the group past `XFS_AGFL_BLOCK` (`xfs_verify_agbno`). An
+    /// entry this driver took on trust lands in another group, past the
+    /// device, or on the group's own headers. The fixture's group is 2048
+    /// blocks of 1 KiB with 512-byte sectors, so its headers end at block 1.
+    #[test]
+    fn a_free_list_entry_that_is_not_a_block_of_the_group_is_refused() {
+        let sb = sb();
+        for (what, block) in [
+            ("NULLAGBLOCK", u32::MAX),
+            ("the first block past the group", 2048),
+            ("a block in the next group", 3000),
+            ("the superblock's block", 0),
+            ("the free list's own block", 1),
+        ] {
+            let (raw, agf) = list(&sb, 7, &[block, 960]);
+            let mut fl = Agfl::parse(&raw, &sb, &agf, 0).expect("the header is sound");
+            assert!(
+                fl.take(&sb, 0).is_err(),
+                "an entry naming {what} ({block}) was handed out"
+            );
+            assert_eq!(fl.count(), 2, "a refused take left the list as it was");
+        }
+        let (raw, agf) = list(&sb, 7, &[2, 2047]);
+        let mut fl = Agfl::parse(&raw, &sb, &agf, 0).expect("the header is sound");
+        assert_eq!(
+            fl.take(&sb, 0).expect("the first block past the headers"),
+            2
+        );
+        assert_eq!(fl.take(&sb, 0).expect("the group's last block"), 2047);
+    }
+
     /// The measured shape: 512-byte sectors hold 119 entries.
     #[test]
     fn a_sector_holds_a_hundred_and_nineteen_blocks() {
@@ -424,10 +488,10 @@ mod tests {
         assert_eq!(fl.take(&sb, 0).expect("take"), 960);
         assert_eq!(fl.take(&sb, 0).expect("take"), 961);
         assert_eq!(fl.count(), 1);
-        fl.put(&sb, 0, 4242).expect("put");
+        fl.put(&sb, 0, 1242).expect("put");
         assert_eq!(fl.count(), 2);
         assert_eq!(fl.take(&sb, 0).expect("take"), 962, "962 was there first");
-        assert_eq!(fl.take(&sb, 0).expect("take"), 4242);
+        assert_eq!(fl.take(&sb, 0).expect("take"), 1242);
         assert_eq!(fl.count(), 0);
     }
 
