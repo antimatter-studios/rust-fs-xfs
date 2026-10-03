@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{oracle, scratch};
+use common::{oracle, repair, scratch};
 use fs_core::{BlockDevice, BlockRead, FileDevice};
 use fs_xfs::Filesystem;
 use std::io::{Seek, SeekFrom, Write};
@@ -181,12 +181,14 @@ fn an_inode_version_the_filesystem_does_not_use_is_refused() {
 fn every_wrong_version_is_corruption_to_xfs_repair_and_refused_here() {
     let clean = fresh_copy("oracle-undamaged");
     let (ino, at, size) = the_file(clean.path());
-    let judged = oracle("xfs_repair").args(["-n", &clean.guest()]).output();
-    assert!(
-        judged.ok(),
-        "the undamaged copy must be clean to xfs_repair -n, or nothing below means \
-         anything:\n{}",
-        judged.repair_report()
+    // The host path, which is inside the repository and so is the same
+    // path in the guest. Graded by repair::assert_agreed rather than the
+    // exit status alone: a clean exit beside a note that the log was
+    // ignored is the tool declining to look (#124).
+    let judged = oracle("xfs_repair").arg("-n").arg(clean.path()).output();
+    repair::assert_agreed(
+        &judged.repair_report(),
+        "the undamaged copy must be clean to xfs_repair -n, or nothing below means anything",
     );
     drop(clean);
 
@@ -194,8 +196,16 @@ fn every_wrong_version_is_corruption_to_xfs_repair_and_refused_here() {
     for version in WRONG_VERSIONS {
         let volume = fresh_copy(&format!("oracle-v{version}"));
         set_version(volume.path(), at, version);
-        let judged = oracle("xfs_repair").args(["-n", &volume.guest()]).output();
-        if judged.ok() {
+        let judged = oracle("xfs_repair").arg("-n").arg(volume.path()).output();
+        // A complaint from a tool that ignored the log is not a verdict
+        // either, so it cannot stand as the corruption this needs.
+        if repair::was_blind(&judged.repair_report()) {
+            wrong.push(format!(
+                "version {version} (inode {ino}): xfs_repair -n ignored the log, so its report judges \
+                 nothing:\n{}",
+                judged.repair_report()
+            ));
+        } else if judged.ok() {
             wrong.push(format!(
                 "version {version} (inode {ino}): xfs_repair -n called it clean, so this \
                  is not a damage the driver should refuse:\n{}",
