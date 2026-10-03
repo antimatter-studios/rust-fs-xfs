@@ -24,10 +24,9 @@
 //! release asset; no other job, and not the workflow as a whole, may
 //! hold any of those grants.
 //!
-//! The command-line tools' tarballs are held to the same promise by a job
-//! of their own: signed by this workflow, from the artifacts the package
-//! legs built, before they are attached beside the crate
-//! ([`tarball_gaps`]).
+//! The command-line tools' tarballs are packaged, attested and attached by
+//! rust-fs-core's release-cli workflow, which this one calls
+//! ([`core_call_gaps`]); this repository keeps no copy of those jobs.
 //!
 //! The workflow is PARSED rather than scanned, so a step name, a comment
 //! or a quoted string cannot satisfy a check meant for a real step.
@@ -123,9 +122,14 @@ fn attestation_gaps(yaml: &str) -> Vec<String> {
         .expect("the workflow has jobs");
     let mut attesting = 0;
     for (name, job) in jobs {
-        // The tools' tarballs are attested by a job of their own, held to
-        // its own rules by `tarball_gaps`.
-        if attests_tarballs(job) {
+        // The tools' tarballs are attested inside rust-fs-core's
+        // release-cli workflow, which the calling job holds the grants
+        // for; `core_call_gaps` holds that call to its own rules.
+        if job
+            .as_mapping_get("uses")
+            .and_then(Yaml::as_str)
+            .is_some_and(|u| u.starts_with(CORE_RELEASE_CLI))
+        {
             continue;
         }
         let name = name.as_str().unwrap_or("?");
@@ -232,118 +236,6 @@ fn attest_step<'a>(job: &'a Yaml<'a>) -> Option<(usize, &'a str, String)> {
 /// Whether a job attests the command-line tools' release tarballs.
 fn attests_tarballs(job: &Yaml) -> bool {
     attest_step(job).is_some_and(|(_, _, subject)| subject.contains(".tar.gz"))
-}
-
-/// Everything wrong with how `yaml` attests the command-line tools'
-/// tarballs; empty when nothing is.
-///
-/// The same promise as the crate's, for the other thing a release
-/// publishes: each tarball is signed by this workflow before it is
-/// attached, so `gh attestation verify` can say it was built here from a
-/// commit here and not uploaded from somebody's machine. The job must
-/// take the tarballs the package legs built (downloaded artifacts, not
-/// something it made itself), sign them with a pinned action, attach
-/// them to the release, and hold the three grants that takes.
-fn tarball_gaps(yaml: &str) -> Vec<String> {
-    let doc = load(yaml);
-    let jobs = doc
-        .as_mapping_get("jobs")
-        .and_then(Yaml::as_mapping)
-        .expect("the workflow has jobs");
-    let mut gaps = Vec::new();
-    let mut attesting = 0;
-    for (name, job) in jobs {
-        if !attests_tarballs(job) {
-            continue;
-        }
-        attesting += 1;
-        let name = name.as_str().unwrap_or("?");
-        let steps = steps_of(job);
-        let (at, uses, _) = attest_step(job).expect("a tarball job attests");
-        if !is_full_sha(&uses[ATTEST.len()..]) {
-            gaps.push(format!(
-                "job {name} uses {uses}, which a moved tag can redirect; pin a full commit SHA"
-            ));
-        }
-        if !steps[..at].iter().any(|s| {
-            s.as_mapping_get("uses")
-                .and_then(Yaml::as_str)
-                .is_some_and(|u| u.starts_with("actions/download-artifact@"))
-        }) {
-            gaps.push(format!(
-                "job {name} attests tarballs it did not take from the package legs"
-            ));
-        }
-        if !steps[at + 1..].iter().any(|s| {
-            runs(s, "gh release upload") && commands(s).iter().any(|c| c.contains(".tar.gz"))
-        }) {
-            gaps.push(format!(
-                "job {name} does not attach the attested tarballs to the GitHub release"
-            ));
-        }
-        let granted = write_grants(job.as_mapping_get("permissions"));
-        for grant in GRANTS {
-            if !granted.iter().any(|g| g == grant) {
-                gaps.push(format!("job {name} attests without {grant}: write"));
-            }
-        }
-    }
-    if attesting == 0 {
-        gaps.push(format!(
-            "no job in the workflow uses {ATTEST}<sha> on the tools' .tar.gz tarballs"
-        ));
-    }
-    gaps
-}
-
-#[test]
-fn the_release_workflow_attests_the_tarballs_it_attaches() {
-    let gaps = tarball_gaps(&workflow());
-    assert!(
-        gaps.is_empty(),
-        "{WORKFLOW} must attest the command-line tarballs it attaches to the release: \
-         {gaps:#?}"
-    );
-}
-
-/// The tarball reader answers for the shapes it is meant to catch.
-#[test]
-fn the_tarball_reader_discriminates() {
-    let sha = "0123456789abcdef0123456789abcdef01234567";
-    let good = format!(
-        "permissions:\n  contents: read\n\
-         jobs:\n  release-cli:\n    permissions:\n      id-token: write\n      attestations: write\n      contents: write\n\
-         \x20   steps:\n      - uses: actions/download-artifact@{sha}\n        with:\n          path: dist\n\
-         \x20     - uses: {ATTEST}{sha} # v4.2.2\n        with:\n          subject-path: dist/*.tar.gz\n\
-         \x20     - run: |\n          assets=(dist/*.tar.gz)\n          gh release upload \"$GITHUB_REF_NAME\" \"${{assets[@]}}\" --clobber\n"
-    );
-    assert_eq!(tarball_gaps(&good), Vec::<String>::new(), "{good}");
-    let expect = |yaml: String, want: &str| {
-        let gaps = tarball_gaps(&yaml);
-        assert!(
-            gaps.iter().any(|g| g.contains(want)),
-            "expected a gap mentioning {want:?}, got {gaps:#?} for\n{yaml}"
-        );
-    };
-    expect(
-        good.replace("subject-path: dist/*.tar.gz", "subject-path: dist/*.zip"),
-        "no job in the workflow uses",
-    );
-    expect(good.replace(sha, "v4"), "pin a full commit SHA");
-    expect(
-        good.replace("actions/download-artifact@", "actions/checkout@"),
-        "did not take from the package legs",
-    );
-    expect(
-        good.replace("gh release upload", "echo gh-release-upload"),
-        "does not attach the attested tarballs",
-    );
-    for grant in GRANTS {
-        expect(
-            good.replace(&format!("      {grant}: write\n"), ""),
-            &format!("attests without {grant}: write"),
-        );
-    }
 }
 
 #[test]
