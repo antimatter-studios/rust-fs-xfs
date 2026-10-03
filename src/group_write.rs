@@ -421,6 +421,10 @@ impl<'a> GroupAlloc<'a> {
                 &mut read,
                 crate::refcount::decode,
             )?;
+            // THE RECORDS, NOT ONLY THEIR BLOCKS (#92). A free asks this
+            // tree which blocks another file still holds, and rewrites it
+            // in the same transaction.
+            crate::refcount::check_records(sb, agno, agf.length, &records)?;
             Some((records, blocks))
         } else {
             None

@@ -209,11 +209,16 @@ pub fn capacity(blocksize: u32) -> usize {
 /// A copy-on-write staging record over the blocks being freed. This
 /// driver does not do copy-on-write, so one being there means something
 /// else is going on and guessing would be worse than stopping.
+///
+/// A record set `check_order` refuses, before anything is edited
+/// (#92): the edit below is built on the records' word, and the same
+/// transaction rewrites the tree that would have shown them wrong.
 pub fn release(
     records: &mut Vec<Refcount>,
     startblock: u32,
     blockcount: u32,
 ) -> Result<Vec<crate::alloc_btree::FreeExtent>> {
+    check_order(records)?;
     let start = u64::from(startblock);
     let end = start + u64::from(blockcount);
 
@@ -329,8 +334,13 @@ pub fn release(
 /// A copy-on-write staging record never merges with an ordinary one:
 /// they describe different things over the same blocks, which is the
 /// reason the flag exists.
+///
+/// The sort is the tree's own key order: the flag is the key's top bit,
+/// so every staging record sorts after every shared one. Sorting by
+/// block first put a staging record among the shared ones, and the
+/// tree laid out from that order had keys out of order.
 fn merge_adjacent(records: &mut Vec<Refcount>) {
-    records.sort_by_key(|r| (r.startblock, r.cow));
+    records.sort_by_key(|r| (r.cow, r.startblock));
     let mut i = 0;
     while i + 1 < records.len() {
         let a = records[i];
@@ -343,6 +353,98 @@ fn merge_adjacent(records: &mut Vec<Refcount>) {
             i += 1;
         }
     }
+}
+
+/// Refuse a group's reference-count records unless each is a record of
+/// that group, as the kernel checks it when it reads one (#92).
+///
+/// `xfs_refcount_check_irec` requires the run inside the group and past
+/// its headers (`xfs_verify_agbext`), on top of what [`check_order`]
+/// checks. The tree's blocks are verified as they are read; this is the
+/// records inside them, which a free acts on.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] naming the first record that fails.
+pub(crate) fn check_records(
+    sb: &crate::superblock::Superblock,
+    agno: u32,
+    length: u32,
+    records: &[Refcount],
+) -> Result<()> {
+    // XFS_AGFL_BLOCK: the block holding the group's last header sector.
+    let headers = 3 * u64::from(sb.sectsize) / u64::from(sb.blocksize);
+    check_runs(agno, length, headers, records)
+}
+
+/// [`check_records`] with the group's last header block given as a
+/// number, so the rule can be tested without a superblock.
+fn check_runs(agno: u32, length: u32, headers: u64, records: &[Refcount]) -> Result<()> {
+    for (i, r) in records.iter().enumerate() {
+        let start = u64::from(r.startblock);
+        let end = start + u64::from(r.blockcount);
+        let why = if start <= headers {
+            "starts on the group's headers"
+        } else if end > u64::from(length) {
+            "runs past the end of the group"
+        } else {
+            continue;
+        };
+        return Err(Error::BadSuperblock(format!(
+            "AG {agno}: reference-count record {i} ({} blocks at {}) {why}, in a group of \
+             {length} blocks",
+            r.blockcount, r.startblock
+        )));
+    }
+    check_order(records)
+}
+
+/// Refuse records the kernel would not read as a reference-count tree,
+/// whatever the group's geometry (#92).
+///
+/// From `xfs_refcount_check_irec`: a record is not empty; a shared one
+/// has at least two owners and a staging one exactly one. From the
+/// tree's key order: every shared record precedes every staging one
+/// (the flag is the key's top bit), and within each, records ascend and
+/// do not overlap.
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] naming the first record that fails.
+pub(crate) fn check_order(records: &[Refcount]) -> Result<()> {
+    let mut previous: Option<&Refcount> = None;
+    for (i, r) in records.iter().enumerate() {
+        let start = u64::from(r.startblock);
+        let why = if r.blockcount == 0 {
+            Some("is empty")
+        } else if !r.cow && r.refcount < 2 {
+            Some("is shared by fewer than two owners, and a record should only exist while there is more than one")
+        } else if r.cow && r.refcount != 1 {
+            Some("is a staging record with other than one owner")
+        } else {
+            match previous {
+                Some(p) if p.cow && !r.cow => Some("is shared and follows a staging record"),
+                Some(p)
+                    if p.cow == r.cow
+                        && u64::from(p.startblock) + u64::from(p.blockcount) > start =>
+                {
+                    Some("starts before the record before it ends")
+                }
+                _ => None,
+            }
+        };
+        if let Some(why) = why {
+            return Err(Error::BadSuperblock(format!(
+                "reference-count record {i} ({} blocks at {}, {} owners{}) {why}",
+                r.blockcount,
+                r.startblock,
+                r.refcount,
+                if r.cow { ", staging" } else { "" }
+            )));
+        }
+        previous = Some(r);
+    }
+    Ok(())
 }
 
 fn overlaps(r: &Refcount, startblock: u32, end: u64) -> bool {
@@ -672,6 +774,35 @@ mod tests {
                 }
                 Err(_) => panic!("{what} panicked rather than being refused: {records:?}"),
             }
+        }
+    }
+
+    /// A record names blocks inside its group, past the headers, or the
+    /// tree is refused, as `xfs_verify_agbext` decides. A group of 1000
+    /// blocks whose headers end at block 0.
+    #[test]
+    fn a_record_must_lie_inside_its_group() {
+        let rec = |startblock, blockcount| Refcount {
+            startblock,
+            blockcount,
+            refcount: 2,
+            cow: false,
+        };
+        check_runs(0, 1000, 0, &[rec(10, 6), rec(24, 976)])
+            .expect("two ordered records inside the group");
+        for (what, records) in [
+            ("a record on the group's headers", vec![rec(0, 16)]),
+            ("a record past the group's end", vec![rec(999, 6)]),
+            (
+                "a record whose end does not fit a u32",
+                vec![rec(u32::MAX - 1, 4)],
+            ),
+            ("a record out of order", vec![rec(24, 6), rec(10, 6)]),
+        ] {
+            assert!(
+                check_runs(0, 1000, 0, &records).is_err(),
+                "{what} was accepted: {records:?}"
+            );
         }
     }
 
