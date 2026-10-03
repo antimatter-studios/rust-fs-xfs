@@ -10,6 +10,16 @@ repository = "https://github.com/antimatter-studios/rust-fs-xfs"
 # try to include it and fail on the nightly-only dependency.
 exclude = ["fuzz"]
 
+# What the release tarball ships, read by rust-fs-core's
+# scripts/package-cli.sh (run as `scripts/core.sh package-cli`): every
+# dotted name the binary answers to, with its man section, and the licence
+# files at the root. CAVEATS is the default, packaging/CAVEATS. The binary
+# lists its names itself (`rust-fs-xfs generate names`), and the two must
+# agree.
+[package.metadata.package-cli]
+names = { "fs.xfs" = 1 }
+licenses = ["LICENSE"]
+
 [lib]
 name = "fs_xfs"
 crate-type = ["staticlib", "rlib"]
@@ -18,7 +28,8 @@ crate-type = ["staticlib", "rlib"]
 # which answers to each dotted name (`fs.xfs`) it is linked as. Cargo
 # refuses a dot in a target name, so the dotted names are symlinks made
 # when the tools are staged (scripts/cli-install.sh) or packaged
-# (scripts/package-cli.sh), never targets of their own.
+# (rust-fs-core's package-cli, through scripts/core.sh), never targets
+# of their own.
 #
 # REQUIRED-FEATURES, so a build of the library -- the static library a
 # consumer links -- compiles none of it and gains no dependency: the
@@ -40,7 +51,7 @@ cli = ["dep:clap", "am-fs-core/cli"]
 crc32c = "0.6"
 # Block-device trait surface shared with the sister fs-* drivers and the
 # img-* disk-image readers.
-am-fs-core = { path = "../rust-fs-core", version = "0.2.18" }
+am-fs-core = { path = "../rust-fs-core", version = "0.2.23" }
 # The command-line tools' argument parser, behind `cli` (see the
 # `rust-fs-xfs` target above). No derive: the builder API keeps each
 # tool's command a function the man pages and completions can be made from.

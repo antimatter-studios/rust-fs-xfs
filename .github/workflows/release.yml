@@ -25,7 +25,7 @@ permissions:
 # `rust-deps-pinned` pre-commit hook refuses a lock that names a version
 # no workflow pins, which is what catches them being raised apart.
 env:
-  FS_CORE_REF: v0.2.18
+  FS_CORE_REF: v0.2.23
 
 jobs:
   # Cheap and release-specific: a tag that disagrees with Cargo.toml
@@ -62,124 +62,34 @@ jobs:
   # library's release, at the same version: one tag, one CHANGELOG, and no
   # binary that could wrap a library other than the one it was tagged with.
   #
-  # scripts/package-cli.sh lays the tarball out as an install prefix --
-  # bin/rust-fs-xfs, each dotted name a relative symlink to it,
-  # share/rust-fs-xfs/CAVEATS and LICENSE -- so an installer copies it
-  # whole and never names a tool, and then checks it: exactly those
-  # members, every link relative, and every name answering --help and a
-  # --version naming this crate and this tag's version. The `cli` job in
-  # ci.yml runs the same script on every pull request, so a release is not
-  # the first time the tarball is put together.
+  # Packaged, attested and attached by rust-fs-core's release-cli workflow,
+  # the family's one copy of those jobs: a native leg per platform builds
+  # the binary and runs core's package-cli.sh, which lays the tarball out
+  # as an install prefix and checks it, and one job attests both tarballs
+  # and attaches them to the release `publish` made. What the tarball
+  # ships is this repository's, declared in Cargo.toml under
+  # [package.metadata.package-cli]. This repository used to carry its own
+  # copy of all of it, and ten such copies had drifted
+  # (antimatter-studios/rust-fs-core#193).
   #
-  # Native builds, one runner per platform: cross-compiling needs a cross
-  # toolchain or an emulator, and GitHub provides both platforms natively.
-  package-cli:
-    name: package the tools (${{ matrix.label }})
-    needs: [verify-tag, gate]
-    # Read-only. A leg uploads its tarball as a workflow artifact; the
-    # `release-cli` job publishes them together once every leg has passed,
-    # so a release never carries one platform without the other.
-    strategy:
-      # One platform failing should not hide whether the other built.
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            label: darwin-arm64
-          - runner: ubuntu-latest
-            label: linux-x86_64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      # The path dependency, at the ref this workflow pins beside the
-      # branch gate's (see FS_CORE_REF above).
-      - name: clone am-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-
-      - name: build the multi-call binary
-        shell: bash
-        run: cargo build --release --locked --features cli --bin rust-fs-xfs
-
-      - name: package and check the tarball
-        id: pack
-        shell: bash
-        run: |
-          set -euo pipefail
-          tarball="$(scripts/package-cli.sh "${GITHUB_REF_NAME#v}" "${{ matrix.label }}")"
-          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
-          # The formula needs this to verify the download; in the job
-          # summary, updating a formula is a copy, not a re-download.
-          {
-            echo "### $tarball"
-            echo ""
-            echo '```'
-            echo "sha256 $(shasum -a 256 "$tarball" | cut -d' ' -f1)"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # AN ARTIFACT, NOT THE RELEASE: a leg that published its own asset
-      # would do so whether or not the other leg later failed.
-      - name: keep the tarball for the release job
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: cli-${{ matrix.label }}
-          path: ${{ steps.pack.outputs.tarball }}
-          if-no-files-found: error
-          retention-days: 7
-
-  # The tarballs, attested and attached to the release `publish` made. It
-  # runs after `publish` so there is one release for the tag and one job
-  # creating it, and it checks nothing out: it downloads the legs'
-  # tarballs, attests their provenance, and hands them to `gh`. Anyone can
-  # then check a download with
+  # PINNED BY COMMIT SHA, with the tag beside it, at the core release
+  # FS_CORE_REF names; `with:` cannot read `env`, so core-ref repeats it,
+  # and tests/release_attestation.rs holds the three to one value. Anyone
+  # can check a download with
   #
   #   gh attestation verify <tarball> --repo <owner>/<repo> \
-  #       --signer-workflow <owner>/<repo>/.github/workflows/release.yml
-  release-cli:
-    name: attest and attach the tools
-    needs: [package-cli, publish]
-    runs-on: ubuntu-latest
+  #       --signer-workflow antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml
+  cli:
+    name: the tools
+    needs: [verify-tag, gate, publish]
     permissions:
       contents: write
       id-token: write
       attestations: write
-    steps:
-      - name: collect every leg's tarball
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: cli-*
-          path: dist
-          merge-multiple: true
-
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/*.tar.gz
-
-      - name: attach the tarballs to the GitHub release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          assets=(dist/*.tar.gz)
-          if [ "${#assets[@]}" -ne 2 ]; then
-            echo "expected 2 tarballs (one per package-cli leg), found ${#assets[@]}: ${assets[*]}" >&2
-            exit 1
-          fi
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "See CHANGELOG.md."
-          fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@0f7714910080f5f2a080ed6032cccf19bc338064 # v0.2.23
+    with:
+      core-ref: v0.2.23
+      toolchain: 1.95.0
 
   publish:
     name: publish to crates.io
