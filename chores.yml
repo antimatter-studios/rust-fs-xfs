@@ -114,7 +114,7 @@ vars:
   # scripts/tier.sh resolves and verifies. v0.2.10 does not
   # contain it, so this pin cannot go back below v0.2.11 while the tiers read
   # the wrapper from core.
-  FS_CORE_REF: v0.2.17
+  FS_CORE_REF: v0.2.18
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -635,7 +635,7 @@ tasks:
     desc: Formatting and clippy, exactly as CI runs them
     cmds:
       - scripts/agents-core-check.sh
-      - scripts/ci-gate.sh
+      - bash scripts/core.sh ci-gate
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
       # a scripts/core.sh that differs from core's, or a call to a local copy.
       - bash scripts/core.sh family-check
@@ -701,4 +701,4 @@ tasks:
     # strings, and as a cargo test counted towards the executed-test floor the
     # gate itself enforces.
     cmds:
-      - scripts/ci-gate.sh
+      - bash scripts/core.sh ci-gate
