@@ -1488,6 +1488,73 @@ fn the_oracle_tools_are_still_installed_in_the_guest_the_tests_reach() {
     );
 }
 
+/// The harness release this repository pins, as `(major, minor, patch)`,
+/// read from `chores.yml`'s `LINUX_HARNESS_REF: vX.Y.Z`.
+fn linux_harness_ref(chores: &str) -> Option<(u32, u32, u32)> {
+    let raw = chores
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("LINUX_HARNESS_REF:"))?
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
+    let mut parts = raw.strip_prefix('v')?.split('.').map(|p| p.parse().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// THE GUEST'S OWN RECOVERY IS THE HARNESS'S, NOT A COPY HERE.
+///
+/// #132. Every Linux driver used to carry its own VM and its own
+/// orchestrator, and the copies drifted: a fix reached one repository's
+/// copy and not the others. The orchestrators are gone -- the harness
+/// owns them -- but the drift came back one level down, in the
+/// per-repository `[setup]` scripts. Finishing a dpkg transaction an
+/// interrupted boot left half done is guest-level and has nothing to do
+/// with XFS, yet only this repository's `vm-setup.sh` did it, so the
+/// other drivers' guests stayed wedged on the same failure.
+///
+/// fs-linux-test-harness v0.3.0 does it once, for every consumer, in
+/// its per-boot `apt-ready.sh`, before the setup script runs
+/// (fs-linux-test-harness#31, #33). So the pin must be at least that
+/// release, and the setup script must not keep its own copy: a copy
+/// here is the drift #132 is about, waiting for the next fix to land in
+/// one place and not the other.
+#[test]
+fn the_guest_setup_leaves_dpkg_recovery_to_the_harness() {
+    let chores_path = manifest_dir().join("chores.yml");
+    let chores = read_or_panic(&chores_path);
+    let pinned = linux_harness_ref(&chores).unwrap_or_else(|| {
+        panic!(
+            "{}: no `LINUX_HARNESS_REF: vX.Y.Z` to read the harness release from",
+            chores_path.display()
+        )
+    });
+    assert!(
+        pinned >= (0, 3, 0),
+        "{}: LINUX_HARNESS_REF is v{}.{}.{}. Below v0.3.0 the harness does not finish \
+         an interrupted dpkg transaction before setup runs, and this repository no \
+         longer does it itself (#132).",
+        chores_path.display(),
+        pinned.0,
+        pinned.1,
+        pinned.2
+    );
+
+    let script_path = manifest_dir().join("scripts/vm-setup.sh");
+    let setup = read_or_panic(&script_path);
+    let copies: Vec<String> = shell_lines(&setup)
+        .into_iter()
+        .filter(|line| line.contains("dpkg") && names_word(line, "--configure"))
+        .collect();
+    assert!(
+        copies.is_empty(),
+        "{} still recovers an interrupted dpkg itself: {copies:?}. The harness's \
+         apt-ready.sh does that for every consumer before this script runs \
+         (fs-linux-test-harness#33); a copy here is the per-repository drift #132 \
+         removed. Fix it in the harness instead.",
+        script_path.display()
+    );
+}
+
 /// THE CLAIM TURNED INTO EVIDENCE.
 ///
 /// The workflow says every xfsprogs call happens in the guest. The
