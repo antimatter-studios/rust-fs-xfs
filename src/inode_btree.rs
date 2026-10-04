@@ -528,6 +528,46 @@ pub struct Trees<'a> {
     changed: bool,
 }
 
+/// Refuse a chunk record that does not start on a chunk boundary inside
+/// its group (#314).
+///
+/// A create takes `startino + n` as the new inode's number, so a chunk that
+/// starts anywhere else builds the new file on a slot it does not own. The
+/// kernel's `xfs_inobt_check_irec` requires the chunk's first and last
+/// inode inside the group, past its headers (`xfs_verify_agino`), and
+/// `xfs_repair` refuses a start that is not a multiple of
+/// [`INODES_PER_CHUNK`].
+///
+/// # Errors
+///
+/// [`Error::BadSuperblock`] naming the first chunk that fails.
+fn check_chunk_starts(
+    sb: &Superblock,
+    agno: u32,
+    length: u32,
+    chunks: &[InodeChunk],
+) -> Result<()> {
+    let first_block = u64::from(crate::agfl::last_header_block(sb)) + 1;
+    for chunk in chunks {
+        let start = u64::from(chunk.startino);
+        let last = start + u64::from(INODES_PER_CHUNK) - 1;
+        let why = if !start.is_multiple_of(u64::from(INODES_PER_CHUNK)) {
+            "is not on a chunk boundary"
+        } else if start >> sb.inopblog < first_block {
+            "is on the group's headers"
+        } else if last >> sb.inopblog >= u64::from(length) {
+            "runs past the end of the group"
+        } else {
+            continue;
+        };
+        return Err(Error::BadSuperblock(format!(
+            "AG {agno}: the inode chunk at {start} {why}, so it does not describe inodes \
+             in a group of {length} blocks"
+        )));
+    }
+    Ok(())
+}
+
 impl<'a> Trees<'a> {
     /// Read the group's inode header and both its trees, at whatever
     /// depth they are.
@@ -593,6 +633,9 @@ impl<'a> Trees<'a> {
         } else {
             Vec::new()
         };
+
+        // Where each chunk starts, before a create builds on it.
+        check_chunk_starts(sb, agno, agf.length, &chunks)?;
 
         for &agblock in inobt_blocks.iter().chain(finobt_blocks.iter()) {
             let mut raw = vec![0u8; sb.blocksize as usize];
