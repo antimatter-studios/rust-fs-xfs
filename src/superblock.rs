@@ -860,6 +860,46 @@ impl Superblock {
         (ag, ag_block)
     }
 
+    /// Whether `blockcount` blocks from `startblock` lie inside one
+    /// allocation group, past its headers: the kernel's
+    /// `xfs_verify_fsbext` (#92).
+    ///
+    /// A block number is packed as `agno << agblklog | agbno`, and
+    /// `agblklog` rounds the group size up to a power of two. So a number
+    /// whose `agbno` is at or past the group's length names no block of
+    /// that group: [`Superblock::fsblock_offset`] puts it in the next
+    /// group, on its superblock, AGF, AGI and free list. Every extent a
+    /// write acts on has to pass this first.
+    ///
+    /// The group is worked out in 64 bits here, rather than through
+    /// [`Superblock::split_fsblock`]'s `u32`, so a group number too large
+    /// for a `u32` cannot wrap to a small one and pass.
+    pub(crate) fn extent_in_bounds(&self, startblock: u64, blockcount: u64) -> bool {
+        if blockcount == 0 {
+            return false;
+        }
+        let Some(last) = startblock.checked_add(blockcount - 1) else {
+            return false;
+        };
+        let shift = u32::from(self.agblklog);
+        let agno = startblock >> shift;
+        if agno >= u64::from(self.agcount) || last >> shift != agno {
+            return false;
+        }
+        let mask = (1u64 << shift) - 1;
+        let (first, last) = (startblock & mask, last & mask);
+        // The last group is shorter when `dblocks` is not a whole number
+        // of groups.
+        let length = self
+            .dblocks
+            .saturating_sub(agno * u64::from(self.agblocks))
+            .min(u64::from(self.agblocks));
+        // XFS_AGFL_BLOCK: the block holding the group's last header sector.
+        // Nothing a file owns starts at or before it.
+        let headers = 3 * u64::from(self.sectsize) / u64::from(self.blocksize);
+        first > headers && last < length
+    }
+
     /// Byte offset of a filesystem block within the device.
     pub fn fsblock_offset(&self, fsblock: u64) -> u64 {
         let (ag, ag_block) = self.split_fsblock(fsblock);
@@ -1342,6 +1382,45 @@ mod tests {
         // And an ordinary one still lands where it should.
         assert_eq!(sb.fsblock_offset(0), 0);
         assert_eq!(sb.fsblock_offset(1), 4096);
+    }
+
+    /// An extent is inside one group, past its headers, or it is refused
+    /// (#92), as the kernel's `xfs_verify_fsbext` decides. The fixture has
+    /// 4 groups of 1000 blocks packed on 1024, and 512-byte sectors on
+    /// 4 KiB blocks, so block 0 of each group holds all four headers.
+    #[test]
+    fn an_extent_must_lie_inside_one_group_past_its_headers() {
+        let sb = Superblock::parse(&v5_superblock()).expect("superblock");
+        let group = |agno: u64, agbno: u64| (agno << 10) | agbno;
+
+        for (start, count) in [(group(0, 1), 10), (group(1, 500), 100), (group(3, 990), 10)] {
+            assert!(
+                sb.extent_in_bounds(start, count),
+                "{count} blocks at {start} are inside their group"
+            );
+        }
+        for (what, start, count) in [
+            ("on the group's headers", group(1, 0), 8),
+            (
+                "past the group's length, inside its packing",
+                group(0, 995),
+                10,
+            ),
+            ("across into the next group", group(0, 1020), 10),
+            ("in a group the filesystem does not have", group(4, 5), 1),
+            (
+                "in a group number a u32 would wrap to zero",
+                group(1 << 32, 5),
+                1,
+            ),
+            ("zero blocks long", group(0, 5), 0),
+            ("past the end of a u64", u64::MAX, 2),
+        ] {
+            assert!(
+                !sb.extent_in_bounds(start, count),
+                "an extent {what} ({count} blocks at {start}) was accepted"
+            );
+        }
     }
 
     /// The cluster is 8 KiB scaled by how many minimum-size inodes fit
