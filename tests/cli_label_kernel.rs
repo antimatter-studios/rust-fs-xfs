@@ -86,7 +86,13 @@ fn kernel_label(image: &str) -> String {
 }
 
 fn relabel_is_read_everywhere(name: &str, label: &str) {
-    let path = scratch_dir(&format!("label-{name}")).join(name);
+    // One scratch directory per image AND label: the tests run in parallel,
+    // and two relabelling the same fixture would otherwise share a copy.
+    let tag: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = scratch_dir(&format!("label-{name}-{tag}")).join(name);
     std::fs::copy(fixture(name), &path).expect("copy the fixture");
     let image = path.to_str().expect("a UTF-8 scratch path");
 
