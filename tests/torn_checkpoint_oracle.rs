@@ -96,8 +96,10 @@ fn payload() -> Vec<u8> {
     (0..PAYLOAD_LEN).map(|i| (i % 251 + 1) as u8).collect()
 }
 
-/// A kernel-made image holding `gone`, `from`, `big` (64 KiB in one
-/// extent) and `empty`, plus the payload file the kernel compares with.
+/// A kernel-made image holding `gone` (empty: the driver unlinks only a
+/// file with no blocks, and refuses any other before writing a record),
+/// `from` and `big` (64 KiB in one extent each) and `empty`, plus the
+/// payload file the kernel compares with.
 fn base_image(tag: &str) -> scratch::Volume {
     let dir = scratch::dir(SUITE);
     let body: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
@@ -112,7 +114,7 @@ fn base_image(tag: &str) -> scratch::Volume {
     std::fs::write(
         dir.join(format!("{tag}-proto")),
         format!(
-            "/dev/null\n0 0\nd--755 0 0\ngone ---644 0 0 {b}\nfrom ---644 0 0 {b}\n\
+            "/dev/null\n0 0\nd--755 0 0\ngone ---644 0 0 {n}\nfrom ---644 0 0 {b}\n\
              big ---644 0 0 {b}\nempty ---644 0 0 {n}\n$\n",
             b = source("body"),
             n = source("none"),
