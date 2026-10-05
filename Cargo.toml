@@ -17,7 +17,7 @@ exclude = ["fuzz"]
 # lists its names itself (`rust-fs-xfs generate names`), and the two must
 # agree.
 [package.metadata.package-cli]
-names = { "fs.xfs" = 1 }
+names = { "fs.xfs" = 1, "mkfs.xfs" = 8 }
 licenses = ["LICENSE"]
 
 [lib]
