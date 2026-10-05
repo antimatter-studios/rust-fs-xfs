@@ -55,10 +55,18 @@ fn fsck(image: &str) -> (Option<i32>, String) {
     )
 }
 
-/// `xfs_repair -n` on `image`: its exit status and report.
+/// `xfs_repair -n` on `image`: whether it found anything, and its report.
+///
+/// Read through the shared check (#124): a report saying the tool ignored
+/// the log is neither clean nor damage, and is refused rather than counted.
 fn repair(image: &str) -> (bool, String) {
     let out = oracle("xfs_repair").args(["-n", image]).output();
-    (out.ok(), format!("{}{}", out.stdout, out.stderr))
+    let report = out.repair_report();
+    assert!(
+        !common::repair::was_blind(&report),
+        "xfs_repair -n declined to look at {image}: its log holds records\n{report}"
+    );
+    (out.ok(), report)
 }
 
 #[test]
@@ -70,11 +78,11 @@ fn every_volume_the_reference_calls_clean_is_clean() {
             &format!("{}-{name}", std::process::id()),
         );
         let image = copy.path().to_str().unwrap();
-        let (clean, report) = repair(image);
-        assert!(
-            clean,
-            "{name}: xfs_repair -n does not call the fixture clean:\n{report}"
-        );
+        let report = oracle("xfs_repair")
+            .args(["-n", image])
+            .output()
+            .repair_report();
+        common::repair::assert_agreed(&report, &format!("{name}: the clean fixture"));
         let (code, said) = fsck(image);
         assert_eq!(
             code,
