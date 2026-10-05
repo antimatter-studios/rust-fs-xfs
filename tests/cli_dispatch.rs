@@ -15,11 +15,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[test]
 fn the_binary_links_exactly_the_tools_this_crate_can_back() {
-    // fs.xfs and mkfs.xfs, and no fsck (no checker). A missing link is
-    // the packaging-level signal.
+    // fs.xfs, mkfs.xfs and fsck.xfs (#339). A missing link is the
+    // packaging-level signal.
     assert_eq!(
         dotted_names(),
-        vec!["fs.xfs".to_string(), "mkfs.xfs".to_string()]
+        vec![
+            "fs.xfs".to_string(),
+            "mkfs.xfs".to_string(),
+            "fsck.xfs".to_string()
+        ]
     );
 }
 
@@ -72,7 +76,7 @@ fn the_repository_name_reaches_mkfs_by_verb_and_by_full_name() {
 
 #[test]
 fn a_verb_this_crate_does_not_ship_is_a_wrong_command_line() {
-    for verb in ["fsck", "fsck.xfs"] {
+    for verb in ["growfs", "growfs.xfs"] {
         let out = tool("rust-fs-xfs").arg(verb).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "rust-fs-xfs {verb}");
         assert!(
