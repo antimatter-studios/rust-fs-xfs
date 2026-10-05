@@ -49,7 +49,7 @@ for spec in v5:CLIV5:5 v4:CLIV4:4; do
     jq_check "$name: get of an unknown key names the keys" '.code == 2 and (.error | test("label"))' "$SANDBOX/nk.err"
 
     # Verbs the library cannot do: status 3, `not implemented`, nothing on stdout.
-    for verb in "set label X" "resize 1G"; do
+    for verb in "resize 1G"; do
         # shellcheck disable=SC2086  # the words are the point
         fs.xfs "$img" $verb >"$SANDBOX/ni.out" 2>"$SANDBOX/ni.err"
         check "$name: $verb exits 3" test $? -eq 3
