@@ -50,10 +50,11 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
             assert!(text.contains(verb), "{name}'s page does not mention {verb}");
         }
     }
-    // No section 8: this crate ships no mkfs.* and no fsck.*.
+    // Section 8 holds mkfs.xfs and nothing else: this crate ships no fsck.*.
+    assert!(share.join("man/man8/mkfs.xfs.8").is_file(), "no mkfs.xfs.8");
     assert!(
-        !share.join("man/man8").exists(),
-        "a section-8 page was written for a tool this crate does not ship"
+        !share.join("man/man8/fsck.xfs.8").exists(),
+        "a section-8 page was written for fsck.xfs, which this crate does not ship"
     );
     // fs.xfs's subcommands have pages of their own, which its list names.
     for verb in [

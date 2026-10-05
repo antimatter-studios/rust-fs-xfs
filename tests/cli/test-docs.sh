@@ -17,7 +17,13 @@ for name in $(rust-fs-xfs generate names) rust-fs-xfs; do
         continue
     fi
     share="$(cd "$(dirname "$path")/.." && pwd)/share"
-    page="$share/man/man1/$name.1"
+    # mkfs.* and fsck.* are system administration commands, section 8, as
+    # every other mkfs and fsck is; everything else is section 1.
+    case "$name" in
+        mkfs.* | fsck.*) section=8 ;;
+        *) section=1 ;;
+    esac
+    page="$share/man/man$section/$name.$section"
     check "$name has a man page at $page" test -s "$page"
     found="$(man -M "$share/man" -w "$name" 2>/dev/null || true)"
     check "man -w $name finds $page (found '$found')" test "$found" = "$page"
@@ -35,6 +41,7 @@ share="$(cd "$(dirname "$(command -v fs.xfs)")/.." && pwd)/share"
 for verb in ls read write mkdir get info set resize; do
     check "fs.xfs-$verb has a page of its own" test -s "$share/man/man1/fs.xfs-$verb.1"
 done
-check "no section-8 page: this crate ships no mkfs.* or fsck.*" test ! -e "$share/man/man8"
+check "mkfs.xfs has its section-8 page" test -s "$share/man/man8/mkfs.xfs.8"
+check "no fsck.xfs page: this crate ships no checker" test ! -e "$share/man/man8/fsck.xfs.8"
 
 finish

@@ -51,6 +51,7 @@ pub mod inode_btree;
 pub mod log;
 pub(crate) mod log_recover;
 pub mod log_write;
+pub mod mkfs;
 pub(crate) mod overlay;
 pub mod refcount;
 pub mod rmap;

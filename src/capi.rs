@@ -56,6 +56,8 @@ fn errno_for(e: &Error) -> c_int {
         Error::NotAFile => libc_eisdir(),
         Error::ReadOnly => libc_erofs(),
         Error::UnsupportedFeature(_) => libc_enotsup(),
+        // A format the caller asked for that cannot be made.
+        Error::InvalidGeometry(_) => libc_einval(),
         // The data is on a device this mount was not given: "no such
         // device", which a client can tell apart from a feature it lacks.
         Error::RealtimeDeviceAbsent { .. } => libc_enxio(),

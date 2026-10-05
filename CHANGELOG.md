@@ -6,6 +6,23 @@ never does.
 
 ## [Unreleased]
 
+**Breaking:** `Error` gains the variant `InvalidGeometry`, so this release is
+0.11.0. A `match` over `Error` without a wildcard arm needs one more arm.
+
+### Added
+
+- **`mkfs.xfs`, and `fs_xfs::mkfs` under it (#338).** A v5 filesystem with
+  the standard formatter's default features, laid out exactly as it lays
+  one out: on a device of the same size with the same UUID, every
+  allocation group's headers and btree roots are byte-identical to its
+  output (`tests/mkfs_layout.rs`), and `xfs_repair -n` and the kernel accept
+  the result (`tests/cli_mkfs_kernel.rs`). Block sizes of 1, 2 and 4 KiB,
+  devices of 300 MiB and up, `-b size=`, `-d agcount=`, `-L`, `-m uuid=`,
+  `-f`, `-q`, `-N`; every other option is refused by name.
+- **`Error::InvalidGeometry`**, for a format that cannot be made: a device
+  too small, a block size or group count out of range, a label too long.
+  `EINVAL` through the C ABI.
+
 ### Fixed
 
 - **A free checks the reference-count records before it edits the tree on

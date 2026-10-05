@@ -271,8 +271,28 @@ else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
 Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed,
 2 the command line was wrong, 3 the verb exists and this crate cannot do it.
-There is no `mkfs.xfs` and no `fsck.xfs`: this crate has no initial-layout
-builder and no checker, and a missing name is how a package says so.
+There is no `fsck.xfs`: this crate has no checker, and a missing name is how
+a package says so.
+
+`mkfs.xfs` makes a v5 filesystem with the standard formatter's default
+features (checksums, the free inode btree, sparse inode chunks, reflink,
+large timestamps, directory entry file types) on a device or image of at
+least 300 MiB:
+
+```sh
+mkfs.xfs --size 1G -L BACKUP disk.img
+truncate -s 4G disk.img && mkfs.xfs -b size=4096 -d agcount=8 disk.img
+mkfs.xfs -N disk.img          # the geometry, written nowhere
+```
+
+It takes `-b size=` (1, 2 or 4 KiB), `-d agcount=`, `-L`, `-m uuid=`, `-f`,
+`-q` and `-N`. Any other option the standard formatter accepts is refused by
+name rather than ignored, so the filesystem made is the one asked for. A
+device that already holds a filesystem or a partition table is refused
+without `-f`. The layout is the standard formatter's, measured: on the same
+device with the same UUID, every allocation group header and btree root is
+byte-identical to its output, and `tests/cli_mkfs_kernel.rs` has
+`xfs_repair -n` and the kernel accept the result.
 
 A journalled write -- a new file, a filled empty file, a directory -- lands as
 a record in the log, as the driver's writes always do: the kernel applies it
