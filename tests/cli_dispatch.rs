@@ -15,9 +15,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[test]
 fn the_binary_links_exactly_the_tools_this_crate_can_back() {
-    // fs.xfs and nothing else: no mkfs (no initial-layout builder) and no
-    // fsck (no checker). A missing link is the packaging-level signal.
-    assert_eq!(dotted_names(), vec!["fs.xfs".to_string()]);
+    // fs.xfs and mkfs.xfs, and no fsck (no checker). A missing link is
+    // the packaging-level signal.
+    assert_eq!(
+        dotted_names(),
+        vec!["fs.xfs".to_string(), "mkfs.xfs".to_string()]
+    );
 }
 
 #[test]
@@ -54,8 +57,22 @@ fn the_repository_name_reaches_a_tool_by_verb_and_by_full_name() {
 }
 
 #[test]
+fn the_repository_name_reaches_mkfs_by_verb_and_by_full_name() {
+    let dotted = ok(tool("mkfs.xfs").arg("--help"));
+    for word in ["mkfs", "mkfs.xfs"] {
+        let repo = ok(tool("rust-fs-xfs").args([word, "--help"]));
+        assert_eq!(stdout(&repo), stdout(&dotted), "rust-fs-xfs {word}");
+        let version = ok(tool("rust-fs-xfs").args([word, "--version"]));
+        assert_eq!(
+            stdout(&version).trim_end(),
+            format!("mkfs.xfs ({CRATE}) {VERSION}")
+        );
+    }
+}
+
+#[test]
 fn a_verb_this_crate_does_not_ship_is_a_wrong_command_line() {
-    for verb in ["mkfs", "fsck", "mkfs.xfs", "fsck.xfs"] {
+    for verb in ["fsck", "fsck.xfs"] {
         let out = tool("rust-fs-xfs").arg(verb).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "rust-fs-xfs {verb}");
         assert!(
@@ -84,7 +101,10 @@ fn every_tool_help_carries_an_example_for_every_subcommand() {
             .filter_map(|l| l.split_whitespace().next().map(str::to_string))
             .filter(|v| v != "help")
             .collect();
-        assert!(!verbs.is_empty(), "{name} --help lists no subcommands");
+        // fs.xfs is a set of verbs; mkfs.xfs is one command.
+        if name == "fs.xfs" {
+            assert!(!verbs.is_empty(), "{name} --help lists no subcommands");
+        }
         for verb in verbs {
             let sub = ok(tool(&name).args(["x.img", &verb, "--help"]));
             assert!(

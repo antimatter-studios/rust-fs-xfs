@@ -1,13 +1,12 @@
 # Every name this repository installs resolves on PATH, answers --version
 # as itself and this crate, at the one version the entry point reports,
 # and carries an example in its --help. And the names it does NOT install
-# stay uninstalled: no mkfs.xfs and no fsck.xfs, because this crate has
-# no initial-layout builder and no checker.
+# stay uninstalled: no fsck.xfs, because this crate has no checker.
 source "$(dirname "$0")/lib.sh"
 
 # The names are written here, not read from the binary: a binary that
 # forgot one would otherwise agree with itself.
-EXPECTED="fs.xfs"
+EXPECTED="fs.xfs mkfs.xfs"
 
 version="$(rust-fs-xfs --version | sed -n "s/^rust-fs-xfs ($CRATE) //p")"
 check "rust-fs-xfs --version names a version" test -n "$version"
@@ -39,13 +38,13 @@ for name in $EXPECTED; do
     check "rust-fs-xfs $verb --version answered '$got'" test "$got" = "$name ($CRATE) $version"
 done
 
-# No mkfs and no fsck: neither verb exists on the entry point, and the
-# staged prefix links neither name.
+# No fsck: the verb does not exist on the entry point, and the staged
+# prefix does not link the name.
 bin="$(dirname "$(command -v rust-fs-xfs)")"
-for missing in mkfs.xfs fsck.xfs; do
+for missing in fsck.xfs; do
     check "$bin holds no $missing" test ! -e "$bin/$missing"
 done
-for verb in mkfs fsck; do
+for verb in fsck; do
     rust-fs-xfs "$verb" >"$SANDBOX/$verb.out" 2>"$SANDBOX/$verb.err"
     check "rust-fs-xfs $verb is refused as a wrong command line (exit 2)" test $? -eq 2
     jq_check "rust-fs-xfs $verb is a structured error" '.code == 2' "$SANDBOX/$verb.err"
