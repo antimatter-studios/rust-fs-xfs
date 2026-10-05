@@ -185,6 +185,17 @@ impl Agfl {
         self.count
     }
 
+    /// The blocks on the list, first to last.
+    pub fn entries(&self, sb: &Superblock) -> Vec<u32> {
+        (0..self.count)
+            .map(|i| {
+                let index = (self.first + i) % self.capacity as u32;
+                let at = self.entry_at(sb, index);
+                u32::from_be_bytes(self.raw[at..at + 4].try_into().expect("4 bytes"))
+            })
+            .collect()
+    }
+
     /// Index of the first live entry.
     pub fn first(&self) -> u32 {
         self.first

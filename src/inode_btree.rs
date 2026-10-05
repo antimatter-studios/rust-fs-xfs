@@ -204,7 +204,7 @@ impl InodeChunk {
 /// which reads plainly as 16,445 — so refusing it turns the one
 /// misreading the arithmetic below would not otherwise catch into an
 /// error rather than a silent truncation back to a plausible number.
-fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> {
+pub(crate) fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> {
     let startino = be32(buf, at);
     let free = be64(buf, at + 8);
     if sparse {

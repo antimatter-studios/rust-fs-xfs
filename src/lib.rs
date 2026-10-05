@@ -35,6 +35,7 @@ pub mod attr;
 pub mod bmbt;
 pub mod buf_write;
 pub mod capi;
+pub mod check;
 pub mod create;
 pub mod dir;
 pub mod dir_block;

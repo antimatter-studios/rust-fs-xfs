@@ -11,6 +11,13 @@ never does.
 
 ### Added
 
+- **`fsck.xfs`, and `fs_xfs::check` under it (#339).** Checks a volume
+  without changing it: secondary superblocks, each allocation group's
+  headers against its btrees, one owner for every block, allocated inodes,
+  the directory tree and link counts, and the superblock's counters. Exit 0
+  clean, 4 problems found, 8 could not check, 16 usage (a repair request is
+  refused). Agrees with `xfs_repair -n` on twelve clean fixtures and ten
+  kinds of damage.
 - **`fs.xfs set label` and `Filesystem::set_label` (#341).** The label is
   written into the superblock of every allocation group, each with a fresh
   CRC on a v5 volume, secondaries first and the primary last, as the
