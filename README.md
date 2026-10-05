@@ -265,7 +265,7 @@ else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
 | `write <path>` | the bytes on stdin. A new path is a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Every other shape -- appending, shortening, a v4 create, a file larger than any free run -- is refused with the driver's reason (exit 3) and the volume is left as it was |
 | `mkdir <path>` | a directory, mode 0755 (v5) |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log held records nothing had applied), and `xfs.*` |
-| `set label <value>` | answers `not implemented` (exit 3): there is no label writer |
+| `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; refuses a volume whose log is not clean |
 | `resize <size>` | answers `not implemented` (exit 3) |
 
 Metadata is JSON on stdout by default, `--text` for people. A failure is

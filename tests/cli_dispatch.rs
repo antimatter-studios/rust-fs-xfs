@@ -175,17 +175,18 @@ fn a_failed_run_is_a_structured_error_on_stderr_with_status_1() {
 
 #[test]
 fn what_the_library_cannot_do_answers_not_implemented_with_status_3() {
-    // Neither verb opens the image: the answer does not depend on it.
-    for verb in [&["set", "label", "X"][..], &["resize", "1G"][..]] {
-        let out = tool("fs.xfs").arg("x.img").args(verb).output().unwrap();
-        assert_eq!(out.status.code(), Some(3), "{verb:?}");
-        assert!(out.stdout.is_empty(), "{verb:?}: {}", stdout(&out));
-        assert!(
-            stderr(&out).starts_with("{\"error\": \"not implemented: "),
-            "{verb:?}: {}",
-            stderr(&out)
-        );
-    }
+    // The verb does not open the image: the answer does not depend on it.
+    let out = tool("fs.xfs")
+        .args(["x.img", "resize", "1G"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty(), "resize: {}", stdout(&out));
+    assert!(
+        stderr(&out).starts_with("{\"error\": \"not implemented: "),
+        "resize: {}",
+        stderr(&out)
+    );
 }
 
 // ---------------------------------------------------------------------------

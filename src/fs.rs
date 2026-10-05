@@ -840,6 +840,62 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Set the volume label: `sb_fname` in the superblock of every
+    /// allocation group, each with a fresh CRC on a v5 volume, the
+    /// secondaries first and the primary last (#341).
+    ///
+    /// The label is the superblock's and nothing else's, so this is the
+    /// whole change, written in place as the reference tool writes it on
+    /// an unmounted volume: no transaction, and nothing else in any copy
+    /// changes. A secondary superblock carries the label too, and a
+    /// repair that rebuilds the primary from one would bring the old name
+    /// back if only the primary were rewritten.
+    ///
+    /// This mount keeps the superblock it read: [`Filesystem::superblock`]
+    /// reports the old label until the volume is mounted again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] on a mount that cannot write.
+    /// [`Error::UnsupportedFeature`] for a label longer than the field's
+    /// 12 bytes or holding a NUL, and on a mount that has already logged
+    /// a change, whose records a replay would write over the label.
+    /// Whatever reading or writing the device returns.
+    pub fn set_label(&self, label: &str) -> Result<()> {
+        use crate::superblock::offsets::{FNAME, FNAME_LEN};
+        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
+        if label.len() > FNAME_LEN || label.contains('\0') {
+            return Err(Error::UnsupportedFeature(format!(
+                "an XFS label is at most {FNAME_LEN} bytes, with no NUL; this one is {}",
+                label.len()
+            )));
+        }
+        if self
+            .logged_anything
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::UnsupportedFeature(
+                "set the label before logging any change on this mount: a replay of \
+                 those records would write over it"
+                    .into(),
+            ));
+        }
+        let sector = usize::from(self.sb.sectsize);
+        for ag in (0..self.sb.agcount).rev() {
+            let at = self.ag_offset(ag);
+            let mut buf = vec![0u8; sector];
+            device.read_at(at, &mut buf)?;
+            buf[FNAME..FNAME + FNAME_LEN].fill(0);
+            buf[FNAME..FNAME + label.len()].copy_from_slice(label.as_bytes());
+            if self.sb.is_v5() {
+                crate::group_write::restamp_crc(&mut buf, crate::superblock::SB_CRC_OFFSET);
+            }
+            device.write_at(at, &buf)?;
+        }
+        device.flush()?;
+        Ok(())
+    }
+
     /// Whether this mount can write.
     ///
     /// Asked by callers deciding what to offer, rather than discovered
