@@ -208,13 +208,15 @@ fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> {
     let startino = be32(buf, at);
     let free = be64(buf, at + 8);
     if sparse {
-        return Ok(InodeChunk {
+        let chunk = InodeChunk {
             startino,
             holemask: be16(buf, at + 4),
             count: buf[at + 6],
             freecount: buf[at + 7],
             free,
-        });
+        };
+        check_counts(&chunk)?;
+        return Ok(chunk);
     }
 
     let freecount = be32(buf, at + 4);
@@ -223,13 +225,47 @@ fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> {
             "an inode chunk at {startino} claims {freecount} free inodes, more than the              {INODES_PER_CHUNK} a chunk holds — which is what a packed record looks like              when it is read as a plain one"
         )));
     }
-    Ok(InodeChunk {
+    let chunk = InodeChunk {
         startino,
         holemask: 0,
         count: INODES_PER_CHUNK,
         freecount: freecount as u8,
         free,
-    })
+    };
+    check_counts(&chunk)?;
+    Ok(chunk)
+}
+
+/// Refuse a chunk record whose counts disagree with its masks (#314), as
+/// the kernel's `xfs_inobt_check_irec` does: between 4 and 64 inodes, and a
+/// free count equal to the free bits of the inodes the chunk has.
+///
+/// The free count is what a create decrements and an unlink increments, and
+/// the free mask is what chooses the inode. A record whose two disagree
+/// would be rewritten with the disagreement carried forward, or, with a
+/// count of zero beside a free bit, decremented through zero.
+fn check_counts(chunk: &InodeChunk) -> Result<()> {
+    let start = chunk.startino;
+    if chunk.count < INODES_PER_HOLEMASK_BIT || chunk.count > INODES_PER_CHUNK {
+        return Err(Error::BadSuperblock(format!(
+            "the inode chunk at {start} claims {} inodes, where a chunk holds between \
+             {INODES_PER_HOLEMASK_BIT} and {INODES_PER_CHUNK}",
+            chunk.count
+        )));
+    }
+    let holes = (0..INODES_PER_CHUNK / INODES_PER_HOLEMASK_BIT)
+        .filter(|bit| chunk.holemask & (1u16 << bit) != 0)
+        .fold(0u64, |m, bit| {
+            m | (((1u64 << INODES_PER_HOLEMASK_BIT) - 1) << (bit * INODES_PER_HOLEMASK_BIT))
+        });
+    let free = (chunk.free & !holes).count_ones();
+    if u32::from(chunk.freecount) != free {
+        return Err(Error::BadSuperblock(format!(
+            "the inode chunk at {start} counts {} free inodes, but its free mask has {free}",
+            chunk.freecount
+        )));
+    }
+    Ok(())
 }
 
 /// What tells one inode tree from the other, for the shared descent and
@@ -604,20 +640,13 @@ impl<'a> Trees<'a> {
             agi.root,
             agi.level,
             &mut read,
-            move |buf, at| {
-                // A record this walk has already bounds-checked; the
-                // only way it can fail is a plain free count larger than
-                // a chunk holds, which `record` refuses and which cannot
-                // be expressed as a value here.
-                record(buf, at, sparse).unwrap_or(InodeChunk {
-                    startino: 0,
-                    holemask: 0,
-                    count: 0,
-                    freecount: 0,
-                    free: 0,
-                })
-            },
+            // A REFUSED RECORD REFUSES THE OPEN (#314). This used to put an
+            // all-zero chunk in its place, which the trees were then laid
+            // out again with -- writing a chunk at inode 0 over the one this
+            // could not read.
+            move |buf, at| record(buf, at, sparse),
         )?;
+        let chunks = chunks.into_iter().collect::<Result<Vec<_>>>()?;
 
         let finobt_blocks = if sb.has_finobt() && agi.free_level > 0 {
             let (_, blocks) = crate::ag_btree::walk_blocks(
@@ -886,11 +915,11 @@ mod tests {
         assert_eq!(sparse, plain, "the same chunk, however it was written");
 
         // Read with the wrong rule they do not. The plain bytes read as
-        // packed give a chunk of no inodes at all — a self-contradiction
-        // the arithmetic in the oracle catches.
-        assert_eq!(
-            record(&plain_bytes, 0, true).expect("decodes").count,
-            0,
+        // packed give a chunk of no inodes at all, and that
+        // self-contradiction is refused as the record is decoded (#314)
+        // rather than left for a later check to notice.
+        assert!(
+            record(&plain_bytes, 0, true).is_err(),
             "a chunk of no inodes, which is the self-contradiction that gives it away"
         );
 
@@ -903,6 +932,62 @@ mod tests {
             record(&sparse_bytes, 0, false).is_err(),
             "a packed record read plainly must be refused, not truncated back into a \
              plausible free count"
+        );
+    }
+
+    /// A record whose counts disagree with its masks is refused as it is
+    /// decoded (#314), as the kernel's `xfs_inobt_check_irec` refuses it,
+    /// and `take` cannot decrement a free count through zero.
+    #[test]
+    fn a_chunk_record_whose_counts_disagree_with_its_masks_is_refused() {
+        let packed = |count: u8, freecount: u8, holemask: u16, free: u64| {
+            let mut b = [0u8; RECORD_LEN];
+            b[0..4].copy_from_slice(&128u32.to_be_bytes());
+            b[4..6].copy_from_slice(&holemask.to_be_bytes());
+            b[6] = count;
+            b[7] = freecount;
+            b[8..16].copy_from_slice(&free.to_be_bytes());
+            b
+        };
+        // A sparse chunk: the last 16 inodes are holes, whose free bits are
+        // set and do not count.
+        let free = 0xffff_ffff_ffff_fff8u64;
+        record(&packed(48, 45, 0xf000, free), 0, true)
+            .expect("45 free of the 48 the chunk has, holes not counted");
+        for (what, bytes) in [
+            ("a free count above the mask's", packed(64, 63, 0, free)),
+            (
+                "a free count of zero beside free bits",
+                packed(64, 0, 0, free),
+            ),
+            ("holes counted as free", packed(48, 61, 0xf000, free)),
+            ("more than 64 inodes", packed(65, 61, 0, free)),
+            ("fewer than four inodes", packed(3, 0, 0, 0)),
+        ] {
+            assert!(
+                record(&bytes, 0, true).is_err(),
+                "a record with {what} was accepted"
+            );
+        }
+        let mut plain = [0u8; RECORD_LEN];
+        plain[0..4].copy_from_slice(&128u32.to_be_bytes());
+        plain[4..8].copy_from_slice(&62u32.to_be_bytes());
+        plain[8..16].copy_from_slice(&free.to_be_bytes());
+        assert!(
+            record(&plain, 0, false).is_err(),
+            "a plain record counting 62 free beside 61 free bits was accepted"
+        );
+
+        let mut chunk = InodeChunk {
+            startino: 128,
+            holemask: 0,
+            count: 64,
+            freecount: 0,
+            free,
+        };
+        assert!(
+            chunk.take(3).is_err(),
+            "take decremented a free count of zero"
         );
     }
 
@@ -1019,8 +1104,18 @@ impl InodeChunk {
             )));
         }
 
+        // Checked, because `freecount` is a `u8` off the disk: a record
+        // whose count is zero beside a free bit would wrap to 255 in a
+        // release build. `record` refuses that record; this is the second
+        // line, for a chunk built any other way.
+        let freecount = self.freecount.checked_sub(1).ok_or_else(|| {
+            Error::CorruptLog(format!(
+                "inode {n} of the chunk at {} is free, but the chunk counts no free inodes",
+                self.startino
+            ))
+        })?;
         self.free &= !(1u64 << n);
-        self.freecount -= 1;
+        self.freecount = freecount;
         Ok(if self.freecount == 0 {
             Taken::ChunkNowFull
         } else {
