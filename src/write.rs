@@ -115,6 +115,24 @@ impl Filesystem {
             )));
         }
 
+        // THE INODE AS IT IS NOW, not only the caller's copy (#330). A copy
+        // read before an in-place shrink still shows the old size and
+        // extents, and the shrink keeps those blocks past the new end, so a
+        // write judged against the copy alone lands where no read returns
+        // it. The range is checked again against the inode re-read here,
+        // and the destinations come from it.
+        // The caller's bytes are superseded by the ones re-read here.
+        let _ = raw;
+        let (current, current_raw) = self.read_inode_raw(inode.ino)?;
+        if end > current.size {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {}: writing to {end} would grow the file past its {} bytes, \
+                 which changes the inode",
+                current.ino, current.size
+            )));
+        }
+        let (inode, raw) = (&current, current_raw.as_slice());
+
         // Resolve every destination before writing any of them. A write
         // that discovered a hole halfway through would leave the file
         // half updated with no way to say how far it got.
@@ -402,6 +420,22 @@ impl Filesystem {
             )));
         }
         if new_size == inode.size {
+            return Ok(());
+        }
+
+        // Judged again against the inode as it is now (#330). A copy read
+        // before an earlier shrink still shows the old size, and a grow
+        // measured against that copy alone would bring back the bytes the
+        // shrink hid.
+        let current = self.read_inode_raw(inode.ino)?.0;
+        if new_size > current.size {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {}: growing from {} to {new_size} needs blocks that are not \
+                 allocated",
+                current.ino, current.size
+            )));
+        }
+        if new_size == current.size {
             return Ok(());
         }
 
