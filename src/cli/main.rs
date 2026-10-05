@@ -4,9 +4,9 @@
 //! dispatch and the output contract every tool shares are `fs_core::cli`
 //! (am-fs-core's `cli` feature); `xfs` is the tools themselves.
 //!
-//! There is one dotted name, `fs.xfs`. No `mkfs.xfs` and no `fsck.xfs`:
-//! this crate has no initial-layout builder and no checker, and a missing
-//! link is how a package says a tool is not there.
+//! There are two dotted names, `fs.xfs` and `mkfs.xfs`. No `fsck.xfs`:
+//! this crate has no checker, and a missing link is how a package says a
+//! tool is not there.
 
 mod xfs;
 
@@ -22,7 +22,7 @@ static FAMILY: cli::Family = cli::Family {
         "`chore cli:install` from a checkout of this repository",
         "`brew install antimatter-studios/tap/rust-fs-xfs`",
     ],
-    tools: &[xfs::fs::TOOL],
+    tools: &[xfs::fs::TOOL, xfs::mkfs::TOOL],
 };
 
 fn main() -> ExitCode {

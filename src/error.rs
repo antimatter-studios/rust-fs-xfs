@@ -103,6 +103,11 @@ pub enum Error {
     /// These were `debug_assert!`, which every build this project
     /// produces compiles out.
     Internal(String),
+
+    /// A format was asked for that cannot be made: a device too small,
+    /// a block size or allocation group count out of range, a label too
+    /// long. Nothing was written.
+    InvalidGeometry(String),
 }
 
 impl fmt::Display for Error {
@@ -138,6 +143,7 @@ impl fmt::Display for Error {
                  not given one"
             ),
             Error::Internal(m) => write!(f, "internal consistency check failed: {m}"),
+            Error::InvalidGeometry(m) => write!(f, "cannot format: {m}"),
         }
     }
 }
