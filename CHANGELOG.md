@@ -11,6 +11,11 @@ never does.
 
 ### Added
 
+- **`fs.xfs set label` and `Filesystem::set_label` (#341).** The label is
+  written into the superblock of every allocation group, each with a fresh
+  CRC on a v5 volume, secondaries first and the primary last, as the
+  reference tool writes it. A label over 12 bytes, and a volume whose log
+  is not clean, are refused with the image untouched.
 - **`mkfs.xfs`, and `fs_xfs::mkfs` under it (#338).** A v5 filesystem with
   the standard formatter's default features, laid out exactly as it lays
   one out: on a device of the same size with the same UUID, every
