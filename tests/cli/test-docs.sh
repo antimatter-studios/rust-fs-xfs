@@ -42,6 +42,6 @@ for verb in ls read write mkdir get info set resize; do
     check "fs.xfs-$verb has a page of its own" test -s "$share/man/man1/fs.xfs-$verb.1"
 done
 check "mkfs.xfs has its section-8 page" test -s "$share/man/man8/mkfs.xfs.8"
-check "no fsck.xfs page: this crate ships no checker" test ! -e "$share/man/man8/fsck.xfs.8"
+check "fsck.xfs has its section-8 page" test -s "$share/man/man8/fsck.xfs.8"
 
 finish
