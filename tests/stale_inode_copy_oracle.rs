@@ -52,7 +52,8 @@ fn a_stale_copy_of_the_inode_can_neither_regrow_the_file_nor_write_past_its_end(
     let (stale, stale_raw) = fs.read_inode_raw(ino).unwrap();
     assert_eq!(stale.size, body.len() as u64);
 
-    fs.truncate(&stale, 4096, None).expect("the in-place shrink");
+    fs.truncate(&stale, 4096, None)
+        .expect("the in-place shrink");
     assert_eq!(fs.read_inode_raw(ino).unwrap().0.size, 4096);
 
     let regrown = fs.truncate(&stale, 32 * 1024, None);
