@@ -347,6 +347,25 @@ impl Inode {
                 "inode {ino}: version {version} is not 1, 2 or 3"
             )));
         }
+        // THE FILESYSTEM DECIDES THE VERSION, NOT THE RECORD (#92). A v5
+        // filesystem's inodes are all version 3 and a v4 filesystem's are 1
+        // or 2, as the kernel's `xfs_dinode_good_version` requires. Taking
+        // the record's word for it let one flipped bit -- 3 is 0b11, 2 is
+        // 0b10 -- switch off the checksum and identity checks below, and
+        // move the data fork 76 bytes into the v3 core, whose checksum, LSN
+        // and UUID were then decoded as extents.
+        let expected_v3 = sb.is_v5();
+        if (version == 3) != expected_v3 {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: version {version} on a {} filesystem, whose inodes are {}",
+                if expected_v3 { "v5" } else { "v4" },
+                if expected_v3 {
+                    "version 3"
+                } else {
+                    "version 1 or 2"
+                }
+            )));
+        }
         let is_v3 = version == 3;
 
         // v3 inodes are CRC32C protected over the whole inode record.
@@ -744,6 +763,55 @@ mod tests {
                 "a free slot that is {what} was accepted"
             );
         }
+    }
+
+    /// The same superblock as v4, which has no CRCs and v1 or v2 inodes.
+    fn sb_v4() -> Superblock {
+        let mut b = vec![0u8; 512];
+        b[0..4].copy_from_slice(&XFS_SB_MAGIC.to_be_bytes());
+        b[4..8].copy_from_slice(&4096u32.to_be_bytes());
+        b[8..16].copy_from_slice(&4000u64.to_be_bytes());
+        b[48..56].copy_from_slice(&100u64.to_be_bytes());
+        b[56..64].copy_from_slice(&128u64.to_be_bytes());
+        b[84..88].copy_from_slice(&1000u32.to_be_bytes());
+        b[88..92].copy_from_slice(&4u32.to_be_bytes());
+        b[100..102].copy_from_slice(&4u16.to_be_bytes());
+        b[102..104].copy_from_slice(&512u16.to_be_bytes());
+        b[104..106].copy_from_slice(&512u16.to_be_bytes());
+        b[106..108].copy_from_slice(&8u16.to_be_bytes());
+        b[120] = 12;
+        b[121] = 9;
+        b[122] = 9;
+        b[123] = 3;
+        b[124] = 10;
+        Superblock::parse(&b).unwrap()
+    }
+
+    /// The filesystem decides an inode's version, not the record (#92), as
+    /// the kernel's `xfs_dinode_good_version` does. One flipped bit turns 3
+    /// into 2, and a v2 record skips the checksum and identity checks and
+    /// has its fork 76 bytes earlier.
+    #[test]
+    fn an_inode_version_the_filesystem_does_not_use_is_refused() {
+        let v5 = sb_v5();
+        for version in [1u8, 2] {
+            let mut buf = v3_inode(&v5, 128);
+            buf[offsets::VERSION] = version;
+            assert!(
+                Inode::parse(&buf, &v5, 128).is_err(),
+                "a version {version} record was accepted on a v5 filesystem"
+            );
+        }
+
+        let v4 = sb_v4();
+        assert!(
+            Inode::parse(&v3_inode(&v5, 128), &v4, 128).is_err(),
+            "a version 3 record was accepted on a v4 filesystem"
+        );
+        let mut v2 = v3_inode(&v5, 128);
+        v2[offsets::VERSION] = 2;
+        let inode = Inode::parse(&v2, &v4, 128).expect("a v2 record is a v4 filesystem's own");
+        assert_eq!(inode.version, 2);
     }
 
     #[test]
