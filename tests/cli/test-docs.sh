@@ -17,7 +17,13 @@ for name in $(rust-fs-xfs generate names) rust-fs-xfs; do
         continue
     fi
     share="$(cd "$(dirname "$path")/.." && pwd)/share"
-    page="$share/man/man1/$name.1"
+    # mkfs.* and fsck.* are system administration commands, section 8, as
+    # every other mkfs and fsck is; everything else is section 1.
+    case "$name" in
+        mkfs.* | fsck.*) section=8 ;;
+        *) section=1 ;;
+    esac
+    page="$share/man/man$section/$name.$section"
     check "$name has a man page at $page" test -s "$page"
     found="$(man -M "$share/man" -w "$name" 2>/dev/null || true)"
     check "man -w $name finds $page (found '$found')" test "$found" = "$page"
