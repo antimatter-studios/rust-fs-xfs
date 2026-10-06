@@ -1,21 +1,7 @@
 # rust-fs-xfs
 
-> **Renamed to [`rust-fs-xfs`](https://crates.io/crates/rust-fs-xfs).**
-> `am-fs-xfs` 0.11.0 is the last version published under this name. New versions
-> are published only as `rust-fs-xfs`, starting at 0.12.0. To move, change one line
-> in `Cargo.toml`:
->
-> ```toml
-> # before
-> am-fs-xfs = "0.11"
-> # after
-> rust-fs-xfs = "0.12"
-> ```
->
-> The import is unchanged: `use fs_xfs::...` keeps working.
-
 Pure-Rust [XFS](https://docs.kernel.org/filesystems/xfs/index.html) driver over the
-shared [`am-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device
+shared [`rust-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device
 trait, exposing a stable C ABI (`fs_xfs_*`) for FFI from Swift, C, or Go.
 
 ## Byte order
@@ -338,7 +324,7 @@ chore test:cli                             # doctor first, then tests/cli/*.sh
 
 The binary is behind the `cli` feature (`cargo build --release --features
 cli --bin rust-fs-xfs`), so the library a consumer links gains no
-dependency. Each release attaches `am-fs-xfs-<version>-<platform>.tar.gz`
+dependency. Each release attaches `rust-fs-xfs-<version>-<platform>.tar.gz`
 for `darwin-arm64` and `linux-x86_64`: an install prefix (`bin/rust-fs-xfs`,
 `bin/fs.xfs`, section-1 man pages and zsh, bash and fish completions under
 `share/`, `share/rust-fs-xfs/CAVEATS`, `LICENSE`) with the same
@@ -357,8 +343,8 @@ repository, not uploaded from someone's machine. To check the crates.io
 download of version `X.Y.Z`:
 
 ```sh
-curl -sSfLo am-fs-xfs-X.Y.Z.crate https://static.crates.io/crates/am-fs-xfs/am-fs-xfs-X.Y.Z.crate
-gh attestation verify am-fs-xfs-X.Y.Z.crate \
+curl -sSfLo rust-fs-xfs-X.Y.Z.crate https://static.crates.io/crates/rust-fs-xfs/rust-fs-xfs-X.Y.Z.crate
+gh attestation verify rust-fs-xfs-X.Y.Z.crate \
   --repo antimatter-studios/rust-fs-xfs \
   --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
 ```
@@ -371,7 +357,7 @@ The command-line tarballs on the same release page are attested by the same
 workflow, and checked the same way:
 
 ```sh
-gh attestation verify am-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
+gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
   --repo antimatter-studios/rust-fs-xfs \
   --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
 ```

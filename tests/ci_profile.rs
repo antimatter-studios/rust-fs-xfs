@@ -3222,9 +3222,9 @@ tasks:
     }
 }
 
-// ------------------------------------------------------- the am-fs-core pin
+// ------------------------------------------------------- the rust-fs-core pin
 
-/// Which `am-fs-core` this crate is built against, as stated in one file.
+/// Which `rust-fs-core` this crate is built against, as stated in one file.
 ///
 /// Four spellings, because the pin is a dependency version in a
 /// manifest, a resolved package in a lockfile, an environment variable
@@ -3251,19 +3251,19 @@ fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
         // to on the next, inside the same `[[package]]` entry.
         if in_lock_entry {
             if let Some(v) = quoted_value_after(line, "version") {
-                found.push(("the locked am-fs-core `version`".to_string(), v));
+                found.push(("the locked rust-fs-core `version`".to_string(), v));
                 in_lock_entry = false;
             } else if line.is_empty() || line.starts_with('[') {
                 in_lock_entry = false;
             }
         }
-        if line == "name = \"am-fs-core\"" {
+        if line == "name = \"rust-fs-core\"" {
             in_lock_entry = true;
             continue;
         }
-        if line.contains("am-fs-core") {
+        if line.contains("rust-fs-core") {
             if let Some(v) = quoted_value_after(line, "version") {
-                found.push(("the am-fs-core dependency's `version`".to_string(), v));
+                found.push(("the rust-fs-core dependency's `version`".to_string(), v));
             }
         }
         if let Some(rest) = line.split_once("FS_CORE_REF:") {
@@ -3324,7 +3324,7 @@ const FILES_THAT_PIN_AM_FS_CORE: &[(&str, usize)] = &[
     (".github/workflows/fuzz.yml", 1),
 ];
 
-/// Every file that names the `am-fs-core` this crate is built against
+/// Every file that names the `rust-fs-core` this crate is built against
 /// names the same one.
 ///
 /// Six files carry that version and nothing compared them.
@@ -3355,7 +3355,7 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
 
     assert!(
         miscounted.is_empty(),
-        "these files no longer declare the am-fs-core pin as many times as \
+        "these files no longer declare the rust-fs-core pin as many times as \
          they are listed to: {miscounted:?}. Either the pin moved somewhere \
          this guard does not read -- in which case update \
          FILES_THAT_PIN_AM_FS_CORE -- or the file stopped pinning the sibling \
@@ -3365,7 +3365,7 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
     assert_eq!(
         declared.len(),
         sites,
-        "the guard read {} declarations of the am-fs-core pin across {} files, \
+        "the guard read {} declarations of the rust-fs-core pin across {} files, \
          where {sites} are listed",
         declared.len(),
         FILES_THAT_PIN_AM_FS_CORE.len(),
@@ -3379,9 +3379,9 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
         .collect();
     assert!(
         disagreeing.is_empty(),
-        "the am-fs-core pin disagrees across the files that declare it. \
+        "the rust-fs-core pin disagrees across the files that declare it. \
          {}: {} says {agreed}, but {disagreeing:?}. A bump has to move every \
-         one of them, the lockfiles included: `cargo update -p am-fs-core` in \
+         one of them, the lockfiles included: `cargo update -p rust-fs-core` in \
          the crate and again with `--manifest-path fuzz/Cargo.toml`.",
         declared[0].0,
         declared[0].1,
@@ -3394,11 +3394,11 @@ mod core_pin_parser {
     /// The real dependency line.
     #[test]
     fn a_path_dependency_declares_its_version() {
-        let toml = "am-fs-core = { path = \"../rust-fs-core\", version = \"0.2.13\" }\n";
+        let toml = "rust-fs-core = { path = \"../rust-fs-core\", version = \"0.2.13\" }\n";
         assert_eq!(
             am_fs_core_versions_declared(toml),
             vec![(
-                "the am-fs-core dependency's `version`".to_string(),
+                "the rust-fs-core dependency's `version`".to_string(),
                 "0.2.13".to_string()
             )],
         );
@@ -3409,22 +3409,22 @@ mod core_pin_parser {
     /// second declaration.
     #[test]
     fn a_lockfile_entry_declares_its_version_once() {
-        let lock = "[[package]]\nname = \"am-fs-core\"\nversion = \"0.2.10\"\n\n\
-                    [[package]]\nname = \"am-fs-xfs\"\nversion = \"0.5.0\"\n\
-                    dependencies = [\n \"am-fs-core\",\n \"crc32c\",\n]\n";
+        let lock = "[[package]]\nname = \"rust-fs-core\"\nversion = \"0.2.10\"\n\n\
+                    [[package]]\nname = \"rust-fs-xfs\"\nversion = \"0.5.0\"\n\
+                    dependencies = [\n \"rust-fs-core\",\n \"crc32c\",\n]\n";
         assert_eq!(
             am_fs_core_versions_declared(lock),
             vec![(
-                "the locked am-fs-core `version`".to_string(),
+                "the locked rust-fs-core `version`".to_string(),
                 "0.2.10".to_string()
             )],
         );
     }
 
-    /// Another package's version is not am-fs-core's.
+    /// Another package's version is not rust-fs-core's.
     #[test]
     fn a_neighbouring_package_version_is_not_a_declaration() {
-        let lock = "[[package]]\nname = \"am-fs-xfs\"\nversion = \"0.5.0\"\n";
+        let lock = "[[package]]\nname = \"rust-fs-xfs\"\nversion = \"0.5.0\"\n";
         assert!(am_fs_core_versions_declared(lock).is_empty());
     }
 

@@ -27,7 +27,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  FS_CORE_REF: v0.2.23
+  FS_CORE_REF: v0.3.0
   CARGO_INCREMENTAL: 0
 
 # Read-only unless a job asks for more. This repository's default token
@@ -73,7 +73,7 @@ jobs:
 
       # cargo-fuzz has no --locked of its own, so every fuzz build would
       # rewrite a stale fuzz/Cargo.lock in place and build something
-      # nobody committed -- which it did, with am-fs-core 0.2.10 locked
+      # nobody committed -- which it did, with rust-fs-core 0.2.10 locked
       # while the crate needed 0.2.13 (#258). Resolving under --locked
       # first turns that drift into a failure before anything is fuzzed.
       - name: The fuzz workspace resolves from its committed lockfile

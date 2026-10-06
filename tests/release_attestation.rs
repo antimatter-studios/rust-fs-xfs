@@ -358,15 +358,15 @@ fn pinned_toolchain() -> String {
         .expect("rust-toolchain.toml pins a channel")
 }
 
-/// The am-fs-core version `Cargo.toml` depends on.
+/// The rust-fs-core version `Cargo.toml` depends on.
 fn manifest_core_version() -> String {
     repo_file("Cargo.toml")
         .lines()
-        .find(|l| l.starts_with("am-fs-core = "))
+        .find(|l| l.starts_with("rust-fs-core = "))
         .and_then(|l| l.split("version = \"").nth(1))
         .and_then(|v| v.split('"').next())
         .map(str::to_owned)
-        .expect("Cargo.toml depends on am-fs-core with a version")
+        .expect("Cargo.toml depends on rust-fs-core with a version")
 }
 
 /// Everything wrong with how `yaml` hands the tools' tarballs to
@@ -392,7 +392,7 @@ fn core_call_gaps(yaml: &str, toolchain: &str, core_version: &str) -> Vec<String
     let mut gaps = Vec::new();
     if core_ref != format!("v{core_version}") {
         gaps.push(format!(
-            "FS_CORE_REF is {core_ref:?}, not v{core_version}, the am-fs-core Cargo.toml depends on"
+            "FS_CORE_REF is {core_ref:?}, not v{core_version}, the rust-fs-core Cargo.toml depends on"
         ));
     }
     let mut calls = 0;

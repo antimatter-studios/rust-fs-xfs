@@ -25,7 +25,7 @@ permissions:
 # `rust-deps-pinned` pre-commit hook refuses a lock that names a version
 # no workflow pins, which is what catches them being raised apart.
 env:
-  FS_CORE_REF: v0.2.23
+  FS_CORE_REF: v0.3.0
 
 jobs:
   # Cheap and release-specific: a tag that disagrees with Cargo.toml
@@ -86,9 +86,9 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@0f7714910080f5f2a080ed6032cccf19bc338064 # v0.2.23
+    uses: antimatter-studios/rust-fs-core/.github/workflows/release-cli.yml@9e900154a7dff2a6c8f136db31def33bed9f09cc # v0.3.0
     with:
-      core-ref: v0.2.23
+      core-ref: v0.3.0
       toolchain: 1.95.0
 
   publish:
@@ -113,7 +113,7 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      # Clone the sibling repo that satisfies the am-fs-core path
+      # Clone the sibling repo that satisfies the rust-fs-core path
       # dependency. `cargo publish` rewrites the path into its registry
       # equivalent, but the manifest still has to resolve locally first.
       # PINNED THROUGH THE SHARED VARIABLE, not a literal. This line
@@ -124,7 +124,7 @@ jobs:
       # release, from a job that has never run against the current
       # manifest, with a message about a candidate version that did not
       # match rather than about a stale pin.
-      - name: clone am-fs-core sibling
+      - name: clone rust-fs-core sibling
         shell: bash
         run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
@@ -169,10 +169,10 @@ jobs:
         if: steps.already.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        # No `--locked`: publish must rewrite the am-fs-core path
+        # No `--locked`: publish must rewrite the rust-fs-core path
         # dependency into its registry equivalent in the packaged
         # lockfile, which `--locked` forbids. The verify build resolves
-        # am-fs-core from crates.io through the `version` constraint, so
+        # rust-fs-core from crates.io through the `version` constraint, so
         # the published artifact is pinned by that constraint rather than
         # by the local path checkout.
         run: cargo publish

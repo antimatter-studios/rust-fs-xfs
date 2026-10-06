@@ -2,7 +2,7 @@
 //!
 //! Installed as `rust-fs-xfs` and linked as each dotted name. The
 //! dispatch and the output contract every tool shares are `fs_core::cli`
-//! (am-fs-core's `cli` feature); `xfs` is the tools themselves.
+//! (rust-fs-core's `cli` feature); `xfs` is the tools themselves.
 //!
 //! There are two dotted names, `fs.xfs` and `mkfs.xfs`. No `fsck.xfs`:
 //! this crate has no checker, and a missing link is how a package says a

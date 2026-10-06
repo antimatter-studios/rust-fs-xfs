@@ -1,8 +1,17 @@
 # Changelog
 
-Notable changes to `am-fs-xfs`, newest first. This is a `0.x` crate, so the
+Notable changes to `rust-fs-xfs` (published as `am-fs-xfs` until its last version), newest first. This is a `0.x` crate, so the
 **minor** is the compatibility boundary: a minor bump may break API, a patch
 never does.
+
+## [0.12.0] — 2026-10-06
+
+### Changed
+
+- **Published as `rust-fs-xfs`, the repository's name.** The crate was `am-fs-xfs`
+  until its last version, which stays on crates.io pointing here. A
+  dependent changes one line in `Cargo.toml`; the import (`fs_xfs`) and the C symbols are unchanged.
+- **Depends on `rust-fs-core` 0.3.0**, the same library under its new name.
 
 ## [Unreleased]
 
@@ -638,6 +647,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.12.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.8.0...v0.9.0
