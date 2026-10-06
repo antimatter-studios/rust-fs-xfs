@@ -3,7 +3,7 @@ name = "am-fs-xfs"
 version = "0.11.0"
 edition = "2021"
 license = "MIT"
-description = "Pure-Rust XFS filesystem driver. Exposes a C ABI (fs_xfs_*) suitable for FFI from C/C++/Swift/Go."
+description = "Renamed to rust-fs-xfs: this crate receives no further versions. Depend on rust-fs-xfs instead; the import is unchanged (use fs_xfs)."
 repository = "https://github.com/antimatter-studios/rust-fs-xfs"
 # The fuzz crate is its own package, on its own toolchain, and is not
 # part of this one. Without this, `cargo package` and `cargo publish`

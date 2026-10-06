@@ -1,5 +1,19 @@
 # rust-fs-xfs
 
+> **Renamed to [`rust-fs-xfs`](https://crates.io/crates/rust-fs-xfs).**
+> `am-fs-xfs` 0.11.0 is the last version published under this name. New versions
+> are published only as `rust-fs-xfs`, starting at 0.12.0. To move, change one line
+> in `Cargo.toml`:
+>
+> ```toml
+> # before
+> am-fs-xfs = "0.11"
+> # after
+> rust-fs-xfs = "0.12"
+> ```
+>
+> The import is unchanged: `use fs_xfs::...` keeps working.
+
 Pure-Rust [XFS](https://docs.kernel.org/filesystems/xfs/index.html) driver over the
 shared [`am-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device
 trait, exposing a stable C ABI (`fs_xfs_*`) for FFI from Swift, C, or Go.

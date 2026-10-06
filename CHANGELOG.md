@@ -6,8 +6,17 @@ never does.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-06
+
 **Breaking:** `Error` gains the variant `InvalidGeometry`, so this release is
 0.11.0. A `match` over `Error` without a wildcard arm needs one more arm.
+
+### Renamed
+
+- **The last version published as `am-fs-xfs`.** The crate is renamed to
+  `rust-fs-xfs`, the repository's name; every later version is published under
+  that name only, starting at 0.12.0. The description and the README say where
+  the crate went. The import is unchanged: `use fs_xfs::...` keeps working.
 
 ### Added
 
@@ -629,6 +638,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.11.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.7.0...v0.8.0
