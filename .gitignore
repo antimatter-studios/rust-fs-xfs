@@ -25,7 +25,7 @@ Cargo.lock.bak
 # Test scratch and the tier logs. scripts/with-test-temp.sh puts every
 # test's scratch directory in here rather than in /tmp, because the
 # oracle tools run in the harness guest, which sees this repository and
-# nothing else of the host; scripts/tier.sh writes tmp/logs/<tier>.log.
+# nothing else of the host; rust-fs-core's tier.sh writes tmp/logs/<tier>.log.
 tmp/
 
 # chore fingerprint cache (sources:/generates: checksums). Derived data.

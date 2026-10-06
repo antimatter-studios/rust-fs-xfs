@@ -89,7 +89,7 @@ export FS_XFS_TEST_TEMP_ACTIVE=1
 # either boot takes the machine-wide slot, ONE for every repository on the
 # machine. Left to chore's `after_all` reaper, which runs only inside a
 # chore invocation of this repository, a run that reached cargo any other
-# way (scripts/test.sh by hand, scripts/tier.sh) exited with the VM idle
+# way (scripts/test.sh by hand, ../rust-fs-core/scripts/tier.sh) exited with the VM idle
 # and the slot held, and every other repository's VM work queued behind it
 # until the guest's idle deadline. `vm.sh session` runs the command inside
 # a harness session: the VM comes down and the slot is released when the

@@ -26,7 +26,6 @@ HOST_SIDE=(
     "$REPO/scripts/test.sh"
     "$REPO/scripts/ci-test.sh"
     "$REPO/scripts/build-fixtures.sh"
-    "$REPO/scripts/tier.sh"
     "$REPO/.github/workflows/ci.yml"
 )
 

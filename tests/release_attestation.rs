@@ -498,7 +498,7 @@ fn this_repository_keeps_no_copy_of_the_packaging() {
     ] {
         assert!(
             !root.join(copy).exists(),
-            "{copy} is a copy of rust-fs-core's packaging; `scripts/core.sh package-cli` runs core's"
+            "{copy} is a copy of rust-fs-core's packaging; `../rust-fs-core/scripts/package-cli.sh` runs core's"
         );
     }
     assert!(

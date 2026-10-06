@@ -110,11 +110,11 @@ vars:
   # org, and a URL rebuilt from a repo name points at a repository that
   # does not exist for exactly the ones that are not.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  # v0.2.11 is the release that packages scripts/output-budget.sh, which
-  # scripts/tier.sh resolves and verifies. v0.2.10 does not
+  # v0.2.11 is the release that packages ../rust-fs-core/scripts/output-budget.sh, which
+  # ../rust-fs-core/scripts/tier.sh resolves and verifies. v0.2.10 does not
   # contain it, so this pin cannot go back below v0.2.11 while the tiers read
   # the wrapper from core.
-  FS_CORE_REF: v0.3.0
+  FS_CORE_REF: v0.3.3
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -322,7 +322,7 @@ tasks:
     # The floor is 380: 427 executed in run 35435470063 on 2026-09-19
     # (job 105877256028), less the usual margin. Raise it deliberately.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
       - 'scripts/ci-test.sh --gate 380 tmp/logs/unit.log "the debug unit tier"'
 
   test:images:
@@ -337,7 +337,7 @@ tasks:
     # aarch64 Linux and 589 / 34,505 on Darwin; budget half as much again.
     # The floor is 90: 100 executed (job 105877826088), less the margin.
     cmds:
-      - 'CI_TEST_FLOOR=90 scripts/tier.sh test:images images 900 52000 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
+      - 'CI_TEST_FLOOR=90 ../rust-fs-core/scripts/tier.sh test:images images 900 52000 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
 
   test:stress:
     desc: 'The fsstress/fsx corpus read back — the one fixture set `chore fixtures` does not build by default'
@@ -368,7 +368,7 @@ tasks:
     # edit to this line.
     cmds:
       - 'scripts/build-fixtures.sh --check stress'
-      - 'CI_TEST_FLOOR=3 scripts/tier.sh test:stress stress 400 24000 -- scripts/ci-test.sh $(scripts/test-targets.sh stress)'
+      - 'CI_TEST_FLOOR=3 ../rust-fs-core/scripts/tier.sh test:stress stress 400 24000 -- scripts/ci-test.sh $(scripts/test-targets.sh stress)'
 
   test:oracle:
     desc: 'The driver writes, xfsprogs reads back — every tool call made inside the harness VM'
@@ -393,7 +393,7 @@ tasks:
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=16 scripts/tier.sh test:oracle oracle 330 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 330 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
@@ -410,7 +410,7 @@ tasks:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=36 scripts/tier.sh test:kernel kernel 750 42000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 750 42000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -463,7 +463,7 @@ tasks:
           guest_args="$guest_args $arg"
         done
         # shellcheck disable=SC2086  # the words are the point
-        CI_TEST_FLOOR=525 scripts/tier.sh test:vm vm 2600 190000 -- \
+        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 2600 190000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -484,7 +484,7 @@ tasks:
     cmds:
       - |
         set -eu
-        scripts/tier.sh test:scripts scripts 40 2500 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 40 2500 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
@@ -539,7 +539,7 @@ tasks:
       - task: test:oracle
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=525 scripts/tier.sh "test:native (whole suite, release)" suite 2400 180000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
+      - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 2400 180000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
       - task: test:scripts
       # The command-line tools, built and staged the way an install lays
       # them out, then tested as installed: found on PATH, doctor first.
@@ -587,7 +587,7 @@ tasks:
     # (run 37444985503), so 1200.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - 'scripts/tier.sh test:cli cli 30 1200 -- scripts/test-cli.sh'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 30 1200 -- scripts/test-cli.sh'
       - 'scripts/ci-test.sh --gate 685 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
@@ -641,11 +641,11 @@ tasks:
   lint:
     desc: Formatting and clippy, exactly as CI runs them
     cmds:
-      - scripts/agents-core-check.sh
-      - bash scripts/core.sh ci-gate
+      - bash ../rust-fs-core/scripts/agents-core-check.sh
+      - bash ../rust-fs-core/scripts/ci-gate.sh
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
-      # a scripts/core.sh that differs from core's, or a call to a local copy.
-      - bash scripts/core.sh family-check
+      # or a call to a local copy.
+      - bash ../rust-fs-core/scripts/family-check.sh
       - cargo fmt --check
       # `--features cli`: the command-line tools' target requires it, and
       # clippy silently leaves out a target whose features are off.
@@ -698,7 +698,7 @@ tasks:
     # room for a warning block without hiding a flood. No floor: it is one
     # check, not a suite.
     cmds:
-      - 'scripts/tier.sh semver semver 40 4000 -- bash scripts/core.sh semver-check'
+      - '../rust-fs-core/scripts/tier.sh semver semver 40 4000 -- bash ../rust-fs-core/scripts/semver-check.sh'
 
   check:ci-gate:
     desc: The one required check stands for every job in ci.yml
@@ -708,4 +708,4 @@ tasks:
     # strings, and as a cargo test counted towards the executed-test floor the
     # gate itself enforces.
     cmds:
-      - bash scripts/core.sh ci-gate
+      - bash ../rust-fs-core/scripts/ci-gate.sh

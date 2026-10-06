@@ -40,7 +40,7 @@ name: CI
 #                on PATH, and tested AS INSTALLED -- `rust-fs-xfs doctor`
 #                first, then tests/cli/*.sh against the kernel-made `cli`
 #                fixtures. Then the release tarball is built and its layout
-#                checked (`scripts/core.sh package-cli`), so a change that breaks a
+#                checked (`../rust-fs-core/scripts/package-cli.sh`), so a change that breaks a
 #                tool or the tarball fails the pull request, not the
 #                release. No VM: what xfsprogs and the kernel make of the
 #                tools is judged in the oracle and kernel tiers
@@ -529,7 +529,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          tarball="$(bash scripts/core.sh package-cli "$version" linux-x86_64 | tail -n 1)"
+          tarball="$(bash ../rust-fs-core/scripts/package-cli.sh "$version" linux-x86_64 | tail -n 1)"
           tar -tvzf "$tarball"
       - name: Keep the tier logs
         # Not before the tier ran: there is no log then, and this step's red
@@ -545,12 +545,12 @@ jobs:
     # `chore check:semver`: this tree's public API against the newest
     # version on crates.io, refusing a break the version in Cargo.toml does
     # not declare. Why, and what it cannot see, is at the top of
-    # scripts/semver-check.sh.
+    # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The version scripts/semver-check.sh expects. A prebuilt binary,
+      # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
       # checksum-verified by the action, rather than a ten-minute build.
       CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
       # A failing tier prints only its verdict by default. Here the tail IS
