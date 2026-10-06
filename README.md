@@ -271,9 +271,6 @@ else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
 Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed,
 2 the command line was wrong, 3 the verb exists and this crate cannot do it.
-There is no `fsck.xfs`: this crate has no checker, and a missing name is how
-a package says so.
-
 `mkfs.xfs` makes a v5 filesystem with the standard formatter's default
 features (checksums, the free inode btree, sparse inode chunks, reflink,
 large timestamps, directory entry file types) on a device or image of at
@@ -293,6 +290,22 @@ without `-f`. The layout is the standard formatter's, measured: on the same
 device with the same UUID, every allocation group header and btree root is
 byte-identical to its output, and `tests/cli_mkfs_kernel.rs` has
 `xfs_repair -n` and the kernel accept the result.
+
+`fsck.xfs` checks a volume without changing it, a subset of what
+`xfs_repair -n` checks: the secondary superblocks against the primary, each
+allocation group's headers against its free-space and inode btrees, one owner
+for every block (a block claimed twice is a cross-link unless reflink shares
+it; a block claimed by nothing is lost), every allocated inode, the directory
+tree and link counts, and the superblock's counters.
+
+```sh
+fsck.xfs disk.img          # exit 0 clean, 4 problems found, 8 could not check
+fsck.xfs --text disk.img   # one line per finding
+```
+
+It repairs nothing: `-n` is accepted, and `-y` and `-p` are refused (exit 16)
+rather than ignored. `tests/cli_fsck_oracle.rs` holds it to `xfs_repair -n` on
+twelve clean fixtures and ten kinds of damage.
 
 A journalled write -- a new file, a filled empty file, a directory -- lands as
 a record in the log, as the driver's writes always do: the kernel applies it

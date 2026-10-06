@@ -22,7 +22,7 @@ static FAMILY: cli::Family = cli::Family {
         "`chore cli:install` from a checkout of this repository",
         "`brew install antimatter-studios/tap/rust-fs-xfs`",
     ],
-    tools: &[xfs::fs::TOOL, xfs::mkfs::TOOL],
+    tools: &[xfs::fs::TOOL, xfs::mkfs::TOOL, xfs::fsck::TOOL],
 };
 
 fn main() -> ExitCode {

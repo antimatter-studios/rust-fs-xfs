@@ -589,6 +589,47 @@ impl Superblock {
         Ok(sb)
     }
 
+    /// Parse a secondary superblock: one of the copies at the start of
+    /// every allocation group but the first.
+    ///
+    /// The same checks as [`Superblock::parse`] but one: the standard
+    /// formatter writes the copies while the format is still in progress
+    /// and leaves `sb_inprogress` set in them, so a copy that says so is
+    /// a copy as it should be, not an unfinished filesystem.
+    ///
+    /// # Errors
+    ///
+    /// As [`Superblock::parse`].
+    pub fn parse_copy(buf: &[u8]) -> Result<Self> {
+        match Self::parse(buf) {
+            Err(Error::BadSuperblock(m)) if m.starts_with("sb_inprogress set") => {
+                let mut copy = buf.to_vec();
+                copy[offsets::INPROGRESS] = 0;
+                if be16(buf, offsets::VERSIONNUM) & XFS_SB_VERSION_NUMBITS == 5 {
+                    // The checksum covered the byte as it was; check it
+                    // there, then parse the copy with the byte cleared.
+                    let crc = crc32c_with_zeroed_crc(
+                        &buf[..usize::from(be16(buf, offsets::SECTSIZE)).min(buf.len())],
+                        offsets::CRC,
+                    );
+                    if crc != le32(buf, offsets::CRC) {
+                        return Err(Error::ChecksumMismatch {
+                            what: "superblock copy",
+                            block: 0,
+                        });
+                    }
+                    let n = usize::from(be16(buf, offsets::SECTSIZE)).min(copy.len());
+                    let crc = crc32c_with_zeroed_crc(&copy[..n], offsets::CRC);
+                    copy[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+                }
+                let mut sb = Self::parse(&copy)?;
+                sb.inprogress = 1;
+                Ok(sb)
+            }
+            other => other,
+        }
+    }
+
     /// Structural sanity checks.
     ///
     /// Each `log2` field must agree with the value it describes. That
