@@ -114,7 +114,7 @@ vars:
   # scripts/tier.sh resolves and verifies. v0.2.10 does not
   # contain it, so this pin cannot go back below v0.2.11 while the tiers read
   # the wrapper from core.
-  FS_CORE_REF: v0.2.23
+  FS_CORE_REF: v0.3.0
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -388,10 +388,12 @@ tasks:
     # them. Budget double, which is where the line length makes the bytes
     # the binding half.
     # The floor is 16: 18 executed (job 105877826105), less the margin.
+    # Budget: 312 lines measured with the mkfs and fsck oracle suites in the
+    # tier (run 37444985503), so 330.
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=16 scripts/tier.sh test:oracle oracle 300 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 scripts/tier.sh test:oracle oracle 330 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
@@ -581,9 +583,11 @@ tasks:
     # file is three lines when it passes and every tool a doctor line, so a
     # new file is a visible step. Budget half as much again, with room in
     # the bytes for a runner's longer checkout path in the doctor lines.
+    # Measured at 1001 bytes once every version line names rust-fs-xfs
+    # (run 37444985503), so 1200.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - 'scripts/tier.sh test:cli cli 30 1000 -- scripts/test-cli.sh'
+      - 'scripts/tier.sh test:cli cli 30 1200 -- scripts/test-cli.sh'
       - 'scripts/ci-test.sh --gate 685 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
@@ -611,7 +615,7 @@ tasks:
       - 'include/*.h'
       # fs_core.h is a source of ours because we ship it (see the cp below).
       # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do —
-      # it is the same path Cargo.toml resolves am-fs-core from.
+      # it is the same path Cargo.toml resolves rust-fs-core from.
       - '../rust-fs-core/include/fs_core.h'
 
     # Templated, which is fine here where it is not fine above: the check

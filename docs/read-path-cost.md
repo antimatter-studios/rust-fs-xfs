@@ -78,7 +78,7 @@ Serving those from the block already cached is tracked as
 reduction is, and this measurement is what says so rather than a guess
 about where time goes.
 
-## 2026-09-06 — with `am-fs-core` 0.2.8, which serves partial reads
+## 2026-09-06 — with `rust-fs-core` 0.2.8, which serves partial reads
 
 Same fixture, same walk, same 512-block cache. The only change is
 underneath: `CachingDevice` now serves a read from the blocks it falls

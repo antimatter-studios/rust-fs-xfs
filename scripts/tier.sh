@@ -75,14 +75,14 @@ else
 import json, sys
 packages = json.load(sys.stdin)["packages"]
 print(next((p["manifest_path"].rsplit("/", 1)[0]
-            for p in packages if p["name"] == "am-fs-core"), ""))
+            for p in packages if p["name"] == "rust-fs-core"), ""))
 ')"
-    WHO="cargo could not say where am-fs-core is, or its copy"
+    WHO="cargo could not say where rust-fs-core is, or its copy"
 fi
 if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/scripts/output-budget.sh" ]; then
     echo "tier.sh: $WHO has no" >&2
     echo "         scripts/output-budget.sh. The wrapper lives in rust-fs-core;" >&2
-    echo "         check the am-fs-core dependency resolves and is at a version" >&2
+    echo "         check the rust-fs-core dependency resolves and is at a version" >&2
     echo "         that ships it (v0.2.11 or later)." >&2
     exit 1
 fi

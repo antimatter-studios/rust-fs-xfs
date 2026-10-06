@@ -19,7 +19,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-am-fs-xfs = { path = ".." }
+rust-fs-xfs = { path = ".." }
 
 [[bin]]
 name = "superblock"
