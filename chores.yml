@@ -581,9 +581,11 @@ tasks:
     # file is three lines when it passes and every tool a doctor line, so a
     # new file is a visible step. Budget half as much again, with room in
     # the bytes for a runner's longer checkout path in the doctor lines.
+    # Measured at 1001 bytes once every version line names rust-fs-xfs
+    # (run 37444985503), so 1200.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - 'scripts/tier.sh test:cli cli 30 1000 -- scripts/test-cli.sh'
+      - 'scripts/tier.sh test:cli cli 30 1200 -- scripts/test-cli.sh'
       - 'scripts/ci-test.sh --gate 685 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
