@@ -118,7 +118,7 @@ fi
 # BOTH HALVES, ON A LOG A TIER ALREADY WROTE. The run mode below pins
 # `--release`, which the debug tier cannot use — the whole point of that
 # tier is a profile where an arithmetic overflow traps — so it runs cargo
-# itself and hands the log here. scripts/tier.sh writes every tier's
+# itself and hands the log here. ../rust-fs-core/scripts/tier.sh writes every tier's
 # output to tmp/logs/<tier>.log in full, so there is a log to hand over
 # and no second run to pay for.
 #
