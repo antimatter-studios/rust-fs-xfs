@@ -388,10 +388,12 @@ tasks:
     # them. Budget double, which is where the line length makes the bytes
     # the binding half.
     # The floor is 16: 18 executed (job 105877826105), less the margin.
+    # Budget: 312 lines measured with the mkfs and fsck oracle suites in the
+    # tier (run 37444985503), so 330.
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=16 scripts/tier.sh test:oracle oracle 300 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 scripts/tier.sh test:oracle oracle 330 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
