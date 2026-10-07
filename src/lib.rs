@@ -54,6 +54,7 @@ pub(crate) mod log_recover;
 pub mod log_write;
 pub mod mkfs;
 pub(crate) mod overlay;
+pub mod quota;
 pub mod refcount;
 pub mod rmap;
 pub mod super_write;

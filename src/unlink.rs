@@ -231,6 +231,16 @@ impl Filesystem {
         stamp_change(&mut dir_core, clock_now(), Changed::Contents);
 
         let victim_core = emptied_core(&victim_raw);
+        let quota_items = crate::quota::accounting_items(
+            self,
+            &[crate::quota::QuotaChange {
+                uid: victim.uid,
+                gid: victim.gid,
+                project_id: crate::quota::project_id(&victim_raw),
+                blocks_512: 0,
+                inodes: -1,
+            }],
+        )?;
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;
@@ -245,7 +255,10 @@ impl Filesystem {
         let mut fork_op = fork;
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
-        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 3 + 2;
+        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + 3
+            + 2;
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -265,6 +278,9 @@ impl Filesystem {
                 },
             ];
             for item in &group_items {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
@@ -301,6 +317,9 @@ impl Filesystem {
 
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&group_items);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
         self.logged_inode(parent, &dir_core, &logged_fork)?;
         self.logged_inode(ino, &victim_core, &[])?;
 

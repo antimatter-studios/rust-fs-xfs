@@ -441,12 +441,71 @@ pub(crate) fn replay(device: &dyn BlockRead, sb: &Superblock, into: &Overlay) ->
                     apply_icreate(sb, into, item)?;
                     out.chunks += 1;
                 }
+                item_types::XFS_LI_DQUOT => {
+                    apply_dquot(sb, into, item)?;
+                    out.buffers += 1;
+                }
                 other => *out.deferred.entry(other).or_default() += 1,
             }
         }
         Ok(())
     })?;
     Ok(out)
+}
+
+/// Replay one dquot item. Linux logs the complete 136-byte dquot together
+/// with the quota buffer address; recovery copies the record and refreshes
+/// its v5 checksum.
+fn apply_dquot(sb: &Superblock, into: &Overlay, item: &Item) -> Result<()> {
+    use crate::quota::{DQBLK_SIZE, DQ_MAGIC, DQ_VERSION};
+    let f = &item.regions[0];
+    if f.len() < 24 || item.regions.len() != 2 || item.regions[1].len() != DQBLK_SIZE {
+        return Err(Error::CorruptLog(
+            "a dquot log item has an invalid format or record length".into(),
+        ));
+    }
+    let size = native_u16(f, 2);
+    if size != 2 {
+        return Err(Error::CorruptLog(format!(
+            "a dquot log item says it has {size} operations, expected 2"
+        )));
+    }
+    let id = native_u32(f, 4);
+    let blkno = native_u64(f, 8) as i64;
+    let len = i32::from_ne_bytes(f[16..20].try_into().expect("4 bytes"));
+    let offset = native_u32(f, 20) as usize;
+    if blkno < 0 || len != 1 || offset + DQBLK_SIZE > sb.blocksize as usize {
+        return Err(Error::CorruptLog(format!(
+            "dquot {id} has invalid buffer address {blkno}, length {len}, or offset {offset}"
+        )));
+    }
+    let record = &item.regions[1];
+    if u16::from_be_bytes(record[0..2].try_into().expect("2 bytes")) != DQ_MAGIC
+        || record[2] != DQ_VERSION
+        || u32::from_be_bytes(record[4..8].try_into().expect("4 bytes")) != id
+    {
+        return Err(Error::CorruptLog(format!(
+            "dquot log item {id} carries a different or malformed record"
+        )));
+    }
+    let bb_per_block = u64::from(sb.blocksize) / 512;
+    if bb_per_block == 0 || !(blkno as u64).is_multiple_of(bb_per_block) {
+        return Err(Error::CorruptLog(format!(
+            "dquot {id} buffer address {blkno} is not filesystem-block aligned"
+        )));
+    }
+    let at = blkno as u64 * 512;
+    let mut buffer = vec![0u8; sb.blocksize as usize];
+    into.read_at(at, &mut buffer)?;
+    buffer[offset..offset + DQBLK_SIZE].copy_from_slice(record);
+    let crc = crate::superblock::crc32c_with_zeroed_crc(
+        &buffer[offset..offset + DQBLK_SIZE],
+        crate::quota::DQ_CRC,
+    );
+    buffer[offset + crate::quota::DQ_CRC..offset + crate::quota::DQ_CRC + 4]
+        .copy_from_slice(&crc.to_le_bytes());
+    into.wrote(at, &buffer);
+    Ok(())
 }
 
 fn native_u16(buf: &[u8], at: usize) -> u16 {
@@ -920,6 +979,36 @@ mod tests {
         let mut out = vec![0u8; len];
         into.read_at(at, &mut out).expect("a read");
         out
+    }
+
+    #[test]
+    fn a_dquot_log_item_replays_the_record_and_refreshes_its_crc() {
+        let sb = sb();
+        let into = overlay(4096);
+        let mut format = vec![0u8; 24];
+        format[0..2].copy_from_slice(&item_types::XFS_LI_DQUOT.to_ne_bytes());
+        format[2..4].copy_from_slice(&2u16.to_ne_bytes());
+        format[4..8].copy_from_slice(&5u32.to_ne_bytes());
+        format[16..20].copy_from_slice(&1i32.to_ne_bytes());
+        let mut record = vec![0u8; crate::quota::DQBLK_SIZE];
+        record[0..2].copy_from_slice(&crate::quota::DQ_MAGIC.to_be_bytes());
+        record[2] = crate::quota::DQ_VERSION;
+        record[3] = crate::quota::DQ_USER;
+        record[4..8].copy_from_slice(&5u32.to_be_bytes());
+        let item = Item {
+            regions: vec![format, record.clone()],
+            total: 2,
+        };
+
+        apply_dquot(&sb, &into, &item).expect("replay dquot");
+
+        let block = read(&into, 0, 4096);
+        assert_eq!(&block[..108], &record[..108]);
+        assert_eq!(&block[112..crate::quota::DQBLK_SIZE], &record[112..]);
+        assert_eq!(
+            u32::from_le_bytes(block[108..112].try_into().unwrap()),
+            crate::superblock::crc32c_with_zeroed_crc(&block[..crate::quota::DQBLK_SIZE], 108)
+        );
     }
 
     #[test]

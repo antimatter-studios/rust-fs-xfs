@@ -386,14 +386,17 @@ pub mod trans_header {
 /// The `xfs_log_item` type codes seen in the first `u16` of an item's
 /// format operation.
 ///
-/// Only these two were mapped. Both were observed in quantity — the
-/// buffer item across 434 parsed items, the inode item across 527 logged
-/// cores — and both are the first field of their format structure, so
-/// the type is what tells a replayer which of the layouts below to use.
+/// The buffer and inode items were observed in quantity; the dquot item
+/// follows the kernel's `xfs_dq_logformat` and carries a full disk dquot.
+/// Each code is the first field of its format structure, so it tells a
+/// replayer which layout follows.
 ///
 /// Marked `#[allow(dead_code)]`: a reference module, held to be read.
 #[allow(dead_code)]
 pub mod item_types {
+    /// `XFS_LI_DQUOT` — one quota record and its on-disk buffer location.
+    pub const XFS_LI_DQUOT: u16 = 0x123d;
+
     /// `XFS_LI_INODE` — an inode item. Its format structure is
     /// [`super::inode_log_format`].
     pub const XFS_LI_INODE: u16 = 0x123b;

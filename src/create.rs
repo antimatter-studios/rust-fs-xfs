@@ -1000,6 +1000,36 @@ impl Filesystem {
             Kind::Directory => empty_short_form_dir(parent),
         };
         let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64, when);
+        let quota_block_delta = dir_blocks
+            .checked_sub(dir_inode.nblocks)
+            .and_then(|blocks| blocks.checked_mul(u64::from(self.sb.blocksize) / 512))
+            .and_then(|blocks| i64::try_from(blocks).ok())
+            .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
+        let quota_items = crate::quota::accounting_items(
+            self,
+            &[
+                crate::quota::QuotaChange {
+                    uid: crate::endian::be32(
+                        &new_core,
+                        crate::format::log_items::log_dinode::offsets::UID,
+                    ),
+                    gid: crate::endian::be32(
+                        &new_core,
+                        crate::format::log_items::log_dinode::offsets::GID,
+                    ),
+                    project_id: crate::quota::project_id(&new_core),
+                    blocks_512: 0,
+                    inodes: 1,
+                },
+                crate::quota::QuotaChange {
+                    uid: dir_inode.uid,
+                    gid: dir_inode.gid,
+                    project_id: crate::quota::project_id(&dir_raw),
+                    blocks_512: quota_block_delta,
+                    inodes: 0,
+                },
+            ],
+        )?;
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;
@@ -1042,6 +1072,7 @@ impl Filesystem {
             + usize::from(icreate.is_some())
             + inode_tree_items.iter().map(|i| i.op_count()).sum::<usize>()
             + extra.iter().map(|i| i.op_count()).sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + new_ops;
 
@@ -1079,6 +1110,9 @@ impl Filesystem {
                 ops.extend(item.ops());
             }
             for item in &extra {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
@@ -1141,6 +1175,9 @@ impl Filesystem {
         self.logged_buffers(&allocation_items);
         self.logged_buffers(&inode_tree_items);
         self.logged_buffers(&extra);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
         if let Some((agno, startino)) = new_chunk {
             // Recovery initialises every inode of a chunk an icreate item
             // names, not only the one being created, and the next create
