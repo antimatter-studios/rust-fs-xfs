@@ -13,6 +13,9 @@ never does.
   step to have run, so a failed `chore lint` is no longer joined by an upload
   that found no log. A tier that ran and wrote no log still fails the upload,
   and `tests/ci_profile.rs` holds every job to that.
+- **A transient HTTP 5xx from the chore release download no longer fails a CI
+  job.** `scripts/ci-install-chore.sh` retries both downloads up to five times
+  on any error; the checksum check still guards what was fetched.
 
 ## [0.12.1] — 2026-10-07
 
