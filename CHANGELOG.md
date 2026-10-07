@@ -6,6 +6,14 @@ never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A job that stops before its first tier shows one red, not two.** Each
+  `Keep the tier logs` upload in CI now waits for the job's first `chore test*`
+  step to have run, so a failed `chore lint` is no longer joined by an upload
+  that found no log. A tier that ran and wrote no log still fails the upload,
+  and `tests/ci_profile.rs` holds every job to that.
+
 ## [0.12.1] — 2026-10-07
 
 A tooling release: the library and its C ABI are unchanged.

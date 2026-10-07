@@ -134,13 +134,16 @@ jobs:
             exit 1
           fi
       - name: chore test:unit
+        id: tier
         run: chore test:unit
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
         # so the detail a quiet run kept is the one thing nobody can read.
-        # `if: always()` — the run worth reading is the one that failed.
-        if: always()
+        # `always()` — the run worth reading is the one that failed. Not
+        # before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: tier-logs-unit
@@ -256,6 +259,7 @@ jobs:
       - name: chore lint
         run: chore lint
       - name: chore test
+        id: tier
         run: chore test
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
@@ -263,8 +267,10 @@ jobs:
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
         # so the detail a quiet run kept is the one thing nobody can read.
-        # `if: always()` — the run worth reading is the one that failed.
-        if: always()
+        # `always()` — the run worth reading is the one that failed. Not
+        # before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: tier-logs-x86_64
@@ -328,6 +334,7 @@ jobs:
       - name: chore lint
         run: chore lint
       - name: chore test:unit
+        id: tier
         run: chore test:unit
       # Everything that reads a fixture but needs no VM. The oracle and
       # kernel tiers cannot run here — GitHub's arm64 runners have no
@@ -339,8 +346,10 @@ jobs:
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
         # so the detail a quiet run kept is the one thing nobody can read.
-        # `if: always()` — the run worth reading is the one that failed.
-        if: always()
+        # `always()` — the run worth reading is the one that failed. Not
+        # before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: tier-logs-aarch64
@@ -396,6 +405,7 @@ jobs:
       # sweep into a migration. What this job is for is the code paths
       # only this target compiles, and the tiers below build all of them.
       - name: chore test:unit
+        id: tier
         run: chore test:unit
       # The tiers a Mac can run, which is the same set as the arm64 Linux
       # job. The oracle and kernel tiers need the guest, and on a Mac
@@ -417,8 +427,10 @@ jobs:
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
         # so the detail a quiet run kept is the one thing nobody can read.
-        # `if: always()` — the run worth reading is the one that failed.
-        if: always()
+        # `always()` — the run worth reading is the one that failed. Not
+        # before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: tier-logs-darwin
@@ -460,13 +472,16 @@ jobs:
       # job — on a Mac there is no usable host toolchain for these tests
       # either.
       - name: chore test:vm
+        id: tier
         run: chore test:vm
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
         # so the detail a quiet run kept is the one thing nobody can read.
-        # `if: always()` — the run worth reading is the one that failed.
-        if: always()
+        # `always()` — the run worth reading is the one that failed. Not
+        # before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: tier-logs-suite-in-vm
