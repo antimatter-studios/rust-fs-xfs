@@ -98,9 +98,11 @@ fn quotas_track_create_write_truncate_unlink_and_refuse_over_limit_write() {
         mkfs.xfs -q -f -m rmapbt=0 {image}
         m=$(mktemp -d)
         mount -o loop,nouuid,uquota {image} "$m"
+        # Private scratch parents block nobody, and creation can reserve over 4 KiB.
+        # Create and transfer ownership as root before imposing the hard limit.
+        touch "$m/over-limit"
+        chown 65534:65534 "$m/over-limit"
         xfs_quota -x -c 'limit -u bhard=4k 65534' "$m"
-        chmod 0777 "$m"
-        runuser -u nobody -- touch "$m/over-limit"
         if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         rmdir "$m"
         echo DONE
