@@ -6,6 +6,19 @@ never does.
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-10-07
+
+A tooling release: the library and its C ABI are unchanged.
+
+### Fixed
+
+- **The tools are released again.** 0.12.0's GitHub release has no tarballs:
+  its crate was published by hand, CI's repackaged `.crate` did not match the
+  published one, and the release stopped at the attestation check. 0.12.1 is
+  published by CI through crates.io trusted publishing, and rust-fs-core
+  0.3.7's release workflow packages the darwin-arm64 and linux-x86_64 tarballs
+  with their attestations.
+
 ### Changed
 
 - **The family's scripts run in place from rust-fs-core, and this repository
@@ -14,6 +27,9 @@ never does.
   (rust-fs-core 0.3.3, #212).
 - **A release's notes are its CHANGELOG section**, and a tag the CHANGELOG
   does not describe stops before anything is published (rust-fs-core#209).
+- **rust-fs-core 0.3.7.** Cargo, both lockfiles and every workflow that
+  clones the rust-fs-core sibling move to it; its release workflow is the one
+  that packages the tools.
 
 ## [0.12.0] — 2026-10-06
 
@@ -656,6 +672,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.12.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.9.0...v0.10.0

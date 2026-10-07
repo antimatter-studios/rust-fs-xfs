@@ -362,6 +362,70 @@ gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
   --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
 ```
 
+## Changelog
+
+The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
+
+### v0.12.1 — 2026-10-07
+
+- The tools are released again.
+- The family's scripts run in place from rust-fs-core, and this repository keeps no copy.
+- A release's notes are its CHANGELOG section.
+- rust-fs-core 0.3.7.
+
+### v0.12.0 — 2026-10-06
+
+- Published as `rust-fs-xfs`, the repository's name.
+- Depends on `rust-fs-core` 0.3.0.
+
+### v0.11.0 — 2026-10-06
+
+- The last version published as `am-fs-xfs`.
+- `fsck.xfs`, and `fs_xfs::check` under it (#339).
+- `fs.xfs set label` and `Filesystem::set_label` (#341).
+- `mkfs.xfs`, and `fs_xfs::mkfs` under it (#338).
+- `Error::InvalidGeometry`.
+
+### v0.10.0 — 2026-10-01
+
+- `Error` gains `RealtimeDeviceAbsent { ino }`.
+- A create in a directory with a default ACL is refused.
+- A POSIX ACL is listed as root lists it through the kernel.
+
+### v0.9.0 — 2026-09-30
+
+- In-image paths cross the C ABI as bytes, not UTF-8 (#269).
+- `fs.xfs`, a command-line tool over the library.
+
+### v0.8.0 — 2026-09-27
+
+- `fs_xfs_readlink` follows the readlink contract every driver in the family now shares.
+- The parsers are fuzzed, on two tiers.
+- A checkpoint larger than one in-core log buffer is written as several records.
+- A volume with a dirty log mounts, replaying into memory.
+- A directory takes entries after it has outgrown the inode.
+
+### v0.7.0 — 2026-09-06
+
+- Every write path works in a group whose B+trees are more than one block deep.
+- The reverse-mapping tree is read as the interval tree it is.
+- One operation allocates once from a group however many times it takes from it.
+- Freeing part of a shared extent splits the reference-count record rather than refusing, and records that adjoin and say the same thing are merged.
+
+### v0.6.0 — 2026-09-04
+
+- `File`, and `Filesystem::open` / `open_ino` / `root`.
+
+### v0.5.2 — 2026-09-04
+
+- A superblock can be written back, and is proved against `mkfs.xfs`.
+- The block-map tree's block addresses are checked.
+
+### v0.5.1 — 2026-08-29
+
+- Directory writes.
+- The mount's one checkpoint is spent on writes, not on refusals.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
