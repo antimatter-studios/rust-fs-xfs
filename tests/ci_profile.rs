@@ -459,6 +459,15 @@ fn release_in(arguments: &[&str]) -> bool {
 struct Step {
     keys: Vec<String>,
     run: String,
+    /// The step's `id:`, which is what `steps.<id>.outcome` names.
+    id: Option<String>,
+    /// The action a `uses:` step runs, such as `actions/upload-artifact@v4`.
+    uses: Option<String>,
+    /// The `if:` value, kept for the steps whose condition is the
+    /// property: the tier-log uploads (#334).
+    condition: Option<String>,
+    /// The `with:` inputs that are scalars, as name and value.
+    with: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -588,6 +597,19 @@ fn parse_workflow(text: &str) -> Workflow {
                         .and_then(Yaml::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    id: field(step, "id").and_then(Yaml::as_str).map(str::to_string),
+                    uses: field(step, "uses")
+                        .and_then(Yaml::as_str)
+                        .map(str::to_string),
+                    condition: field(step, "if").and_then(Yaml::as_str).map(str::to_string),
+                    with: field(step, "with")
+                        .and_then(Yaml::as_mapping)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(key, value)| {
+                            Some((key.as_str()?.to_string(), value.as_str()?.to_string()))
+                        })
+                        .collect(),
                 })
                 .collect();
             // `needs:` takes two legal shapes, a sequence or a single
@@ -3521,4 +3543,176 @@ fn ci_cancels_only_a_pull_requests_superseded_run() {
         "ci.yml's concurrency group is shared between pushes, so a queued push run is \
          cancelled by the next: {group}"
     );
+}
+
+/// Every step that keeps the tier logs, in every job, that does not wait
+/// for a tier to have run (#334).
+///
+/// A tier writes `tmp/logs/<tier>.log`, and the upload keeps it with
+/// `if-no-files-found: error`, because a tier that ran and wrote no log
+/// is a defect worth a red. But under a bare `if: always()` the upload
+/// also runs when the job stopped BEFORE any tier, at `chore lint` for
+/// instance. There is no log then, so the upload fails too, and its red
+/// sits beside the real failure looking like the cause.
+///
+/// So each upload must be `always()` (the failed run is the one worth
+/// reading) AND `steps.<id>.outcome != 'skipped'`, where `<id>` is an
+/// EARLIER step in the same job that runs a `chore test*` task. A guard
+/// naming a step that does not exist, or one after the upload, reads as
+/// `''`, which is not `'skipped'`, and would let the upload run anyway.
+fn tier_log_upload_gaps(workflow: &str) -> Vec<String> {
+    let wf = parse_workflow(workflow);
+    let mut gaps = Vec::new();
+    for job in &wf.jobs {
+        for (at, step) in job.steps.iter().enumerate() {
+            let input = |name: &str| {
+                step.with
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            let is_upload = step
+                .uses
+                .as_deref()
+                .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"));
+            if !is_upload || !input("path").is_some_and(|path| path.contains("tmp/logs")) {
+                continue;
+            }
+            let what = format!(
+                "job {}: the upload of {}",
+                job.id,
+                input("name").unwrap_or("tmp/logs")
+            );
+            if input("if-no-files-found") != Some("error") {
+                gaps.push(format!(
+                    "{what} does not keep `if-no-files-found: error`, so a tier that \
+                     ran and wrote no log passes"
+                ));
+            }
+            let condition: String = step
+                .condition
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .map(|c| if c == '"' { '\'' } else { c })
+                .collect();
+            if !condition.contains("always()") {
+                gaps.push(format!(
+                    "{what} is not `always()`, so a failed tier's log is never kept"
+                ));
+            }
+            let guarded = job.steps[..at].iter().any(|tier| {
+                let Some(id) = tier.id.as_deref() else {
+                    return false;
+                };
+                let runs_a_tier = shell_commands(&tier.run)
+                    .iter()
+                    .any(|words| chore_task_of(words).is_some_and(|task| task.starts_with("test")));
+                runs_a_tier && condition.contains(&format!("steps.{id}.outcome!='skipped'"))
+            });
+            if !guarded {
+                gaps.push(format!(
+                    "{what} carries `if: {}`, which does not wait on an earlier \
+                     `chore test*` step with `steps.<id>.outcome != 'skipped'`; when \
+                     the job stops before any tier, the upload finds no log and its \
+                     red hides the real one",
+                    step.condition.as_deref().unwrap_or("")
+                ));
+            }
+        }
+    }
+    gaps
+}
+
+#[test]
+fn every_tier_log_upload_waits_for_a_tier_that_ran() {
+    let path = ci_yml();
+    let workflow = read_or_panic(&path);
+    let uploads = parse_workflow(&workflow)
+        .jobs
+        .iter()
+        .flat_map(|job| &job.steps)
+        .filter(|step| {
+            step.with
+                .iter()
+                .any(|(key, value)| key == "path" && value.contains("tmp/logs"))
+        })
+        .count();
+    assert!(
+        uploads >= 6,
+        "control: {} must keep the tier logs in each of its six tier jobs, found {uploads}",
+        path.display()
+    );
+    let gaps = tier_log_upload_gaps(&workflow);
+    assert!(gaps.is_empty(), "{}: {gaps:#?}", path.display());
+}
+
+mod tier_log_upload {
+    use super::tier_log_upload_gaps as gaps;
+
+    fn workflow(tier: &str, condition: &str, missing: &str) -> String {
+        format!(
+            "\
+on: pull_request
+jobs:
+  unit:
+    steps:
+      - run: chore lint
+{tier}      - if: {condition}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-unit
+          path: tmp/logs/*.log
+          if-no-files-found: {missing}
+"
+        )
+    }
+
+    const TIER: &str = "      - id: tier\n        run: chore test:unit\n";
+
+    /// The guarded shape passes, so the others fail for their own reason.
+    #[test]
+    fn the_control_shape_passes() {
+        let wf = workflow(TIER, "always() && steps.tier.outcome != 'skipped'", "error");
+        assert_eq!(gaps(&wf), Vec::<String>::new());
+    }
+
+    /// The defect: a bare `always()` uploads after a failed `chore lint`.
+    #[test]
+    fn a_bare_always_is_reported() {
+        assert_eq!(gaps(&workflow(TIER, "always()", "error")).len(), 1);
+    }
+
+    /// Without `always()` a failed tier's log is never kept.
+    #[test]
+    fn a_guard_without_always_is_reported() {
+        assert_eq!(
+            gaps(&workflow(TIER, "steps.tier.outcome != 'skipped'", "error")).len(),
+            1
+        );
+    }
+
+    /// A guard naming a step that is not there reads `''` and never skips.
+    #[test]
+    fn a_guard_on_a_missing_step_is_reported() {
+        let tier = "      - run: chore test:unit\n";
+        let wf = workflow(tier, "always() && steps.tier.outcome != 'skipped'", "error");
+        assert_eq!(gaps(&wf).len(), 1);
+    }
+
+    /// A guard on a step that is not a tier waits on the wrong thing.
+    #[test]
+    fn a_guard_on_a_step_that_is_not_a_tier_is_reported() {
+        let tier = "      - id: tier\n        run: chore cli:install\n";
+        let wf = workflow(tier, "always() && steps.tier.outcome != 'skipped'", "error");
+        assert_eq!(gaps(&wf).len(), 1);
+    }
+
+    /// A tier that ran and wrote no log must still fail the upload.
+    #[test]
+    fn dropping_if_no_files_found_error_is_reported() {
+        let wf = workflow(TIER, "always() && steps.tier.outcome != 'skipped'", "warn");
+        assert_eq!(gaps(&wf).len(), 1);
+    }
 }
