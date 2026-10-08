@@ -131,7 +131,7 @@ requires a clean read/check and zero writes for every selected source fixture.
 | meta_uuid | crc=1; populated image changed with pinned xfs_db uuid | expected supported | expected success per operation | metadata identity | refused |
 | quota | crc=1; mount uquota; UID 1001 owns populated data.bin | supported | declared operations supported; ownership transfer refused | known structures; no quota audit | refused |
 | stripe | crc=1 -d su=64k,sw=4,agcount=4 -l size=64m; four 100 MiB AGs, unit=16,width=64 blocks | supported | in-place attributes supported; checkpoint writes refuse multi-block log headers before mutation | geometry | refused |
-| sector4k | crc=1 -s size=4096 | expected supported | expected success per operation | whole-sector CRC | refused |
+| sector4k | crc=1 -s size=4096 | supported | log writes and next-record reservations round to logsunit; directory conversion requires kernel replay and clean repair | whole-sector CRC | refused |
 
 The eleven operation columns are create file, create directory, rename,
 unlink, truncate to zero, write into empty file, setattr, truncate shared,

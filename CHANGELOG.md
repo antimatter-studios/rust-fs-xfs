@@ -121,6 +121,9 @@ never does.
   `Error::Io` and the device is not touched. Reads still work, and a fresh
   mount reads the log as a crash would have left it.
 
+- Log records include the filesystem's log-stripe padding in both their
+  payload length and space reservation, so 4 KiB-sector directory conversion
+  replays completely and leaves a clean log for the independent checker.
 - Empty extent-format attribute forks are read as empty, allowing creation
   in directories that reserve attribute-fork space without allocating blocks.
 - Advertised unknown legacy feature bits and historical shared superblocks

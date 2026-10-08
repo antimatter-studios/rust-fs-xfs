@@ -523,7 +523,7 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                         unjudged += 1;
                         eprintln!(
                             "{combo:22} {op:22} NOT JUDGED: the log was not replayed, so \
-                             xfs_repair is describing that rather than this driver"
+                             xfs_repair is describing that rather than this driver\n{repair}"
                         );
                         continue;
                     }
