@@ -727,6 +727,32 @@ pub fn record_blocks(tid: u32, ops: &[Op], iclog_size: u32) -> Result<u32> {
     Ok(1 + payload.len().div_ceil(BBSIZE) as u32)
 }
 
+/// Reserve the log's stripe padding as well as the header and operations.
+/// Linux v6.1's xlog_calc_iclog_size and xlog_state_switch_iclogs round
+/// both the write and the next record position to sb_logsunit.
+pub(crate) fn record_blocks_for_log(
+    tid: u32,
+    ops: &[Op],
+    iclog_size: u32,
+    logsunit: u32,
+) -> Result<u32> {
+    let alignment = logsunit.max(BBSIZE as u32);
+    if !alignment.is_multiple_of(BBSIZE as u32) {
+        return Err(Error::UnsupportedFeature(format!(
+            "log stripe unit {logsunit} is not a whole basic block"
+        )));
+    }
+    let blocks = record_blocks(tid, ops, iclog_size)?;
+    let aligned =
+        (u64::from(blocks) * BBSIZE as u64).div_ceil(u64::from(alignment)) * u64::from(alignment);
+    if aligned > u64::from(iclog_size) {
+        return Err(Error::UnsupportedFeature(format!(
+            "stripe-aligned log record needs {aligned} bytes but the log buffer holds {iclog_size}"
+        )));
+    }
+    Ok((aligned / BBSIZE as u64) as u32)
+}
+
 /// Divide one checkpoint's operations into records, each of which fits
 /// an in-core log buffer (#216).
 ///
@@ -830,7 +856,14 @@ pub fn append_at_with_tail(
         )));
     }
 
-    let record_blocks = 1 + payload.len().div_ceil(BBSIZE);
+    let record_blocks = record_blocks_for_log(tid, ops, head.iclog_size, sb.logsunit)? as usize;
+    let alignment_blocks = sb.logsunit.max(BBSIZE as u32) / BBSIZE as u32;
+    if !head.block.is_multiple_of(alignment_blocks) {
+        return Err(Error::UnsupportedFeature(format!(
+            "log head block {} is not aligned to the {}-byte log stripe unit",
+            head.block, sb.logsunit
+        )));
+    }
     if record_blocks > head.free_blocks as usize {
         return Err(Error::UnsupportedFeature(format!(
             "the checkpoint needs {record_blocks} basic blocks and only {} remain before \
@@ -839,11 +872,9 @@ pub fn append_at_with_tail(
         )));
     }
 
-    // `h_len` is the operations rounded up to a whole basic block, not
-    // their exact length. The kernel writes it that way — a record of
-    // 608 bytes of operations records 1024 — and the trailing zeros read
-    // back as nothing, because `h_num_logops` says when to stop.
-    let padded = payload.len().div_ceil(BBSIZE) * BBSIZE;
+    // Include stripe padding in h_len, as Linux does. The header plus
+    // payload occupies a whole log stripe; h_num_logops excludes padding.
+    let padded = (record_blocks - 1) * BBSIZE;
     let mut payload = payload;
     payload.resize(padded, 0);
 

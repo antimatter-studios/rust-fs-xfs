@@ -219,7 +219,22 @@ impl Filesystem {
         // does not fit an in-core buffer, and the kernel writes several
         // records rather than refusing.
         let groups = crate::log_write::split_into_records(&ops, head.iclog_size)?;
-        let needed = crate::log_write::blocks_for_records(tid, &groups) as u32;
+        let record_lengths: Vec<u32> = groups
+            .iter()
+            .map(|group| {
+                crate::log_write::record_blocks_for_log(
+                    tid,
+                    group,
+                    head.iclog_size,
+                    self.sb.logsunit,
+                )
+            })
+            .collect::<Result<_>>()?;
+        let needed = record_lengths.iter().try_fold(0u32, |total, length| {
+            total.checked_add(*length).ok_or_else(|| {
+                Error::UnsupportedFeature("checkpoint log-space reservation overflows".into())
+            })
+        })?;
 
         // THE RING IS REUSED RATHER THAN EXHAUSTED. A record may not
         // straddle the wrap, so one that will not fit in what is left
@@ -287,7 +302,7 @@ impl Filesystem {
         let mut at = head;
         let mut first = None;
         let mut lsn = 0;
-        for group in &groups {
+        for (group, used) in groups.iter().zip(record_lengths) {
             lsn = crate::log_write::append_at_with_tail(
                 device.as_ref(),
                 &self.sb,
@@ -297,7 +312,6 @@ impl Filesystem {
                 tail,
             )?;
             first.get_or_insert(lsn);
-            let used = crate::log_write::record_blocks(tid, group, at.iclog_size)?;
             at = crate::log::Head {
                 block: at.block + used,
                 cycle: at.cycle,
