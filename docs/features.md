@@ -59,7 +59,7 @@ States:
 |---|---|---|---|---|
 | `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
 | Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | Unreleased (#403) | | `cli_fsck_oracle.rs` |
-| Quota records | Upcoming | | #395 (PR #402) | |
+| Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | Unreleased (#402) | #378 | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
 | Reverse-map, reference-count and realtime metadata | Upcoming | | #379, #380, #381 | |
 | The checker's remaining gaps against `xfs_repair -n` | Upcoming | | #364 | |
 | Repair planning, `fsck.xfs --dry-run` and `fs_xfs::repair`: proposed changes with before and after bytes, writing nothing; refused by `repair.*` finding without exclusive access, under `rmapbt`, realtime, quota or `log_incompat`, on a dirty log, an incomplete scan or ambiguous ownership | Experimental: no repair rule ships yet, so every error is listed as left | Unreleased (#404) | #376, #377 | `repair_plan.rs`, `cli_repair_plan_oracle.rs` |

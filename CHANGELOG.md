@@ -25,6 +25,13 @@ never does.
   volume uses a feature the checker does not validate (such as `rmapbt`), the
   log needed replay, the scan was incomplete, or a block or directory has two
   owners. No repair rule ships yet: `-y` and `-p` are still refused.
+- **User, group and project quota records are checked (#395).** The checker
+  validates quota inode references, record identities, v5 checksums and UUIDs,
+  limits and grace timers, and compares checked accounting with allocated
+  inode usage. Kernel-created v4 and v5 quotas, including sparse project IDs,
+  are cross-validated against `xfs_db`, `xfs_quota` and `xfs_repair`. Quota
+  findings carry the codes `quota.flags`, `quota.inode`, `quota.unreadable`
+  and `quota.usage`.
 
 ### Changed
 

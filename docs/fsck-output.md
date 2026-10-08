@@ -170,3 +170,7 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `repair.log-dirty` | warning | no | No repair was planned: the log needed replay. |
 | `repair.incomplete` | warning | no | No repair was planned: the check did not cover the volume, or a rule could not finish. |
 | `repair.ambiguous` | warning | no | No repair was planned: a block or directory has two owners. |
+| `quota.flags` | error | no | The superblock's quota flags are not valid for its version. |
+| `quota.inode` | error | no | A quota inode is missing, shared between quota types, not a quota file, maps blocks a quota file cannot have, or holds a record that fails its checksum, UUID, identity or field checks. |
+| `quota.unreadable` | error | yes | A quota inode's extent map or records, or the usage they are checked against, could not be read. |
+| `quota.usage` | error | no | Quota accounting is not what the allocated inodes add up to. |

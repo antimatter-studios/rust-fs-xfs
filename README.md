@@ -248,7 +248,11 @@ byte-identical to its output, and `tests/cli_mkfs_kernel.rs` has
 allocation group's headers against its free-space and inode btrees, one owner
 for every block (a block claimed twice is a cross-link unless reflink shares
 it; a block claimed by nothing is lost), every allocated inode, the directory
-tree and link counts, and the superblock's counters.
+tree and link counts, and the superblock's counters. User, group and project
+quota inodes and records are checked for identity, limits and grace timers;
+checked accounting is compared with the allocated inodes' usage. Quota
+records are read through their extent maps even when the quota inode has
+size zero, including sparse records for high IDs.
 
 ```sh
 fsck.xfs disk.img          # exit 0 clean, 4 problems found, 8 could not check

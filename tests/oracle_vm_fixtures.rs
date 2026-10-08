@@ -13,8 +13,8 @@
 //! dies here.
 //!
 //! Running the comparison on the host keeps the iterate-and-check loop
-//! fast: the VM is only needed when fixtures are regenerated, not on
-//! every `cargo test`.
+//! fast. The quota comparison additionally builds mounted quota fixtures
+//! and queries `xfs_db` in the guest, so this suite belongs to the kernel tier.
 //!
 //! The fixtures are gitignored and generated: `chore fixtures` builds
 //! every image and its dumps in the harness guest. An empty `.vm-share`
@@ -23,10 +23,107 @@
 //! one compared against every image.
 
 mod common;
+mod quota_support;
 
 use fs_xfs::superblock::Superblock;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+#[test]
+fn quota_record_fields_agree_with_xfs_db_and_kernel_accounting() {
+    use fs_core::{BlockRead, FileDevice};
+    use fs_xfs::quota::{Kind, Record, RECORD_SIZE};
+    use fs_xfs::Filesystem;
+    use std::sync::Arc;
+    for &(label, geometry, options) in quota_support::CASES {
+        let image = quota_support::build("quota_field_oracle", label, geometry, options, |s| {
+            common::kernel_run(s)
+        });
+        let device = Arc::new(FileDevice::open(image.path()).unwrap());
+        let fs = Filesystem::mount(device.clone()).unwrap();
+        let sb = fs.superblock();
+        for (kind, flag, id, ino) in [
+            (Kind::User, "u", 17, sb.uquotino),
+            (Kind::Group, "g", 18, sb.gquotino),
+            (
+                Kind::Project,
+                "p",
+                65553,
+                if sb.is_v5() { sb.pquotino } else { sb.gquotino },
+            ),
+        ] {
+            let enabled = match kind {
+                Kind::User => "usrquota",
+                Kind::Group => "grpquota",
+                Kind::Project => "prjquota",
+            };
+            if !options.split(',').any(|o| o == enabled) {
+                continue;
+            }
+            let (inode, raw) = fs.read_inode_raw(ino).unwrap();
+            assert_eq!(
+                inode.size, 0,
+                "the real kernel never updates quota inode size"
+            );
+            let per_block = sb.blocksize as usize / RECORD_SIZE;
+            let logical = id as u64 / per_block as u64;
+            let extent = fs
+                .data_extents(&inode, &raw)
+                .unwrap()
+                .into_iter()
+                .find(|e| logical >= e.startoff && logical < e.startoff + e.blockcount)
+                .unwrap();
+            let address = sb.fsblock_offset(extent.startblock + logical - extent.startoff);
+            let mut bytes = vec![0; sb.blocksize as usize];
+            device.read_at(address, &mut bytes).unwrap();
+            let start = id as usize % per_block * RECORD_SIZE;
+            let record = Record::parse(
+                &bytes[start..start + RECORD_SIZE],
+                kind,
+                id,
+                sb.is_v5().then_some(&sb.meta_uuid),
+                sb.features_incompat & fs_xfs::superblock::incompat::BIGTIME != 0,
+            )
+            .unwrap();
+            let dump = common::oracle("xfs_db")
+                .args(["-r", "-c", &format!("dquot -{flag} {id}"), "-c", "print"])
+                .arg(image.path())
+                .output();
+            assert!(dump.ok(), "{}{}", dump.stdout, dump.stderr);
+            let fields = parse_sbdump(&dump.stdout);
+            for (name, ours) in [
+                ("diskdq.id", u64::from(record.id)),
+                ("diskdq.blk_hardlimit", record.blocks.hard_limit),
+                ("diskdq.blk_softlimit", record.blocks.soft_limit),
+                ("diskdq.ino_hardlimit", record.inodes.hard_limit),
+                ("diskdq.ino_softlimit", record.inodes.soft_limit),
+                ("diskdq.rtb_hardlimit", record.realtime.hard_limit),
+                ("diskdq.rtb_softlimit", record.realtime.soft_limit),
+                ("diskdq.bcount", record.blocks.count),
+                ("diskdq.icount", record.inodes.count),
+                ("diskdq.rtbcount", record.realtime.count),
+                ("diskdq.btimer", u64::from(record.blocks.timer)),
+                ("diskdq.itimer", u64::from(record.inodes.timer)),
+                ("diskdq.rtbtimer", u64::from(record.realtime.timer)),
+            ] {
+                assert_eq!(fields.get(name), Some(&ours), "{label} {flag}: {name}");
+            }
+            assert_eq!(record.blocks.count, 16384 / u64::from(sb.blocksize));
+            assert_eq!(
+                record.inodes.count,
+                if kind == Kind::Project { 2 } else { 1 }
+            );
+            assert_eq!(
+                record.blocks.soft_limit,
+                (1 << 20) / u64::from(sb.blocksize)
+            );
+            assert_eq!(
+                record.blocks.hard_limit,
+                (2 << 20) / u64::from(sb.blocksize)
+            );
+        }
+    }
+}
 
 /// Parse an `xfs_db ... print` dump into a field map, normalising the
 /// numeric forms the debugger uses (plain decimal, or `0x`-prefixed hex).

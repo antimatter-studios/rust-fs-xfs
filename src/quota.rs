@@ -1,5 +1,8 @@
 //! XFS quota-record accounting helpers.
 
+mod record;
+pub use record::{Kind, Record, Resource, RECORD_SIZE};
+
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::log_write::Op;
