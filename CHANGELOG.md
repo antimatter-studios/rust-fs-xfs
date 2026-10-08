@@ -14,6 +14,8 @@ never does.
   refuse mounting; active quota accounting refuses writable mounts before mutation.
 - Volumes carrying unsupported log-incompatible features are refused before
   either mount can inspect or replay the log or issue a write.
+- Feature-matrix fixtures retain their row names after creating mixed-case
+  directory entries, so the final image evidence is recorded for each recipe.
 - **A job that stops before its first tier shows one red, not two.** Each
   `Keep the tier logs` upload in CI now waits for the job's first `chore test*`
   step to have run, so a failed `chore lint` is no longer joined by an upload
