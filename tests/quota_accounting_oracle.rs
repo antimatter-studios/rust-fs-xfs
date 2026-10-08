@@ -258,7 +258,7 @@ fn quotas_track_create_write_truncate_unlink_and_refuse_over_limit_write() {
     assert!(fs_xfs::extent::lookup(&extents, logical).is_some());
     let reference = kernel_run(&format!(
         "xfs_db -r -c 'inode {}' -c 'p core.size' -c 'dquot -u 65534' \
-         -c 'p diskdq.id diskdq.blk_hardlimit diskdq.bcount diskdq.icount' {image}",
+         -c 'p diskdq.id diskdq.blk_hardlimit diskdq.bcount diskdq.icount' {image}\necho DONE",
         sb.uquotino,
     ));
     for field in [
