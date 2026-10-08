@@ -17,16 +17,10 @@
 //! writing new records on top of it means taking the volume over, which
 //! is a larger promise than this driver makes.
 //!
-//! # What is deliberately refused
-//!
-//! A driver that guesses is worse than one that declines, so this
-//! refuses rather than approximates in two cases:
-//!
-//! - **Real-time inodes.** Their extents live on a separate device this
-//!   driver was never handed.
-//! - **B+tree-format forks.** Files fragmented past what the inode can
-//!   hold need the bmbt walker, which is not written yet. The error says
-//!   so instead of returning a truncated file.
+//! Realtime files require an explicit second device, supplied through
+//! [`Filesystem::mount_with_realtime`]. Their extent maps, including B+tree
+//! blocks, remain on the data device; only file contents use the realtime
+//! device's linear block addresses.
 //!
 //! # Holes and unwritten extents
 //!
@@ -46,6 +40,10 @@ use crate::log;
 use crate::superblock::{crc32c_with_zeroed_crc, Superblock};
 use fs_core::{BlockDevice, BlockRead};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+#[path = "realtime_read_tests.rs"]
+mod realtime_read_tests;
 
 /// File byte offset at which a directory's leaf blocks begin.
 ///
@@ -552,24 +550,71 @@ impl Filesystem {
         realtime: Arc<dyn BlockRead>,
     ) -> Result<Self> {
         let mut fs = Self::mount(device)?;
-        if fs.sb.rblocks == 0 {
+        fs.check_realtime_device(realtime.as_ref())?;
+        fs.realtime = Some(realtime);
+        Ok(fs)
+    }
+
+    /// Validate traditional realtime geometry without changing feature admission.
+    /// Relations are checked against Linux's xfs_validate_sb_common and the
+    /// xfsprogs/kernel fixture in tests/realtime_oracle.rs.
+    fn check_realtime_device(&self, realtime: &dyn BlockRead) -> Result<()> {
+        let sb = &self.sb;
+        if sb.rblocks == 0 {
             return Err(Error::BadSuperblock(
                 "a realtime device was supplied, and the superblock describes no realtime \
                  section (sb_rblocks is 0)"
                     .into(),
             ));
         }
-        let needed = fs.sb.rblocks.saturating_mul(u64::from(fs.sb.blocksize));
+        let needed = sb
+            .rblocks
+            .checked_mul(u64::from(sb.blocksize))
+            .ok_or_else(|| {
+                Error::BadSuperblock(format!(
+                    "realtime section of {} blocks of {} bytes overflows the byte address space",
+                    sb.rblocks, sb.blocksize
+                ))
+            })?;
+        let extent_bytes = u64::from(sb.rextsize) * u64::from(sb.blocksize);
+        if !(4096..=1 << 30).contains(&extent_bytes) {
+            return Err(Error::BadSuperblock(format!(
+                "realtime extent size {} blocks ({extent_bytes} bytes) is outside 4 KiB..1 GiB",
+                sb.rextsize
+            )));
+        }
+        let expected_extents = sb.rblocks / u64::from(sb.rextsize);
+        if expected_extents == 0 || sb.rextents != expected_extents {
+            return Err(Error::BadSuperblock(format!(
+                "realtime rextents {} disagrees with rblocks {} / rextsize {} ({expected_extents})",
+                sb.rextents, sb.rblocks, sb.rextsize
+            )));
+        }
+        let expected_log = 63 - sb.rextents.leading_zeros();
+        let expected_bitmap = sb.rextents.div_ceil(u64::from(sb.blocksize) * 8);
+        if u32::from(sb.rextslog) != expected_log || u64::from(sb.rbmblocks) != expected_bitmap {
+            return Err(Error::BadSuperblock(format!(
+                "realtime geometry: rextslog {} (expected {expected_log}), rbmblocks {} (expected {expected_bitmap})",
+                sb.rextslog, sb.rbmblocks
+            )));
+        }
+        if sb.rbmino == 0 || sb.rsumino == 0 || sb.rbmino == sb.rsumino {
+            return Err(Error::BadSuperblock(format!(
+                "realtime bitmap inode {} and summary inode {} must be distinct nonzero data-device inodes",
+                sb.rbmino, sb.rsumino
+            )));
+        }
+        self.inode_offset(sb.rbmino)?;
+        self.inode_offset(sb.rsumino)?;
         let have = realtime.size_bytes();
         if have < needed {
             return Err(Error::BadSuperblock(format!(
                 "the superblock describes a realtime section of {} blocks ({needed} bytes), \
                  and the realtime device supplied holds {have}",
-                fs.sb.rblocks
+                sb.rblocks
             )));
         }
-        fs.realtime = Some(realtime);
-        Ok(fs)
+        Ok(())
     }
 
     /// Open `device` for reading **and writing**.
@@ -1045,6 +1090,24 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Check every allocated run, including unwritten runs and runs outside
+    /// the requested byte range, before copying any file contents.
+    fn check_realtime_extents(&self, ino: u64, extents: &[Extent]) -> Result<()> {
+        for (i, e) in extents.iter().enumerate() {
+            if e.blockcount == 0
+                || e.startblock
+                    .checked_add(e.blockcount)
+                    .is_none_or(|end| end > self.sb.rblocks)
+            {
+                return Err(Error::BadSuperblock(format!(
+                    "inode {ino}: realtime extent {i} maps {} blocks at block {}, outside the {}-block realtime section",
+                    e.blockcount, e.startblock, self.sb.rblocks
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The data fork's extents whatever device they address: filesystem
     /// blocks on the data device, or on the realtime device for a realtime
     /// inode. Kept private so no caller can take a realtime inode's
@@ -1106,7 +1169,9 @@ impl Filesystem {
             let Some(realtime) = self.realtime.as_deref() else {
                 return Err(Error::RealtimeDeviceAbsent { ino: inode.ino });
             };
-            (self.fork_extents(inode, raw)?, realtime)
+            let extents = self.fork_extents(inode, raw)?;
+            self.check_realtime_extents(inode.ino, &extents)?;
+            (extents, realtime)
         } else {
             (self.data_extents(inode, raw)?, self.device.as_ref())
         };
@@ -1130,21 +1195,22 @@ impl Filesystem {
                         .map(file_block)
                         .expect("lookup returned a covering extent");
                     let at = if inode.is_realtime() {
-                        // Not packed by group: the realtime section is one
-                        // linear run of blocks. One past its end is a map
-                        // that is wrong, not a read to attempt.
-                        if phys >= self.sb.rblocks {
-                            return Err(Error::BadSuperblock(format!(
-                                "inode {} maps file block {file_block} to realtime block \
-                                 {phys}, past the {}-block realtime section",
-                                inode.ino, self.sb.rblocks
-                            )));
-                        }
+                        // The whole run was checked before any copy. Realtime
+                        // blocks are linear, not packed by allocation group.
                         phys * block_size + within as u64
                     } else {
                         self.block_offset(phys) + within as u64
                     };
-                    data_device.read_at(at, &mut buf[done..done + chunk])?;
+                    data_device.read_at(at, &mut buf[done..done + chunk]).map_err(|error| {
+                        if inode.is_realtime() {
+                            Error::Io(format!(
+                                "inode {}: realtime device read of {chunk} bytes at byte {at} failed: {error}",
+                                inode.ino
+                            ))
+                        } else {
+                            Error::from(error)
+                        }
+                    })?;
                 }
                 // An unwritten extent has blocks allocated but never
                 // written. Returning what they hold would leak the
