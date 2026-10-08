@@ -528,6 +528,19 @@ pub mod inode_log_format {
     /// short-form directory's 30 bytes is the proof of it.
     pub const XFS_ILOG_DEXT: u32 = 0x04;
 
+    /// The data fork's inline bmbt root, whose pointer array moves when
+    /// an attribute fork changes the data fork's capacity.
+    pub const XFS_ILOG_DBROOT: u32 = 0x08;
+
+    /// Inline attribute bytes. The intervening bits are DEV (0x10)
+    /// and the obsolete UUID field (0x20), not attribute fork flags.
+    /// Verified by the kernel recovery and xfs_logprint oracles (#389).
+    pub const XFS_ILOG_ADATA: u32 = 0x40;
+    /// Attribute extent records, verified by kernel recovery (#389).
+    pub const XFS_ILOG_AEXT: u32 = 0x80;
+    /// The attribute fork's inline bmbt root.
+    pub const XFS_ILOG_ABROOT: u32 = 0x100;
+
     /// # What the sizes mean, and how the fork operation is framed
     ///
     /// Measured on a rename inside a short-form directory — 8 operations,

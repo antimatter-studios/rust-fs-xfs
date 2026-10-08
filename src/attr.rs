@@ -23,7 +23,7 @@
 //! `trusted.SGI_ACL_DEFAULT`, with the bytes as stored.
 //! [`crate::format::acl`] has both formats.
 
-use crate::endian::{be16, be32};
+use crate::endian::{be16, be32, be64};
 use crate::error::{Error, Result};
 use crate::extent::{self, Extent};
 use crate::format::acl::{
@@ -82,6 +82,11 @@ impl Filesystem {
     /// not fit where they claim to be, or a stored ACL the kernel would
     /// refuse to read, and whatever reading its blocks returns.
     pub fn list_xattrs(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Xattr>> {
+        with_acl_views(inode.ino, self.stored_xattrs(inode, raw)?, self.sb.is_v5())
+    }
+
+    /// Stored names only: ACL aliases must never be written as new entries.
+    pub(crate) fn stored_xattrs(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Xattr>> {
         let isize = usize::from(self.sb.inodesize);
         let Some((start, end)) = inode.attr_fork_range(isize) else {
             return Ok(Vec::new());
@@ -93,7 +98,11 @@ impl Filesystem {
             Format::Local => shortform(inode.ino, fork)?,
             Format::Extents | Format::Btree => {
                 let extents = self.attr_extents(inode, fork)?;
-                self.leaf_attrs(inode.ino, &extents)?
+                if extents.is_empty() {
+                    Vec::new()
+                } else {
+                    self.leaf_attrs(inode.ino, &extents)?
+                }
             }
             other => {
                 return Err(corrupt(
@@ -102,7 +111,7 @@ impl Filesystem {
                 ))
             }
         };
-        with_acl_views(inode.ino, stored, self.sb.is_v5())
+        Ok(stored)
     }
 
     /// One attribute's value by its full name (`user.colour`), or `None`
@@ -139,7 +148,43 @@ impl Filesystem {
         let e = extent::lookup(extents, dablk)
             .ok_or_else(|| corrupt(ino, &format!("block {dablk} is a hole")))?;
         let phys = e.map(dablk).expect("block inside its own extent");
-        self.read_block_at(phys)
+        let block = self.read_block_at(phys)?;
+        if self.sb.is_v5() {
+            self.verify_attr_block(ino, phys, &block)?;
+        }
+        Ok(block)
+    }
+
+    pub(crate) fn verify_attr_block(&self, ino: u64, physical: u64, block: &[u8]) -> Result<()> {
+        let remote = be32(block, 0) == crate::format::attr::XFS_ATTR3_RMT_MAGIC;
+        let magic = be16(block, 8);
+        if !remote && !matches!(magic, XFS_ATTR3_LEAF_MAGIC | XFS_DA3_NODE_MAGIC) {
+            return Err(corrupt(ino, "unrecognized v5 attribute block"));
+        }
+        let crc = u32::from_le_bytes(block[12..16].try_into().expect("attribute CRC"));
+        if crate::superblock::crc32c_with_zeroed_crc(block, 12) != crc {
+            return Err(Error::ChecksumMismatch {
+                what: "attribute block",
+                block: physical,
+            });
+        }
+        let (uuid, owner, address) = if remote { (16, 32, 40) } else { (32, 48, 16) };
+        if block[uuid..uuid + 16] != self.sb.meta_uuid {
+            return Err(corrupt(ino, "attribute UUID differs from the superblock"));
+        }
+        for (expected, found) in [
+            (ino, be64(block, owner)),
+            (self.block_offset(physical) / 512, be64(block, address)),
+        ] {
+            if expected != found {
+                return Err(Error::BlockIdentityMismatch {
+                    what: "attribute block",
+                    expected,
+                    found,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn leaf_attrs(&self, ino: u64, extents: &[Extent]) -> Result<Vec<Xattr>> {
@@ -271,6 +316,12 @@ impl Filesystem {
         for n in 0..blocks as u64 {
             let block = self.attr_block(ino, extents, u64::from(valueblk) + n)?;
             let take = (valuelen as usize - value.len()).min(bs - header);
+            if v5 && (be32(&block, 4) as usize != value.len() || be32(&block, 8) as usize != take) {
+                return Err(corrupt(
+                    ino,
+                    "remote value offset or byte count disagrees with its extent",
+                ));
+            }
             value.extend_from_slice(&block[header..header + take]);
         }
         if value.len() != valuelen as usize {

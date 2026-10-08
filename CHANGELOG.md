@@ -73,6 +73,17 @@ never does.
   group's trees, quota and the inode's whole extent list. A file whose extents
   are in a B+tree, or a write that would need one, is refused by name.
 
+- **Extended attributes can be written and removed on v5 (#389).** `set_xattr`
+  supports insert, create-only and replace-only semantics in the `user.`,
+  `trusted.` and `security.` namespaces; `remove_xattr` releases their blocks.
+  Journalled fork replacements grow and shrink between shortform, leaf, node
+  and remote layouts, preserve the data fork, and accept values through 64 KiB.
+  Attribute block checksums, UUIDs, owners and disk addresses are verified.
+- **The C ABI exposes extended attributes.** `fs_xfs_setxattr`,
+  `fs_xfs_getxattr`, `fs_xfs_listxattr` and `fs_xfs_removexattr` preserve raw
+  name and value bytes, support size queries and create/replace flags,
+  distinguish missing attributes from missing paths, and reject small buffers
+  without partially filling them.
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount

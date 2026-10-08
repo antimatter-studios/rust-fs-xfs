@@ -743,16 +743,42 @@ fn apply_inode(
             ));
         };
         region += 1;
-        let take = dsize.min(fork.len()).min(inode.len() - fork_start);
-        inode[fork_start..fork_start + take].copy_from_slice(&fork[..take]);
+        if fields & inode_log_format::XFS_ILOG_DBROOT != 0 {
+            let forkoff = usize::from(inode[crate::inode::offsets::FORKOFF]) * 8;
+            let end = if forkoff == 0 {
+                inode.len()
+            } else {
+                fork_start + forkoff
+            };
+            let logged = fork
+                .get(..dsize)
+                .ok_or_else(|| Error::CorruptLog("short logged data bmbt root".into()))?;
+            let capacity = end
+                .checked_sub(fork_start)
+                .filter(|_| end <= inode.len())
+                .ok_or_else(|| Error::CorruptLog("data fork past its inode".into()))?;
+            let root = crate::bmbt::inode_root_from_log(logged, sb, capacity)?;
+            inode[fork_start..end].copy_from_slice(&root);
+        } else {
+            let take = dsize.min(fork.len()).min(inode.len() - fork_start);
+            inode[fork_start..fork_start + take].copy_from_slice(&fork[..take]);
+        }
     }
     if fields & ATTR_FORK_FIELDS != 0 && asize > 0 {
         if let Some(fork) = item.regions.get(region) {
             let forkoff = usize::from(inode[crate::inode::offsets::FORKOFF]) * 8;
             let start = fork_start + forkoff;
             if start < inode.len() {
-                let take = asize.min(fork.len()).min(inode.len() - start);
-                inode[start..start + take].copy_from_slice(&fork[..take]);
+                if fields & inode_log_format::XFS_ILOG_ABROOT != 0 {
+                    let logged = fork.get(..asize).ok_or_else(|| {
+                        Error::CorruptLog("short logged attribute bmbt root".into())
+                    })?;
+                    let root = crate::bmbt::inode_root_from_log(logged, sb, inode.len() - start)?;
+                    inode[start..].copy_from_slice(&root);
+                } else {
+                    let take = asize.min(fork.len()).min(inode.len() - start);
+                    inode[start..start + take].copy_from_slice(&fork[..take]);
+                }
             }
         }
     }
@@ -768,7 +794,9 @@ const FORK_FIELDS: u32 = 0x02 | 0x04 | 0x08;
 
 /// `XFS_ILOG_ADATA | XFS_ILOG_AEXT | XFS_ILOG_ABROOT`, the same for the
 /// attribute fork.
-const ATTR_FORK_FIELDS: u32 = 0x10 | 0x20 | 0x40;
+const ATTR_FORK_FIELDS: u32 = crate::format::log_items::inode_log_format::XFS_ILOG_ADATA
+    | crate::format::log_items::inode_log_format::XFS_ILOG_AEXT
+    | crate::format::log_items::inode_log_format::XFS_ILOG_ABROOT;
 
 /// Initialise a chunk of inodes an icreate item names.
 ///
