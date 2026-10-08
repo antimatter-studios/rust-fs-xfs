@@ -205,6 +205,11 @@ impl Filesystem {
             }],
         )?;
 
+        // Reject unsupported log headers before writing file data. The
+        // checkpoint would otherwise discover this after the data write.
+        let head = crate::log::head(device.as_ref(), &self.sb)?;
+        crate::log_write::max_payload(head.iclog_size)?;
+
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
         // here rather than on the way in: a refusal must not spend it.

@@ -286,6 +286,9 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
         // use, which is the worst outcome available here and one that
         // only shows up on a filesystem where sharing happened.
         "truncate_shared" => {
+            if fs.superblock().features_ro_compat & 1 == 0 {
+                return Err("not applicable: no shared extent on this filesystem".into());
+            }
             let shared = match fs.lookup_path("/sf/shared.bin") {
                 Ok(i) => i.ino,
                 // No shared file: this row's filesystem does not permit
@@ -618,7 +621,14 @@ fn pinned_feature_geometry_matches_independent_reference() {
                 .lines()
                 .find_map(|line| line.strip_prefix(&format!("{name} = ")))
                 .expect("missing independent field");
-            if let Some(hex) = value.strip_prefix("0x") {
+            // xfs_db appends decoded flag names after the numeric value.
+            let value = value
+                .split_whitespace()
+                .next()
+                .expect("empty independent field");
+            if value == "null" {
+                u64::MAX // xfs_db's NULLFSINO spelling
+            } else if let Some(hex) = value.strip_prefix("0x") {
                 u64::from_str_radix(hex, 16).unwrap()
             } else {
                 value.parse().unwrap()
