@@ -8,7 +8,9 @@
 //! calls clean is one on which none of THESE invariants is broken.
 //!
 //! It never writes. `-n` is accepted because scripts pass it; `-y` and
-//! `-p` (repair) are refused, because there is no repair.
+//! `-p` (repair) are refused, because there is no repair. `--dry-run`
+//! plans one (#375): it takes the target for itself, then prints what a
+//! repair would change and what it would leave, and still writes nothing.
 //!
 //! THE JSON REPORT IS VERSIONED (#363). Its shape is documented in
 //! `docs/fsck-output.md`, and [`SCHEMA_VERSION`] changes only when a key
@@ -69,6 +71,10 @@ fn command() -> Cmd {
              JSON reports use schema rust-fs-xfs/fsck version 1. Findings carry stable codes, \
              severity and location. scan is complete, partial, or none; a partial scan is \
              never clean. The schema and codes are documented in docs/fsck-output.md.\n\n\
+             --dry-run plans a repair and prints the plan under the report's plan key. It \
+             takes the target for itself first (an exclusive lock, and on Linux no mount or \
+             loop device using it), refuses volumes it cannot reason about with repair.* \
+             findings, and writes nothing.\n\n\
              Exit status is fsck(8)'s: 0 clean, 4 errors found (and left), 8 the target could \
              not be checked, 16 a wrong command line.",
         )
@@ -96,6 +102,12 @@ fn command() -> Cmd {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .help("Plan a repair and print it, writing nothing")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("repair")
                 .short('y')
                 .help("Refused: this checker does not repair")
@@ -112,6 +124,7 @@ fn command() -> Cmd {
             "Examples:\n  \
              fsck.xfs disk.img                     the report, as JSON\n  \
              fsck.xfs --text disk.img              the findings, one per line\n  \
+             fsck.xfs --dry-run disk.img           what a repair would change\n  \
              fsck.xfs --offset 1048576 whole.img   a partition inside a disk image",
         )
 }
@@ -129,6 +142,39 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .expect("clap requires the target");
     let name = target.to_string_lossy().into_owned();
     let offset = *matches.get_one::<u64>("offset").expect("defaulted");
+    let dry_run = matches.get_flag("dry-run");
+
+    // Taken before anything is read, and held until the plan is made.
+    let access = if dry_run {
+        match fs_xfs::repair::Exclusive::claim(std::path::Path::new(target)) {
+            Ok(access) => Some(access),
+            Err(refusal) => {
+                let text = format!(
+                    "{name}: plan: refused: {}: {}",
+                    refusal.code.as_str(),
+                    refusal.what
+                );
+                let report = Json::object([
+                    ("schema", Json::from(SCHEMA)),
+                    ("schema_version", Json::from(SCHEMA_VERSION)),
+                    ("fs", Json::from("xfs")),
+                    ("device", Json::from(name.as_str())),
+                    ("clean", Json::from(false)),
+                    ("dirty", Json::from(false)),
+                    ("scan", Json::from("none")),
+                    ("exit", Json::from(u64::from(OPERATIONAL))),
+                    ("findings", Json::Arr(Vec::new())),
+                    ("suppressed", Json::from(0u64)),
+                    ("plan", refused_plan(&refusal)),
+                ]);
+                return Ok(Outcome::report(report)
+                    .with_text(text)
+                    .with_code(OPERATIONAL));
+            }
+        }
+    } else {
+        None
+    };
 
     let dev: Arc<dyn BlockRead> = Arc::new(
         FileDevice::open(&*name)
@@ -181,13 +227,29 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
                 })]),
             ));
             report.push(("suppressed", Json::from(0u64)));
+            if dry_run {
+                report.push((
+                    "plan",
+                    refused_plan(&fs_xfs::check::Finding {
+                        code: fs_xfs::check::Code::RepairIncomplete,
+                        location: fs_xfs::check::Location::default(),
+                        what: "the filesystem could not be mounted, so nothing was checked".into(),
+                    }),
+                ));
+            }
             return Ok(Outcome::report(Json::object(report))
                 .with_text(format!("{name}: mount: {what}"))
                 .with_code(UNCORRECTED));
         }
     };
 
-    let checked = fs_xfs::check::check(&fs);
+    let planned = access
+        .as_ref()
+        .map(|access| fs_xfs::repair::plan(&fs, access));
+    let checked = match &planned {
+        Some(plan) => plan.check.clone(),
+        None => fs_xfs::check::check(&fs),
+    };
     let code = if checked.is_clean() {
         CLEAN
     } else {
@@ -229,9 +291,90 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             checked.inodes, checked.directories
         ));
     }
+    if let Some(plan) = &planned {
+        report.push(("plan", plan_json(plan)));
+        text.extend(plan_text(&name, plan));
+    }
     Ok(Outcome::report(Json::object(report))
         .with_text(text.join("\n"))
         .with_code(code))
+}
+
+/// A plan refused for `refusal`, with nothing proposed.
+fn refused_plan(refusal: &fs_xfs::check::Finding) -> Json {
+    Json::object([
+        (
+            "status",
+            Json::from(fs_xfs::repair::Status::Refused.as_str()),
+        ),
+        ("changes", Json::Arr(Vec::new())),
+        ("refusals", Json::Arr(vec![finding(refusal)])),
+        ("unplanned", Json::Arr(Vec::new())),
+    ])
+}
+
+/// A plan, as the report's `plan` key holds it.
+fn plan_json(plan: &fs_xfs::repair::Plan) -> Json {
+    let changes = plan
+        .changes
+        .iter()
+        .map(|c| {
+            Json::object([
+                ("offset", Json::from(c.offset)),
+                ("length", Json::from(c.after.len() as u64)),
+                ("code", Json::from(c.code.as_str())),
+                ("rule", Json::from(c.rule)),
+                (
+                    "before_crc32c",
+                    Json::from(u64::from(crc32c::crc32c(&c.before))),
+                ),
+                (
+                    "after_crc32c",
+                    Json::from(u64::from(crc32c::crc32c(&c.after))),
+                ),
+                ("what", Json::from(c.what.as_str())),
+            ])
+        })
+        .collect();
+    Json::object([
+        ("status", Json::from(plan.status.as_str())),
+        ("changes", Json::Arr(changes)),
+        (
+            "refusals",
+            Json::Arr(plan.refusals.iter().map(finding).collect()),
+        ),
+        (
+            "unplanned",
+            Json::Arr(plan.unplanned.iter().map(finding).collect()),
+        ),
+    ])
+}
+
+/// A plan, one line per refusal or change, and a summary.
+fn plan_text(name: &str, plan: &fs_xfs::repair::Plan) -> Vec<String> {
+    let mut lines: Vec<String> = plan
+        .refusals
+        .iter()
+        .map(|f| format!("{name}: plan: refused: {}: {}", f.code.as_str(), f.what))
+        .collect();
+    lines.extend(plan.changes.iter().map(|c| {
+        format!(
+            "{name}: plan: {} bytes at {}: {} ({}): {}",
+            c.after.len(),
+            c.offset,
+            c.code.as_str(),
+            c.rule,
+            c.what
+        )
+    }));
+    if plan.status == fs_xfs::repair::Status::Ready {
+        lines.push(format!(
+            "{name}: plan: ready, {} changes, {} findings no rule repairs, nothing written",
+            plan.changes.len(),
+            plan.unplanned.len()
+        ));
+    }
+    lines
 }
 
 /// One finding, as the report lists it.
