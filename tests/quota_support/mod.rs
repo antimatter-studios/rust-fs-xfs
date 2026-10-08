@@ -59,6 +59,7 @@ umount "$d/m" || {{ echo 'quota fixture unmount failed' >&2; exit 1; }}
 mounted=0
 cp --sparse=always "$d/image" {destination}
 echo QUOTA_FIXTURE_BUILT
+echo DONE
 "#,
         destination = guest_quote(&image.guest())
     ));

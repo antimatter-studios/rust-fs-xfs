@@ -165,6 +165,7 @@ xfs_quota -x -c 'report -{kind} -n -b -i' "$d"
 sync
 umount "$d" || {{ echo UMOUNT_FAILED >&2; exit 1; }}
 mounted=0
+echo DONE
 "#,
                 image = common::guest_quote(&image.guest())
             ));
