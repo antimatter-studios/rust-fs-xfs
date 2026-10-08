@@ -750,20 +750,25 @@ fn apply_inode(
         if fields & FORK_FIELDS == XFS_ILOG_DBROOT {
             // A B+tree root is logged as the kernel holds it in memory, a
             // full block header and its pointers straight after its keys,
-            // and stored in the inode in its short form (#367).
+            // and stored in the inode in its short form (#367). A logged
+            // root shorter than it says, or a fork past its inode, is a
+            // corrupt log, not something to copy from (#389).
             let forkoff = usize::from(inode[crate::inode::offsets::FORKOFF]) * 8;
-            let fork_len = if forkoff == 0 {
-                inode.len() - fork_start
+            let end = if forkoff == 0 {
+                inode.len()
             } else {
-                forkoff
+                fork_start + forkoff
             };
+            let logged = fork
+                .get(..dsize)
+                .ok_or_else(|| Error::CorruptLog("short logged data bmbt root".into()))?;
+            let fork_len = end
+                .checked_sub(fork_start)
+                .filter(|_| end <= inode.len())
+                .ok_or_else(|| Error::CorruptLog("data fork past its inode".into()))?;
             let v5 = inode[crate::inode::offsets::VERSION] >= 3;
-            let disk = crate::bmbt_write::logged_root_to_disk(
-                &fork[..dsize.min(fork.len())],
-                v5,
-                fork_len,
-            )?;
-            inode[fork_start..fork_start + fork_len].copy_from_slice(&disk);
+            let disk = crate::bmbt_write::logged_root_to_disk(logged, v5, fork_len)?;
+            inode[fork_start..end].copy_from_slice(&disk);
         } else {
             let take = dsize.min(fork.len()).min(inode.len() - fork_start);
             inode[fork_start..fork_start + take].copy_from_slice(&fork[..take]);
@@ -774,8 +779,16 @@ fn apply_inode(
             let forkoff = usize::from(inode[crate::inode::offsets::FORKOFF]) * 8;
             let start = fork_start + forkoff;
             if start < inode.len() {
-                let take = asize.min(fork.len()).min(inode.len() - start);
-                inode[start..start + take].copy_from_slice(&fork[..take]);
+                if fields & inode_log_format::XFS_ILOG_ABROOT != 0 {
+                    let logged = fork.get(..asize).ok_or_else(|| {
+                        Error::CorruptLog("short logged attribute bmbt root".into())
+                    })?;
+                    let root = crate::bmbt::inode_root_from_log(logged, sb, inode.len() - start)?;
+                    inode[start..].copy_from_slice(&root);
+                } else {
+                    let take = asize.min(fork.len()).min(inode.len() - start);
+                    inode[start..start + take].copy_from_slice(&fork[..take]);
+                }
             }
         }
     }
@@ -794,7 +807,9 @@ const XFS_ILOG_DBROOT: u32 = 0x08;
 
 /// `XFS_ILOG_ADATA | XFS_ILOG_AEXT | XFS_ILOG_ABROOT`, the same for the
 /// attribute fork.
-const ATTR_FORK_FIELDS: u32 = 0x10 | 0x20 | 0x40;
+const ATTR_FORK_FIELDS: u32 = crate::format::log_items::inode_log_format::XFS_ILOG_ADATA
+    | crate::format::log_items::inode_log_format::XFS_ILOG_AEXT
+    | crate::format::log_items::inode_log_format::XFS_ILOG_ABROOT;
 
 /// Initialise a chunk of inodes an icreate item names.
 ///

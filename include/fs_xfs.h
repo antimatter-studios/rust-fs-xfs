@@ -317,6 +317,34 @@ int fs_xfs_set_attributes(fs_xfs_fs_t *fs, const char *path,
                           int64_t atime_sec, uint32_t atime_nsec,
                           int64_t mtime_sec, uint32_t mtime_nsec);
 
+/* Attribute flags are library constants, independent of host OS flags. */
+#define FS_XFS_XATTR_CREATE 1
+#define FS_XFS_XATTR_REPLACE 2
+
+/*
+ * Journalled v5 xattr writes in user., trusted. and security. namespaces.
+ * Names include the namespace, at most 255 bytes; values at most 65536.
+ * flags: 0 inserts or replaces, CREATE requires absence, REPLACE presence.
+ * NULL value is valid with size 0. ACL policy attributes are read-only.
+ * These calls resolve the inode itself without following a final symlink.
+ * Returns 0 or -1. Missing path: ENOENT; missing attribute: ENODATA on
+ * Linux, ENOATTR on Darwin; existing CREATE: EEXIST.
+ */
+int fs_xfs_setxattr(fs_xfs_fs_t *fs, const char *path, const char *name,
+                   const void *value, size_t size, int flags);
+int fs_xfs_removexattr(fs_xfs_fs_t *fs, const char *path, const char *name);
+
+/*
+ * Return the value size or the size of NUL-separated names, or -1.
+ * size 0 queries the required byte count (buffer may be NULL).
+ * A small buffer returns ERANGE without modifying it; a nonzero size
+ * requires a non-NULL buffer. Names include namespace prefixes.
+ */
+int64_t fs_xfs_getxattr(const fs_xfs_fs_t *fs, const char *path,
+                       const char *name, void *value, size_t size);
+int64_t fs_xfs_listxattr(const fs_xfs_fs_t *fs, const char *path,
+                        void *names, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
