@@ -10,6 +10,12 @@
 //! It never writes. `-n` is accepted because scripts pass it; `-y` and
 //! `-p` (repair) are refused, because there is no repair.
 //!
+//! THE JSON REPORT IS VERSIONED (#363). Its shape is documented in
+//! `docs/fsck-output.md`, and [`SCHEMA_VERSION`] changes only when a key
+//! is removed or its meaning changes; a key may be added without one.
+//! Every finding carries a stable `code` and a `severity`; the `what`
+//! beside them is for a person, and may be reworded in any release.
+//!
 //! EXIT STATUS IS fsck(8)'s, because scripts and the `fsck` front-end read
 //! it: 0 clean, 4 errors left uncorrected, 8 an operational error (the
 //! target could not be opened, or is not XFS), 16 a wrong command line.
@@ -30,6 +36,11 @@ pub const UNCORRECTED: u8 = 4;
 pub const OPERATIONAL: u8 = 8;
 /// fsck(8): usage or syntax error.
 pub const USAGE: u8 = 16;
+
+/// What the report's `schema` key says it is.
+pub const SCHEMA: &str = "rust-fs-xfs/fsck";
+/// The report's `schema_version`.
+pub const SCHEMA_VERSION: u64 = 1;
 
 pub const TOOL: Tool = Tool {
     name: "fsck.xfs",
@@ -55,6 +66,9 @@ fn command() -> Cmd {
              allocated inode of the type it records and every link count matching the entries \
              that reach the inode; and the superblock's counters. A volume whose log needed \
              replay is checked as the replay leaves it, and reported as dirty.\n\n\
+             JSON reports use schema rust-fs-xfs/fsck version 1. Findings carry stable codes, \
+             severity and location. scan is complete, partial, or none; a partial scan is \
+             never clean. The schema and codes are documented in docs/fsck-output.md.\n\n\
              Exit status is fsck(8)'s: 0 clean, 4 errors found (and left), 8 the target could \
              not be checked, 16 a wrong command line.",
         )
@@ -133,12 +147,15 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         Arc::new(OwnedSlice::new(dev, offset, size - offset))
     };
 
-    let base = |clean: bool, dirty: bool, code: u8| -> Vec<(&'static str, Json)> {
+    let base = |clean: bool, dirty: bool, scan: &str, code: u8| -> Vec<(&'static str, Json)> {
         vec![
+            ("schema", Json::from(SCHEMA)),
+            ("schema_version", Json::from(SCHEMA_VERSION)),
             ("fs", Json::from("xfs")),
             ("device", Json::from(name.as_str())),
             ("clean", Json::from(clean)),
             ("dirty", Json::from(dirty)),
+            ("scan", Json::from(scan)),
             ("exit", Json::from(u64::from(code))),
         ]
     };
@@ -150,16 +167,22 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         Err(e @ (fs_xfs::Error::NotXfs { .. } | fs_xfs::Error::Io(_))) => {
             return Err(CliError::failed(format!("{name}: {e}")).with_code(OPERATIONAL))
         }
-        // XFS, and too damaged to mount: that is a finding.
+        // XFS, and too damaged to mount: that is a finding, and nothing
+        // under it was checked.
         Err(e) => {
             let what = format!("the filesystem cannot be mounted: {e}");
-            let mut report = base(false, false, UNCORRECTED);
+            let mut report = base(false, false, "none", UNCORRECTED);
             report.push((
                 "findings",
-                Json::Arr(vec![Json::object([("what", Json::from(what.as_str()))])]),
+                Json::Arr(vec![finding(&fs_xfs::check::Finding {
+                    code: fs_xfs::check::Code::Mount,
+                    location: fs_xfs::check::Location::default(),
+                    what: what.clone(),
+                })]),
             ));
+            report.push(("suppressed", Json::from(0u64)));
             return Ok(Outcome::report(Json::object(report))
-                .with_text(format!("{name}: {what}"))
+                .with_text(format!("{name}: mount: {what}"))
                 .with_code(UNCORRECTED));
         }
     };
@@ -170,39 +193,35 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     } else {
         UNCORRECTED
     };
-    let mut report = base(checked.is_clean(), checked.dirty, code);
+    let mut report = base(
+        checked.is_clean(),
+        checked.dirty,
+        checked.scan.as_str(),
+        code,
+    );
     report.push(("inodes", Json::from(checked.inodes)));
     report.push(("directories", Json::from(checked.directories)));
     report.push(("free_blocks", Json::from(checked.free_blocks)));
     report.push((
         "findings",
-        Json::Arr(
-            checked
-                .findings
-                .iter()
-                .map(|f| {
-                    Json::object([
-                        (
-                            "ag",
-                            f.ag.map(|a| Json::from(u64::from(a))).unwrap_or(Json::Null),
-                        ),
-                        ("ino", f.ino.map(Json::from).unwrap_or(Json::Null)),
-                        ("what", Json::from(f.what.as_str())),
-                    ])
-                })
-                .collect(),
-        ),
+        Json::Arr(checked.findings.iter().map(finding).collect()),
     ));
+    report.push(("suppressed", Json::from(checked.suppressed)));
     let mut text: Vec<String> = checked
         .findings
         .iter()
-        .map(|f| format!("{name}: {}", f.what))
+        .map(|f| format!("{name}: {}: {}", f.code.as_str(), f.what))
         .collect();
-    if checked.dirty {
-        text.insert(
-            0,
-            format!("{name}: the log held unapplied records; checked as replayed"),
-        );
+    if checked.suppressed > 0 {
+        text.push(format!(
+            "{name}: {} more findings are not listed",
+            checked.suppressed
+        ));
+    }
+    if checked.scan == fs_xfs::check::Scan::Partial {
+        text.push(format!(
+            "{name}: the scan is partial: what could not be read was not checked"
+        ));
     }
     if checked.is_clean() {
         text.push(format!(
@@ -213,4 +232,28 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     Ok(Outcome::report(Json::object(report))
         .with_text(text.join("\n"))
         .with_code(code))
+}
+
+/// One finding, as the report lists it.
+fn finding(f: &fs_xfs::check::Finding) -> Json {
+    let at = &f.location;
+    Json::object([
+        ("code", Json::from(f.code.as_str())),
+        ("severity", Json::from(f.severity().as_str())),
+        (
+            "ag",
+            at.ag
+                .map(|a| Json::from(u64::from(a)))
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "agbno",
+            at.agbno
+                .map(|b| Json::from(u64::from(b)))
+                .unwrap_or(Json::Null),
+        ),
+        ("ino", at.ino.map(Json::from).unwrap_or(Json::Null)),
+        ("field", at.field.map(Json::from).unwrap_or(Json::Null)),
+        ("what", Json::from(f.what.as_str())),
+    ])
 }

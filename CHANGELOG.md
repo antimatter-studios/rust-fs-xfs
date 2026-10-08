@@ -12,6 +12,17 @@ never does.
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
   writes one checkpoint, is a short summary pointing to it.
+- **Stable fsck finding codes and versioned JSON reports (#363).** Findings
+  carry a code, severity and structured location; reports distinguish complete,
+  partial and unstarted scans and count suppressed findings. Human descriptions
+  remain available, and a partial scan cannot report clean.
+
+### Changed
+
+- **The Rust checker reports structured findings.** `Finding` now exposes
+  `code` and `location` instead of its separate `ag` and `ino` fields; `Report`
+  adds scan status and suppression counts. The version moves to 0.13.0 for this
+  Rust API break. The C ABI is unchanged.
 
 ### Fixed
 
