@@ -313,7 +313,7 @@ fn a_target_another_holder_has_locked_is_refused_and_not_read() {
     let before = image_hash(volume.path());
     let (code, report) = dry_run(volume.path().to_str().unwrap());
     assert_eq!(code, Some(8), "{report}");
-    assert!(report.contains(r#""scan":"none""#), "{report}");
+    assert!(compact(&report).contains(r#""scan":"none""#), "{report}");
     let plan = plan_of(&report);
     assert!(
         plan.starts_with(r#"{"status":"refused","changes":[]"#),
