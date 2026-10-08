@@ -43,6 +43,8 @@ use crate::inode::{FileType, Format};
 use crate::inode_btree::{InodeChunk, Which, INODES_PER_CHUNK};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod quotas;
+
 /// What a finding is, by a name that does not change (#363).
 ///
 /// The words in [`Finding::what`] are for a person and may be reworded
@@ -158,6 +160,17 @@ pub enum Code {
     /// directory is reached from two places, so there is no single owner
     /// to repair towards.
     RepairAmbiguous,
+    /// The superblock's quota flags are not valid for its version (#395).
+    QuotaFlags,
+    /// A quota inode is missing, shared between quota types, not a quota
+    /// file, maps blocks a quota file cannot have, or holds a record that
+    /// fails its checksum, UUID, identity or field checks.
+    QuotaInode,
+    /// A quota inode's extent map or records, or the usage they are checked
+    /// against, could not be read.
+    QuotaUnreadable,
+    /// Quota accounting is not what the allocated inodes add up to.
+    QuotaUsage,
 }
 
 impl Code {
@@ -212,6 +225,10 @@ impl Code {
         Code::RepairLogDirty,
         Code::RepairIncomplete,
         Code::RepairAmbiguous,
+        Code::QuotaFlags,
+        Code::QuotaInode,
+        Code::QuotaUnreadable,
+        Code::QuotaUsage,
     ];
 
     /// The code as it appears in the output.
@@ -266,6 +283,10 @@ impl Code {
             Code::RepairLogDirty => "repair.log-dirty",
             Code::RepairIncomplete => "repair.incomplete",
             Code::RepairAmbiguous => "repair.ambiguous",
+            Code::QuotaFlags => "quota.flags",
+            Code::QuotaInode => "quota.inode",
+            Code::QuotaUnreadable => "quota.unreadable",
+            Code::QuotaUsage => "quota.usage",
         }
     }
 
@@ -303,6 +324,7 @@ impl Code {
                 | Code::DirNotADirectory
                 | Code::DirUnreadable
                 | Code::Mount
+                | Code::QuotaUnreadable
         )
     }
 }
@@ -1271,6 +1293,8 @@ impl Checker<'_> {
                 ),
             }
         }
+
+        self.quotas(&usable, &raws);
 
         // The tree, from the root.
         let mut links: HashMap<u64, u32> = HashMap::new();
