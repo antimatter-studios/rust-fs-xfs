@@ -17,7 +17,7 @@ struct Usage {
 
 fn usage(image: &str) -> (Usage, Usage) {
     let out = kernel_run(&format!(
-        r#"
+        r##"
         m=$(mktemp -d)
         if ! mount -o loop,nouuid,uquota {image} "$m"; then
             echo MOUNT_FAILED
@@ -26,8 +26,9 @@ fn usage(image: &str) -> (Usage, Usage) {
         fi
         report() {{
             id=$1
-            blocks=$(xfs_quota -x -c 'report -u -b -n' "$m" | awk -v id="$id" '$1 == id {{print $2; exit}}')
-            inodes=$(xfs_quota -x -c 'report -u -i -n' "$m" | awk -v id="$id" '$1 == id {{print $2; exit}}')
+            # Numeric report IDs have a leading '#' (xfsprogs report_row).
+            blocks=$(xfs_quota -x -c 'report -u -b -n' "$m" | awk -v id="$id" '$1 == "#" id {{print $2; exit}}')
+            inodes=$(xfs_quota -x -c 'report -u -i -n' "$m" | awk -v id="$id" '$1 == "#" id {{print $2; exit}}')
             echo "USAGE_${{id}} $blocks $inodes"
         }}
         report 0
@@ -35,7 +36,7 @@ fn usage(image: &str) -> (Usage, Usage) {
         if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
         rmdir "$m"
         echo DONE
-        "#
+        "##
     ));
     assert!(
         !out.contains("MOUNT_FAILED"),
