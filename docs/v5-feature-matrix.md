@@ -130,7 +130,7 @@ requires a clean read/check and zero writes for every selected source fixture.
 | fullinodes | exhausted existing inode slots; rmapbt+finobt | supported | inode chunk allocation | existing structural checker | refused |
 | meta_uuid | crc=1; populated image changed with pinned xfs_db uuid | expected supported | expected success per operation | metadata identity | refused |
 | quota | crc=1; mount uquota; UID 1001 owns populated data.bin | supported | declared operations supported; ownership transfer refused | known structures; no quota audit | refused |
-| stripe | crc=1 -d su=64k,sw=4 -l size=64m; unit=16,width=64 blocks | expected supported | expected success per operation | geometry | refused |
+| stripe | crc=1 -d su=64k,sw=4,agcount=1 -l size=64m; unit=16,width=64 blocks | expected supported | expected success per operation | geometry | refused |
 | sector4k | crc=1 -s size=4096 | expected supported | expected success per operation | whole-sector CRC | refused |
 
 The eleven operation columns are create file, create directory, rename,

@@ -50,9 +50,13 @@ for tool in mkfs.xfs xfs_info xfs_db xfs_quota xfs_repair; do
 if [ "${1:-}" = -V ]; then
     echo "${0##*/} version 6.13.0"
 else
-    if [ "${0##*/}" = mkfs.xfs ] && [[ " $* " == *" su=64k,sw=4 "* ]]; then
+    if [ "${0##*/}" = mkfs.xfs ] && [[ " $* " == *" su=64k,sw=4"* ]]; then
         if [[ " $* " != *" -l size=64m "* ]]; then
             echo 'Log size must be at least 64MB.' >&2
+            exit 42
+        fi
+        if [[ " $* " != *" su=64k,sw=4,agcount=1 "* ]]; then
+            echo 'internal log size 16384 too large, must be less than 12772' >&2
             exit 42
         fi
     fi
