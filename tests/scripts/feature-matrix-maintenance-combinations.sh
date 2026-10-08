@@ -20,7 +20,7 @@ done
 for recipe in \
     'meta_uuid:-m crc=1' \
     'quota:-m crc=1' \
-    'stripe:-m crc=1 -d su=64k,sw=4 -l size=64m' \
+    'stripe:-m crc=1 -d su=64k,sw=4,agcount=1 -l size=64m' \
     'sector4k:-m crc=1 -s size=4096'; do
     if ! grep -Fq -- "\"$recipe\"" "$REPO/scripts/build-feature-matrix-fixtures.sh"; then
         printf 'FAIL  missing exact recipe %s\n' "$recipe"
