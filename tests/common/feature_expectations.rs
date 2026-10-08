@@ -29,6 +29,21 @@ const LEGACY: [Expected; 11] = [
     R("v4"),
 ];
 const QUOTA: [Expected; 11] = SHARED;
+// In-place attributes work; every checkpoint writer rejects the 64 KiB
+// log record headers produced by this stripe geometry.
+const STRIPE: [Expected; 11] = [
+    R("multi-block record header"),
+    R("multi-block record header"),
+    R("multi-block record header"),
+    R("multi-block record header"),
+    R("multi-block record header"),
+    R("multi-block record header"),
+    W,
+    R("multi-block record header"),
+    R("multi-block record header"),
+    R("multi-block record header"),
+    R("multi-block record header"),
+];
 
 pub const ROWS: &[(&str, [Expected; 11])] = &[
     ("v4", LEGACY),
@@ -57,7 +72,7 @@ pub const ROWS: &[(&str, [Expected; 11])] = &[
     ("fullinodes", SHARED),
     ("meta_uuid", SHARED),
     ("quota", QUOTA),
-    ("stripe", SHARED),
+    ("stripe", STRIPE),
     ("sector4k", SHARED),
 ];
 
