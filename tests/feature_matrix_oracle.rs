@@ -286,7 +286,7 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
         // use, which is the worst outcome available here and one that
         // only shows up on a filesystem where sharing happened.
         "truncate_shared" => {
-            if fs.superblock().features_ro_compat & 1 == 0 {
+            if fs.superblock().features_ro_compat & fs_xfs::superblock::ro_compat::REFLINK == 0 {
                 return Err("not applicable: no shared extent on this filesystem".into());
             }
             let shared = match fs.lookup_path("/sf/shared.bin") {
