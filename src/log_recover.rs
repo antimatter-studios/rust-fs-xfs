@@ -235,14 +235,18 @@ fn check_record(headers: &[u8], header_blocks: usize, data: &[u8], at: u64) -> R
     // The checksum covers the header struct — not the whole basic block
     // it sits in — then each further header block's struct, then the
     // payload as it was written.
-    let mut buf = headers[..rec_header::XLOG_REC_HEADER_SIZE].to_vec();
-    buf[rec_header::offsets::CRC..rec_header::offsets::CRC + 4].copy_from_slice(&[0; 4]);
-    for block in 1..header_blocks {
-        let from = block * BBSIZE;
-        buf.extend_from_slice(&headers[from..from + rec_header::XLOG_REC_HEADER_SIZE]);
+    let version = u32::from_be_bytes(headers[8..12].try_into().expect("4 bytes"));
+    if version & 2 != 0
+        && data
+            .len()
+            .div_ceil(crate::log::XLOG_HEADER_CYCLE_SIZE as usize)
+            > header_blocks
+    {
+        return Err(Error::CorruptLog(format!(
+            "the log record at basic block {at} has too few cycle-data headers"
+        )));
     }
-    buf.extend_from_slice(data);
-    let computed = crc32c::crc32c(&buf);
+    let computed = crate::log::record_checksum(headers, data);
     if computed != stored {
         return Err(Error::CorruptLog(format!(
             "the log record at basic block {at} says its checksum is {stored:#010x} and \

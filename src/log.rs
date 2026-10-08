@@ -178,9 +178,27 @@ const SCAN_CHUNK: usize = 1 << 20;
 ///
 /// Verified against all 24 checksummed records across four filesystems
 /// the kernel wrote.
+///
+/// `header` includes every basic block reserved by the record's `h_size`.
+/// Version-2 payloads larger than 32 KiB also checksum the 260-byte
+/// extended cycle-data structs needed by the payload length.
+/// See Linux v6.1 `fs/xfs/xfs_log.c::xlog_cksum` and
+/// `fs/xfs/libxfs/xfs_log_format.h::xlog_rec_ext_header`.
+///
+/// # Panics
+/// If `header` omits checksum fields or required extended headers.
 pub fn record_checksum(header: &[u8], data: &[u8]) -> u32 {
     let mut buf = header[..XLOG_REC_HEADER_SIZE.min(header.len())].to_vec();
     buf[offsets::CRC..offsets::CRC + 4].copy_from_slice(&[0, 0, 0, 0]);
+    // Linux v6.1 xlog_cksum covers each additional cycle-data struct
+    // needed by h_len, not every header reserved by h_size. Its extended
+    // struct is a 4-byte cycle plus 64 saved words: 260 bytes, not 328.
+    if be32(header, offsets::VERSION) & XLOG_VERSION_2 != 0 {
+        for block in 1..data.len().div_ceil(XLOG_HEADER_CYCLE_SIZE as usize) {
+            let start = block * BBSIZE;
+            buf.extend_from_slice(&header[start..start + 260]);
+        }
+    }
     buf.extend_from_slice(data);
     crc32c::crc32c(&buf)
 }
