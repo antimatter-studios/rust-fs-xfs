@@ -406,11 +406,15 @@ tasks:
     # MEASURED in run 35435470063 on 2026-09-19: 482 lines / 26,812 bytes;
     # budget half as much again.
     # The floor is 36: 41 executed (job 105877826105), less the margin.
+    # Budget: 738 lines / 51,109 bytes measured with the quota record oracle
+    # in the tier (run 37791688001), every byte of its growth an `[oracle vm]`
+    # line naming a tool call and its verdict; half as much again, so 1110
+    # lines / 77,000 bytes.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 750 42000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1110 77000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
