@@ -18,64 +18,16 @@ corrupt.
 
 ## Status
 
-| Area | Support |
-|------|---------|
-| On-disk version | v5 (primary target), v4 parsed |
-| Superblock | geometry, feature masks, CRC32C, inode-number splitting |
-| Allocation groups | AGF, AGI, with v5 self-describing identity checks |
-| Free-space B+trees | both trees read and edited; extents freed and allocated |
-| Inode B+trees | both trees read; inodes taken and given back |
-| Inodes | v1/v2/v3 cores, `bigtime` and 64-bit extent counts |
-| Directories | short form, block, leaf and node; rename within short form |
-| Extents / bmbt | inline extent lists and the block-map B+tree |
-| Symlinks | inline and remote (`XSLM`), across multiple extents |
-| Extended attributes | read (`list_xattrs`, `get_xattr`): short form, leaf, node and remote values; POSIX ACLs also as `system.posix_acl_*` in the VFS format; not written, not in the C ABI |
-| Log replay | read-only: a dirty volume is replayed into memory and reads as the kernel reads it; the device is not written |
-| Log **writing** | inode cores, rename, truncate, allocating write, create, unlink, mkdir, directory conversion; a create in a directory with a default ACL is refused, since the ACL the new inode would inherit is not written |
-| Write path | overwrite in place, plus the journalled operations above |
-
-### What the write path can do
-
-An overwrite of bytes that already exist touches no metadata, so it needs no journal and
-is done directly. Everything else goes through the log, and each of these produces a
-record the Linux kernel replays:
-
-| operation | ops | items |
-|---|---|---|
-| rename within a short-form directory | 8 | 2 |
-| truncate a file to nothing | 11 | 4 |
-| write into an empty file, allocating | 12 | 4 |
-| create an empty file | 14 | 5 |
-| remove an empty file | 14 | 5 |
-| make an empty directory | 15 | 5 |
-| convert a directory to block form | 23 | 9 |
-
-Those op and item counts are not this driver's choice. They were measured from
-filesystems the kernel wrote, recorded in `docs/transaction-shapes.md`, and the encoder
-reproduced them without being fitted to them.
-
-Nothing on disk is touched by a journalled operation — the record is the change. That is
-what makes the result checkable: a filesystem that came out different is one something
-replayed, and `xfs_repair -n` afterwards is what catches metadata that is plausible on
-its own and inconsistent with the rest.
-
-**A mount writes at most one checkpoint.** A journalled operation touches nothing on
-disk, so a second would be built from a disk that does not yet reflect the first — two
-creates in a row would hand out the same inode. The second attempt is refused rather
-than answered wrongly; supporting more needs a dirty-block overlay this does not have.
-
-That budget is spent by writing, not by asking. An operation this driver refuses — a
-name that already exists, an inode of a shape it cannot rewrite — leaves the disk as it
-found it and leaves the checkpoint for whatever the caller does next.
-
-Each operation also refuses by name what it cannot do rather than attempting it. See
-`docs/transaction-shapes.md` for the list. Every shape that document measured is now
-written; what remains is the next size up — a directory that has outgrown a single
-block, which is the leaf form.
-
-Features recognised in the superblock and gated rather than guessed: `finobt`,
-`rmapbt`, `reflink`, `inobtcnt`, `ftype`, `sparse inodes`, `metadata UUID`, `bigtime`,
-64-bit extent counters. An unknown *incompatible* feature bit is refused outright.
+Reading is supported for v5 and v4 volumes, clean or with a dirty log (replayed
+in memory, the device untouched), including extended attributes, POSIX ACLs and
+realtime files. `fsck.xfs` checks without repairing, and `mkfs.xfs` formats v5.
+An overwrite of existing bytes is written in place, on v5 and v4; on v5,
+create, unlink, mkdir, rename within a short-form directory, allocating writes
+and truncate to zero are journalled records the Linux kernel replays.
+**[docs/features.md](docs/features.md) is the full list**: every feature, its
+state (supported, experimental, partial, refused, not supported or upcoming),
+the release it shipped in, its tracking issue and the test that checks it.
+Every pull request that changes behaviour updates it.
 
 ### Self-describing metadata
 
