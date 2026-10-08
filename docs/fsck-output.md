@@ -29,6 +29,7 @@ Retired codes remain reserved. Human descriptions (`what`) may change freely.
 | `free_blocks` | integer | Free blocks counted; omitted when scan is `none`. |
 | `findings` | array | Findings in traversal order. |
 | `suppressed` | integer | Findings omitted after 20 of one code in one allocation group. |
+| `plan` | object | Only with `--dry-run`: the repair plan, below. |
 
 `complete` means every structure reached by the documented checker subset was
 read. It does not claim all invariants checked by `xfs_repair -n` were checked.
@@ -46,7 +47,44 @@ Failure to open/read the target, or a non-XFS target, produces an operational
 error on stderr with exit `8`, without a report. Usage errors and unsupported
 repair requests (`-y`, `-p`) exit `16`. A mount refusal for an unsupported XFS
 feature is currently a `mount` finding, exit `4`; inspect its human description.
-No progress, cancellation or repair API is introduced by this schema.
+No progress or cancellation API is introduced by this schema. `--dry-run` adds
+a `plan` key, below; nothing is ever written.
+
+## Repair plan
+
+`fsck.xfs --dry-run` plans a repair and prints the plan. It never writes, and
+it applies nothing: the plan is what a repair would do. It first takes the
+target for itself: an exclusive lock on the file and, on Linux, no mount or
+loop device using it. If that fails, the report has scan `none`, a `plan`
+with status `refused` and a `repair.not-exclusive` refusal, and exit `8`.
+Otherwise the exit status is the check's.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `status` | string | `ready`, or `refused` when a precondition failed. |
+| `changes` | array | Proposed changes in device order; empty unless `ready`. |
+| `refusals` | array | Findings saying why no plan was made, sorted; empty when `ready`. |
+| `unplanned` | array | Error findings no repair rule owns, sorted. A `ready` plan with these leaves them. |
+
+Each change has `offset` and `length` (bytes on the device), `code` (the
+finding it repairs), `rule` (the rule that proposed it), `before_crc32c` and
+`after_crc32c` (CRC32C of the bytes there now and of the bytes proposed), and `what`.
+Refusals and unplanned entries are findings, with the keys below.
+
+The plan is deterministic: the same volume gives the same `plan` byte for byte.
+A plan is refused, before any rule is asked, for:
+
+- `repair.not-exclusive`: another holder has the target, or it is mounted.
+- `repair.feature`: a v4 volume, an incompatible or read-only-compatible
+  feature outside `ftype`, `sparse`, `meta_uuid`, `bigtime`, `nrext64`,
+  `finobt`, `reflink` and `inobtcount` (so `rmapbt` is refused), any
+  log-incompatible feature, a realtime section, or quota flags. `field` names
+  the superblock field.
+- `repair.log-dirty`: the log needed replay.
+- `repair.incomplete`: the scan was partial, findings were suppressed, or a
+  rule could not finish its plan.
+- `repair.ambiguous`: a `cross-link` or `dir.reached-twice` finding; its
+  location is carried over.
 
 ## Findings
 
@@ -78,6 +116,7 @@ filesystem and has a null group. No location is inferred from description text.
 ## Codes
 
 The partial-scan column states whether this finding prevents a complete walk.
+`repair.*` codes appear only in a plan's `refusals`, never in `findings`.
 `mount` is serialized by the CLI with scan `none` instead of `partial`.
 
 | Code | Severity | Partial scan | Meaning |
@@ -126,3 +165,8 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `dir.unreached` | error | no | An allocated inode is reached by no directory. |
 | `log.replayed` | warning | no | The log held records that had not been applied; the volume was checked as replaying them leaves it, and its counters were not. |
 | `mount` | error | yes | The filesystem could not be mounted, so nothing was checked. |
+| `repair.not-exclusive` | warning | no | No repair was planned: another holder has the target, or it is mounted. |
+| `repair.feature` | warning | no | No repair was planned: the volume uses a feature the planner does not reason about. |
+| `repair.log-dirty` | warning | no | No repair was planned: the log needed replay. |
+| `repair.incomplete` | warning | no | No repair was planned: the check did not cover the volume, or a rule could not finish. |
+| `repair.ambiguous` | warning | no | No repair was planned: a block or directory has two owners. |

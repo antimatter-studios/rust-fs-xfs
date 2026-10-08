@@ -142,6 +142,22 @@ pub enum Code {
     LogReplayed,
     /// The filesystem could not be mounted, so nothing was checked.
     Mount,
+    /// No repair was planned: another holder has the target, or it is
+    /// mounted or attached to a loop device (#375).
+    RepairNotExclusive,
+    /// No repair was planned: the volume uses a feature whose metadata
+    /// the planner does not reason about.
+    RepairFeature,
+    /// No repair was planned: the log held records that had not been
+    /// applied, so the disk is not what a repair would read.
+    RepairLogDirty,
+    /// No repair was planned: the check did not cover the whole volume,
+    /// or a rule could not finish its plan.
+    RepairIncomplete,
+    /// No repair was planned: two structures claim the same block, or a
+    /// directory is reached from two places, so there is no single owner
+    /// to repair towards.
+    RepairAmbiguous,
 }
 
 impl Code {
@@ -191,6 +207,11 @@ impl Code {
         Code::DirUnreached,
         Code::LogReplayed,
         Code::Mount,
+        Code::RepairNotExclusive,
+        Code::RepairFeature,
+        Code::RepairLogDirty,
+        Code::RepairIncomplete,
+        Code::RepairAmbiguous,
     ];
 
     /// The code as it appears in the output.
@@ -240,13 +261,25 @@ impl Code {
             Code::DirUnreached => "dir.unreached",
             Code::LogReplayed => "log.replayed",
             Code::Mount => "mount",
+            Code::RepairNotExclusive => "repair.not-exclusive",
+            Code::RepairFeature => "repair.feature",
+            Code::RepairLogDirty => "repair.log-dirty",
+            Code::RepairIncomplete => "repair.incomplete",
+            Code::RepairAmbiguous => "repair.ambiguous",
         }
     }
 
     /// How bad a finding with this code is.
     pub fn severity(self) -> Severity {
         match self {
-            Code::LogReplayed => Severity::Warning,
+            // A refusal to plan says nothing about damage: a clean volume
+            // with a feature the planner does not know is still clean.
+            Code::LogReplayed
+            | Code::RepairNotExclusive
+            | Code::RepairFeature
+            | Code::RepairLogDirty
+            | Code::RepairIncomplete
+            | Code::RepairAmbiguous => Severity::Warning,
             _ => Severity::Error,
         }
     }

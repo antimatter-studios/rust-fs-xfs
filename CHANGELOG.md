@@ -16,6 +16,15 @@ never does.
   carry a code, severity and structured location; reports distinguish complete,
   partial and unstarted scans and count suppressed findings. Human descriptions
   remain available, and a partial scan cannot report clean.
+- **Repair planning, separate from repair (#375).** `fs_xfs::repair` plans a
+  repair from a read-only mount and the checker's report, and writes nothing:
+  each proposed change carries the bytes there now and the bytes it would put
+  there, in device order, and findings no rule repairs are listed as left.
+  `fsck.xfs --dry-run` prints the plan under the report's `plan` key. A plan is
+  refused with `repair.*` findings when the target is not held exclusively, the
+  volume uses a feature the checker does not validate (such as `rmapbt`), the
+  log needed replay, the scan was incomplete, or a block or directory has two
+  owners. No repair rule ships yet: `-y` and `-p` are still refused.
 
 ### Changed
 

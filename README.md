@@ -253,6 +253,7 @@ tree and link counts, and the superblock's counters.
 ```sh
 fsck.xfs disk.img          # exit 0 clean, 4 problems found, 8 could not check
 fsck.xfs --text disk.img   # one line per finding
+fsck.xfs --dry-run disk.img  # what a repair would change, writing nothing
 ```
 
 JSON reports carry schema version 1, stable finding codes, severity and location.
@@ -261,7 +262,14 @@ that could not be mounted. A partial scan is never clean. See
 [the output contract](docs/fsck-output.md) for the schema and code catalogue.
 
 It repairs nothing: `-n` is accepted, and `-y` and `-p` are refused (exit 16)
-rather than ignored. `tests/cli_fsck_oracle.rs` holds it to `xfs_repair -n` on
+rather than ignored. `--dry-run` plans a repair with `fs_xfs::repair` and prints
+it without writing (#375). It first takes the target exclusively, and it refuses
+with `repair.*` findings a volume it cannot reason about: a feature the checker
+does not validate (such as `rmapbt`), a dirty log, an incomplete scan, or a block
+or directory with two owners. No repair rule ships yet, so a plan lists every
+error it would leave. `tests/cli_repair_plan_oracle.rs` holds the plan to
+`xfs_repair -n`, requires it to be the same twice, and requires the image
+unchanged. `tests/cli_fsck_oracle.rs` holds it to `xfs_repair -n` on
 twelve clean fixtures and representative corruption families, including golden
 JSON checks for codes, severity, locations and incomplete scans.
 

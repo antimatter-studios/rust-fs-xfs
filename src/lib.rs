@@ -56,6 +56,7 @@ pub mod mkfs;
 pub(crate) mod overlay;
 pub mod quota;
 pub mod refcount;
+pub mod repair;
 pub mod rmap;
 pub mod super_write;
 pub mod superblock;
