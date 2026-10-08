@@ -146,8 +146,8 @@ fn copy(source: &str, tag: &str) -> scratch::Volume {
 fn a_volume_the_reference_calls_clean_plans_nothing() {
     for source in ["xfs-default.img", "xfs-1k.img", "xfsdata-default.img"] {
         let volume = copy(source, "clean");
-        let (clean, said) = reference_clean(volume.path().to_str().unwrap());
-        assert!(clean, "{source}: xfs_repair -n calls it damaged:\n{said}");
+        let (_, said) = reference_clean(volume.path().to_str().unwrap());
+        common::repair::assert_agreed(&said, &format!("{source}: the clean fixture"));
         let (code, plan) = planned_twice(volume.path(), source);
         assert_eq!(code, Some(0), "{source}: {plan}");
         assert_eq!(
@@ -241,11 +241,8 @@ fn two_files_claiming_one_block_are_refused_as_ambiguous() {
 #[test]
 fn a_feature_the_planner_does_not_reason_about_is_refused_on_a_clean_volume() {
     let volume = copy("xfs-reflink.img", "rmapbt");
-    let (clean, said) = reference_clean(volume.path().to_str().unwrap());
-    assert!(
-        clean,
-        "xfs_repair -n calls the reflink fixture damaged:\n{said}"
-    );
+    let (_, said) = reference_clean(volume.path().to_str().unwrap());
+    common::repair::assert_agreed(&said, "the reflink+rmapbt fixture");
     let (code, plan) = planned_twice(volume.path(), "rmapbt");
     assert_eq!(code, Some(0), "a refusal to plan is not damage: {plan}");
     assert!(
