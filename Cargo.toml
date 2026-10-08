@@ -1,6 +1,6 @@
 [package]
 name = "rust-fs-xfs"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust XFS filesystem driver. Exposes a C ABI (fs_xfs_*) suitable for FFI from C/C++/Swift/Go."

@@ -43,22 +43,319 @@ use crate::inode::{FileType, Format};
 use crate::inode_btree::{InodeChunk, Which, INODES_PER_CHUNK};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// What a finding is, by a name that does not change (#363).
+///
+/// The words in [`Finding::what`] are for a person and may be reworded
+/// in any release; the code is for a script, and is part of the output
+/// schema documented in `docs/fsck-output.md`. A code is never renamed
+/// or reused for something else: one that stops being emitted is
+/// retired, and a new kind of finding gets a new code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Code {
+    /// A metadata block or inode failed its CRC.
+    Checksum,
+    /// A metadata block's self-describing header names another place.
+    Identity,
+    /// A secondary superblock could not be read or parsed.
+    SbCopyUnreadable,
+    /// A secondary superblock disagrees with the primary on a field.
+    SbCopyField,
+    /// A secondary superblock carries another filesystem's UUID.
+    SbCopyUuid,
+    /// A group's AGF could not be read.
+    AgfUnreadable,
+    /// A group's AGI could not be read.
+    AgiUnreadable,
+    /// A group's free list could not be read.
+    AgflUnreadable,
+    /// The AGF, the AGI and the geometry disagree on a group's length.
+    AgLength,
+    /// A btree could not be walked.
+    BtreeUnreadable,
+    /// An inode btree record could not be decoded.
+    InobtRecord,
+    /// An inode chunk's counts disagree with its masks.
+    InobtChunkCount,
+    /// The free inode btree is not the inode btree's chunks with a free inode.
+    FinobtMismatch,
+    /// A free-space record is empty.
+    FreespEmpty,
+    /// A free-space record overlaps or precedes the one before it.
+    FreespOverlap,
+    /// The free-space-by-count btree is out of order.
+    FreespCntOrder,
+    /// The two free-space btrees hold different extents.
+    FreespDisagree,
+    /// The AGF's free block count is not what the free-space btree holds.
+    CounterAgfFreeblks,
+    /// The AGF's longest free extent is not the longest one there is.
+    CounterAgfLongest,
+    /// The AGF's count of free-space btree blocks is wrong.
+    CounterAgfBtreeblks,
+    /// The AGI's inode or free inode count is not what the inode btree holds.
+    CounterAgiInodes,
+    /// The AGI's count of inode btree blocks is wrong.
+    CounterAgiIblocks,
+    /// The AGI's count of free inode btree blocks is wrong.
+    CounterAgiFblocks,
+    /// The superblock's inode count is not what the groups add up to.
+    CounterSbIcount,
+    /// The superblock's free inode count is not what the groups add up to.
+    CounterSbIfree,
+    /// The superblock's free block count is not what the groups add up to.
+    CounterSbFdblocks,
+    /// Blocks are claimed outside the group, or outside any group.
+    RangeBlock,
+    /// An inode maps an extent outside one allocation group.
+    RangeExtent,
+    /// A block is claimed by two owners.
+    CrossLink,
+    /// Blocks are claimed by nothing.
+    Lost,
+    /// An inode's extent list or extent tree could not be read.
+    ExtentUnreadable,
+    /// An inode could not be read.
+    InodeUnreadable,
+    /// An inode the inode btree calls free is in use.
+    InodeFreeInUse,
+    /// An inode the inode btree calls allocated is not in use.
+    InodeAllocatedUnused,
+    /// An inode's link count is not the number of entries that reach it.
+    InodeNlink,
+    /// The root directory is missing or unreadable.
+    DirRoot,
+    /// An inode reached as a directory is not one.
+    DirNotADirectory,
+    /// A directory's entries could not be read.
+    DirUnreadable,
+    /// A directory entry points at an inode that is not in use.
+    DirEntryTarget,
+    /// A directory entry's recorded type is not its inode's.
+    DirEntryFtype,
+    /// A directory is reached from more than one place.
+    DirReachedTwice,
+    /// An allocated inode is reached by no directory.
+    DirUnreached,
+    /// The log held records that had not been applied; the volume was
+    /// checked as replaying them leaves it, and its counters were not.
+    LogReplayed,
+    /// The filesystem could not be mounted, so nothing was checked.
+    Mount,
+}
+
+impl Code {
+    /// Every code, in the order `docs/fsck-output.md` lists them.
+    pub const ALL: &'static [Code] = &[
+        Code::Checksum,
+        Code::Identity,
+        Code::SbCopyUnreadable,
+        Code::SbCopyField,
+        Code::SbCopyUuid,
+        Code::AgfUnreadable,
+        Code::AgiUnreadable,
+        Code::AgflUnreadable,
+        Code::AgLength,
+        Code::BtreeUnreadable,
+        Code::InobtRecord,
+        Code::InobtChunkCount,
+        Code::FinobtMismatch,
+        Code::FreespEmpty,
+        Code::FreespOverlap,
+        Code::FreespCntOrder,
+        Code::FreespDisagree,
+        Code::CounterAgfFreeblks,
+        Code::CounterAgfLongest,
+        Code::CounterAgfBtreeblks,
+        Code::CounterAgiInodes,
+        Code::CounterAgiIblocks,
+        Code::CounterAgiFblocks,
+        Code::CounterSbIcount,
+        Code::CounterSbIfree,
+        Code::CounterSbFdblocks,
+        Code::RangeBlock,
+        Code::RangeExtent,
+        Code::CrossLink,
+        Code::Lost,
+        Code::ExtentUnreadable,
+        Code::InodeUnreadable,
+        Code::InodeFreeInUse,
+        Code::InodeAllocatedUnused,
+        Code::InodeNlink,
+        Code::DirRoot,
+        Code::DirNotADirectory,
+        Code::DirUnreadable,
+        Code::DirEntryTarget,
+        Code::DirEntryFtype,
+        Code::DirReachedTwice,
+        Code::DirUnreached,
+        Code::LogReplayed,
+        Code::Mount,
+    ];
+
+    /// The code as it appears in the output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Code::Checksum => "checksum",
+            Code::Identity => "identity",
+            Code::SbCopyUnreadable => "sb.copy.unreadable",
+            Code::SbCopyField => "sb.copy.field",
+            Code::SbCopyUuid => "sb.copy.uuid",
+            Code::AgfUnreadable => "ag.agf.unreadable",
+            Code::AgiUnreadable => "ag.agi.unreadable",
+            Code::AgflUnreadable => "ag.agfl.unreadable",
+            Code::AgLength => "ag.length",
+            Code::BtreeUnreadable => "btree.unreadable",
+            Code::InobtRecord => "inobt.record",
+            Code::InobtChunkCount => "inobt.chunk-count",
+            Code::FinobtMismatch => "finobt.mismatch",
+            Code::FreespEmpty => "freesp.empty",
+            Code::FreespOverlap => "freesp.overlap",
+            Code::FreespCntOrder => "freesp.cnt-order",
+            Code::FreespDisagree => "freesp.disagree",
+            Code::CounterAgfFreeblks => "counter.agf.freeblks",
+            Code::CounterAgfLongest => "counter.agf.longest",
+            Code::CounterAgfBtreeblks => "counter.agf.btreeblks",
+            Code::CounterAgiInodes => "counter.agi.inodes",
+            Code::CounterAgiIblocks => "counter.agi.iblocks",
+            Code::CounterAgiFblocks => "counter.agi.fblocks",
+            Code::CounterSbIcount => "counter.sb.icount",
+            Code::CounterSbIfree => "counter.sb.ifree",
+            Code::CounterSbFdblocks => "counter.sb.fdblocks",
+            Code::RangeBlock => "range.block",
+            Code::RangeExtent => "range.extent",
+            Code::CrossLink => "cross-link",
+            Code::Lost => "lost",
+            Code::ExtentUnreadable => "extent.unreadable",
+            Code::InodeUnreadable => "inode.unreadable",
+            Code::InodeFreeInUse => "inode.free-in-use",
+            Code::InodeAllocatedUnused => "inode.allocated-unused",
+            Code::InodeNlink => "inode.nlink",
+            Code::DirRoot => "dir.root",
+            Code::DirNotADirectory => "dir.not-a-directory",
+            Code::DirUnreadable => "dir.unreadable",
+            Code::DirEntryTarget => "dir.entry-target",
+            Code::DirEntryFtype => "dir.entry-ftype",
+            Code::DirReachedTwice => "dir.reached-twice",
+            Code::DirUnreached => "dir.unreached",
+            Code::LogReplayed => "log.replayed",
+            Code::Mount => "mount",
+        }
+    }
+
+    /// How bad a finding with this code is.
+    pub fn severity(self) -> Severity {
+        match self {
+            Code::LogReplayed => Severity::Warning,
+            _ => Severity::Error,
+        }
+    }
+
+    /// True when a finding with this code means something could not be
+    /// read, so what lies under it went unchecked.
+    pub fn stops_the_walk(self) -> bool {
+        matches!(
+            self,
+            Code::Checksum
+                | Code::Identity
+                | Code::SbCopyUnreadable
+                | Code::AgfUnreadable
+                | Code::AgiUnreadable
+                | Code::AgflUnreadable
+                | Code::BtreeUnreadable
+                | Code::InobtRecord
+                | Code::ExtentUnreadable
+                | Code::InodeUnreadable
+                | Code::DirRoot
+                | Code::DirNotADirectory
+                | Code::DirUnreadable
+                | Code::Mount
+        )
+    }
+}
+
+/// How bad a finding is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Severity {
+    /// The volume is damaged. A volume with one is not clean.
+    Error,
+    /// Worth knowing, and not damage: a volume with only these is clean.
+    Warning,
+}
+
+impl Severity {
+    /// The severity as it appears in the output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        }
+    }
+}
+
+/// Where a finding is, as far as it is known.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Location {
+    /// The allocation group, where it belongs to one.
+    pub ag: Option<u32>,
+    /// The block within that group, where it concerns one.
+    pub agbno: Option<u32>,
+    /// The inode, where it concerns one.
+    pub ino: Option<u64>,
+    /// The field or structure, by its on-disk name, where it names one.
+    pub field: Option<&'static str>,
+}
+
 /// One thing found wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
-    /// The allocation group it was found in, where it belongs to one.
-    pub ag: Option<u32>,
-    /// The inode it concerns, where it concerns one.
-    pub ino: Option<u64>,
+    /// What kind of thing is wrong.
+    pub code: Code,
+    /// Where it is.
+    pub location: Location,
     /// What is wrong, in words.
     pub what: String,
+}
+
+impl Finding {
+    /// How bad it is: the code's severity.
+    pub fn severity(&self) -> Severity {
+        self.code.severity()
+    }
+}
+
+/// How much of the volume a check covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scan {
+    /// Every structure the walk reached was read.
+    #[default]
+    Complete,
+    /// Something could not be read, so what lies under it was not
+    /// checked: a volume with no other finding may still be damaged.
+    Partial,
+}
+
+impl Scan {
+    /// The scan as it appears in the output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scan::Complete => "complete",
+            Scan::Partial => "partial",
+        }
+    }
 }
 
 /// What a check found.
 #[derive(Debug, Clone, Default)]
 pub struct Report {
-    /// Everything found wrong, in the order it was found.
+    /// Everything found wrong, in the order it was found, up to
+    /// [`PER_KIND`] of one code in one group.
     pub findings: Vec<Finding>,
+    /// Findings found and not listed, past [`PER_KIND`] of one code in
+    /// one group, so a wholesale corruption does not print a million lines.
+    pub suppressed: u64,
+    /// Whether everything reached was read.
+    pub scan: Scan,
     /// The log held records that had not been applied. The volume was
     /// checked as replaying them leaves it.
     pub dirty: bool,
@@ -71,15 +368,35 @@ pub struct Report {
 }
 
 impl Report {
-    /// True when nothing was found wrong.
+    /// Keep reporting bounded without losing whether the scan finished.
+    fn record(&mut self, counted: &mut HashMap<(Option<u32>, Code), usize>, finding: Finding) {
+        if finding.code.stops_the_walk() {
+            self.scan = Scan::Partial;
+        }
+        let n = counted
+            .entry((finding.location.ag, finding.code))
+            .or_insert(0);
+        *n += 1;
+        if *n <= PER_KIND {
+            self.findings.push(finding);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+
+    /// True when nothing was found wrong: no finding is an error.
     pub fn is_clean(&self) -> bool {
-        self.findings.is_empty()
+        self.scan == Scan::Complete
+            && self.suppressed == 0
+            && self
+                .findings
+                .iter()
+                .all(|f| f.severity() != Severity::Error)
     }
 }
 
-/// The most findings reported of one kind in one group, so a wholesale
-/// corruption does not print a million lines.
-const PER_KIND: usize = 20;
+/// The most findings listed of one code in one group.
+pub const PER_KIND: usize = 20;
 
 /// Who a block belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,8 +440,8 @@ struct Checker<'a> {
     owners: Vec<Vec<Owner>>,
     /// Per group, the blocks the refcount btree says files share.
     shared: Vec<HashSet<u32>>,
-    /// Per (group, kind), how many findings were reported.
-    counted: HashMap<(Option<u32>, &'static str), usize>,
+    /// Per (group, code), how many findings were reported.
+    counted: HashMap<(Option<u32>, Code), usize>,
     /// Every inode the inode btrees call allocated, and every one they
     /// call free.
     allocated: HashSet<u64>,
@@ -175,25 +492,55 @@ struct Totals {
 }
 
 impl Checker<'_> {
-    fn find(&mut self, kind: &'static str, ag: Option<u32>, ino: Option<u64>, what: String) {
-        let n = self.counted.entry((ag, kind)).or_insert(0);
-        *n += 1;
-        if *n <= PER_KIND {
-            self.report.findings.push(Finding { ag, ino, what });
-        } else if *n == PER_KIND + 1 {
-            self.report.findings.push(Finding {
-                ag,
-                ino: None,
-                what: format!("more findings of this kind ({kind}) are not listed"),
-            });
+    fn find(&mut self, code: Code, ag: Option<u32>, ino: Option<u64>, what: String) {
+        let location = Location {
+            ag,
+            ino,
+            ..Location::default()
+        };
+        self.find_at(code, location, what);
+    }
+
+    fn find_at(&mut self, code: Code, mut location: Location, what: String) {
+        // An inode is in one group, whether or not the check that found
+        // it was walking that group.
+        if let (None, Some(ino)) = (location.ag, location.ino) {
+            location.ag = Some(self.fs.superblock().split_ino(ino).0);
         }
+        self.report.record(
+            &mut self.counted,
+            Finding {
+                code,
+                location,
+                what,
+            },
+        );
+    }
+
+    /// Something could not be read. A checksum or a self-describing
+    /// header that names another place is reported as that, whatever was
+    /// being read; anything else as `code`.
+    fn failed(
+        &mut self,
+        code: Code,
+        e: &crate::error::Error,
+        ag: Option<u32>,
+        ino: Option<u64>,
+        what: String,
+    ) {
+        let code = match e {
+            crate::error::Error::ChecksumMismatch { .. } => Code::Checksum,
+            crate::error::Error::BlockIdentityMismatch { .. } => Code::Identity,
+            _ => code,
+        };
+        self.find(code, ag, ino, what);
     }
 
     /// Claim `len` blocks at `start` in group `ag` for `owner`.
     fn claim(&mut self, ag: u32, start: u32, len: u32, owner: Owner) {
         let Some(map) = self.owners.get_mut(ag as usize) else {
             self.find(
-                "range",
+                Code::RangeBlock,
                 None,
                 None,
                 format!(
@@ -210,7 +557,13 @@ impl Checker<'_> {
                 owner.describe(),
                 u64::from(start) + u64::from(len)
             );
-            self.find("range", Some(ag), owner_ino(owner), what);
+            let location = Location {
+                ag: Some(ag),
+                agbno: Some(start),
+                ino: owner_ino(owner),
+                field: None,
+            };
+            self.find_at(Code::RangeBlock, location, what);
             return;
         }
         let mut clash: Option<(u32, Owner)> = None;
@@ -233,7 +586,13 @@ impl Checker<'_> {
                 was.describe(),
                 owner.describe()
             );
-            self.find("cross-link", Some(ag), owner_ino(owner), what);
+            let location = Location {
+                ag: Some(ag),
+                agbno: Some(b),
+                ino: owner_ino(owner),
+                field: None,
+            };
+            self.find_at(Code::CrossLink, location, what);
         }
     }
 
@@ -243,7 +602,7 @@ impl Checker<'_> {
         match u32::try_from(len) {
             Ok(len) => self.claim(ag, agbno, len, owner),
             Err(_) => self.find(
-                "range",
+                Code::RangeExtent,
                 Some(ag),
                 owner_ino(owner),
                 format!("{} claims {len} blocks in one extent", owner.describe()),
@@ -260,7 +619,7 @@ impl Checker<'_> {
             let at = u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize);
             if let Err(e) = self.fs.device().read_at(at, &mut raw) {
                 self.find(
-                    "superblock",
+                    Code::SbCopyUnreadable,
                     Some(ag),
                     None,
                     format!("reading the superblock copy: {e}"),
@@ -270,8 +629,9 @@ impl Checker<'_> {
             let copy = match crate::superblock::Superblock::parse_copy(&raw) {
                 Ok(copy) => copy,
                 Err(e) => {
-                    self.find(
-                        "superblock",
+                    self.failed(
+                        Code::SbCopyUnreadable,
+                        &e,
                         Some(ag),
                         None,
                         format!("the superblock copy: {e}"),
@@ -279,7 +639,7 @@ impl Checker<'_> {
                     continue;
                 }
             };
-            let fields: [(&str, u64, u64); 12] = [
+            let fields: [(&'static str, u64, u64); 12] = [
                 ("blocksize", sb.blocksize.into(), copy.blocksize.into()),
                 ("dblocks", sb.dblocks, copy.dblocks),
                 ("agblocks", sb.agblocks.into(), copy.agblocks.into()),
@@ -315,17 +675,21 @@ impl Checker<'_> {
             ];
             for (name, primary, secondary) in fields {
                 if primary != secondary {
-                    self.find(
-                        "superblock",
-                        Some(ag),
-                        None,
+                    let location = Location {
+                        ag: Some(ag),
+                        field: Some(name),
+                        ..Location::default()
+                    };
+                    self.find_at(
+                        Code::SbCopyField,
+                        location,
                         format!("the superblock copy says {name} {secondary}; the primary says {primary}"),
                     );
                 }
             }
             if copy.uuid != sb.uuid {
                 self.find(
-                    "superblock",
+                    Code::SbCopyUuid,
                     Some(ag),
                     None,
                     "the superblock copy has another filesystem's UUID".into(),
@@ -351,20 +715,32 @@ impl Checker<'_> {
         let agf = match fs.read_agf(ag) {
             Ok(agf) => agf,
             Err(e) => {
-                self.find("header", Some(ag), None, format!("the AGF: {e}"));
+                self.failed(
+                    Code::AgfUnreadable,
+                    &e,
+                    Some(ag),
+                    None,
+                    format!("the AGF: {e}"),
+                );
                 return;
             }
         };
         let agi = match fs.read_agi(ag) {
             Ok(agi) => agi,
             Err(e) => {
-                self.find("header", Some(ag), None, format!("the AGI: {e}"));
+                self.failed(
+                    Code::AgiUnreadable,
+                    &e,
+                    Some(ag),
+                    None,
+                    format!("the AGI: {e}"),
+                );
                 return;
             }
         };
         if agf.length != ag_length(fs, ag) || agi.length != agf.length {
             self.find(
-                "header",
+                Code::AgLength,
                 Some(ag),
                 None,
                 format!(
@@ -399,7 +775,13 @@ impl Checker<'_> {
                     self.claim(ag, b, 1, Owner::FreeList);
                 }
             }
-            Err(e) => self.find("header", Some(ag), None, format!("the free list: {e}")),
+            Err(e) => self.failed(
+                Code::AgflUnreadable,
+                &e,
+                Some(ag),
+                None,
+                format!("the free list: {e}"),
+            ),
         }
 
         // The refcount btree first: which blocks may be claimed twice.
@@ -427,7 +809,13 @@ impl Checker<'_> {
                         }
                     }
                 }
-                Err(e) => self.find("btree", Some(ag), None, format!("the refcount btree: {e}")),
+                Err(e) => self.failed(
+                    Code::BtreeUnreadable,
+                    &e,
+                    Some(ag),
+                    None,
+                    format!("the refcount btree: {e}"),
+                ),
             }
         }
         let _ = refcount_blocks;
@@ -460,7 +848,13 @@ impl Checker<'_> {
                     }
                     *out = records;
                 }
-                Err(e) => self.find("btree", Some(ag), None, format!("the {name} btree: {e}")),
+                Err(e) => self.failed(
+                    Code::BtreeUnreadable,
+                    &e,
+                    Some(ag),
+                    None,
+                    format!("the {name} btree: {e}"),
+                ),
             }
         }
         if sb.has_rmapbt() && agf.levels[crate::ag::agf_btree::RMAP] > 0 {
@@ -480,8 +874,9 @@ impl Checker<'_> {
                         self.claim(ag, b, 1, Owner::Btree("reverse mapping"));
                     }
                 }
-                Err(e) => self.find(
-                    "btree",
+                Err(e) => self.failed(
+                    Code::BtreeUnreadable,
+                    &e,
                     Some(ag),
                     None,
                     format!("the reverse-mapping btree: {e}"),
@@ -517,7 +912,7 @@ impl Checker<'_> {
             Ok((records, blocks)) => {
                 if has_inobt_counts(sb) && blocks.len() as u32 != agi_blocks.0 {
                     self.find(
-                        "counter",
+                        Code::CounterAgiIblocks,
                         Some(ag),
                         None,
                         format!(
@@ -534,8 +929,9 @@ impl Checker<'_> {
                 for r in records {
                     match r {
                         Ok(chunk) => chunks.push(chunk),
-                        Err(e) => self.find(
-                            "btree",
+                        Err(e) => self.failed(
+                            Code::InobtRecord,
+                            &e,
                             Some(ag),
                             None,
                             format!("an inode btree record: {e}"),
@@ -545,7 +941,13 @@ impl Checker<'_> {
                 chunks
             }
             Err(e) => {
-                self.find("btree", Some(ag), None, format!("the inode btree: {e}"));
+                self.failed(
+                    Code::BtreeUnreadable,
+                    &e,
+                    Some(ag),
+                    None,
+                    format!("the inode btree: {e}"),
+                );
                 Vec::new()
             }
         };
@@ -562,7 +964,7 @@ impl Checker<'_> {
                 Ok((records, blocks)) => {
                     if has_inobt_counts(sb) && blocks.len() as u32 != agi_blocks.1 {
                         self.find(
-                            "counter",
+                            Code::CounterAgiFblocks,
                             Some(ag),
                             None,
                             format!(
@@ -580,7 +982,7 @@ impl Checker<'_> {
                         chunks.iter().copied().filter(|c| c.freecount > 0).collect();
                     if got != want {
                         self.find(
-                            "btree",
+                            Code::FinobtMismatch,
                             Some(ag),
                             None,
                             format!(
@@ -592,8 +994,9 @@ impl Checker<'_> {
                         );
                     }
                 }
-                Err(e) => self.find(
-                    "btree",
+                Err(e) => self.failed(
+                    Code::BtreeUnreadable,
+                    &e,
                     Some(ag),
                     None,
                     format!("the free inode btree: {e}"),
@@ -616,7 +1019,7 @@ impl Checker<'_> {
         for (i, e) in by_block.iter().enumerate() {
             if e.blockcount == 0 {
                 self.find(
-                    "free space",
+                    Code::FreespEmpty,
                     Some(ag),
                     None,
                     format!("free extent {i} is empty"),
@@ -624,7 +1027,7 @@ impl Checker<'_> {
             }
             if i > 0 && u64::from(e.startblock) < end {
                 self.find(
-                    "free space",
+                    Code::FreespOverlap,
                     Some(ag),
                     None,
                     format!(
@@ -639,7 +1042,7 @@ impl Checker<'_> {
         for w in by_count.windows(2) {
             if (w[0].blockcount, w[0].startblock) >= (w[1].blockcount, w[1].startblock) {
                 self.find(
-                    "free space",
+                    Code::FreespCntOrder,
                     Some(ag),
                     None,
                     format!(
@@ -662,7 +1065,7 @@ impl Checker<'_> {
         b.sort_unstable();
         if a != b {
             self.find(
-                "free space",
+                Code::FreespDisagree,
                 Some(ag),
                 None,
                 format!(
@@ -675,7 +1078,7 @@ impl Checker<'_> {
         let free: u64 = by_block.iter().map(|e| u64::from(e.blockcount)).sum();
         if free != u64::from(agf.freeblks) {
             self.find(
-                "counter",
+                Code::CounterAgfFreeblks,
                 Some(ag),
                 None,
                 format!(
@@ -687,7 +1090,7 @@ impl Checker<'_> {
         let longest = by_block.iter().map(|e| e.blockcount).max().unwrap_or(0);
         if longest != agf.longest {
             self.find(
-                "counter",
+                Code::CounterAgfLongest,
                 Some(ag),
                 None,
                 format!(
@@ -699,7 +1102,7 @@ impl Checker<'_> {
         let sb = self.fs.superblock();
         if has_lazy_counters(sb) && agf.btreeblks != btree_blocks {
             self.find(
-                "counter",
+                Code::CounterAgfBtreeblks,
                 Some(ag),
                 None,
                 format!(
@@ -729,7 +1132,7 @@ impl Checker<'_> {
                 .count() as u64;
             if existing != u64::from(chunk.count) || free != u64::from(chunk.freecount) {
                 self.find(
-                    "inode btree",
+                    Code::InobtChunkCount,
                     Some(ag),
                     None,
                     format!(
@@ -760,7 +1163,7 @@ impl Checker<'_> {
         }
         if count != u64::from(agi.count) || freecount != u64::from(agi.freecount) {
             self.find(
-                "counter",
+                Code::CounterAgiInodes,
                 Some(ag),
                 None,
                 format!(
@@ -784,7 +1187,7 @@ impl Checker<'_> {
             let (ag, _, _) = sb.split_ino(ino);
             match fs.read_inode_raw(ino) {
                 Ok((inode, _)) if inode.mode != 0 => self.find(
-                    "inode",
+                    Code::InodeFreeInUse,
                     Some(ag),
                     Some(ino),
                     format!(
@@ -814,7 +1217,7 @@ impl Checker<'_> {
                 Ok((inode, raw)) => {
                     if inode.mode == 0 {
                         self.find(
-                            "inode",
+                            Code::InodeAllocatedUnused,
                             Some(ag),
                             Some(ino),
                             format!("inode {ino} is allocated in the inode btree but not in use"),
@@ -826,7 +1229,13 @@ impl Checker<'_> {
                     raws.insert(ino, raw);
                     usable.insert(ino, inode);
                 }
-                Err(e) => self.find("inode", Some(ag), Some(ino), format!("inode {ino}: {e}")),
+                Err(e) => self.failed(
+                    Code::InodeUnreadable,
+                    &e,
+                    Some(ag),
+                    Some(ino),
+                    format!("inode {ino}: {e}"),
+                ),
             }
         }
 
@@ -843,7 +1252,7 @@ impl Checker<'_> {
                 "is not an allocated inode"
             };
             self.find(
-                "directory",
+                Code::DirRoot,
                 None,
                 Some(sb.rootino),
                 format!("the root directory, inode {}, {why}", sb.rootino),
@@ -856,7 +1265,7 @@ impl Checker<'_> {
             };
             if !inode.is_dir() {
                 self.find(
-                    "directory",
+                    Code::DirNotADirectory,
                     None,
                     Some(dir),
                     format!("inode {dir} is reached as a directory and is not one"),
@@ -867,8 +1276,9 @@ impl Checker<'_> {
             let entries = match fs.read_dir(&inode, &raws[&dir]) {
                 Ok(e) => e,
                 Err(e) => {
-                    self.find(
-                        "directory",
+                    self.failed(
+                        Code::DirUnreadable,
+                        &e,
                         None,
                         Some(dir),
                         format!("directory {dir}: {e}"),
@@ -887,7 +1297,7 @@ impl Checker<'_> {
                         "an inode in no chunk"
                     };
                     self.find(
-                        "directory",
+                        Code::DirEntryTarget,
                         None,
                         Some(dir),
                         format!(
@@ -900,7 +1310,7 @@ impl Checker<'_> {
                 *links.entry(entry.ino).or_insert(0) += 1;
                 if sb.has_ftype() && entry.ftype.is_some() && entry.ftype != target.file_type() {
                     self.find(
-                        "directory",
+                        Code::DirEntryFtype,
                         None,
                         Some(dir),
                         format!(
@@ -915,7 +1325,7 @@ impl Checker<'_> {
                     *subdirs.entry(dir).or_insert(0) += 1;
                     if !reached.insert(entry.ino) {
                         self.find(
-                            "directory",
+                            Code::DirReachedTwice,
                             None,
                             Some(entry.ino),
                             format!(
@@ -939,7 +1349,7 @@ impl Checker<'_> {
             let (ag, _, _) = sb.split_ino(ino);
             if !reached.contains(&ino) {
                 self.find(
-                    "directory",
+                    Code::DirUnreached,
                     Some(ag),
                     Some(ino),
                     format!("inode {ino} is allocated and no directory reaches it"),
@@ -953,7 +1363,7 @@ impl Checker<'_> {
             };
             if inode.nlink != want {
                 self.find(
-                    "link count",
+                    Code::InodeNlink,
                     Some(ag),
                     Some(ino),
                     format!(
@@ -1010,7 +1420,7 @@ impl Checker<'_> {
                 for e in extents {
                     if !sb.extent_in_bounds(e.startblock, e.blockcount) {
                         self.find(
-                            "extent",
+                            Code::RangeExtent,
                             Some(ag),
                             Some(ino),
                             format!(
@@ -1023,8 +1433,9 @@ impl Checker<'_> {
                     self.claim_fsblocks(e.startblock, e.blockcount, owner);
                 }
             }
-            Err(e) => self.find(
-                "extent",
+            Err(e) => self.failed(
+                Code::ExtentUnreadable,
+                &e,
                 Some(ag),
                 Some(ino),
                 format!("inode {ino}'s extents: {e}"),
@@ -1042,10 +1453,14 @@ impl Checker<'_> {
                 .map(|(b, _)| b as u32)
                 .collect();
             if let Some(&first) = lost.first() {
-                self.find(
-                    "lost",
-                    Some(ag as u32),
-                    None,
+                let location = Location {
+                    ag: Some(ag as u32),
+                    agbno: Some(first),
+                    ..Location::default()
+                };
+                self.find_at(
+                    Code::Lost,
+                    location,
                     format!(
                         "{} blocks of group {ag} belong to nothing, the first at block {first}",
                         lost.len()
@@ -1060,17 +1475,30 @@ impl Checker<'_> {
         // A volume that needed replay has counters the kernel recomputes
         // at mount: they say nothing until then.
         if self.report.dirty {
+            self.find(
+                Code::LogReplayed,
+                None,
+                None,
+                "the log held unapplied records: checked as replayed, and the superblock's \
+                 counters, which the kernel recomputes at mount, were not compared"
+                    .into(),
+            );
             return;
         }
         let sb = self.fs.superblock().clone();
-        for (name, said, counted) in [
-            ("icount", sb.icount, totals.icount),
-            ("ifree", sb.ifree, totals.ifree),
-            ("fdblocks", sb.fdblocks, totals.fdblocks),
+        for (code, name, said, counted) in [
+            (Code::CounterSbIcount, "icount", sb.icount, totals.icount),
+            (Code::CounterSbIfree, "ifree", sb.ifree, totals.ifree),
+            (
+                Code::CounterSbFdblocks,
+                "fdblocks",
+                sb.fdblocks,
+                totals.fdblocks,
+            ),
         ] {
             if said != counted {
                 self.find(
-                    "counter",
+                    code,
                     None,
                     None,
                     format!("the superblock says {name} {said}; the groups add up to {counted}"),
@@ -1106,3 +1534,92 @@ fn has_lazy_counters(sb: &crate::superblock::Superblock) -> bool {
 /// on first use: attributes and quotas.
 const LATE_VERSION_BITS: u16 =
     crate::superblock::version_flags::ATTRBIT | crate::superblock::version_flags::QUOTABIT;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finding_limits_preserve_scan_status_and_count_by_code_and_group() {
+        let mut report = Report::default();
+        let mut counted = HashMap::new();
+        let mut finding = Finding {
+            code: Code::InodeNlink,
+            location: Location {
+                ag: Some(0),
+                ino: Some(128),
+                ..Location::default()
+            },
+            what: "link count differs".into(),
+        };
+        for _ in 0..PER_KIND + 3 {
+            report.record(&mut counted, finding.clone());
+        }
+        assert_eq!(report.findings.len(), PER_KIND);
+        assert_eq!(report.suppressed, 3);
+        assert_eq!(report.scan, Scan::Complete);
+        finding.location.ag = Some(1);
+        report.record(&mut counted, finding.clone());
+        finding.code = Code::Checksum;
+        for _ in 0..PER_KIND + 1 {
+            report.record(&mut counted, finding.clone());
+        }
+        assert_eq!(report.findings.len(), PER_KIND * 2 + 1);
+        assert_eq!(report.suppressed, 4);
+        assert_eq!(report.scan, Scan::Partial);
+        assert!(!report.is_clean());
+        assert_eq!(report.findings.last().unwrap().location.ino, Some(128));
+    }
+
+    #[test]
+    fn finding_codes_are_unique_and_documented() {
+        let mut seen = HashSet::new();
+        let docs = include_str!("../docs/fsck-output.md");
+        for &code in Code::ALL {
+            assert!(seen.insert(code.as_str()), "duplicate code {code:?}");
+            let row = format!(
+                "| `{}` | {} | {} |",
+                code.as_str(),
+                code.severity().as_str(),
+                if code.stops_the_walk() { "yes" } else { "no" },
+            );
+            assert!(docs.contains(&row), "missing documented contract: {row}");
+        }
+        assert_eq!(Scan::Complete.as_str(), "complete");
+        assert_eq!(Scan::Partial.as_str(), "partial");
+    }
+
+    #[test]
+    fn incomplete_or_suppressed_reports_cannot_be_clean() {
+        let mut report = Report::default();
+        assert!(report.is_clean());
+        report.scan = Scan::Partial;
+        assert!(
+            !report.is_clean(),
+            "an empty incomplete report is not clean"
+        );
+        report.scan = Scan::Complete;
+        report.suppressed = 1;
+        assert!(!report.is_clean(), "omitted findings cannot imply clean");
+    }
+
+    #[test]
+    fn warnings_preserve_clean_only_for_complete_reports() {
+        let mut report = Report {
+            findings: vec![Finding {
+                code: Code::LogReplayed,
+                location: Location::default(),
+                what: "replayed in memory".into(),
+            }],
+            ..Report::default()
+        };
+        assert_eq!(report.findings[0].severity(), Severity::Warning);
+        assert!(report.is_clean());
+        report.scan = Scan::Partial;
+        assert!(!report.is_clean());
+        report.scan = Scan::Complete;
+        report.findings[0].code = Code::Checksum;
+        assert_eq!(report.findings[0].severity(), Severity::Error);
+        assert!(!report.is_clean());
+    }
+}

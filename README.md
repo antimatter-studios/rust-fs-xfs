@@ -255,9 +255,15 @@ fsck.xfs disk.img          # exit 0 clean, 4 problems found, 8 could not check
 fsck.xfs --text disk.img   # one line per finding
 ```
 
+JSON reports carry schema version 1, stable finding codes, severity and location.
+The `scan` field distinguishes a complete check from a partial scan or a volume
+that could not be mounted. A partial scan is never clean. See
+[the output contract](docs/fsck-output.md) for the schema and code catalogue.
+
 It repairs nothing: `-n` is accepted, and `-y` and `-p` are refused (exit 16)
 rather than ignored. `tests/cli_fsck_oracle.rs` holds it to `xfs_repair -n` on
-twelve clean fixtures and ten kinds of damage.
+twelve clean fixtures and representative corruption families, including golden
+JSON checks for codes, severity, locations and incomplete scans.
 
 A journalled write -- a new file, a filled empty file, a directory -- lands as
 a record in the log, as the driver's writes always do: the kernel applies it

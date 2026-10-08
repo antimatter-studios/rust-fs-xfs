@@ -58,7 +58,7 @@ States:
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
 | `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
-| Findings with stable codes, machine-readable | Upcoming | | #363 (PR #403) | |
+| Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | Unreleased (#403) | | `cli_fsck_oracle.rs` |
 | Quota records | Upcoming | | #395 (PR #402) | |
 | Reverse-map, reference-count and realtime metadata | Upcoming | | #379, #380, #381 | |
 | The checker's remaining gaps against `xfs_repair -n` | Upcoming | | #364 | |
