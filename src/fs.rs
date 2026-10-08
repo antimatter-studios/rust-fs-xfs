@@ -665,6 +665,14 @@ impl Filesystem {
     /// the failure the bit exists to prevent — and worse than a refusal,
     /// because nothing reports it and `xfs_repair` finds it weeks later.
     fn refuse_unmaintained_features(&self) -> Result<()> {
+        // No write path updates dquot inode/block counters. Accounting must
+        // remain read-only until those updates are independently validated.
+        if self.sb.qflags != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "quota accounting flags {:#x} are not maintained by writes",
+                self.sb.qflags
+            )));
+        }
         // Readable incompat bits whose structures no write here keeps
         // (#99). Parent pointers need an attribute added, moved or removed
         // by every create, rename and unlink; exchange-range is refused
