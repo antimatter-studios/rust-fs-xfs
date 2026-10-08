@@ -114,6 +114,37 @@ fn quotas_track_create_write_truncate_unlink_and_refuse_over_limit_write() {
         "quota fixture setup failed:\n{setup}"
     );
 
+    // Ask the independent debugger to find the actual Linux-created
+    // record before testing enforcement. Quota inode di_size does not
+    // describe the addressable sparse dquot clusters.
+    let fs = Filesystem::mount(Arc::new(FileDevice::open(&path).unwrap())).unwrap();
+    let sb = fs.superblock();
+    let (qfile, qraw) = fs.read_inode_raw(sb.uquotino).unwrap();
+    let per_block = u64::from(sb.blocksize) / 136;
+    let logical = 65534 / per_block;
+    assert!(logical * u64::from(sb.blocksize) >= qfile.size);
+    let extents = fs.data_extents(&qfile, &qraw).unwrap();
+    assert!(fs_xfs::extent::lookup(&extents, logical).is_some());
+    let reference = kernel_run(&format!(
+        "xfs_db -r -c 'inode {}' -c 'p core.size' -c 'dquot -u 65534' \
+         -c 'p diskdq.id diskdq.blk_hardlimit diskdq.bcount diskdq.icount' {image}",
+        sb.uquotino,
+    ));
+    for field in [
+        format!("core.size = {}", qfile.size),
+        "diskdq.id = 65534".into(),
+        // On-disk limits use filesystem blocks (Linux xfs_qm_scall_setqlim).
+        format!("diskdq.blk_hardlimit = {}", 4096 / sb.blocksize),
+        "diskdq.bcount = 0".into(),
+        "diskdq.icount = 1".into(),
+    ] {
+        assert!(
+            reference.lines().any(|line| line.trim() == field),
+            "{reference}"
+        );
+    }
+    drop(fs);
+
     let baseline = usage(&image);
     stage(&path, |fs| {
         let victim = fs.lookup_path("/over-limit").expect("nobody's empty file");

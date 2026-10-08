@@ -140,6 +140,22 @@ pub(crate) fn accounting_items(
         .collect()
 }
 
+fn record_address(blocksize: u32, id: u32) -> Result<(u64, usize)> {
+    // Linux xfs_dquot_alloc addresses one filesystem-block quota cluster
+    // by ID / qi_dqperchunk, with ID % qi_dqperchunk selecting its record.
+    // The unused bytes at each block's end are padding, not another dquot.
+    let per_block = blocksize as usize / DQBLK_SIZE;
+    if per_block == 0 {
+        return Err(Error::UnsupportedFeature(
+            "filesystem block is too small for an XFS dquot".into(),
+        ));
+    }
+    Ok((
+        u64::from(id) / per_block as u64,
+        (u64::from(id) % per_block as u64) as usize * DQBLK_SIZE,
+    ))
+}
+
 fn update_dquot(
     fs: &Filesystem,
     qino: u64,
@@ -150,22 +166,11 @@ fn update_dquot(
     enforce: bool,
 ) -> Result<QuotaLogItem> {
     let (qfile, qraw) = fs.read_inode_raw(qino)?;
-    let file_offset = u64::from(id)
-        .checked_mul(DQBLK_SIZE as u64)
-        .ok_or_else(|| Error::UnsupportedFeature("quota record offset overflowed".into()))?;
-    if file_offset + DQBLK_SIZE as u64 > qfile.size {
-        return Err(Error::UnsupportedFeature(format!(
-            "quota inode {qino} ends before record {id}"
-        )));
-    }
+    // Quota inodes are internal sparse metadata files. Linux maps their
+    // extents directly without updating or bounding reads by di_size.
+    // A missing cluster remains an error below; its allocation is separate.
     let blocksize = u64::from(fs.sb.blocksize);
-    let logical = file_offset / blocksize;
-    let within = (file_offset % blocksize) as usize;
-    if within + DQBLK_SIZE > blocksize as usize {
-        return Err(Error::UnsupportedFeature(format!(
-            "quota record {id} crosses a filesystem block and cannot be journalled safely"
-        )));
-    }
+    let (logical, within) = record_address(fs.sb.blocksize, id)?;
     let extents = fs.data_extents(&qfile, &qraw)?;
     let extent = crate::extent::lookup(&extents, logical).ok_or_else(|| {
         Error::UnsupportedFeature(format!(
@@ -272,6 +277,25 @@ fn usage_after(current: u64, delta: i64, what: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_dquot_chunk_addresses_keep_padding_between_blocks() {
+        // Linux v6.1 xfs_dquot_alloc divides IDs by qi_dqperchunk and
+        // takes the remainder for q_bufoffset; a 4 KiB chunk holds 30
+        // complete 136-byte xfs_dqblk records, followed by 16 pad bytes.
+        assert_eq!(record_address(4096, 29).unwrap(), (0, 3944));
+        assert_eq!(record_address(4096, 30).unwrap(), (1, 0));
+        assert_eq!(record_address(4096, 65534).unwrap(), (2184, 1904));
+        assert_eq!(record_address(1024, 7).unwrap(), (1, 0));
+        assert_eq!(record_address(2048, 15).unwrap(), (1, 0));
+        assert_eq!(record_address(4096, u32::MAX).unwrap(), (143165576, 2040));
+    }
+
+    #[test]
+    fn blocks_too_small_for_a_dquot_are_refused() {
+        assert!(record_address(0, 65534).is_err());
+        assert!(record_address(135, 65534).is_err());
+    }
 
     fn seal(record: &mut [u8]) {
         let crc = crate::superblock::crc32c_with_zeroed_crc(record, DQ_CRC);
