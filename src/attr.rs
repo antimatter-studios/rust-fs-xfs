@@ -91,6 +91,10 @@ impl Filesystem {
             .ok_or_else(|| corrupt(inode.ino, "fork past the inode record"))?;
         let stored = match inode.aformat {
             Format::Local => shortform(inode.ino, fork)?,
+            // Linux's xfs_inode_hasattr treats an extent-format fork with
+            // no extents as empty, even when di_forkoff reserves space.
+            // There is no block 0 to read in that valid representation.
+            Format::Extents if inode.anextents == 0 => Vec::new(),
             Format::Extents | Format::Btree => {
                 let extents = self.attr_extents(inode, fork)?;
                 self.leaf_attrs(inode.ino, &extents)?

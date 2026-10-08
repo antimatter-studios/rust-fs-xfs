@@ -674,6 +674,44 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_extent_attribute_fork_needs_no_block_read() {
+        let fs = fs_over(dev(), false);
+        let mut inode = regular_inode(0);
+        inode.forkoff = 20;
+        inode.aformat = Format::Extents;
+        let raw = vec![0; 512];
+        assert!(fs.list_xattrs(&inode, &raw).unwrap().is_empty());
+        assert_eq!(
+            fs.get_xattr(&inode, &raw, b"system.posix_acl_default")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_nonempty_extent_attribute_fork_cannot_omit_block_zero() {
+        let fs = fs_over(dev(), false);
+        let mut inode = regular_inode(0);
+        inode.forkoff = 20;
+        inode.aformat = Format::Extents;
+        inode.anextents = 1;
+        let mut raw = vec![0; 512];
+        let (start, _) = inode.attr_fork_range(raw.len()).unwrap();
+        raw[start..start + 16].copy_from_slice(
+            &crate::extent::Extent {
+                startoff: 1,
+                startblock: 1,
+                blockcount: 1,
+                unwritten: false,
+            }
+            .to_bytes()
+            .unwrap(),
+        );
+        let error = fs.list_xattrs(&inode, &raw).unwrap_err();
+        assert!(error.to_string().contains("block 0 is a hole"), "{error}");
+    }
+
+    #[test]
     fn a_read_only_mount_refuses_to_write() {
         let fs = fs_over(dev(), false);
         let inode = regular_inode(4096);

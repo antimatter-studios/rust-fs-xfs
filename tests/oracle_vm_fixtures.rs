@@ -193,6 +193,23 @@ fn agrees_with_xfs_db_on_every_field() {
             label,
             &mut checked,
         );
+        // The feature inventory includes legacy words and geometry too.
+        // Missing independent fields cannot silently reduce that coverage.
+        for (field, ours) in [
+            ("versionnum", u64::from(sb.versionnum)),
+            ("features2", u64::from(sb.features2)),
+            ("bad_features2", u64::from(sb.bad_features2)),
+            ("features_log_incompat", u64::from(sb.features_log_incompat)),
+            ("qflags", u64::from(sb.qflags)),
+            ("unit", u64::from(sb.unit)),
+            ("width", u64::from(sb.width)),
+        ] {
+            assert!(
+                oracle.contains_key(field),
+                "{label}: xfs_db omitted {field}"
+            );
+            expect(&oracle, field, ours, label, &mut checked);
+        }
 
         assert!(
             checked >= 15,

@@ -710,6 +710,14 @@ impl Filesystem {
     /// the failure the bit exists to prevent — and worse than a refusal,
     /// because nothing reports it and `xfs_repair` finds it weeks later.
     fn refuse_unmaintained_features(&self) -> Result<()> {
+        // Known quota accounting is maintained by the quota module. Future
+        // flags still require a refusal before journal inspection or writes.
+        let unknown_quota = self.sb.qflags & !0x07ff;
+        if unknown_quota != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "unknown quota flags {unknown_quota:#x} are not maintained by writes"
+            )));
+        }
         // Readable incompat bits whose structures no write here keeps
         // (#99). Parent pointers need an attribute added, moved or removed
         // by every create, rename and unlink; exchange-range is refused

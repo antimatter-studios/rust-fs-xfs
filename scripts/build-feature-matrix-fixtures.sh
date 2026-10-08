@@ -65,7 +65,22 @@ as_root() {
     fi
 }
 
-command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs not found; install xfsprogs" >&2; exit 1; }
+# The matrix is reproducible only when every recipe has the same formatter.
+# The guest setup owns this pinned installation; the override permits a
+# hermetic negative-path test without installing Linux tools on the host.
+XFSPROGS_BIN="${XFS_MATRIX_XFSPROGS_BIN:-/usr/local/xfsprogs-parent/sbin}"
+export PATH="$XFSPROGS_BIN:$PATH"
+for tool in mkfs.xfs xfs_info xfs_db xfs_quota xfs_repair; do
+    [ -x "$XFSPROGS_BIN/$tool" ] || {
+        echo "feature matrix needs pinned xfsprogs 6.13.0; run chore vm:provision" >&2
+        exit 1
+    }
+    version="$("$XFSPROGS_BIN/$tool" -V 2>&1)"
+    case "$version" in
+        *"version 6.13.0") ;;
+        *) echo "feature matrix: $tool must be version 6.13.0, got $version" >&2; exit 1 ;;
+    esac
+done
 
 mkdir -p "$OUT"
 
@@ -92,13 +107,17 @@ mkdir -p "$OUT"
 # only ftype=0 filesystem there can be.
 COMBOS=(
     "v4:-m crc=0 -n ftype=0"
-    "base:-m crc=1,finobt=0,rmapbt=0,reflink=0"
-    "finobt:-m crc=1,finobt=1,rmapbt=0,reflink=0"
+    "base:-m crc=1,finobt=0,inobtcount=0,rmapbt=0,reflink=0"
+    "finobt:-m crc=1,finobt=1,inobtcount=0,rmapbt=0,reflink=0"
     "finobt-inobtcount:-m crc=1,finobt=1,inobtcount=1,rmapbt=0,reflink=0"
-    "reflink:-m crc=1,finobt=0,rmapbt=0,reflink=1"
-    "reflink-finobt:-m crc=1,finobt=1,rmapbt=0,reflink=1"
-    "rmapbt:-m crc=1,finobt=0,rmapbt=1,reflink=0"
-    "rmapbt-reflink:-m crc=1,finobt=1,rmapbt=1,reflink=1"
+    "reflink:-m crc=1,finobt=0,inobtcount=0,rmapbt=0,reflink=1"
+    "reflink-finobt:-m crc=1,finobt=1,inobtcount=0,rmapbt=0,reflink=1"
+    "reflink-finobt-inobtcount:-m crc=1,finobt=1,inobtcount=1,rmapbt=0,reflink=1"
+    "rmapbt:-m crc=1,finobt=0,inobtcount=0,rmapbt=1,reflink=0"
+    "rmapbt-finobt:-m crc=1,finobt=1,inobtcount=0,rmapbt=1,reflink=0"
+    "rmapbt-finobt-inobtcount:-m crc=1,finobt=1,inobtcount=1,rmapbt=1,reflink=0"
+    "rmapbt-reflink-nofinobt:-m crc=1,finobt=0,inobtcount=0,rmapbt=1,reflink=1"
+    "rmapbt-reflink:-m crc=1,finobt=1,inobtcount=0,rmapbt=1,reflink=1"
     "everything:-m crc=1,finobt=1,inobtcount=1,rmapbt=1,reflink=1"
 
     # --- how things are encoded, with the features held still ---------
@@ -134,6 +153,13 @@ COMBOS=(
     # blocks it gets are next to the chunk before them with the same
     # owner -- which is a reverse-mapping record the kernel merges.
     "fullinodes:-m crc=1,rmapbt=1,finobt=1"
+    # META_UUID is set by xfs_db changing a populated v5 volume's UUID.
+    "meta_uuid:-m crc=1"
+    # Quotas are activated at mount; mkfs has no quota feature switch.
+    "quota:-m crc=1"
+    # su is bytes; sw is the number of stripe units (16/64 fs blocks).
+    "stripe:-m crc=1 -d su=64k,sw=4 -l size=64m"
+    "sector4k:-m crc=1 -s size=4096"
 )
 
 built=0
@@ -145,14 +171,16 @@ for combo in "${COMBOS[@]}"; do
     rm -f "$img"
     truncate -s "$SIZE" "$img"
     # shellcheck disable=SC2086
-    if ! mkfs.xfs -f -q $args "$img" >/dev/null 2>&1; then
-        rm -f "$img"
-        echo "SKIP  $name (mkfs.xfs rejected $args)"
-        continue
+    if ! mkfs.xfs -f $args "$img" > "$OUT/xfsfeat-$name.mkfs" 2>&1; then
+        echo "feature matrix: $name rejected by pinned mkfs.xfs ($args)" >&2
+        cat "$OUT/xfsfeat-$name.mkfs" >&2
+        exit 1
     fi
 
     m=$(mktemp -d)
-    as_root mount -o loop "$img" "$m"
+    mount_options=loop
+    [ "$name" != quota ] || mount_options=loop,uquota
+    as_root mount -o "$mount_options" "$img" "$m"
 
     # THE SAME TREE ON EVERY ROW, so a difference in the result is a
     # difference in the features and nothing else. Each entry exists for
@@ -221,7 +249,7 @@ for combo in "${COMBOS[@]}"; do
     # are the same value and a fixture made only of those cannot tell a
     # driver using the wrong one apart. Every name here was lowercase,
     # and the `ci` row passed without proving anything.
-    for name in Mixed UPPER CamelCase mIxEd; do as_root touch "$m/full/$name"; done
+    for entry in Mixed UPPER CamelCase mIxEd; do as_root touch "$m/full/$entry"; done
     n=0
     while [ "$n" -lt 400 ]; do
         as_root touch "$m/full/e$n"
@@ -266,10 +294,50 @@ for combo in "${COMBOS[@]}"; do
         done
     fi
 
+    if [ "$name" = quota ]; then
+        as_root chown 1001 "$m/sf/data.bin"
+        as_root sync
+        as_root xfs_quota -x -c 'report -u -n' "$m" > "$OUT/xfsfeat-$name.quota"
+        grep -q '1001' "$OUT/xfsfeat-$name.quota" || {
+            echo 'quota fixture lacks the populated UID 1001 reference' >&2; exit 1;
+        }
+    fi
     sync
     # Unmounted rather than only synced: a mounted filesystem's headers
     # are a cache of what is in memory, and the tests read the image.
     as_root umount "$m"; rmdir "$m"
+
+    postformat=none
+    if [ "$name" = meta_uuid ]; then
+        postformat='xfs_db -x -c uuid 22222222-2222-4222-8222-222222222222'
+        as_root xfs_db -x -c 'uuid 22222222-2222-4222-8222-222222222222' "$img" \
+            > "$OUT/xfsfeat-$name.uuid"
+    fi
+
+    # Evidence describes the final, cleanly unmounted image, not the
+    # formatter's initial state before the kernel populated it.
+    xfs_info "$img" > "$OUT/xfsfeat-$name.info"
+    xfs_db -r -c 'sb 0' -c print "$img" > "$OUT/xfsfeat-$name.sbdump"
+    rootino="$(xfs_db -r -c 'sb 0' -c 'p rootino' "$img" | awk '/^rootino =/ {print $3}')"
+    [ -n "$rootino" ] || { echo 'missing independent root inode number' >&2; exit 1; }
+    xfs_db -r -c "inode $rootino" -c print "$img" > "$OUT/xfsfeat-$name.rootdump"
+    # Independent evidence is collected only from real pinned tools in the
+    # guest. Hermetic script tests exercise this protocol, not its truth.
+    xfs_repair -n "$img" > "$OUT/xfsfeat-$name.repair" 2>&1
+    {
+        printf 'fixture=%s\n' "xfsfeat-$name.img"
+        printf 'recipe=mkfs.xfs -f %s %s\n' "$args" "$img"
+        printf 'mount_options=%s\npostformat=%s\n' "$mount_options" "$postformat"
+        mkfs.xfs -V
+        xfs_info -V
+        xfs_db -V
+        xfs_quota -V
+        xfs_repair -V
+        sha256sum "$XFSPROGS_BIN/"{mkfs.xfs,xfs_info,xfs_db,xfs_quota,xfs_repair}
+        uname -a
+        sha256sum "$img"
+        sha256sum "$OUT/xfsfeat-$name."{mkfs,info,sbdump,rootdump,repair}
+    } > "$OUT/xfsfeat-$name.provenance" 2>&1
 
     echo "BUILT xfsfeat-$name  ($args)"
     built=$((built + 1))
