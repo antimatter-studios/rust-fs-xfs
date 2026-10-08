@@ -285,6 +285,7 @@ fn a_log_the_kernel_left_unreplayed_is_refused() {
         xfs_io -x -c 'shutdown -f' "$m" && echo SHUTDOWN_OK
         umount "$m" || umount -l "$m" || echo UMOUNT_FAILED
         rmdir "$m"
+        echo DONE
         "#
     ));
     assert!(
