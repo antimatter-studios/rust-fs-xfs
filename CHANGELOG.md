@@ -6,6 +6,13 @@ never does.
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/features.md`, a features page kept current by every pull request.**
+  Each feature's state, the release it shipped in, its tracking issue and the
+  test that checks it. The README's status table, which still said a mount
+  writes one checkpoint, is a short summary pointing to it.
+
 ### Fixed
 
 - **Quota block usage and hard limits use Linux's filesystem-block units
