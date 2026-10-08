@@ -237,11 +237,17 @@ fn report(path: &std::path::Path) -> check::Report {
 fn a_quota_inode_cannot_be_a_directory() {
     let image = scratch::Volume::copy_of(
         SUITE,
-        &fixture("xfs-default.img"),
+        &fixture("xfsdata-default.img"),
         &format!("{}-directory.img", std::process::id()),
     );
+    // NOT THE ROOT: xfs_repair judges the root inode as the root before
+    // it asks whether it is a quota inode, so a quota pointer aimed at the
+    // root is never graded as one and the reference calls the volume clean.
     let fs = Filesystem::mount(Arc::new(FileDevice::open(image.path()).unwrap())).unwrap();
-    let root = fs.superblock().rootino;
+    let directory = fs
+        .lookup_path("/sub")
+        .expect("the data fixture has /sub")
+        .ino;
     drop(fs);
     let edit = oracle("xfs_db")
         .args([
@@ -249,7 +255,7 @@ fn a_quota_inode_cannot_be_a_directory() {
             "-c",
             "sb 0",
             "-c",
-            &format!("write -d uquotino {root}"),
+            &format!("write -d uquotino {directory}"),
             "-c",
             "write -d qflags 5",
         ])
