@@ -158,9 +158,9 @@ COMBOS=(
     # Quotas are activated at mount; mkfs has no quota feature switch.
     "quota:-m crc=1"
     # su is bytes; sw is the number of stripe units (16/64 fs blocks).
-    # One AG keeps the required 64 MiB log within mkfs's per-AG limit
-    # on the default 400 MiB image; four default AGs are too small.
-    "stripe:-m crc=1 -d su=64k,sw=4,agcount=1 -l size=64m"
+    # Four 100 MiB AGs retain redundant superblocks and leave room for
+    # the required 64 MiB log plus metadata and stripe alignment.
+    "stripe:-m crc=1 -d su=64k,sw=4,agcount=4 -l size=64m"
     "sector4k:-m crc=1 -s size=4096"
 )
 

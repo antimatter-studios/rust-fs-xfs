@@ -51,12 +51,32 @@ if [ "${1:-}" = -V ]; then
     echo "${0##*/} version 6.13.0"
 else
     if [ "${0##*/}" = mkfs.xfs ] && [[ " $* " == *" su=64k,sw=4"* ]]; then
-        if [[ " $* " != *" -l size=64m "* ]]; then
+        # Model this fixture's pinned 6.13 constraints, not a preferred recipe.
+        # mkfs/xfs_mkfs.c validates redundancy and the minimum log, then
+        # bounds the log by libxfs_alloc_ag_max_usable() and stripe alignment.
+        groups=8
+        log_mib=0
+        for arg in "$@"; do
+            case "$arg" in
+                su=64k,sw=4,agcount=*) groups="${arg##*agcount=}" ;;
+                size=*m) log_mib="${arg#size=}"; log_mib="${log_mib%m}" ;;
+            esac
+        done
+        if [ "$groups" -lt 2 ]; then
+            echo 'Filesystem must have at least 2 superblocks for redundancy!' >&2
+            exit 42
+        fi
+        if [ "$log_mib" -lt 64 ]; then
             echo 'Log size must be at least 64MB.' >&2
             exit 42
         fi
-        if [[ " $* " != *" su=64k,sw=4,agcount=1 "* ]]; then
-            echo 'internal log size 16384 too large, must be less than 12772' >&2
+        # Fixed 400 MiB, 4 KiB blocks, 64 KiB stripe-unit geometry. The
+        # 28-block margin matches the pinned formatter's observed cap
+        # (12772 blocks in a 50 MiB AG), including alignment/reservations.
+        max_logblocks=$((400 * 256 / groups - 28))
+        logblocks=$((log_mib * 256))
+        if [ "$logblocks" -gt "$max_logblocks" ]; then
+            echo "internal log size $logblocks too large, must be less than $max_logblocks" >&2
             exit 42
         fi
     fi
@@ -72,6 +92,25 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$sandbox/success-bin/cp"
 printf '#!/usr/bin/env bash\necho 8\n' > "$sandbox/success-bin/stat"
 printf '#!/usr/bin/env bash\necho 0\n' > "$sandbox/success-bin/id"
 chmod +x "$sandbox/success-bin/"*
+
+for probe in '1:64:at least 2 superblocks' '4:32:at least 64MB' '8:64:too large' '4:128:too large'; do
+    groups="${probe%%:*}"; rest="${probe#*:}"
+    log_mib="${rest%%:*}"; expected="${rest#*:}"
+    if "$sandbox/success-bin/mkfs.xfs" -f -m crc=1 \
+        -d "su=64k,sw=4,agcount=$groups" -l "size=${log_mib}m" \
+        "$sandbox/images/constraint.img" > "$sandbox/constraint.log" 2>&1; then
+        fail "formatter model accepted invalid stripe constraint $probe"
+    elif ! grep -q "$expected" "$sandbox/constraint.log"; then
+        fail "formatter model gave an unrelated refusal for $probe"
+    fi
+done
+for groups in 2 4; do
+    if ! "$sandbox/success-bin/mkfs.xfs" -f -m crc=1 \
+        -d "su=64k,sw=4,agcount=$groups" -l size=64m \
+        "$sandbox/images/constraint.img" > "$sandbox/constraint.log" 2>&1; then
+        fail "formatter model refused a fitting 64 MiB log with $groups AGs"
+    fi
+done
 
 if TMPDIR="$sandbox" PATH="$sandbox/success-bin:$PATH" XFS_MATRIX_XFSPROGS_BIN="$sandbox/success-bin" \
     XFS_FIXTURE_DIR="$sandbox/success-images" XFS_FIXTURE_SIZE=1M \
