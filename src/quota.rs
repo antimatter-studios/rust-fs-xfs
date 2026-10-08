@@ -36,7 +36,8 @@ pub(crate) struct QuotaChange {
     pub uid: u32,
     pub gid: u32,
     pub project_id: u32,
-    pub blocks_512: i64,
+    /// Filesystem blocks, matching Linux's dquot counters and limits.
+    pub blocks_fs: i64,
     pub inodes: i64,
 }
 
@@ -101,7 +102,7 @@ pub(crate) fn accounting_items(
     const GENFD: u16 = 1 << 7;
 
     for change in changes {
-        if change.blocks_512 == 0 && change.inodes == 0 {
+        if change.blocks_fs == 0 && change.inodes == 0 {
             continue;
         }
         let owners = [
@@ -124,7 +125,7 @@ pub(crate) fn accounting_items(
             let delta = deltas.entry((qino, id, kind, enforce)).or_default();
             delta.0 = delta
                 .0
-                .checked_add(change.blocks_512)
+                .checked_add(change.blocks_fs)
                 .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
             delta.1 = delta
                 .1
@@ -134,8 +135,8 @@ pub(crate) fn accounting_items(
     }
     deltas
         .into_iter()
-        .map(|((qino, id, kind, enforce), (blocks_512, inodes))| {
-            update_dquot(fs, qino, id, kind, blocks_512, inodes, enforce)
+        .map(|((qino, id, kind, enforce), (blocks_fs, inodes))| {
+            update_dquot(fs, qino, id, kind, blocks_fs, inodes, enforce)
         })
         .collect()
 }
@@ -161,7 +162,7 @@ fn update_dquot(
     qino: u64,
     id: u32,
     kind: u8,
-    blocks_512: i64,
+    blocks_fs: i64,
     inodes: i64,
     enforce: bool,
 ) -> Result<QuotaLogItem> {
@@ -186,7 +187,7 @@ fn update_dquot(
         &mut block[within..end],
         kind,
         id,
-        blocks_512,
+        blocks_fs,
         inodes,
         enforce,
     )?;
@@ -201,14 +202,17 @@ fn update_dquot(
     })
 }
 
-/// Apply usage changes to one existing dquot. `blocks_512` is measured
-/// in XFS basic blocks (512-byte units), as are the on-disk limits.
+/// Apply usage changes to one existing dquot. `blocks_fs`, on-disk usage,
+/// and both hard and soft block limits are measured in filesystem blocks.
+/// Linux v6.1 xfs_qm_scall_setqlim converts byte limits with XFS_B_TO_FSB;
+/// xfs_dquot_to_disk stores those counters directly, and xfs_trans_dquot
+/// applies transaction block deltas without a basic-block conversion.
 /// Nothing in the record changes when validation or enforcement fails.
 pub(crate) fn adjust_record(
     record: &mut [u8],
     kind: u8,
     id: u32,
-    blocks_512: i64,
+    blocks_fs: i64,
     inodes: i64,
     enforce: bool,
 ) -> Result<()> {
@@ -243,7 +247,7 @@ pub(crate) fn adjust_record(
 
     let old_blocks = u64::from_be_bytes(record[DQ_BCOUNT..DQ_BCOUNT + 8].try_into().unwrap());
     let old_inodes = u64::from_be_bytes(record[DQ_ICOUNT..DQ_ICOUNT + 8].try_into().unwrap());
-    let next_blocks = usage_after(old_blocks, blocks_512, "block")?;
+    let next_blocks = usage_after(old_blocks, blocks_fs, "block")?;
     let next_inodes = usage_after(old_inodes, inodes, "inode")?;
     let block_limit = u64::from_be_bytes(record[DQ_BHARD..DQ_BHARD + 8].try_into().unwrap());
     let inode_limit = u64::from_be_bytes(record[DQ_IHARD..DQ_IHARD + 8].try_into().unwrap());
@@ -300,6 +304,159 @@ mod tests {
     fn seal(record: &mut [u8]) {
         let crc = crate::superblock::crc32c_with_zeroed_crc(record, DQ_CRC);
         record[DQ_CRC..DQ_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    // Sparse pages keep the formatter's 320 MiB device and 64 MiB log
+    // inexpensive without fixtures, a VM, or host filesystem tools.
+    #[derive(Default)]
+    struct MemoryDevice(std::sync::Mutex<BTreeMap<u64, Vec<u8>>>);
+
+    impl fs_core::BlockRead for MemoryDevice {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+            let pages = self.0.lock().unwrap();
+            let mut done = 0;
+            while done < buf.len() {
+                let at = offset as usize + done;
+                let within = at % 4096;
+                let count = (4096 - within).min(buf.len() - done);
+                if let Some(page) = pages.get(&(at as u64 / 4096)) {
+                    buf[done..done + count].copy_from_slice(&page[within..within + count]);
+                } else {
+                    buf[done..done + count].fill(0);
+                }
+                done += count;
+            }
+            Ok(())
+        }
+
+        fn size_bytes(&self) -> u64 {
+            320 * 1024 * 1024
+        }
+    }
+
+    impl fs_core::BlockDevice for MemoryDevice {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+            let mut pages = self.0.lock().unwrap();
+            let mut done = 0;
+            while done < buf.len() {
+                let at = offset as usize + done;
+                let within = at % 4096;
+                let count = (4096 - within).min(buf.len() - done);
+                let bytes = &buf[done..done + count];
+                let page_id = at as u64 / 4096;
+                if bytes.iter().any(|byte| *byte != 0) || pages.contains_key(&page_id) {
+                    pages.entry(page_id).or_insert_with(|| vec![0; 4096])[within..within + count]
+                        .copy_from_slice(bytes);
+                }
+                done += count;
+            }
+            Ok(())
+        }
+
+        fn is_writable(&self) -> bool {
+            true
+        }
+    }
+
+    fn quota_filesystem(blocksize: u32) -> (Filesystem, std::sync::Arc<MemoryDevice>, u64, u64) {
+        let dev = std::sync::Arc::new(MemoryDevice::default());
+        crate::mkfs::format(
+            dev.as_ref(),
+            &crate::mkfs::Options {
+                block_size: blocksize,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut fs = Filesystem::mount_rw(dev.clone()).unwrap();
+        let root = fs.sb.rootino;
+        let qino = fs.create_file(root, b"quota", 0o600).unwrap().0;
+        let mut records = vec![0; blocksize as usize];
+        for id in 0..=1 {
+            let record = &mut records[id * DQBLK_SIZE..(id + 1) * DQBLK_SIZE];
+            record[0..2].copy_from_slice(&DQ_MAGIC.to_be_bytes());
+            record[2] = DQ_VERSION;
+            record[3] = DQ_USER;
+            record[4..8].copy_from_slice(&(id as u32).to_be_bytes());
+            if id == 1 {
+                // Linux v6.1 xfs_qm_scall_setqlim converts a one-block
+                // byte limit with XFS_B_TO_FSB; xfs_dquot_to_disk stores
+                // that value directly in both hard and soft limits.
+                record[DQ_BHARD..DQ_BHARD + 8].copy_from_slice(&1u64.to_be_bytes());
+                record[16..24].copy_from_slice(&1u64.to_be_bytes());
+                record[DQ_ICOUNT..DQ_ICOUNT + 8].copy_from_slice(&1u64.to_be_bytes());
+            }
+            seal(record);
+        }
+        fs.write_into_empty_file(qino, &records).unwrap();
+        let victim = fs.create_file(root, b"victim", 0o600).unwrap().0;
+        let (_, mut raw) = fs.read_inode_raw(victim).unwrap();
+        let uid = crate::inode::offsets::UID;
+        raw[uid..uid + 4].copy_from_slice(&1u32.to_be_bytes());
+        fs.logged_inode(victim, &raw, &[]).unwrap();
+        let (qfile, qraw) = fs.read_inode_raw(qino).unwrap();
+        let qblock = fs.data_extents(&qfile, &qraw).unwrap()[0].startblock;
+        fs.sb.uquotino = qino;
+        fs.sb.qflags = 3;
+        (fs, dev, victim, qblock)
+    }
+
+    fn block_usage(fs: &Filesystem, qblock: u64, id: usize) -> u64 {
+        let block = fs.read_fsblock(qblock).unwrap();
+        let at = id * DQBLK_SIZE + DQ_BCOUNT;
+        u64::from_be_bytes(block[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn one_filesystem_block_fits_the_linux_limit_and_truncate_returns_zero() {
+        for blocksize in [4096, 2048, 1024] {
+            let (fs, dev, victim, qblock) = quota_filesystem(blocksize);
+            let payload = vec![0x5a; blocksize as usize];
+            fs.write_into_empty_file(victim, &payload)
+                .expect("one filesystem block must fit the Linux one-block limit");
+            assert_eq!(block_usage(&fs, qblock, 1), 1);
+            assert_eq!(fs.read_path("/victim").unwrap(), payload);
+            fs.truncate_to_zero(victim).unwrap();
+            assert_eq!(block_usage(&fs, qblock, 1), 0);
+            let before = dev.0.lock().unwrap().clone();
+            let inode_before = fs.read_inode_raw(victim).unwrap().1;
+            let free_before = fs.free_extents(0).unwrap();
+            let dirty_before = fs.dirty_bytes();
+            let error = fs
+                .write_into_empty_file(victim, &vec![0x6b; 2 * blocksize as usize])
+                .expect_err("two filesystem blocks must exceed the one-block limit");
+            assert!(error.to_string().contains("hard limit"), "{error}");
+            assert_eq!(
+                *dev.0.lock().unwrap(),
+                before,
+                "refusal changed data or journal"
+            );
+            assert_eq!(fs.read_inode_raw(victim).unwrap().1, inode_before);
+            assert_eq!(fs.free_extents(0).unwrap(), free_before);
+            assert_eq!(fs.dirty_bytes(), dirty_before);
+            assert_eq!(block_usage(&fs, qblock, 1), 0);
+        }
+    }
+
+    #[test]
+    fn directory_growth_accounts_filesystem_blocks_at_every_geometry() {
+        for blocksize in [4096, 2048, 1024] {
+            let (fs, _, _, qblock) = quota_filesystem(blocksize);
+            let root = fs.sb.rootino;
+            let initial = fs.read_inode(root).unwrap().nblocks;
+            // Promotion allocates one 4 KiB directory block; subsequent
+            // inserts into that block must not charge it again.
+            for index in 0..16 {
+                let name = format!("entry-{index:03}-{}", "x".repeat(80));
+                fs.create_file(root, name.as_bytes(), 0o600).unwrap();
+                let blocks = fs.read_inode(root).unwrap().nblocks;
+                assert_eq!(block_usage(&fs, qblock, 0), blocks - initial);
+            }
+            assert_eq!(
+                fs.read_inode(root).unwrap().nblocks,
+                4096 / u64::from(blocksize)
+            );
+        }
     }
 
     #[test]

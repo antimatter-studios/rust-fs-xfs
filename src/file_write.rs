@@ -192,17 +192,15 @@ impl Filesystem {
         let mut group = crate::group_write::GroupAlloc::open(&self.sb, self.device(), agno)?;
         let agblock = group.take(want, ino as i64, 0)?;
         let group_items = group.into_items()?;
-        let quota_blocks = blocks
-            .checked_mul(blocksize / 512)
-            .and_then(|n| i64::try_from(n).ok())
-            .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
+        let quota_blocks = i64::try_from(blocks)
+            .map_err(|_| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
         let quota_items = crate::quota::accounting_items(
             self,
             &[crate::quota::QuotaChange {
                 uid: file.uid,
                 gid: file.gid,
                 project_id: crate::quota::project_id(&raw),
-                blocks_512: quota_blocks,
+                blocks_fs: quota_blocks,
                 inodes: 0,
             }],
         )?;

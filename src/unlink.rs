@@ -237,7 +237,7 @@ impl Filesystem {
                 uid: victim.uid,
                 gid: victim.gid,
                 project_id: crate::quota::project_id(&victim_raw),
-                blocks_512: 0,
+                blocks_fs: 0,
                 inodes: -1,
             }],
         )?;

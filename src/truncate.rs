@@ -294,9 +294,8 @@ impl Filesystem {
                 sum.checked_add(extent.blockcount)
             })
             .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
-        let freed_quota_blocks = freed_fsblocks
-            .checked_mul(u64::from(self.sb.blocksize) / 512)
-            .and_then(|n| i64::try_from(n).ok())
+        let freed_quota_blocks = i64::try_from(freed_fsblocks)
+            .ok()
             .and_then(i64::checked_neg)
             .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
         let quota_items = crate::quota::accounting_items(
@@ -305,7 +304,7 @@ impl Filesystem {
                 uid: file.uid,
                 gid: file.gid,
                 project_id: crate::quota::project_id(&raw),
-                blocks_512: freed_quota_blocks,
+                blocks_fs: freed_quota_blocks,
                 inodes: 0,
             }],
         )?;

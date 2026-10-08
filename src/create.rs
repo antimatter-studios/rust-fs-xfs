@@ -1002,7 +1002,6 @@ impl Filesystem {
         let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64, when);
         let quota_block_delta = dir_blocks
             .checked_sub(dir_inode.nblocks)
-            .and_then(|blocks| blocks.checked_mul(u64::from(self.sb.blocksize) / 512))
             .and_then(|blocks| i64::try_from(blocks).ok())
             .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
         let quota_items = crate::quota::accounting_items(
@@ -1018,14 +1017,14 @@ impl Filesystem {
                         crate::format::log_items::log_dinode::offsets::GID,
                     ),
                     project_id: crate::quota::project_id(&new_core),
-                    blocks_512: 0,
+                    blocks_fs: 0,
                     inodes: 1,
                 },
                 crate::quota::QuotaChange {
                     uid: dir_inode.uid,
                     gid: dir_inode.gid,
                     project_id: crate::quota::project_id(&dir_raw),
-                    blocks_512: quota_block_delta,
+                    blocks_fs: quota_block_delta,
                     inodes: 0,
                 },
             ],
