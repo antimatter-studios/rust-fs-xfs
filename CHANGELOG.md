@@ -121,6 +121,17 @@ never does.
   `Error::Io` and the device is not touched. Reads still work, and a fresh
   mount reads the log as a crash would have left it.
 
+- Empty extent-format attribute forks are read as empty, allowing creation
+  in directories that reserve attribute-fork space without allocating blocks.
+- Advertised unknown legacy feature bits and historical shared superblocks
+  refuse mounting; unknown quota flags refuse writable mounts before mutation,
+  while recognized quota flags retain supported accounting operations.
+- Volumes carrying unsupported log-incompatible features are refused before
+  either mount can inspect or replay the log or issue a write.
+- Feature-matrix fixtures retain their row names after creating mixed-case
+  directory entries, so the final image evidence is recorded for each recipe.
+- The stripe fixture explicitly requests a 64 MiB log, satisfying the pinned
+  formatter's minimum without dropping its stripe geometry.
 - **Quota block usage and hard limits use Linux's filesystem-block units
   (#396).** Directory growth, writes, and truncation account actual filesystem
   blocks for user, group, and project quotas. A write exactly at a hard limit

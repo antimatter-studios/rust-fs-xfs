@@ -63,10 +63,9 @@ if [[ "$STATUS" -ne 23 || -e "$SELECTED" ]]; then
     exit 1
 fi
 
-STARTED="$(date +%s)"
 : > "$OUTPUT"
 FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
-    "$REPO/scripts/with-test-temp.sh" sh -c 'printf "%s\n" "$TMPDIR"; sleep 2' \
+    "$REPO/scripts/with-test-temp.sh" sh -c 'printf "%s\n" "$TMPDIR"; sleep 30' \
     > "$OUTPUT" &
 WRAPPER_PID=$!
 if ! wait_for_output "$WRAPPER_PID"; then
@@ -74,6 +73,10 @@ if ! wait_for_output "$WRAPPER_PID"; then
     echo "FAIL  wrapper exited or timed out before reporting its scratch directory" >&2
     exit 1
 fi
+# Measure signal forwarding after startup, which has its own bounded wait.
+# Harness startup time must not consume the two-second TERM deadline.
+# A lost signal cannot pass by waiting for the child's sleep to finish.
+STARTED="$(date +%s)"
 kill -TERM "$WRAPPER_PID"
 set +e
 wait "$WRAPPER_PID"
