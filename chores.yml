@@ -481,10 +481,15 @@ tasks:
     # 34 lines / 1,896 bytes across twelve on 2026-09-29 (arm64 macOS), with
     # the packaging and cli-tier guards (#271): inside the budget, which is
     # not raised, and nearer it than it was.
+    #
+    # MEASURED, 2026-10-08, arm64 macOS: 43 lines / 2,464 bytes across
+    # fourteen shell tests, including the numeric quota report regression
+    # and the held-VM session messages. Both budgets carry 50% headroom,
+    # rounded up; the full raw output remains in the tier log.
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 40 2500 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 65 3700 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"

@@ -279,6 +279,16 @@ impl Filesystem {
         if change.is_empty() {
             return Ok(());
         }
+        let quota_accounting = self.sb.qflags & ((1 << 0) | (1 << 3) | (1 << 6)) != 0;
+        if quota_accounting
+            && (change.uid.is_some_and(|uid| uid != inode.uid)
+                || change.gid.is_some_and(|gid| gid != inode.gid))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "changing ownership of inode {} while quota accounting is enabled would move its usage; ownership transfer is not implemented",
+                inode.ino
+            )));
+        }
         if inode.version < 3 {
             return Err(Error::UnsupportedFeature(format!(
                 "inode {} is version {}, which has no CRC and stores a different core",

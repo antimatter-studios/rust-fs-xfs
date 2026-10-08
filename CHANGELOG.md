@@ -8,6 +8,10 @@ never does.
 
 ### Fixed
 
+- **Quota block usage and hard limits use Linux's filesystem-block units
+  (#396).** Directory growth, writes, and truncation account actual filesystem
+  blocks for user, group, and project quotas. A write exactly at a hard limit
+  succeeds; an over-limit write is refused before data or metadata changes.
 - **A job that stops before its first tier shows one red, not two.** Each
   `Keep the tier logs` upload in CI now waits for the job's first `chore test*`
   step to have run, so a failed `chore lint` is no longer joined by an upload

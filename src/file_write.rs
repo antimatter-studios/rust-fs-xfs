@@ -192,6 +192,18 @@ impl Filesystem {
         let mut group = crate::group_write::GroupAlloc::open(&self.sb, self.device(), agno)?;
         let agblock = group.take(want, ino as i64, 0)?;
         let group_items = group.into_items()?;
+        let quota_blocks = i64::try_from(blocks)
+            .map_err(|_| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
+        let quota_items = crate::quota::accounting_items(
+            self,
+            &[crate::quota::QuotaChange {
+                uid: file.uid,
+                gid: file.gid,
+                project_id: crate::quota::project_id(&raw),
+                blocks_fs: quota_blocks,
+                inodes: 0,
+            }],
+        )?;
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -232,7 +244,9 @@ impl Filesystem {
 
         // Three operations for the inode this time — format, core and
         // extent list — where a truncate logs two.
-        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 3;
+        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + 3;
 
         // Kept for the overlay, which needs the same bytes the record
         // carries (#89).
@@ -249,6 +263,9 @@ impl Filesystem {
                 },
             ];
             for item in &group_items {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
@@ -277,6 +294,9 @@ impl Filesystem {
 
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&group_items);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
         self.logged_inode(ino, &core, &logged_fork)?;
 
         Ok(lsn)

@@ -288,6 +288,27 @@ impl Filesystem {
             group_items.extend(self.free_in_group(ino, *agno, freeing_here, extents_here)?);
         }
 
+        let freed_fsblocks = extents
+            .iter()
+            .try_fold(map_blocks.len() as u64, |sum, extent| {
+                sum.checked_add(extent.blockcount)
+            })
+            .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
+        let freed_quota_blocks = i64::try_from(freed_fsblocks)
+            .ok()
+            .and_then(i64::checked_neg)
+            .ok_or_else(|| Error::UnsupportedFeature("quota block delta overflowed".into()))?;
+        let quota_items = crate::quota::accounting_items(
+            self,
+            &[crate::quota::QuotaChange {
+                uid: file.uid,
+                gid: file.gid,
+                project_id: crate::quota::project_id(&raw),
+                blocks_fs: freed_quota_blocks,
+                inodes: 0,
+            }],
+        )?;
+
         let mut core = emptied_core(&raw, true);
         // THE FORK IS AN EMPTY EXTENT LIST NOW, not a tree: the tree's
         // blocks have just been freed, so a format that still says B+tree
@@ -303,7 +324,9 @@ impl Filesystem {
         // items' own counts summed rather than a constant — how many
         // chunks of a tree block changed depends on where the record
         // went.
-        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>() + 2;
+        let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + 2;
 
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
@@ -317,6 +340,9 @@ impl Filesystem {
                 },
             ];
             for item in &group_items {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
@@ -336,6 +362,9 @@ impl Filesystem {
 
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&group_items);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
         self.logged_inode(ino, &core, &[])?;
 
         Ok(lsn)
