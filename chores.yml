@@ -403,14 +403,16 @@ tasks:
     # makes sense. These tests write with the Rust API, have the guest
     # mount the result, and compare what came back.
     #
-    # MEASURED in run 35435470063 on 2026-09-19: 482 lines / 26,812 bytes;
-    # budget half as much again.
+    # MEASURED in run 37765095462, job 113272789103, head b2c8b8e,
+    # on 2026-10-08: all 74 tests passed; 1013 lines / 58,883 bytes.
+    # The expanded matrix judges 308 pairs with zero unjudged. Retain
+    # all per-pair evidence with about 10% output headroom.
     # The floor is 36: 41 executed (job 105877826105), less the margin.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 750 42000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1100 65000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
