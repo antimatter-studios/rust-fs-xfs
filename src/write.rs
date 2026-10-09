@@ -65,9 +65,7 @@ impl Filesystem {
     /// deciding whether to fall back needs to know whether it hit a
     /// hole or a shared extent, not merely that the write was declined.
     pub fn write_at(&self, inode: &Inode, raw: &[u8], offset: u64, data: &[u8]) -> Result<usize> {
-        let Some(device) = self.writable.as_ref() else {
-            return Err(Error::ReadOnly);
-        };
+        let device = self.writable_device()?;
         if data.is_empty() {
             return Ok(0);
         }
@@ -273,9 +271,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for a v1 or v2 inode, which has no
     /// CRC and predates the fields this writes.
     pub fn set_attributes(&self, inode: &Inode, change: &AttrChange) -> Result<()> {
-        let Some(device) = self.writable.as_ref() else {
-            return Err(Error::ReadOnly);
-        };
+        let device = self.writable_device()?;
         if change.is_empty() {
             return Ok(());
         }
@@ -390,9 +386,7 @@ impl Filesystem {
     /// is a decision rather than a correction — so until one is made,
     /// each says it here.
     pub fn truncate(&self, inode: &Inode, new_size: u64, when: Option<Timestamp>) -> Result<()> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         if !inode.is_regular_file() {
             return Err(Error::NotAFile);
         }
@@ -500,9 +494,7 @@ impl Filesystem {
     where
         F: FnOnce(&mut [u8], &Inode, bool) -> Result<()>,
     {
-        let Some(device) = self.writable.as_ref() else {
-            return Err(Error::ReadOnly);
-        };
+        let device = self.writable_device()?;
         self.refuse_after_checkpoint()?;
         let at = self.inode_offset(ino)?;
         let mut raw = vec![0u8; usize::from(self.sb.inodesize)];
@@ -628,6 +620,7 @@ mod tests {
             next_head: std::sync::Mutex::new(None),
             wraps: std::sync::atomic::AtomicUsize::new(0),
             logged_anything: std::sync::atomic::AtomicBool::new(false),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             realtime: None,
         }
     }

@@ -648,9 +648,7 @@ impl Filesystem {
     }
 
     fn create(&self, parent: u64, name: &[u8], mode: u16, kind: Kind) -> Result<(u64, u64)> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "creating writes v5 metadata; a v4 filesystem is not supported".into(),

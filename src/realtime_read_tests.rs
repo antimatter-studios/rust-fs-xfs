@@ -93,6 +93,7 @@ fn filesystem() -> (Filesystem, Arc<Probe>, Arc<Probe>) {
         next_head: Mutex::new(None),
         wraps: AtomicUsize::new(0),
         logged_anything: std::sync::atomic::AtomicBool::new(false),
+        write_failed: std::sync::atomic::AtomicBool::new(false),
         realtime: Some(rt.clone()),
     };
     (fs, data, rt)

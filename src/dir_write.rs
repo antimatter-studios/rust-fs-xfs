@@ -79,9 +79,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] naming which restriction was met
     /// for a directory this cannot yet rewrite.
     pub fn rename_in_directory(&self, dir_ino: u64, from: &[u8], to: &[u8]) -> Result<u64> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         // The v5 gate every other journalled entry point has, and this
         // one did not. Renaming journals the same metadata that
         // creating, removing, truncating and writing do — v5

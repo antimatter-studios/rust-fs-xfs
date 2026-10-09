@@ -42,6 +42,14 @@ never does.
 
 ### Fixed
 
+- **A mount writes nothing after a failed log write (#400).** A record whose
+  write or flush failed may be on the device whole, in part or not at all, and
+  the next record went where it started, over whatever of it had landed. Now a
+  failed log append or push stops the mount writing, as the kernel shuts a
+  filesystem down on a log I/O error: every later change fails with
+  `Error::Io` and the device is not touched. Reads still work, and a fresh
+  mount reads the log as a crash would have left it.
+
 - **Quota block usage and hard limits use Linux's filesystem-block units
   (#396).** Directory growth, writes, and truncation account actual filesystem
   blocks for user, group, and project quotas. A write exactly at a hard limit

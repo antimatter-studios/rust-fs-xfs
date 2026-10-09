@@ -96,7 +96,8 @@ only.
 | Many journalled operations in one mount, each built on the ones before | Supported | 0.8.0 (#89) | #365 (crash at each checkpoint boundary) | `many_ops_per_mount.rs`, `random_operations_replay.rs` |
 | Log reuse in bounded memory (`sync`) | Supported | 0.8.0 (#89) | | `log_reuse.rs` |
 | A checkpoint split across several log records | Supported | 0.8.0 (#216) | | `split_checkpoint.rs` |
-| A checkpoint whose flush fails | Supported: the kernel replays to a consistent volume | 0.8.0 | #400 | `torn_checkpoint_oracle.rs` |
+| A checkpoint whose flush fails | Supported: the kernel replays to a consistent volume | 0.8.0 | | `torn_checkpoint_oracle.rs` |
+| Writing after a failed log write or push | Refused (`Error::Io`, EIO): the mount reads and writes nothing more, as the kernel shuts down | Unreleased (#400) | | `log_write_failure.rs`, `torn_checkpoint_oracle.rs` |
 | In-place writes after a mount has logged a change | Refused | 0.8.0 (#186) | | `in_place_after_checkpoint.rs` |
 | Groups whose B+trees are more than one block deep | Supported | 0.7.0 | | `deeptree_oracle.rs` |
 | Free-list refill | Supported | 0.8.0 (#197) | | `agfl_refill.rs` |

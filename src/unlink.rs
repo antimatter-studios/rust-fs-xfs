@@ -132,9 +132,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn unlink_file(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "removing writes v5 metadata; a v4 filesystem is not supported".into(),
