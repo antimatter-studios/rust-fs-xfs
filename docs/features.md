@@ -61,7 +61,8 @@ States:
 | Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | Unreleased (#403) | | `cli_fsck_oracle.rs` |
 | Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | Unreleased (#402) | #378 | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
 | Realtime metadata checked from the data device: geometry, each realtime file's extents, the bitmap against the extents files map, the summary against the bitmap, and `sb_frextents` (`rt.*`, `counter.sb.frextents`) | Experimental | Unreleased (#381) | | `realtime_check_oracle.rs` |
-| Reverse-map and reference-count metadata | Upcoming | | #379, #380 | |
+| Reverse-mapping btree checked block by block against the owners the walk finds: missing, stale, wrong-owner and duplicate records (`rmap.*`) | Experimental | Unreleased (#380) | | `rmap_check_oracle.rs`, `cli_fsck_oracle.rs` |
+| Reference-count metadata | Upcoming | | #379 | |
 | The checker's remaining gaps against `xfs_repair -n` | Upcoming | | #364 | |
 | Repair planning, `fsck.xfs --dry-run` and `fs_xfs::repair`: proposed changes with before and after bytes, writing nothing; refused by `repair.*` finding without exclusive access, under `rmapbt`, realtime, quota or `log_incompat`, on a dirty log, an incomplete scan or ambiguous ownership | Experimental: no repair rule ships yet, so every error is listed as left | Unreleased (#404) | #376, #377 | `repair_plan.rs`, `cli_repair_plan_oracle.rs` |
 | Repair (`-y`, `-p`) | Refused (exit 16) | 0.11.0 (#339) | #376, #377 | `cli_fsck_oracle.rs` |
