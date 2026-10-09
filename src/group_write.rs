@@ -501,6 +501,33 @@ impl<'a> GroupAlloc<'a> {
     ///
     /// [`Error::UnsupportedFeature`] when no run holds `want` blocks from an
     /// aligned start.
+    /// Take up to `want` blocks from one run: the first run that holds
+    /// them all, or else the longest there is (#388). Returns where the
+    /// blocks start and how many were taken, or `None` if the group has
+    /// no free space at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`GroupAlloc::take`].
+    pub(crate) fn take_up_to(
+        &mut self,
+        want: u32,
+        owner: i64,
+        offset: u64,
+    ) -> Result<Option<(u32, u32)>> {
+        let fits = self.by_block.iter().any(|run| run.blockcount >= want);
+        let got = if fits {
+            want
+        } else {
+            crate::alloc_btree::longest(&self.by_block).min(want)
+        };
+        if got == 0 {
+            return Ok(None);
+        }
+        let start = self.take(got, owner, offset)?;
+        Ok(Some((start, got)))
+    }
+
     pub(crate) fn take_aligned(
         &mut self,
         want: u32,

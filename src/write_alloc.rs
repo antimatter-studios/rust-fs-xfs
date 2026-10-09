@@ -11,7 +11,9 @@
 //! - **written**: the bytes are overwritten in place, and nothing else in
 //!   the block moves;
 //! - **a hole**: blocks are taken from the inode's allocation group and a
-//!   new written extent maps them;
+//!   new written extent maps them, from the inode's own group while it
+//!   has free runs and then from each other group in turn (#388), so one
+//!   hole may become several extents in several groups;
 //! - **unwritten**: the part of the extent the write covers becomes a
 //!   written extent of its own, and what is left on either side stays
 //!   unwritten.
@@ -35,7 +37,7 @@
 //!
 //! - a file whose extents are in a B+tree, or a write that would leave
 //!   more extents than the inode has room to list;
-//! - a hole longer than one free run in the inode's group;
+//! - a hole no allocation group has room left for;
 //! - a reflinked, real-time or inline file, and a v4 filesystem.
 
 use crate::create::clock_now;
@@ -260,12 +262,60 @@ impl Filesystem {
 
         let old = self.data_extents(&file, &raw)?;
         let mut planned = plan(&old, first, last);
-        let pieces: u64 = planned
-            .holes
-            .iter()
-            .map(|&(_, len)| len.div_ceil(MAX_EXTENT_BLOCKS))
-            .sum();
-        let count = planned.extents.len() as u64 + pieces;
+
+        // Every hole is given blocks: from the inode's own group while it
+        // has them, then from each other group in turn (#388), one free run
+        // at a time. Only the groups' copies in memory change here; nothing
+        // is written until every refusal is behind us.
+        let (home, _, _) = self.sb.split_ino(ino);
+        let order: Vec<u32> = (0..self.sb.agcount)
+            .map(|i| (home + i) % self.sb.agcount)
+            .collect();
+        let mut groups: Vec<(u32, crate::group_write::GroupAlloc)> = Vec::new();
+        let mut taken = 0u64;
+        for &(start, len) in &planned.holes {
+            let mut fb = start;
+            let mut next = 0;
+            while fb < start + len {
+                let want = (start + len - fb).min(MAX_EXTENT_BLOCKS) as u32;
+                let Some(&agno) = order.get(next) else {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "no allocation group has room for the {} blocks still wanted at \
+                         file block {fb} of inode {ino}",
+                        start + len - fb
+                    )));
+                };
+                let at = match groups.iter().position(|(a, _)| *a == agno) {
+                    Some(at) => at,
+                    None => {
+                        groups.push((
+                            agno,
+                            crate::group_write::GroupAlloc::open(&self.sb, self.device(), agno)?,
+                        ));
+                        groups.len() - 1
+                    }
+                };
+                let Some((agblock, got)) = groups[at].1.take_up_to(want, ino as i64, fb)? else {
+                    next += 1;
+                    continue;
+                };
+                let got = u64::from(got);
+                let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(agblock);
+                planned.extents.push(Extent {
+                    startoff: fb,
+                    startblock: fsblock,
+                    blockcount: got,
+                    unwritten: false,
+                });
+                for i in 0..got {
+                    planned.mapped.push((fb + i, Block::Whole(fsblock + i)));
+                }
+                taken += got;
+                fb += got;
+            }
+        }
+        planned.extents.sort_by_key(|e| e.startoff);
+        let count = planned.extents.len() as u64;
         let (fork_start, fork_end) = file.data_fork_range(usize::from(self.sb.inodesize));
         let room = ((fork_end - fork_start) / EXTENT_BYTES) as u64;
         if count > room {
@@ -274,32 +324,10 @@ impl Filesystem {
                  fork has room to list; a B+tree would be needed"
             )));
         }
-
-        // Every hole is given blocks in the inode's own group.
-        let (agno, _, _) = self.sb.split_ino(ino);
-        let mut group = crate::group_write::GroupAlloc::open(&self.sb, self.device(), agno)?;
-        let mut taken = 0u64;
-        for &(start, len) in &planned.holes {
-            let mut fb = start;
-            while fb < start + len {
-                let want = (start + len - fb).min(MAX_EXTENT_BLOCKS);
-                let agblock = group.take(want as u32, ino as i64, fb)?;
-                let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(agblock);
-                planned.extents.push(Extent {
-                    startoff: fb,
-                    startblock: fsblock,
-                    blockcount: want,
-                    unwritten: false,
-                });
-                for i in 0..want {
-                    planned.mapped.push((fb + i, Block::Whole(fsblock + i)));
-                }
-                taken += want;
-                fb += want;
-            }
+        let mut group_items = Vec::new();
+        for (_, group) in groups {
+            group_items.extend(group.into_items()?);
         }
-        planned.extents.sort_by_key(|e| e.startoff);
-        let group_items = group.into_items()?;
         let quota_items = crate::quota::accounting_items(
             self,
             &[crate::quota::QuotaChange {
