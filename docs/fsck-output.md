@@ -165,6 +165,12 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `dir.unreached` | error | no | An allocated inode is reached by no directory. |
 | `log.replayed` | warning | no | The log held records that had not been applied; the volume was checked as replaying them leaves it, and its counters were not. |
 | `mount` | error | yes | The filesystem could not be mounted, so nothing was checked. |
+| `rt.geometry` | error | no | The superblock's realtime fields disagree with each other. |
+| `rt.extent` | error | no | A realtime file maps an extent outside the realtime section. |
+| `rt.cross-link` | error | no | Two realtime files map one realtime extent. |
+| `rt.bitmap` | error | no | The realtime bitmap calls an extent free that a file maps, or in use when nothing maps it. |
+| `rt.summary` | error | no | The realtime summary is not what the bitmap adds up to. |
+| `counter.sb.frextents` | error | no | The superblock's free realtime extent count is not what the bitmap holds. |
 | `repair.not-exclusive` | warning | no | No repair was planned: another holder has the target, or it is mounted. |
 | `repair.feature` | warning | no | No repair was planned: the volume uses a feature the planner does not reason about. |
 | `repair.log-dirty` | warning | no | No repair was planned: the log needed replay. |

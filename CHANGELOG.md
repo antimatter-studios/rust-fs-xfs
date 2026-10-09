@@ -25,6 +25,14 @@ never does.
   one that would still need a tree, and a cut inside a block another file
   shares, are refused by name.
 
+- **The checker reads a volume's realtime metadata (#381).** From the data
+  device alone: the realtime geometry fields against each other, every
+  realtime file's extents against the section, the bitmap against the extents
+  files map, the summary against the bitmap, and `sb_frextents` against the
+  bitmap's free count. Realtime files' extent-tree blocks, on the data device,
+  are now claimed like any other. New findings: `rt.geometry`, `rt.extent`,
+  `rt.cross-link`, `rt.bitmap`, `rt.summary` and `counter.sb.frextents`.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount

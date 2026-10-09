@@ -130,6 +130,7 @@ fn run(
         counted: HashMap::new(),
         allocated: allocated.iter().copied().collect(),
         free: HashSet::new(),
+        rt_used: Vec::new(),
     };
     c.quotas(inodes, raws);
     c.report
