@@ -1632,7 +1632,7 @@ impl Filesystem {
             let Some(child) = dir::parse_node(&block, &self.sb)?.child_for_hash(hash) else {
                 return Ok(None);
             };
-            at = u64::from(child);
+            at = self.dablk_to_dir_block(child, dir_inode.ino)?;
             block = self
                 .read_dir_block(&extents, at, dir_inode.ino)?
                 .ok_or_else(|| {
@@ -1660,7 +1660,7 @@ impl Filesystem {
             if !continues {
                 break;
             }
-            at = u64::from(leaf.forw);
+            at = self.dablk_to_dir_block(leaf.forw, dir_inode.ino)?;
             block = match self.read_dir_block(&extents, at, dir_inode.ino)? {
                 Some(b) => b,
                 None => break,
@@ -1685,6 +1685,25 @@ impl Filesystem {
     /// Directory block `dir_block` (in the directory's own block numbers),
     /// read whole through the extent list, or `None` where any of it is a
     /// hole or unwritten.
+    /// The directory block a node entry or a sibling pointer names.
+    ///
+    /// Both hold an `xfs_dablk_t`, which counts FILESYSTEM blocks into the
+    /// directory's file, not directory blocks: with 1 KiB blocks and the
+    /// 4 KiB directory blocks `mkfs.xfs` gives them, the leaf after the
+    /// root is 4 further on, not 1 (#367). One that does not start a
+    /// directory block names none.
+    fn dablk_to_dir_block(&self, dablk: u32, owner: u64) -> Result<u64> {
+        let per = u64::from(self.sb.dirblocksize()) / u64::from(self.sb.blocksize);
+        let dablk = u64::from(dablk);
+        if dablk % per != 0 {
+            return Err(Error::BadSuperblock(format!(
+                "directory inode {owner}: an index pointer names file block {dablk}, inside \
+                 a {per}-block directory block"
+            )));
+        }
+        Ok(dablk / per)
+    }
+
     fn read_dir_block(
         &self,
         extents: &[Extent],
