@@ -66,6 +66,7 @@ pub mod truncate;
 mod truncate_to;
 pub mod unlink;
 pub mod write;
+pub mod write_alloc;
 
 pub use error::{Error, Result};
 pub use fs::Filesystem;

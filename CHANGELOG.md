@@ -64,6 +64,15 @@ never does.
   `Error::DirectoryNotEmpty` (ENOTEMPTY in the C ABI), and a name that is not a
   directory with `Error::NotADirectory`, before anything is written.
 
+- **A write anywhere in a file (#387).** `Filesystem::write(ino, offset,
+  data)` is the journalled write `write_at` cannot make: a hole is given
+  blocks from the inode's group, the covered part of an unwritten extent
+  becomes written and the rest stays unwritten, and a write past the end grows
+  the file. Every byte the write does not reach reads as zero, including the
+  old last block's tail. The data goes down first and one record logs the
+  group's trees, quota and the inode's whole extent list. A file whose extents
+  are in a B+tree, or a write that would need one, is refused by name.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
