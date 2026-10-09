@@ -76,7 +76,7 @@ only.
 
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
-| Overwrite existing bytes in place | Supported | 0.5.0 | #386 | `write_oracle.rs` |
+| Overwrite existing bytes in place: aligned, unaligned, across blocks, at extent edges and repeated, with the size and extent map unchanged | Supported | 0.5.0; cases Unreleased (#386) | | `write_oracle.rs`, `overwrite_ranges_oracle.rs` |
 | Change timestamps, permissions and ownership | Supported | 0.5.0; pre-1970 times 0.8.0 | | `capi.rs`, `write_oracle.rs` |
 | Write into an empty file, allocating | Supported | 0.5.1 (#32) | | `file_write_replay_oracle.rs` |
 | Write anywhere in a file (`Filesystem::write`): holes given blocks, unwritten extents converted where covered, the file grown past its end, zeros wherever the write does not reach | Experimental: extent-format files whose extents fit in the inode, one free run per hole | Unreleased (#387) | #388 (across groups) | `write_through_holes.rs`, `write_holes_oracle.rs` |
