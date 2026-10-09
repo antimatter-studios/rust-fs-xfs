@@ -66,8 +66,6 @@ mod core_at {
     /// `di_format`: how the data fork maps its blocks.
     pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
-    /// `di_format`: how the data fork is kept.
-    pub const FORMAT: usize = 5;
     pub const SIZE: usize = 56;
     /// `di_nblocks`: the blocks the inode owns.
     pub const NBLOCKS: usize = 64;
