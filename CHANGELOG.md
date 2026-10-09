@@ -152,6 +152,12 @@ never does.
   0 bytes and an empty record needs 52". A checkpoint that would leave less
   than a pad record now wraps first, and the pad covers the larger gap.
 
+- **A link or a move costs as much in a big directory as in a small one
+  (#367).** Each listed the whole directory to see whether the name was there,
+  reading every data block, so growing a directory to a two-level index took
+  quadratic time. Both now find the name through the hash index, as a lookup
+  does, and one link reads 39 KiB at 12,000 names where it read 715 KiB.
+
 - **Lookups in node-form directories over small blocks (#367).** A node's child
   pointers and a leaf's sibling pointers count filesystem blocks, not
   directory blocks. With 1 KiB blocks under 4 KiB directory blocks, which

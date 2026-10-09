@@ -117,29 +117,25 @@ impl Filesystem {
         if !src.is_dir() || !dst.is_dir() {
             return Err(Error::NotADirectory);
         }
-        let moved_entry = self
-            .read_dir(&src, &src_raw)?
-            .into_iter()
-            .find(|e| e.name == from)
+        // Both names through the hash index, not a listing, which reads
+        // every data block of a directory however big it is.
+        let moved_ino = self
+            .entry_ino(&src, &src_raw, from)?
             .ok_or(Error::NotFound)?;
-        let target = self
-            .read_dir(&dst, &dst_raw)?
-            .into_iter()
-            .find(|e| e.name == to);
+        let target = self.entry_ino(&dst, &dst_raw, to)?;
         if same_dir && target.is_none() {
             return self.rename_in_directory(from_dir, from, to);
         }
-        let moved_ino = moved_entry.ino;
-        if target.as_ref().is_some_and(|t| t.ino == moved_ino) {
+        if target == Some(moved_ino) {
             return Ok(0);
         }
         let (moved, moved_raw) = self.read_inode_raw(moved_ino)?;
         let is_dir = moved.is_dir();
 
         // What the target is, and whether it may be replaced.
-        let victim = match &target {
+        let victim = match target {
             Some(t) => {
-                let (inode, raw) = self.read_inode_raw(t.ino)?;
+                let (inode, raw) = self.read_inode_raw(t)?;
                 match (is_dir, inode.is_dir()) {
                     (false, true) => return Err(Error::NotAFile),
                     (true, false) => return Err(Error::NotADirectory),
@@ -199,7 +195,7 @@ impl Filesystem {
         let arriving = Entry {
             name: to.to_vec(),
             ino: moved_ino,
-            ftype: dir::ftype_to_raw(moved_entry.ftype),
+            ftype: dir::ftype_to_raw(moved.file_type()),
         };
         let mut allocations = Allocations::new();
         let (src_change, dst_change) = if same_dir {
@@ -489,11 +485,10 @@ impl Filesystem {
                 inode.nlink
             )));
         }
-        if self
-            .read_dir(&dir, &dir_raw)?
-            .iter()
-            .any(|e| e.name == name)
-        {
+        // Through the hash index, not a listing: a listing reads every
+        // data block, so each link into a node-form directory cost as
+        // much as the directory was big.
+        if self.entry_ino(&dir, &dir_raw, name)?.is_some() {
             return Err(Error::AlreadyExists);
         }
 

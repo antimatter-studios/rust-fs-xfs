@@ -1573,6 +1573,31 @@ impl Filesystem {
         self.read_inode(ino)
     }
 
+    /// The inode number `name` names in `dir_inode`, or `None`: through
+    /// the hash index past short form, as [`Filesystem::lookup`] finds it,
+    /// without reading the inode it names.
+    pub(crate) fn entry_ino(
+        &self,
+        dir_inode: &Inode,
+        raw: &[u8],
+        name: &[u8],
+    ) -> Result<Option<u64>> {
+        if !dir_inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        if name == b"." || name == b".." {
+            return Ok(None);
+        }
+        if dir_inode.format == Format::Local {
+            return Ok(self
+                .read_dir(dir_inode, raw)?
+                .into_iter()
+                .find(|e| e.name == name)
+                .map(|e| e.ino));
+        }
+        self.lookup_by_hash(dir_inode, raw, name)
+    }
+
     /// The inode number `name` resolves to in a block-, leaf- or node-form
     /// directory, found through its hash index, or `None`.
     fn lookup_by_hash(&self, dir_inode: &Inode, raw: &[u8], name: &[u8]) -> Result<Option<u64>> {
