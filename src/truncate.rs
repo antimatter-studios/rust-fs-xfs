@@ -161,6 +161,44 @@ impl Filesystem {
         Ok(items)
     }
 
+    /// Free every extent of `ino`'s data fork into `allocations`: each
+    /// extent's reverse mapping is forgotten, matched exactly, and what
+    /// the reference-count tree says no other file holds goes back to free
+    /// space (#383). Nothing is written.
+    pub(crate) fn free_file_extents<'a>(
+        &'a self,
+        allocations: &mut crate::group_write::Allocations<'a>,
+        ino: u64,
+        extents: &[crate::extent::Extent],
+    ) -> Result<()> {
+        for extent in extents {
+            let (agno, agblock) = crate::group_write::split_fsblock(&self.sb, extent.startblock);
+            let blockcount = u32::try_from(extent.blockcount).map_err(|_| {
+                Error::UnsupportedFeature(format!(
+                    "inode {ino} has an extent of {} blocks",
+                    extent.blockcount
+                ))
+            })?;
+            let group = allocations.group(&self.sb, self.device(), agno)?;
+            let offset = extent.startoff
+                | if extent.unwritten {
+                    crate::rmap::OFF_UNWRITTEN
+                } else {
+                    0
+                };
+            group.forget_rmap(crate::rmap::Rmap {
+                startblock: agblock,
+                blockcount,
+                owner: ino as i64,
+                offset,
+            })?;
+            for range in group.release_shared(agblock, blockcount)? {
+                group.give_back(range)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
         self.writable_device()?;
         if !self.sb.is_v5() {

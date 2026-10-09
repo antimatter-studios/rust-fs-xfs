@@ -81,7 +81,7 @@ mod core_at {
 /// The identity fields are left exactly as they are: this inode will be
 /// handed out again, and `di_ino` and `di_uuid` are as correct now as
 /// they will be then.
-fn emptied_core(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn emptied_core(raw: &[u8]) -> Vec<u8> {
     let mut core = raw.to_vec();
     core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0u16.to_be_bytes());
     core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&0u32.to_be_bytes());
@@ -177,6 +177,47 @@ impl Filesystem {
         self.remove_name(parent, name, Target::Directory)
     }
 
+    /// The inode-tree items that give inode `ino` back to its chunk: the
+    /// chunk's free mask and count, both inode trees, and the group's
+    /// header. Nothing is written.
+    pub(crate) fn freed_inode_items(&self, ino: u64) -> Result<Vec<crate::buf_write::BufferItem>> {
+        let (agno, _, _) = self.sb.split_ino(ino);
+
+        // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
+        // are. This read the AGI, checked both trees were a single block
+        // deep, edited a chunk and wrote the roots back. A 1 KiB root
+        // holds 60 chunk records and a chunk is 64 inodes, so a group
+        // with four thousand inodes in it already has a deeper tree and
+        // could not be unlinked from.
+        let mut trees = crate::inode_btree::Trees::open(&self.sb, self.device(), agno)?;
+
+        // Which chunk holds it, and where in that chunk.
+        let (_, ag_block, offset) = self.sb.split_ino(ino);
+        let agino = (ag_block << self.sb.inopblog) | offset;
+        let index = trees
+            .chunks()
+            .iter()
+            .position(|c| {
+                agino >= c.startino
+                    && agino - c.startino < u32::from(crate::inode_btree::INODES_PER_CHUNK)
+            })
+            .ok_or_else(|| {
+                Error::CorruptLog(format!(
+                    "inode {ino} is in no chunk of allocation group {agno}'s inode tree"
+                ))
+            })?;
+        let slot = (agino - trees.chunks()[index].startino) as u8;
+        trees.chunks_mut()[index].give_back(slot)?;
+
+        // The count of allocated inodes does not move: freeing one
+        // inside a chunk leaves the chunk where it was, and the count is
+        // of chunks' worth of inodes rather than of inodes in use.
+        let count = trees.agi().count;
+        let freecount: u32 = trees.chunks().iter().map(|c| u32::from(c.freecount)).sum();
+        trees.set_counts(count, freecount, None);
+        trees.into_items()
+    }
+
     fn remove_name(&self, parent: u64, name: &[u8], target: Target) -> Result<(u64, u64)> {
         self.writable_device()?;
         if !self.sb.is_v5() {
@@ -268,41 +309,7 @@ impl Filesystem {
             )));
         }
 
-        let (agno, _, _) = self.sb.split_ino(ino);
-
-        // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
-        // are. This read the AGI, checked both trees were a single block
-        // deep, edited a chunk and wrote the roots back. A 1 KiB root
-        // holds 60 chunk records and a chunk is 64 inodes, so a group
-        // with four thousand inodes in it already has a deeper tree and
-        // could not be unlinked from.
-        let mut trees = crate::inode_btree::Trees::open(&self.sb, self.device(), agno)?;
-
-        // Which chunk holds it, and where in that chunk.
-        let (_, ag_block, offset) = self.sb.split_ino(ino);
-        let agino = (ag_block << self.sb.inopblog) | offset;
-        let index = trees
-            .chunks()
-            .iter()
-            .position(|c| {
-                agino >= c.startino
-                    && agino - c.startino < u32::from(crate::inode_btree::INODES_PER_CHUNK)
-            })
-            .ok_or_else(|| {
-                Error::CorruptLog(format!(
-                    "inode {ino} is in no chunk of allocation group {agno}'s inode tree"
-                ))
-            })?;
-        let slot = (agino - trees.chunks()[index].startino) as u8;
-        trees.chunks_mut()[index].give_back(slot)?;
-
-        // The count of allocated inodes does not move: freeing one
-        // inside a chunk leaves the chunk where it was, and the count is
-        // of chunks' worth of inodes rather than of inodes in use.
-        let count = trees.agi().count;
-        let freecount: u32 = trees.chunks().iter().map(|c| u32::from(c.freecount)).sum();
-        trees.set_counts(count, freecount, None);
-        let group_items = trees.into_items()?;
+        let group_items = self.freed_inode_items(ino)?;
 
         let mut allocations = crate::group_write::Allocations::new();
         let (fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) =
