@@ -33,6 +33,12 @@ never does.
   are now claimed like any other. New findings: `rt.geometry`, `rt.extent`,
   `rt.cross-link`, `rt.bitmap`, `rt.summary` and `counter.sb.frextents`.
 
+- **The checker counts shared blocks against the refcount btree (#379).**
+  Every refcount record is compared with the number of file mappings the walk
+  finds for its blocks. A record over blocks one mapping or none holds is
+  `refcount.stale`, and a count that differs from the walk's is
+  `refcount.count`.
+
 - **The checker reads the reverse-mapping btree (#380).** On an `rmapbt`
   volume, every record is compared block by block with the owner the walk
   found: the group headers, the log, the free-space and inode btrees, inode

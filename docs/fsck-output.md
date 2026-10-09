@@ -175,6 +175,8 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `rmap.stale` | error | no | The reverse-mapping btree records an owner for a block nothing owns, or that is free. |
 | `rmap.owner` | error | no | The reverse-mapping btree records a block under one owner while the walk found it owned by another. |
 | `rmap.duplicate` | error | no | The reverse-mapping btree records the same owner of a block twice. |
+| `refcount.stale` | error | no | The refcount btree records blocks as shared that one owner or none holds. |
+| `refcount.count` | error | no | The refcount btree's count for shared blocks is not the number of file mappings the walk finds. |
 | `repair.not-exclusive` | warning | no | No repair was planned: another holder has the target, or it is mounted. |
 | `repair.feature` | warning | no | No repair was planned: the volume uses a feature the planner does not reason about. |
 | `repair.log-dirty` | warning | no | No repair was planned: the log needed replay. |

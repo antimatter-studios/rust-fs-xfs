@@ -168,6 +168,12 @@ pub enum Code {
     RmapOwner,
     /// The reverse-mapping btree records the same owner of a block twice.
     RmapDuplicate,
+    /// The refcount btree records blocks as shared that one owner or none
+    /// holds (#379).
+    RefcountStale,
+    /// The refcount btree's count for shared blocks is not the number of
+    /// file mappings the walk finds.
+    RefcountCount,
     /// No repair was planned: another holder has the target, or it is
     /// mounted or attached to a loop device (#375).
     RepairNotExclusive,
@@ -254,6 +260,8 @@ impl Code {
         Code::RmapStale,
         Code::RmapOwner,
         Code::RmapDuplicate,
+        Code::RefcountStale,
+        Code::RefcountCount,
         Code::RepairNotExclusive,
         Code::RepairFeature,
         Code::RepairLogDirty,
@@ -322,6 +330,8 @@ impl Code {
             Code::RmapStale => "rmap.stale",
             Code::RmapOwner => "rmap.owner",
             Code::RmapDuplicate => "rmap.duplicate",
+            Code::RefcountStale => "refcount.stale",
+            Code::RefcountCount => "refcount.count",
             Code::RepairNotExclusive => "repair.not-exclusive",
             Code::RepairFeature => "repair.feature",
             Code::RepairLogDirty => "repair.log-dirty",
@@ -553,6 +563,8 @@ struct Checker<'a> {
     claimed: Vec<Vec<(u32, u32, Owner)>>,
     /// Per group, the reverse-mapping btree's records, when it was read.
     rmaps: Vec<Option<Vec<crate::rmap::Rmap>>>,
+    /// Per group, the refcount btree's records, when it was read.
+    refcounts: Vec<Option<Vec<crate::refcount::Refcount>>>,
 }
 
 /// Check `fs`. Never writes.
@@ -575,6 +587,7 @@ pub fn check(fs: &Filesystem) -> Report {
         rt_used: Vec::new(),
         claimed: vec![Vec::new(); sb.agcount as usize],
         rmaps: vec![None; sb.agcount as usize],
+        refcounts: vec![None; sb.agcount as usize],
     };
     c.secondaries();
     let mut totals = Totals::default();
@@ -586,6 +599,7 @@ pub fn check(fs: &Filesystem) -> Report {
     c.counters(&totals);
     c.realtime();
     c.reverse_mappings();
+    c.reference_counts();
     c.report
 }
 
@@ -1005,13 +1019,14 @@ impl Checker<'_> {
                     for b in blocks {
                         self.claim(ag, b, 1, Owner::Btree("refcount"));
                     }
-                    for r in records {
+                    for r in &records {
                         if r.refcount > 1 && !r.cow {
                             for b in r.startblock..r.startblock.saturating_add(r.blockcount) {
                                 self.shared[ag as usize].insert(b);
                             }
                         }
                     }
+                    self.refcounts[ag as usize] = Some(records);
                 }
                 Err(e) => self.failed(
                     Code::BtreeUnreadable,
@@ -1980,6 +1995,72 @@ impl Checker<'_> {
             for ag in 0..self.rmaps.len() {
                 if let Some(records) = self.rmaps[ag].take() {
                     self.reverse_mapping_group(ag as u32, &records);
+                }
+            }
+        }
+    }
+
+    /// Every group's refcount records against the file mappings the walk
+    /// found (#379).
+    ///
+    /// A block's count is the number of file mappings that claim it, one
+    /// per extent, so one inode mapping a block twice counts twice, as the
+    /// kernel counts it. A record over blocks that one mapping or none
+    /// holds is stale; a record whose count differs from the walk's is
+    /// wrong. A shared block with no record at all is already a
+    /// cross-link. Copy-on-write staging records are left alone, and
+    /// nothing is compared after a partial scan.
+    fn reference_counts(&mut self) {
+        if self.report.scan == Scan::Partial {
+            return;
+        }
+        for ag in 0..self.refcounts.len() {
+            let Some(records) = self.refcounts[ag].take() else {
+                continue;
+            };
+            let mut mappings: HashMap<u32, u32> = HashMap::new();
+            for &(start, len, owner) in &self.claimed[ag] {
+                if owner.is_file_data() {
+                    for b in start..start + len {
+                        *mappings.entry(b).or_insert(0) += 1;
+                    }
+                }
+            }
+            let ag = ag as u32;
+            for r in records.iter().filter(|r| !r.cow) {
+                let end = r.startblock.saturating_add(r.blockcount);
+                let mut b = r.startblock;
+                while b < end {
+                    let found = mappings.get(&b).copied().unwrap_or(0);
+                    let mut run = 1;
+                    while b + run < end && mappings.get(&(b + run)).copied().unwrap_or(0) == found {
+                        run += 1;
+                    }
+                    let verdict = if found <= 1 {
+                        Some(Code::RefcountStale)
+                    } else if found != r.refcount {
+                        Some(Code::RefcountCount)
+                    } else {
+                        None
+                    };
+                    if let Some(code) = verdict {
+                        self.find_at(
+                            code,
+                            Location {
+                                ag: Some(ag),
+                                agbno: Some(b),
+                                ino: None,
+                                field: None,
+                            },
+                            format!(
+                                "blocks {b}..{} of group {ag} are recorded as shared by {} \
+                                 mappings, and the walk finds {found}",
+                                b + run,
+                                r.refcount
+                            ),
+                        );
+                    }
+                    b += run;
                 }
             }
         }

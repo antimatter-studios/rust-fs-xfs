@@ -133,6 +133,7 @@ fn run(
         rt_used: Vec::new(),
         claimed: Vec::new(),
         rmaps: Vec::new(),
+        refcounts: Vec::new(),
     };
     c.quotas(inodes, raws);
     c.report
