@@ -120,6 +120,14 @@ never does.
 
 ### Fixed
 
+- **A directory data block that does not parse is `dir.unreadable` (#364).**
+  The check listed a directory through the reader, which passes over a block
+  whose magic is not a data block's. So a directory missing a block read as a
+  clean one, its names reported only as unreached inodes. XFS leaves a
+  directory's free space unmapped, so every mapped data-region block must parse,
+  and one that does not now stops the walk as `dir.unreadable`. `xfs_repair -n`
+  agreed in the per-code oracle.
+
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and
   the next record went where it started, over whatever of it had landed. Now a

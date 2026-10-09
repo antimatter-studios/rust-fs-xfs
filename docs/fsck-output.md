@@ -205,8 +205,8 @@ code has neither a case nor a reason.
 | `sb.copy.field` | `cli_fsck_oracle.rs`: sb1-logblocks |
 | `sb.copy.uuid` | none: `xfs_repair -n` does not compare a secondary superblock's UUID, so there is no reference verdict to hold this to; this checker reports a copy naming another filesystem, and the repair refuses to overwrite it (`cli_superblock_repair_oracle.rs`). |
 | `ag.agf.unreadable` | `cli_fsck_oracle.rs`: a group that cannot be read |
-| `ag.agi.unreadable` | `cli_fsck_oracle.rs`: agi1-magic |
-| `ag.agfl.unreadable` | `cli_fsck_oracle.rs`: agfl1-magic |
+| `ag.agi.unreadable` | none: this driver's mount reads every group's AGI header, so a damaged one is refused as `mount` (agi-freecount) before the check can report it by group. |
+| `ag.agfl.unreadable` | none: `xfs_repair -n` calls a free list with a damaged header clean, so there is no reference verdict to hold this to; this checker reports it. |
 | `ag.length` | `cli_fsck_oracle.rs`: agi1-length |
 | `btree.unreadable` | `cli_fsck_oracle.rs`: cntbt-magic |
 | `inobt.record` | `cli_fsck_oracle.rs`: inobt-freecount |

@@ -424,6 +424,9 @@ fn every_damage_the_reference_finds_is_found() {
     }
 }
 
+/// A damage case: the code it is for, its name, and the `xfs_db` commands.
+type Case = (&'static str, &'static str, Vec<String>);
+
 /// One damage per checker code (#364): `(code, case, xfs_db commands)`.
 ///
 /// Each is damage `xfs_repair -n` must find, and the report must carry
@@ -434,12 +437,13 @@ fn every_damage_the_reference_finds_is_found() {
 /// `docs/fsck-output.md` lists every code, the case here (or above) that
 /// damages it, or why none does; `tests/fsck_coverage_contract.rs`
 /// holds the two to each other.
-fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<String>)> {
+fn one_damage_per_code(base: &str) -> Vec<Case> {
     let ino = |name: &str| inode_of(base, name);
     let (small, medium) = (ino("small.txt"), ino("medium.bin"));
     let (fragmented, manyfiles) = (ino("fragmented.bin"), ino("manyfiles"));
     let sub = ino("sub");
     let root = db_value(base, &["sb 0", "p rootino"]);
+    let agi0_count = db_value(base, &["agi 0", "p count"]);
     // A free inode in the root's chunk: the fixture allocates its first
     // inodes in order and leaves the end of the chunk free.
     let free_ino = root + 60;
@@ -463,16 +467,6 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             "sb.copy.field",
             "sb1-logblocks",
             vec!["sb 1".into(), "write -d logblocks 1234".into()],
-        ),
-        (
-            "ag.agi.unreadable",
-            "agi1-magic",
-            vec!["agi 1".into(), "write -d magicnum 0".into()],
-        ),
-        (
-            "ag.agfl.unreadable",
-            "agfl1-magic",
-            vec!["agfl 1".into(), "write -d magicnum 0".into()],
         ),
         (
             "ag.length",
@@ -550,17 +544,10 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
         (
             "counter.agi.inodes",
             "agi1-count",
-            vec!["agi 1".into(), "write -d count 64".into()],
-        ),
-        (
-            "counter.agi.iblocks",
-            "agi1-iblocks",
-            vec!["agi 1".into(), "write -d iblocks 5".into()],
-        ),
-        (
-            "counter.agi.fblocks",
-            "agi1-fblocks",
-            vec!["agi 1".into(), "write -d fblocks 5".into()],
+            vec![
+                "agi 0".into(),
+                format!("write -d count {}", agi0_count + 64),
+            ],
         ),
         (
             "counter.sb.ifree",
@@ -638,9 +625,30 @@ fn every_code_fires_on_damage_the_reference_finds() {
     let source = fixture("xfsdata-default.img");
     let base = source.to_str().unwrap();
     let mut wrong = Vec::new();
-    let cases = one_damage_per_code(base);
-    for (code, name, commands) in &cases {
-        let image = damaged(&source, name, commands);
+    // The inode btree block counts mean something only where the volume
+    // keeps them (`inobtcount`), which the data fixture does not, so those
+    // two codes are damaged on a fixture that does.
+    let counted = fixture("xfsfeat-finobt-inobtcount.img");
+    let mut cases: Vec<(&std::path::Path, Case)> = one_damage_per_code(base)
+        .into_iter()
+        .map(|c| (source.as_path(), c))
+        .collect();
+    for case in [
+        (
+            "counter.agi.iblocks",
+            "agi1-iblocks",
+            vec!["agi 1".to_string(), "write -d iblocks 5".to_string()],
+        ),
+        (
+            "counter.agi.fblocks",
+            "agi1-fblocks",
+            vec!["agi 1".to_string(), "write -d fblocks 5".to_string()],
+        ),
+    ] {
+        cases.push((counted.as_path(), case));
+    }
+    for (source, (code, name, commands)) in &cases {
+        let image = damaged(source, name, commands);
         let image = image.path().to_str().unwrap();
         let (clean, said) = repair(image);
         if clean {
