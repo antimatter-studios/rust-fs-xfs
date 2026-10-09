@@ -79,6 +79,9 @@ never does.
   `docs/fsck-output.md` gains a damage-coverage table. It names each code's
   case, or why it has none (the planner's warnings and a replayed log), and a
   contract test fails a code added without one.
+- **`rmap.duplicate` has a damage case (#433).** A copy of the reverse-mapping
+  leaf's last record written after it: `xfs_repair -n` finds it, `fsck.xfs`
+  reports the duplicate and no missing, stale or wrong-owner record.
 
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
