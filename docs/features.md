@@ -51,7 +51,7 @@ States:
 | Filesystems shaped by the stress generators | Supported | 0.8.0 | | `stress_oracle.rs` |
 | `finobt`, `rmapbt`, `reflink`, `inobtcnt`, `ftype`, sparse inodes, metadata UUID | Supported | 0.1.0; pinned matrix with provenance Unreleased (#428) | | `feature_matrix_oracle.rs`, `feature_bit_contract.rs` |
 | Legacy shared superblocks and advertised unknown `features2` bits; any `log_incompat` bit on a writable mount or a log that needs replay | Refused at mount, before the log is read | Unreleased (#428) | | `feature_bit_contract.rs` |
-| An unknown incompatible feature bit | Refused | 0.1.0 | #360 | `src/superblock.rs` unit tests |
+| An unknown incompatible feature bit, named by its exact error before any device write | Refused | 0.1.0; exact gate errors Unreleased (#428) | | `src/superblock.rs` unit tests, `feature_bit_contract.rs` |
 | Fuzzed parsers: superblock, group headers, inodes, directories, btrees | Supported | 0.8.0 (#96) | | `fuzz_decoders.rs` |
 
 ## Checking
