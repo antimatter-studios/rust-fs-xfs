@@ -194,7 +194,10 @@ fn a_bitmap_bit_freeing_a_mapped_extent_is_found() {
         let sb = fs.superblock().clone();
         let ino = fs.lookup_path("/sparse").expect("sparse").ino;
         let (inode, raw) = fs.read_inode_raw(ino).expect("inode");
-        let e = fs.data_extents(&inode, &raw).expect("extents")[0];
+        // Parsed off the fork: `data_extents` refuses a realtime inode on
+        // purpose, so that no caller reads realtime blocks as data blocks.
+        let (start, end) = inode.data_fork_range(usize::from(sb.inodesize));
+        let e = fs_xfs::extent::parse_list(&raw[start..end], inode.nextents).expect("extents")[0];
         e.startblock / u64::from(sb.rextsize)
     };
     patch(&data, at + used / 32 * 4, |w| {
