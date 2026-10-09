@@ -5,8 +5,10 @@
 //!
 //! Two volumes, both made by `mkfs.xfs` in the harness guest:
 //!
-//! - `-b size=1024 -n size=1024`, where a leaf or node block holds 120
-//!   records, so a two-level index arrives after some thousands of names.
+//! - `mkfs.xfs`'s defaults, 4 KiB blocks and directory blocks. A leaf or
+//!   node block holds some 500 records, so a two-level index arrives at
+//!   about 175,000 names; `mkfs.xfs` makes no directory block smaller
+//!   (`XFS_MIN_REC_DIRSIZE`), so no smaller volume reaches it sooner.
 //!   The driver links names to one file into `d` until its root is a node
 //!   of level two, then takes out every third name, which makes leaves
 //!   under-full and joins them, renames some in place, moves some to `e`,
@@ -25,7 +27,7 @@
 //! ownership and the map that holds them.
 //!
 //! Listings are compared by count and SHA-256 of the sorted names, so the
-//! output stays within its budget at tens of thousands of names.
+//! output stays within its budget at a hundred thousand names and more.
 
 mod common;
 
@@ -106,11 +108,11 @@ fn list(key: &str, dir: &str) -> String {
 
 #[test]
 fn a_two_level_index_the_driver_builds_is_one_the_kernel_reads_and_edits() {
-    let volume = scratch::Volume::empty(SUITE, "node1k.img", 300 * 1024 * 1024);
+    let volume = scratch::Volume::empty(SUITE, "node4k.img", 300 * 1024 * 1024);
     let image = volume.guest();
     let built = kernel_run(&format!(
         r#"
-        mkfs.xfs -q -f -b size=1024 -n size=1024 {image} 2>&1 && echo MKFS_OK
+        mkfs.xfs -q -f {image} 2>&1 && echo MKFS_OK
         m=$(mktemp -d)
         mount -o loop {image} "$m" && echo MOUNT_OK
         mkdir "$m/d" "$m/e"
@@ -127,16 +129,18 @@ fn a_two_level_index_the_driver_builds_is_one_the_kernel_reads_and_edits() {
 
     let mut d: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
     let mut e: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-    let dir_ino;
+    let (dir_ino, leaf_dblock);
     {
         let dev = FileDevice::open_rw(volume.path().to_str().unwrap()).expect("open");
         let fs = Filesystem::mount_rw(Arc::new(dev) as Arc<dyn BlockDevice>).expect("mount_rw");
         let ino = |p: &str| fs.lookup_path(p).expect(p).ino;
         let (dir, other, file) = (ino("/d"), ino("/e"), ino("/f"));
         dir_ino = dir;
+        // The index starts 32 GiB into the directory, counted in blocks.
+        leaf_dblock = (1u64 << 35) / u64::from(fs.superblock().blocksize);
         let mut i = 0;
         while root_level(&fs, dir) != Some(2) {
-            assert!(i < 40_000, "{i} names and the root is not a level-2 node");
+            assert!(i < 300_000, "{i} names and the root is not a level-2 node");
             fs.link(file, dir, &name(i))
                 .unwrap_or_else(|err| panic!("link {i}: {err:?}"));
             d.insert(name(i), file);
@@ -149,14 +153,19 @@ fn a_two_level_index_the_driver_builds_is_one_the_kernel_reads_and_edits() {
                 .unwrap_or_else(|err| panic!("unlink {i}: {err:?}"));
             d.remove(&name(i));
         }
-        for i in (1..grown).step_by(37) {
+        // Renames and moves only of names still there: the stride of
+        // three above took some of them.
+        for i in (1..grown).step_by(37).filter(|&i| i % 3 != 0) {
             let new = format!("renamed-{i}-to-a-name-of-another-length").into_bytes();
             fs.rename_in_directory(dir, &name(i), &new)
                 .unwrap_or_else(|err| panic!("rename {i}: {err:?}"));
             d.remove(&name(i));
             d.insert(new, file);
         }
-        for i in (2..grown).step_by(101) {
+        for i in (2..grown)
+            .step_by(101)
+            .filter(|&i| i % 3 != 0 && (i - 1) % 37 != 0)
+        {
             fs.rename(dir, &name(i), other, &name(i))
                 .unwrap_or_else(|err| panic!("move {i}: {err:?}"));
             d.remove(&name(i));
@@ -205,7 +214,7 @@ fn a_two_level_index_the_driver_builds_is_one_the_kernel_reads_and_edits() {
             dmesg | tail -12
         fi
         rmdir "$m" 2>/dev/null
-        echo "LEVEL $(xfs_db -r -c 'inode {dir_ino}' -c 'dblock 33554432' -c 'print nhdr.level' "$img" 2>&1 | tr '\n' ' ')"
+        echo "LEVEL $(xfs_db -r -c 'inode {dir_ino}' -c 'dblock {leaf_dblock}' -c 'print nhdr.level' "$img" 2>&1 | tr '\n' ' ')"
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
