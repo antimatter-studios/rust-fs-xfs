@@ -20,7 +20,10 @@ use crate::buf_write::BufferItem;
 use crate::dir_block::{self, Entry};
 use crate::error::{Error, Result};
 use crate::extent::Extent;
-use crate::format::dir::{leaf_first_fsb, XFS_DIR2_LEAF_OFFSET};
+use crate::format::dir::{
+    leaf_first_fsb, offsets, XFS_DIR2_LEAF_OFFSET, XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_MAGIC,
+    XFS_DIR3_LEAF1_MAGIC,
+};
 use crate::format::log_items::buf_log_format::buf_type::{
     BLFT_DIR_BLOCK, BLFT_DIR_DATA, BLFT_DIR_LEAF1,
 };
@@ -237,6 +240,22 @@ impl Filesystem {
             if at.existing {
                 self.device()
                     .read_at(sb.fsblock_offset(at.fsblock), &mut before)?;
+                // A block kept is a block trusted: one the kernel's
+                // verifier refuses is refused here, not written over.
+                self.verify_dir_block(&before, at.fsblock, ino)?;
+                let magic = crate::endian::be32(&before, 0);
+                let da_magic = crate::endian::be16(&before, offsets::da_blk::MAGIC);
+                let expected = match kind {
+                    BLFT_DIR_LEAF1 => da_magic == XFS_DIR3_LEAF1_MAGIC,
+                    _ => matches!(magic, XFS_DIR3_BLOCK_MAGIC | XFS_DIR3_DATA_MAGIC),
+                };
+                if !expected {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino}'s directory block at {} is not the kind its offset \
+                         calls for",
+                        at.fsblock
+                    )));
+                }
             }
             let blkno = crate::alloc_btree::blkno_of_fsbno(sb, at.fsblock);
             items.push(changed_chunks(blkno, &before, after, kind));

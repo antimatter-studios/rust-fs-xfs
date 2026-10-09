@@ -274,3 +274,41 @@ fn a_name_is_renamed_in_leaf_and_block_form_directories() {
         );
     }
 }
+
+#[test]
+fn a_create_refuses_a_leaf_block_that_names_another_address() {
+    let dev = Arc::new(Sparse(Mutex::new(BTreeMap::new())));
+    fs_xfs::mkfs::format(dev.as_ref(), &fs_xfs::mkfs::Options::default()).expect("mkfs");
+    let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).expect("mount_rw");
+    let leaf_at = {
+        let root = fs.superblock().rootino;
+        let (dir, _) = fs.create_directory(root, b"l", 0o040755).expect("mkdir");
+        for i in 0..200 {
+            fs.create_file(dir, &name(i), 0o100644).expect("create");
+        }
+        assert!(is_leaf_form(&fs, dir));
+        let (inode, raw) = fs.read_inode_raw(dir).expect("directory");
+        let leaf = (1u64 << 35) / u64::from(fs.superblock().blocksize);
+        let e = fs.data_extents(&inode, &raw).expect("extents");
+        let e = e.iter().find(|e| e.startoff == leaf).expect("a leaf");
+        fs.superblock().fsblock_offset(e.startblock)
+    };
+    fs.sync().expect("sync");
+    // The leaf's own address is wrong, under a checksum that matches it,
+    // which is what the kernel's verifier refuses and a checksum alone
+    // does not catch.
+    let bs = 4096;
+    let mut block = vec![0u8; bs];
+    dev.read_at(leaf_at, &mut block).unwrap();
+    use fs_xfs::format::dir::offsets::da_blk;
+    block[da_blk::BLKNO + 7] ^= 0x01;
+    fs_xfs::group_write::restamp_crc(&mut block, da_blk::CRC);
+    dev.write_at(leaf_at, &block).unwrap();
+
+    let dir = fs.lookup_path("/l").expect("l").ino;
+    let created = fs.create_file(dir, b"one-more", 0o100644);
+    assert!(
+        created.is_err(),
+        "a create was journalled on a leaf the kernel refuses: {created:?}"
+    );
+}
