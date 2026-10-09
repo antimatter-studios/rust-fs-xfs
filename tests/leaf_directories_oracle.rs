@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{kernel_run, oracle, repair, scratch};
+use common::{kernel_run, repair, scratch};
 use fs_core::{BlockDevice, FileDevice};
 use fs_xfs::Filesystem;
 use std::collections::BTreeSet;
@@ -68,6 +68,24 @@ fn the_kernel_lists_directories_moved_into_leaf_form_and_back() {
             want.push((dir_name, names));
         }
     }
+    // The directories' inode numbers, read through a mount that replays the
+    // driver's log in memory, for xfs_db to look at in the guest.
+    let inos: Vec<(&str, u64)> = {
+        let dev = FileDevice::open(volume.path().to_str().unwrap()).expect("open");
+        let fs = Filesystem::mount(Arc::new(dev) as Arc<dyn fs_core::BlockRead>).expect("mount");
+        ["big", "shrunk", "kept"]
+            .into_iter()
+            .map(|d| (d, fs.lookup_path(&format!("/{d}")).expect(d).ino))
+            .collect()
+    };
+    let db_checks: String = inos
+        .iter()
+        .map(|(d, ino)| {
+            format!(
+                "echo \"NEXTENTS {d} $(xfs_db -r -c 'inode {ino}' -c 'p core.nextents' \"$img\" | sed 's/.*= //')\"\n"
+            )
+        })
+        .collect();
 
     let out = kernel_run(&format!(
         r#"
@@ -84,6 +102,7 @@ fn the_kernel_lists_directories_moved_into_leaf_form_and_back() {
             dmesg | tail -12
         fi
         rmdir "$m" 2>/dev/null
+        {db_checks}
         echo "REPAIR_BEGIN"
         xfs_repair -n "$img" 2>&1 && echo "REPAIR_RC=0" || echo "REPAIR_RC=$?"
         echo "REPAIR_END"
@@ -109,30 +128,15 @@ fn the_kernel_lists_directories_moved_into_leaf_form_and_back() {
     }
 
     // The shape each directory should have: leaf form while it needs more
-    // than one block, block form once it fits one again.
+    // than one block, block form once it fits one again. Read by xfs_db in
+    // the guest from the copy the kernel replayed, not from this image,
+    // whose inodes are as they were before the driver's log.
     for (dir, leaf) in [("big", true), ("shrunk", false), ("kept", true)] {
-        let ino = {
-            let dev = FileDevice::open(volume.path().to_str().unwrap()).expect("open");
-            let fs =
-                Filesystem::mount(Arc::new(dev) as Arc<dyn fs_core::BlockRead>).expect("mount");
-            fs.lookup_path(&format!("/{dir}")).expect(dir).ino
-        };
-        let shown = oracle("xfs_db")
-            .args([
-                "-r",
-                "-c",
-                &format!("inode {ino}"),
-                "-c",
-                "p core.nextents core.size",
-            ])
-            .arg(volume.path())
-            .output();
-        let nextents: u64 = shown
-            .stdout
+        let nextents: u64 = out
             .lines()
-            .find_map(|l| l.trim().strip_prefix("core.nextents = "))
+            .find_map(|l| l.trim().strip_prefix(&format!("NEXTENTS {dir} ")))
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| panic!("{dir}: xfs_db printed no extent count:\n{}", shown.stdout));
+            .unwrap_or_else(|| panic!("{dir}: xfs_db printed no extent count:\n{out}"));
         if leaf {
             assert!(
                 nextents >= 2,
