@@ -27,6 +27,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod acl;
 pub mod ag;
 pub mod ag_btree;
 pub mod agfl;
