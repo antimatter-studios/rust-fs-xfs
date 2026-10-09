@@ -1,20 +1,30 @@
-//! Moving a name from one directory to another (#382).
+//! Moving a name, within a directory or to another, and over a name that
+//! is already there (#382, #383).
 //!
-//! The name leaves its directory and arrives in the other in one record,
-//! so a crash leaves it in one place or the other and never both or
-//! neither. Each directory changes in whatever form it is in: a directory
-//! in its inode edits its fork, and converts to block form if the name
-//! does not fit; one past its inode is laid out again by
+//! Everything a rename changes goes in one record, so a crash leaves the
+//! name where it was or where it went, never both or neither, and a
+//! replaced target either still there or gone with everything it held.
+//! Each directory changes in whatever form it is in: a directory in its
+//! inode edits its fork, and converts to block form if a name does not
+//! fit; one past its inode is laid out again by
 //! [`Filesystem::rewrite_directory`].
 //!
-//! A directory that moves takes its `..` with it. Its own `..` names the
+//! A directory that moves takes its `..` with it: its own `..` names the
 //! new parent, the old parent loses the link that `..` was, and the new
 //! parent gains it. A directory cannot be moved into itself or anything
-//! beneath it: that would make a loop no path reaches, and is refused
-//! before anything is written.
+//! beneath it, which would make a loop no path reaches.
 //!
-//! Replacing a name that already exists in the target directory is #383,
-//! and refused here.
+//! # Replacing a target (#383)
+//!
+//! The name may already exist where it is going. A file replaces a file;
+//! a directory replaces an empty directory. The replaced inode loses the
+//! link the name was, and an inode left with none is freed in the same
+//! record: its slot goes back to its chunk, its extents to free space,
+//! its quota with them. What POSIX forbids is refused before anything is
+//! written: a file over a directory ([`Error::NotAFile`], EISDIR), a
+//! directory over anything else ([`Error::NotADirectory`], ENOTDIR), a
+//! directory over one that is not empty ([`Error::DirectoryNotEmpty`]).
+//! Two names for the same inode is a rename that does nothing.
 
 use crate::create::clock_now;
 use crate::dir;
@@ -33,7 +43,7 @@ use crate::log_write::{
 /// is not.
 const OP_ALIGN: usize = 4;
 
-/// Offsets within the on-disk inode core that a directory's change moves.
+/// Offsets within the on-disk inode core that a rename moves.
 mod at {
     pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
@@ -45,14 +55,14 @@ mod at {
     pub const FLAGS2: usize = 120;
 }
 
-/// What changes in one directory.
+/// One change to a directory's entries.
 enum Edit<'a> {
     Remove(&'a [u8]),
     Add(Entry),
     Reparent(u64),
 }
 
-/// A directory as one edit leaves it.
+/// A directory as its edits leave it.
 struct Changed_ {
     fork: Vec<u8>,
     flags: u32,
@@ -63,25 +73,32 @@ struct Changed_ {
     items: Vec<crate::buf_write::BufferItem>,
 }
 
+/// One inode the record logs: its number, its new core, and its fork when
+/// that changed too.
+struct Logged {
+    ino: u64,
+    core: Vec<u8>,
+    fork: Option<(u32, Vec<u8>)>,
+}
+
 impl Filesystem {
-    /// Move `from` in directory `from_dir` to `to` in directory `to_dir`.
+    /// Move `from` in directory `from_dir` to `to` in directory `to_dir`,
+    /// replacing `to` if it is there.
     ///
-    /// Within one directory this is [`Filesystem::rename_in_directory`].
-    /// Returns the sequence number the record was given.
+    /// Returns the sequence number the record was given, or 0 when the two
+    /// names are already the same inode and nothing changes.
     ///
     /// # Errors
     ///
     /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
-    /// [`Error::NotADirectory`] if either directory is not one,
-    /// [`Error::NotFound`] if `from` is not there, [`Error::AlreadyExists`]
-    /// if `to` is (replacing it is #383), and
-    /// [`Error::UnsupportedFeature`] for a directory moved beneath itself
-    /// and for the shapes either directory cannot be rewritten in. Every
-    /// refusal comes before anything is written.
+    /// [`Error::NotADirectory`] if either directory is not one or a
+    /// directory would replace something else, [`Error::NotAFile`] if a
+    /// file would replace a directory, [`Error::DirectoryNotEmpty`] if the
+    /// directory replaced is not empty, [`Error::NotFound`] if `from` is
+    /// not there, and [`Error::UnsupportedFeature`] for a directory moved
+    /// beneath itself and for the shapes it cannot change. Every refusal
+    /// comes before anything is written.
     pub fn rename(&self, from_dir: u64, from: &[u8], to_dir: u64, to: &[u8]) -> Result<u64> {
-        if from_dir == to_dir {
-            return self.rename_in_directory(from_dir, from, to);
-        }
         self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
@@ -95,6 +112,7 @@ impl Filesystem {
                 String::from_utf8_lossy(to)
             )));
         }
+        let same_dir = from_dir == to_dir;
 
         let (src, src_raw) = self.read_inode_raw(from_dir)?;
         let (dst, dst_raw) = self.read_inode_raw(to_dir)?;
@@ -106,13 +124,58 @@ impl Filesystem {
             .into_iter()
             .find(|e| e.name == from)
             .ok_or(Error::NotFound)?;
-        if self.read_dir(&dst, &dst_raw)?.iter().any(|e| e.name == to) {
-            return Err(Error::AlreadyExists);
+        let target = self
+            .read_dir(&dst, &dst_raw)?
+            .into_iter()
+            .find(|e| e.name == to);
+        if same_dir && target.is_none() {
+            return self.rename_in_directory(from_dir, from, to);
         }
         let moved_ino = moved_entry.ino;
+        if target.as_ref().is_some_and(|t| t.ino == moved_ino) {
+            return Ok(0);
+        }
         let (moved, moved_raw) = self.read_inode_raw(moved_ino)?;
         let is_dir = moved.is_dir();
-        if is_dir {
+
+        // What the target is, and whether it may be replaced.
+        let victim = match &target {
+            Some(t) => {
+                let (inode, raw) = self.read_inode_raw(t.ino)?;
+                match (is_dir, inode.is_dir()) {
+                    (false, true) => return Err(Error::NotAFile),
+                    (true, false) => return Err(Error::NotADirectory),
+                    (true, true) if !self.read_dir(&inode, &raw)?.is_empty() => {
+                        return Err(Error::DirectoryNotEmpty)
+                    }
+                    _ => {}
+                }
+                Some((inode, raw))
+            }
+            None => None,
+        };
+        let victim_dir = victim.as_ref().is_some_and(|(v, _)| v.is_dir());
+        let victim_freed = victim
+            .as_ref()
+            .is_some_and(|(v, _)| v.is_dir() || v.nlink <= 1);
+        if let Some((v, _)) = victim.as_ref().filter(|_| victim_freed) {
+            if v.format == Format::Btree {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {} keeps its extents in a B+tree, which freeing it with a rename \
+                     does not undo",
+                    v.ino
+                )));
+            }
+            if v.anextents > 0 && v.aformat != Format::Local {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {} has attribute blocks, which freeing it with a rename does not \
+                     give back",
+                    v.ino
+                )));
+            }
+        }
+
+        if is_dir && !same_dir {
             // Up from the target to the root: the moved directory must not
             // be on the way.
             let mut at = to_dir;
@@ -135,40 +198,74 @@ impl Filesystem {
             }
         }
 
+        let arriving = Entry {
+            name: to.to_vec(),
+            ino: moved_ino,
+            ftype: dir::ftype_to_raw(moved_entry.ftype),
+        };
         let mut allocations = Allocations::new();
-        let src_change = self.change_directory(
-            &mut allocations,
-            from_dir,
-            &src,
-            &src_raw,
-            Edit::Remove(from),
-        )?;
-        let dst_change = self.change_directory(
-            &mut allocations,
-            to_dir,
-            &dst,
-            &dst_raw,
-            Edit::Add(Entry {
-                name: to.to_vec(),
-                ino: moved_ino,
-                ftype: dir::ftype_to_raw(moved_entry.ftype),
-            }),
-        )?;
-        let moved_change = if is_dir {
+        let (src_change, dst_change) = if same_dir {
+            let change = self.change_directory(
+                &mut allocations,
+                from_dir,
+                &src,
+                &src_raw,
+                vec![Edit::Remove(from), Edit::Remove(to), Edit::Add(arriving)],
+            )?;
+            (change, None)
+        } else {
+            let mut dst_edits = Vec::new();
+            if target.is_some() {
+                dst_edits.push(Edit::Remove(to));
+            }
+            dst_edits.push(Edit::Add(arriving));
+            (
+                self.change_directory(
+                    &mut allocations,
+                    from_dir,
+                    &src,
+                    &src_raw,
+                    vec![Edit::Remove(from)],
+                )?,
+                Some(self.change_directory(&mut allocations, to_dir, &dst, &dst_raw, dst_edits)?),
+            )
+        };
+        let moved_change = if is_dir && !same_dir {
             Some(self.change_directory(
                 &mut allocations,
                 moved_ino,
                 &moved,
                 &moved_raw,
-                Edit::Reparent(to_dir),
+                vec![Edit::Reparent(to_dir)],
             )?)
         } else {
             None
         };
-        let allocation_items = allocations.into_items()?;
 
+        // The replaced inode: a link fewer, or freed with what it held.
+        let mut freed_items = Vec::new();
         let mut quota_changes = Vec::new();
-        for (inode, raw, change) in [(&src, &src_raw, &src_change), (&dst, &dst_raw, &dst_change)] {
+        if let Some((v, raw)) = victim.as_ref().filter(|_| victim_freed) {
+            freed_items = self.freed_inode_items(v.ino)?;
+            let extents = match v.format {
+                Format::Extents => self.data_extents(v, raw)?,
+                _ => Vec::new(),
+            };
+            self.free_file_extents(&mut allocations, v.ino, &extents)?;
+            quota_changes.push(crate::quota::QuotaChange {
+                uid: v.uid,
+                gid: v.gid,
+                project_id: crate::quota::project_id(raw),
+                blocks_fs: -(v.nblocks as i64),
+                inodes: -1,
+            });
+        }
+        let allocation_items = allocations.into_items()?;
+        let dirs: Vec<(&Inode, &Vec<u8>, &Changed_)> = match &dst_change {
+            Some(d) => vec![(&src, &src_raw, &src_change), (&dst, &dst_raw, d)],
+            None => vec![(&src, &src_raw, &src_change)],
+        };
+        for &(inode, raw, change) in &dirs {
             if change.blocks != inode.nblocks {
                 quota_changes.push(crate::quota::QuotaChange {
                     uid: inode.uid,
@@ -185,64 +282,118 @@ impl Filesystem {
             crate::quota::accounting_items(self, &quota_changes)?
         };
 
-        // One clock reading for all three, as the kernel's `xfs_rename`.
-        let when = clock_now();
+        // Link counts. A directory leaving takes a link from its old parent
+        // and gives one to its new; a directory replaced takes its `..`
+        // from the directory it was in.
         let link = |was: u32, delta: i32| -> Result<u32> {
             was.checked_add_signed(delta).ok_or_else(|| {
                 Error::UnsupportedFeature(format!("a link count of {was} cannot move by {delta}"))
             })
         };
-        let src_core = core_after(
-            &src_raw,
-            &src_change,
-            is_dir.then(|| link(src.nlink, -1)).transpose()?,
-            when,
-            Changed::Contents,
-        )?;
-        let dst_core = core_after(
-            &dst_raw,
-            &dst_change,
-            is_dir.then(|| link(dst.nlink, 1)).transpose()?,
-            when,
-            Changed::Contents,
-        )?;
-        let moved_core = match &moved_change {
-            Some(change) => core_after(&moved_raw, change, None, when, Changed::Status)?,
+        let src_delta = -i32::from(is_dir && !same_dir) - i32::from(same_dir && victim_dir);
+        let dst_delta = i32::from(is_dir) - i32::from(victim_dir);
+
+        // One clock reading for every inode, as the kernel's `xfs_rename`.
+        let when = clock_now();
+        let mut logged = Vec::new();
+        logged.push(Logged {
+            ino: from_dir,
+            core: core_after(
+                &src_raw,
+                &src_change,
+                (src_delta != 0)
+                    .then(|| link(src.nlink, src_delta))
+                    .transpose()?,
+                when,
+                Changed::Contents,
+            )?,
+            fork: Some((src_change.flags, src_change.fork.clone())),
+        });
+        if let Some(d) = &dst_change {
+            logged.push(Logged {
+                ino: to_dir,
+                core: core_after(
+                    &dst_raw,
+                    d,
+                    (dst_delta != 0)
+                        .then(|| link(dst.nlink, dst_delta))
+                        .transpose()?,
+                    when,
+                    Changed::Contents,
+                )?,
+                fork: Some((d.flags, d.fork.clone())),
+            });
+        }
+        logged.push(match &moved_change {
+            Some(change) => Logged {
+                ino: moved_ino,
+                core: core_after(&moved_raw, change, None, when, Changed::Status)?,
+                fork: Some((change.flags, change.fork.clone())),
+            },
             None => {
                 let mut core = moved_raw.clone();
                 bump(&mut core);
                 stamp_change(&mut core, when, Changed::Status);
-                core
+                Logged {
+                    ino: moved_ino,
+                    core,
+                    fork: None,
+                }
             }
-        };
+        });
+        if let Some((v, raw)) = &victim {
+            let core = if victim_freed {
+                crate::unlink::emptied_core(raw)
+            } else {
+                let mut core = raw.clone();
+                core[at::NLINK..at::NLINK + 4].copy_from_slice(&(v.nlink - 1).to_be_bytes());
+                bump(&mut core);
+                stamp_change(&mut core, when, Changed::Status);
+                core
+            };
+            logged.push(Logged {
+                ino: v.ino,
+                core,
+                fork: None,
+            });
+        }
 
         let cluster = self.sb.inode_cluster_bytes();
-        let logged = |ino: u64, core: &[u8]| -> Result<(Vec<u8>, InodeBuffer)> {
-            Ok((
-                log_dinode_from_disk(core)
-                    .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?,
-                InodeBuffer::containing(self.inode_offset(ino)?, cluster),
-            ))
-        };
-        let (src_logged, src_buf) = logged(from_dir, &src_core)?;
-        let (dst_logged, dst_buf) = logged(to_dir, &dst_core)?;
-        let (moved_logged, moved_buf) = logged(moved_ino, &moved_core)?;
-        let padded = |fork: &[u8]| {
-            let mut op = fork.to_vec();
-            op.resize(fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
-            op
-        };
-
+        let mut inode_ops = Vec::new();
+        for l in &logged {
+            let buf = InodeBuffer::containing(self.inode_offset(l.ino)?, cluster);
+            let core = log_dinode_from_disk(&l.core)
+                .map_err(|why| Error::UnsupportedFeature(format!("inode {}: {why}", l.ino)))?;
+            match &l.fork {
+                Some((flags, fork)) => {
+                    let mut op = fork.clone();
+                    op.resize(fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+                    inode_ops.push(inode_log_format_with_fork(
+                        l.ino,
+                        XFS_ILOG_CORE | flags,
+                        &buf,
+                        fork.len() as u16,
+                    ));
+                    inode_ops.push(core);
+                    inode_ops.push(op);
+                }
+                None => {
+                    inode_ops.push(inode_log_format(l.ino, XFS_ILOG_CORE, &buf));
+                    inode_ops.push(core);
+                }
+            }
+        }
+        let dir_items: Vec<&crate::buf_write::BufferItem> = src_change
+            .items
+            .iter()
+            .chain(dst_change.iter().flat_map(|c| &c.items))
+            .chain(moved_change.iter().flat_map(|c| &c.items))
+            .collect();
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
-            + src_change.items.iter().map(|i| i.op_count()).sum::<usize>()
-            + dst_change.items.iter().map(|i| i.op_count()).sum::<usize>()
-            + moved_change
-                .as_ref()
-                .map_or(0, |c| c.items.iter().map(|i| i.op_count()).sum::<usize>())
+            + freed_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
-            + 3
-            + 3
-            + if moved_change.is_some() { 3 } else { 2 };
+            + inode_ops.len();
 
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
@@ -255,70 +406,16 @@ impl Filesystem {
                     data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
             ];
-            for item in allocation_items
-                .iter()
-                .chain(&src_change.items)
-                .chain(&dst_change.items)
-                .chain(moved_change.iter().flat_map(|c| &c.items))
-            {
+            for item in allocation_items.iter().chain(&freed_items) {
+                ops.extend(item.ops());
+            }
+            for item in &dir_items {
                 ops.extend(item.ops());
             }
             for item in &quota_items {
                 ops.extend(item.ops());
             }
-            for (ino, change, buf, logged) in [
-                (from_dir, &src_change, &src_buf, &src_logged),
-                (to_dir, &dst_change, &dst_buf, &dst_logged),
-            ] {
-                ops.push(Op {
-                    flags: 0,
-                    data: inode_log_format_with_fork(
-                        ino,
-                        XFS_ILOG_CORE | change.flags,
-                        buf,
-                        change.fork.len() as u16,
-                    ),
-                });
-                ops.push(Op {
-                    flags: 0,
-                    data: logged.clone(),
-                });
-                ops.push(Op {
-                    flags: 0,
-                    data: padded(&change.fork),
-                });
-            }
-            match &moved_change {
-                Some(change) => {
-                    ops.push(Op {
-                        flags: 0,
-                        data: inode_log_format_with_fork(
-                            moved_ino,
-                            XFS_ILOG_CORE | change.flags,
-                            &moved_buf,
-                            change.fork.len() as u16,
-                        ),
-                    });
-                    ops.push(Op {
-                        flags: 0,
-                        data: moved_logged.clone(),
-                    });
-                    ops.push(Op {
-                        flags: 0,
-                        data: padded(&change.fork),
-                    });
-                }
-                None => {
-                    ops.push(Op {
-                        flags: 0,
-                        data: inode_log_format(moved_ino, XFS_ILOG_CORE, &moved_buf),
-                    });
-                    ops.push(Op {
-                        flags: 0,
-                        data: moved_logged.clone(),
-                    });
-                }
-            }
+            ops.extend(inode_ops.iter().cloned().map(|data| Op { flags: 0, data }));
             ops.push(Op {
                 flags: XLOG_COMMIT_TRANS,
                 data: Vec::new(),
@@ -328,19 +425,16 @@ impl Filesystem {
 
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&allocation_items);
-        self.logged_buffers(&src_change.items);
-        self.logged_buffers(&dst_change.items);
-        if let Some(change) = &moved_change {
-            self.logged_buffers(&change.items);
+        self.logged_buffers(&freed_items);
+        for item in dir_items {
+            self.logged_buffers(std::slice::from_ref(item));
         }
         for item in &quota_items {
             item.apply_overlay(self)?;
         }
-        self.logged_inode(from_dir, &src_core, &src_change.fork)?;
-        self.logged_inode(to_dir, &dst_core, &dst_change.fork)?;
-        match &moved_change {
-            Some(change) => self.logged_inode(moved_ino, &moved_core, &change.fork)?,
-            None => self.logged_inode(moved_ino, &moved_core, &[])?,
+        for l in &logged {
+            let fork = l.fork.as_ref().map(|(_, f)| f.as_slice()).unwrap_or(&[]);
+            self.logged_inode(l.ino, &l.core, fork)?;
         }
         Ok(lsn)
     }
@@ -356,26 +450,17 @@ impl Filesystem {
         }
     }
 
-    /// Apply `edit` to directory `ino`, in whatever form it is in.
+    /// Apply `edits` to directory `ino`, in whatever form it is in.
     fn change_directory<'a>(
         &'a self,
         allocations: &mut Allocations<'a>,
         ino: u64,
         dir: &Inode,
         raw: &[u8],
-        edit: Edit,
+        edits: Vec<Edit>,
     ) -> Result<Changed_> {
         let (start, end) = dir.data_fork_range(usize::from(self.sb.inodesize));
         let space = end - start;
-        let kept = |fork: Vec<u8>| Changed_ {
-            size: fork.len() as u64,
-            fork,
-            flags: XFS_ILOG_DDATA,
-            format: Format::Local,
-            blocks: dir.nblocks,
-            nextents: dir.nextents,
-            items: Vec::new(),
-        };
         let rewritten = |rw: crate::dir_edit::Rewritten| Changed_ {
             fork: rw.fork,
             flags: XFS_ILOG_DEXT,
@@ -385,62 +470,48 @@ impl Filesystem {
             nextents: rw.nextents,
             items: rw.items,
         };
-        match dir.format {
+        let mut entries = match dir.format {
             Format::Local => {
                 let parsed = dir::read_short_form(dir, &raw[start..end], &self.sb)?;
-                match edit {
-                    Edit::Remove(name) => {
-                        Ok(kept(self.short_form_without_entry(&parsed, name, space)?))
-                    }
-                    Edit::Reparent(parent) => {
-                        Ok(kept(self.short_form_reparented(&parsed, parent, space)?))
-                    }
-                    Edit::Add(entry) => {
-                        match self.short_form_with_entry(
-                            &parsed,
-                            &entry.name,
-                            entry.ino,
-                            entry.ftype,
-                            space,
-                        )? {
-                            Some(fork) => Ok(kept(fork)),
-                            // It does not fit: the directory leaves its inode.
-                            None => {
-                                let mut entries =
-                                    crate::dir_block::entries_from_short_form(&parsed, ino, None);
-                                entries.push(entry);
-                                Ok(rewritten(self.rewrite_directory(
-                                    allocations,
-                                    ino,
-                                    dir,
-                                    raw,
-                                    &entries,
-                                )?))
-                            }
-                        }
-                    }
-                }
+                crate::dir_block::entries_from_short_form(&parsed, ino, None)
             }
-            Format::Extents => {
-                let mut entries = self.entries_in_blocks(dir, raw)?;
-                match edit {
-                    Edit::Remove(name) => entries.retain(|e| e.name != name),
-                    Edit::Add(entry) => entries.push(entry),
-                    Edit::Reparent(parent) => entries[1].ino = parent,
-                }
-                Ok(rewritten(self.rewrite_directory(
-                    allocations,
-                    ino,
-                    dir,
-                    raw,
-                    &entries,
-                )?))
+            Format::Extents => self.entries_in_blocks(dir, raw)?,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} keeps its entries in {other:?} form, which a rename does not \
+                     understand"
+                )))
             }
-            other => Err(Error::UnsupportedFeature(format!(
-                "inode {ino} keeps its entries in {other:?} form, which a move does not \
-                 understand"
-            ))),
+        };
+        for edit in edits {
+            match edit {
+                Edit::Remove(name) => entries.retain(|e| e.name != name),
+                Edit::Add(entry) => entries.push(entry),
+                Edit::Reparent(parent) => entries[1].ino = parent,
+            }
         }
+        if dir.format == Format::Local {
+            // Short form keeps `..` in its header and neither dot as an entry.
+            let parsed = dir::read_short_form(dir, &raw[start..end], &self.sb)?;
+            if let Some(fork) = self.short_form_of(&parsed, entries[1].ino, &entries[2..], space)? {
+                return Ok(Changed_ {
+                    size: fork.len() as u64,
+                    fork,
+                    flags: XFS_ILOG_DDATA,
+                    format: Format::Local,
+                    blocks: dir.nblocks,
+                    nextents: dir.nextents,
+                    items: Vec::new(),
+                });
+            }
+        }
+        Ok(rewritten(self.rewrite_directory(
+            allocations,
+            ino,
+            dir,
+            raw,
+            &entries,
+        )?))
     }
 }
 

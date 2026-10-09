@@ -93,7 +93,7 @@ only.
 | Node-form directory changes | Refused by name | 0.8.0 (#215) | #367 | `leaf_directories.rs` |
 | Rename within a short-form directory | Supported | 0.5.1 (#25) | #368 | `rename_oracle.rs` |
 | Move a name across directories (`Filesystem::rename`), a directory taking its `..` and both parents' link counts with it, in any directory form; a move beneath itself refused | Experimental | Unreleased (#382) | | `cross_directory_rename.rs`, `cross_directory_rename_oracle.rs` |
-| Rename over an existing target | Upcoming | | #383 | |
+| Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | Unreleased (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |
 | Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
 | Hard links | Upcoming | | #384 | |
 | Extended attribute and ACL writes | Upcoming | | #389, #390 | |
