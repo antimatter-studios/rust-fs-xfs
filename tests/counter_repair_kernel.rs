@@ -132,6 +132,62 @@ fn repaired_counter(source: &Path, tag: &str, header: &str, field: &str, bad: &s
     );
 }
 
+/// An AGI block count damaged by writing its bytes: the guest's `xfs_db`
+/// does not name `agi_iblocks` and `agi_fblocks`, so the field is changed
+/// directly at its offset and the header's checksum stamped again. The
+/// reference still grades the result.
+fn repaired_agi_count(source: &Path, tag: &str, at: usize) {
+    use fs_core::{BlockDevice, BlockRead, FileDevice};
+    let copy =
+        scratch::Volume::copy_of(SUITE, source, &format!("{}-{tag}.img", std::process::id()));
+    let image = copy.path().to_str().unwrap();
+    let original = digest(copy.path());
+    let dev = FileDevice::open_rw(copy.path()).unwrap();
+    let sectsize = {
+        let fs =
+            fs_xfs::Filesystem::mount(std::sync::Arc::new(FileDevice::open(copy.path()).unwrap()))
+                .unwrap();
+        let sb = fs.superblock();
+        assert!(
+            sb.features_ro_compat & fs_xfs::superblock::ro_compat::INOBTCNT != 0,
+            "{tag}: the fixture keeps no inode btree block counts, so there is nothing to damage"
+        );
+        u64::from(sb.sectsize)
+    };
+    let mut agi = vec![0u8; sectsize as usize];
+    dev.read_at(2 * sectsize, &mut agi).unwrap();
+    let before = u32::from_be_bytes(agi[at..at + 4].try_into().unwrap());
+    agi[at..at + 4].copy_from_slice(&(before + 77).to_be_bytes());
+    fs_xfs::group_write::restamp_crc(&mut agi, fs_xfs::ag::offsets::agi::CRC);
+    dev.write_at(2 * sectsize, &agi).unwrap();
+    drop(dev);
+    let out = run_repair(image);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{tag}: fsck.xfs -y must correct the count (exit 1): {}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert_eq!(
+        digest(copy.path()),
+        original,
+        "{tag}: only the count and CRC may change, and back to what they were"
+    );
+    clean(image, tag);
+    mounted(image);
+    let again = run_repair(image);
+    assert_eq!(again.status.code(), Some(0), "repeat: {}", stdout(&again));
+}
+
+#[test]
+fn inode_btree_block_counts_are_repaired_independently() {
+    let source = fixture("xfsfeat-finobt-inobtcount.img");
+    let iblocks = fs_xfs::ag::offsets::agi::FREE_LEVEL + 4;
+    repaired_agi_count(&source, "iblocks", iblocks);
+    repaired_agi_count(&source, "fblocks", iblocks + 4);
+}
+
 #[test]
 fn each_derivable_counter_is_repaired_independently() {
     let source = fixture("xfsfeat-finobt-inobtcount.img");
@@ -141,8 +197,6 @@ fn each_derivable_counter_is_repaired_independently() {
         ("agf 0", "btreeblks", "99"),
         ("agi 0", "count", "4096"),
         ("agi 0", "freecount", "1"),
-        ("agi 0", "iblocks", "77"),
-        ("agi 0", "fblocks", "77"),
         ("sb 0", "icount", "99999"),
         ("sb 0", "ifree", "7"),
         ("sb 0", "fdblocks", "1"),
