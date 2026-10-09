@@ -424,6 +424,264 @@ fn every_damage_the_reference_finds_is_found() {
     }
 }
 
+/// One damage per checker code (#364): `(code, case, xfs_db commands)`.
+///
+/// Each is damage `xfs_repair -n` must find, and the report must carry
+/// the code it is named for, whatever else the damage also breaks. Unlike
+/// the golden cases above, the rest of the report is not pinned: these
+/// prove that a check exists and fires, not what it says around it.
+///
+/// `docs/fsck-output.md` lists every code, the case here (or above) that
+/// damages it, or why none does; `tests/fsck_coverage_contract.rs`
+/// holds the two to each other.
+fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    let ino = |name: &str| inode_of(base, name);
+    let (small, medium) = (ino("small.txt"), ino("medium.bin"));
+    let (fragmented, manyfiles) = (ino("fragmented.bin"), ino("manyfiles"));
+    let (sub, modes) = (ino("sub"), ino("modes"));
+    let root = db_value(base, &["sb 0", "p rootino"]);
+    // A free inode in the root's chunk: the fixture allocates its first
+    // inodes in order and leaves the end of the chunk free.
+    let free_ino = root + 60;
+    let first_free = db_value(base, &["agf 0", "addr bnoroot", "p recs[0].startblock"]);
+    vec![
+        (
+            "identity",
+            "bnobt-owner",
+            vec![
+                "agf 1".into(),
+                "addr bnoroot".into(),
+                "write -d owner 0".into(),
+            ],
+        ),
+        (
+            "sb.copy.unreadable",
+            "sb1-magic",
+            vec!["sb 1".into(), "write -d magicnum 0".into()],
+        ),
+        (
+            "sb.copy.field",
+            "sb1-logblocks",
+            vec!["sb 1".into(), "write -d logblocks 1234".into()],
+        ),
+        (
+            "sb.copy.uuid",
+            "sb1-uuid",
+            vec![
+                "sb 1".into(),
+                "write -d uuid 01234567-89ab-cdef-0123-456789abcdef".into(),
+            ],
+        ),
+        (
+            "ag.agi.unreadable",
+            "agi1-magic",
+            vec!["agi 1".into(), "write -d magicnum 0".into()],
+        ),
+        (
+            "ag.agfl.unreadable",
+            "agfl1-magic",
+            vec!["agfl 1".into(), "write -d magicnum 0".into()],
+        ),
+        (
+            "ag.length",
+            "agi1-length",
+            vec!["agi 1".into(), "write -d length 1000".into()],
+        ),
+        (
+            "btree.unreadable",
+            "cntbt-magic",
+            vec![
+                "agf 1".into(),
+                "addr cntroot".into(),
+                "write -d magic 0".into(),
+            ],
+        ),
+        (
+            "inobt.record",
+            "inobt-freecount",
+            vec![
+                "agi 0".into(),
+                "addr root".into(),
+                "write -d recs[0].freecount 70".into(),
+            ],
+        ),
+        (
+            "inobt.chunk-count",
+            "inobt-count",
+            vec![
+                "agi 0".into(),
+                "addr root".into(),
+                "write -d recs[0].count 32".into(),
+            ],
+        ),
+        (
+            "finobt.mismatch",
+            "finobt-freecount",
+            vec![
+                "agi 0".into(),
+                "addr free_root".into(),
+                "write -d recs[0].freecount 3".into(),
+            ],
+        ),
+        (
+            "freesp.empty",
+            "bnobt-empty",
+            vec![
+                "agf 1".into(),
+                "addr bnoroot".into(),
+                "write -d recs[0].blockcount 0".into(),
+            ],
+        ),
+        (
+            "freesp.overlap",
+            "bnobt-overlap",
+            vec![
+                "agf 0".into(),
+                "addr bnoroot".into(),
+                format!("write -d recs[1].startblock {first_free}"),
+            ],
+        ),
+        (
+            "freesp.cnt-order",
+            "cntbt-order",
+            vec![
+                "agf 0".into(),
+                "addr cntroot".into(),
+                "write -d recs[0].blockcount 99999".into(),
+            ],
+        ),
+        (
+            "counter.agf.btreeblks",
+            "agf1-btreeblks",
+            vec!["agf 1".into(), "write -d btreeblks 7".into()],
+        ),
+        (
+            "counter.agi.inodes",
+            "agi1-count",
+            vec!["agi 1".into(), "write -d count 64".into()],
+        ),
+        (
+            "counter.agi.iblocks",
+            "agi1-iblocks",
+            vec!["agi 1".into(), "write -d iblocks 5".into()],
+        ),
+        (
+            "counter.agi.fblocks",
+            "agi1-fblocks",
+            vec!["agi 1".into(), "write -d fblocks 5".into()],
+        ),
+        (
+            "counter.sb.ifree",
+            "sb-ifree",
+            vec!["sb 0".into(), "write -d ifree 99999".into()],
+        ),
+        (
+            "range.block",
+            "bnobt-past-end",
+            vec![
+                "agf 1".into(),
+                "addr bnoroot".into(),
+                "write -d recs[0].startblock 4000000".into(),
+            ],
+        ),
+        (
+            "extent.unreadable",
+            "bmbt-magic",
+            vec![
+                format!("inode {fragmented}"),
+                "addr u3.bmbt.ptrs[1]".into(),
+                "write -d magic 0".into(),
+            ],
+        ),
+        (
+            "inode.unreadable",
+            "inode-magic",
+            vec![format!("inode {small}"), "write -d core.magic 0".into()],
+        ),
+        (
+            "inode.free-in-use",
+            "free-inode-mode",
+            vec![
+                format!("inode {free_ino}"),
+                "write -d core.mode 0100644".into(),
+            ],
+        ),
+        (
+            "inode.allocated-unused",
+            "inode-mode-zero",
+            vec![format!("inode {medium}"), "write -d core.mode 0".into()],
+        ),
+        (
+            "dir.root",
+            "sb-rootino",
+            vec!["sb 0".into(), format!("write -d rootino {free_ino}")],
+        ),
+        (
+            "dir.not-a-directory",
+            "root-mode",
+            vec![format!("inode {root}"), "write -d core.mode 0100755".into()],
+        ),
+        (
+            "dir.unreadable",
+            "dir-data-magic",
+            vec![
+                format!("inode {manyfiles}"),
+                "dblock 0".into(),
+                "write -d dhdr.hdr.magic 0".into(),
+            ],
+        ),
+        (
+            "dir.reached-twice",
+            "dir-two-parents",
+            vec![
+                format!("inode {sub}"),
+                format!("write -d u3.sfdir3.list[0].inumber.i4 {modes}"),
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn every_code_fires_on_damage_the_reference_finds() {
+    let source = fixture("xfsdata-default.img");
+    let base = source.to_str().unwrap();
+    let mut wrong = Vec::new();
+    let cases = one_damage_per_code(base);
+    for (code, name, commands) in &cases {
+        let image = damaged(&source, name, commands);
+        let image = image.path().to_str().unwrap();
+        let (clean, said) = repair(image);
+        if clean {
+            wrong.push(format!(
+                "{code} ({name}): xfs_repair -n finds nothing wrong after {commands:?}"
+            ));
+            continue;
+        }
+        let got = report_of(image);
+        let codes: Vec<&str> = got.findings.iter().map(|r| r.code.as_str()).collect();
+        // A traversal that failed is never a clean verdict.
+        if got.clean || got.exit != Some(4) {
+            wrong.push(format!(
+                "{code} ({name}): xfs_repair -n finds damage and fsck.xfs exits {:?}, clean {}:\n{}\n--- xfs_repair -n:\n{said}",
+                got.exit, got.clean, got.json
+            ));
+        } else if !codes.contains(code) {
+            wrong.push(format!(
+                "{code} ({name}): the report has {codes:?} and not {code}:\n{}",
+                got.json
+            ));
+        }
+    }
+    // Every mismatch at once, so one run shows them all.
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases disagree with the reference:\n\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n\n")
+    );
+}
+
 /// A copy of `source` damaged by `commands`, run through `xfs_db -x`.
 fn damaged(source: &std::path::Path, name: &str, commands: &[String]) -> scratch::Volume {
     let copy =

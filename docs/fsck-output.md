@@ -186,3 +186,69 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `quota.inode` | error | no | A quota inode is missing, shared between quota types, not a quota file, maps blocks a quota file cannot have, or holds a record that fails its checksum, UUID, identity or field checks. |
 | `quota.unreadable` | error | yes | A quota inode's extent map or records, or the usage they are checked against, could not be read. |
 | `quota.usage` | error | no | Quota accounting is not what the allocated inodes add up to. |
+
+## Damage coverage
+
+Every code above is checked against `xfs_repair -n` (#364). A case damages a
+copy of a volume the reference calls clean, `xfs_repair -n` must find the
+damage, and the checker must report the code without calling the volume clean.
+A traversal the checker could not finish is never a clean verdict. Codes with
+no damage case say why. `tests/fsck_coverage_contract.rs` fails if a code is
+missing from this table, if a case named here does not name the code, or if a
+code has neither a case nor a reason.
+
+| Code | Damage case |
+|---|---|
+| `checksum` | `cli_fsck_oracle.rs`: inode-checksum |
+| `identity` | `cli_fsck_oracle.rs`: bnobt-owner |
+| `sb.copy.unreadable` | `cli_fsck_oracle.rs`: sb1-magic |
+| `sb.copy.field` | `cli_fsck_oracle.rs`: sb1-logblocks |
+| `sb.copy.uuid` | `cli_fsck_oracle.rs`: sb1-uuid |
+| `ag.agf.unreadable` | `cli_fsck_oracle.rs`: a group that cannot be read |
+| `ag.agi.unreadable` | `cli_fsck_oracle.rs`: agi1-magic |
+| `ag.agfl.unreadable` | `cli_fsck_oracle.rs`: agfl1-magic |
+| `ag.length` | `cli_fsck_oracle.rs`: agi1-length |
+| `btree.unreadable` | `cli_fsck_oracle.rs`: cntbt-magic |
+| `inobt.record` | `cli_fsck_oracle.rs`: inobt-freecount |
+| `inobt.chunk-count` | `cli_fsck_oracle.rs`: inobt-count |
+| `finobt.mismatch` | `cli_fsck_oracle.rs`: finobt-freecount |
+| `freesp.empty` | `cli_fsck_oracle.rs`: bnobt-empty |
+| `freesp.overlap` | `cli_fsck_oracle.rs`: bnobt-overlap |
+| `freesp.cnt-order` | `cli_fsck_oracle.rs`: cntbt-order |
+| `freesp.disagree` | `cli_fsck_oracle.rs`: bno-record |
+| `counter.agf.freeblks` | `cli_fsck_oracle.rs`: agf-freeblks |
+| `counter.agf.longest` | `cli_fsck_oracle.rs`: agf-longest |
+| `counter.agf.btreeblks` | `cli_fsck_oracle.rs`: agf1-btreeblks |
+| `counter.agi.inodes` | `cli_fsck_oracle.rs`: agi1-count |
+| `counter.agi.iblocks` | `cli_fsck_oracle.rs`: agi1-iblocks |
+| `counter.agi.fblocks` | `cli_fsck_oracle.rs`: agi1-fblocks |
+| `counter.sb.icount` | `cli_fsck_oracle.rs`: sb-icount |
+| `counter.sb.ifree` | `cli_fsck_oracle.rs`: sb-ifree |
+| `counter.sb.fdblocks` | `cli_fsck_oracle.rs`: bno-record |
+| `range.block` | `cli_fsck_oracle.rs`: bnobt-past-end |
+| `range.extent` | `cli_fsck_oracle.rs`: extent-out-of-range |
+| `cross-link` | `cli_fsck_oracle.rs`: cross-link |
+| `lost` | `cli_fsck_oracle.rs`: bno-record |
+| `extent.unreadable` | `cli_fsck_oracle.rs`: bmbt-magic |
+| `inode.unreadable` | `cli_fsck_oracle.rs`: inode-magic |
+| `inode.free-in-use` | `cli_fsck_oracle.rs`: free-inode-mode |
+| `inode.allocated-unused` | `cli_fsck_oracle.rs`: inode-mode-zero |
+| `inode.nlink` | `cli_fsck_oracle.rs`: link-count |
+| `dir.root` | `cli_fsck_oracle.rs`: sb-rootino |
+| `dir.not-a-directory` | `cli_fsck_oracle.rs`: root-mode |
+| `dir.unreadable` | `cli_fsck_oracle.rs`: dir-data-magic |
+| `dir.entry-target` | `cli_fsck_oracle.rs`: entry-to-free-inode |
+| `dir.entry-ftype` | `cli_fsck_oracle.rs`: entry-type |
+| `dir.reached-twice` | `cli_fsck_oracle.rs`: dir-two-parents |
+| `dir.unreached` | `cli_fsck_oracle.rs`: entry-to-free-inode |
+| `mount` | `cli_fsck_oracle.rs`: agi-freecount |
+| `quota.flags` | `quota_records_oracle.rs`, by finding text |
+| `quota.inode` | `quota_records_oracle.rs`, by finding text |
+| `quota.unreadable` | `quota_records_oracle.rs`, by finding text |
+| `quota.usage` | `quota_records_oracle.rs`, by finding text |
+| `log.replayed` | none: it is a warning that the log was replayed in memory, not damage, and `xfs_repair -n` refuses a volume whose log holds records, so there is no reference verdict to compare. |
+| `repair.not-exclusive` | none: a warning that no repair was planned, not damage; `cli_repair_plan_oracle.rs` reaches it. |
+| `repair.feature` | none: a warning that no repair was planned, not damage; `cli_repair_plan_oracle.rs` reaches it. |
+| `repair.log-dirty` | none: a warning that no repair was planned, not damage; `cli_repair_plan_oracle.rs` reaches it. |
+| `repair.incomplete` | none: a warning that no repair was planned after a partial scan; every partial-scan case above is the damage behind it. |
+| `repair.ambiguous` | none: a warning that no repair was planned, not damage; `cli_repair_plan_oracle.rs` reaches it. |

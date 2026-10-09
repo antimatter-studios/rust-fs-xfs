@@ -73,6 +73,13 @@ never does.
   group's trees, quota and the inode's whole extent list. A file whose extents
   are in a B+tree, or a write that would need one, is refused by name.
 
+- **Every checker code is checked against `xfs_repair -n` (#364).** One damage
+  per code that had none, 28 in all. Each is damage `xfs_repair -n` finds, and
+  `fsck.xfs` must report the code and never call the volume clean.
+  `docs/fsck-output.md` gains a damage-coverage table. It names each code's
+  case, or why it has none (the planner's warnings and a replayed log), and a
+  contract test fails a code added without one.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
