@@ -183,7 +183,7 @@ fn ambiguous_or_untrusted_state_is_refused_without_any_write() {
         ("owner", vec!["agf 0", "addr bnoroot", "write -d owner 1"]),
         (
             "free-inode-tree",
-            vec!["agi 0", "addr free_root", "write -d recs[0].freecount 0"],
+            vec!["agi 0", "addr free_root", "write -d recs[1].freecount 0"],
         ),
         ("free-list", vec!["agf 0", "write -d flcount 999"]),
     ] {
