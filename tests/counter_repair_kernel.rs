@@ -73,12 +73,15 @@ fn mounted(image: &str) {
         img=$(mktemp /var/tmp/counter-repair-XXXXXX.img)
         cp --sparse=always {image} "$img"
         m=$(mktemp -d)
-        if mount -o loop "$img" "$m"; then
+        # `nouuid`: suites running beside this one mount copies of the
+        # same fixtures, and XFS refuses a second mount of one UUID.
+        if mount -o loop,nouuid "$img" "$m"; then
             ls -a "$m" >/dev/null
             echo MOUNT_OK
             umount "$m" || {{ echo UMOUNT_FAILED; exit 1; }}
         else
             echo MOUNT_REFUSED
+            dmesg | tail -8
             exit 1
         fi
         rmdir "$m"
