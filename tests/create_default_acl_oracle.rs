@@ -105,8 +105,11 @@ fn a_create_under_a_default_acl_inherits_it_as_the_kernels_own_create_does() {
         let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
         for (dir, refused) in DIRS {
             let parent = inode_of(&built, dir);
-            let file = fs.create_file(parent, b"new-file", 0o100644);
-            let sub = fs.create_directory(parent, b"new-dir", 0o040755);
+            // The modes the kernel's own creates ask for: a shell's `: >`
+            // opens with 0666 and `mkdir` with 0777, and under a default
+            // ACL no umask narrows them, so the ACL alone does.
+            let file = fs.create_file(parent, b"new-file", 0o100666);
+            let sub = fs.create_directory(parent, b"new-dir", 0o040777);
             for (what, got) in [("create_file", file), ("create_directory", sub)] {
                 if let Err(e) = got {
                     panic!("{dir}: {what} must be accepted (inherits: {refused}): {e}");
