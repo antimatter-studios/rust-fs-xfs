@@ -158,6 +158,16 @@ pub enum Code {
     /// The superblock's free realtime extent count is not what the bitmap
     /// holds.
     CounterSbFrextents,
+    /// A block has an owner the reverse-mapping btree does not record (#380).
+    RmapMissing,
+    /// The reverse-mapping btree records an owner for a block nothing
+    /// owns, or that is free.
+    RmapStale,
+    /// The reverse-mapping btree records a block under one owner while the
+    /// walk found it owned by another.
+    RmapOwner,
+    /// The reverse-mapping btree records the same owner of a block twice.
+    RmapDuplicate,
     /// No repair was planned: another holder has the target, or it is
     /// mounted or attached to a loop device (#375).
     RepairNotExclusive,
@@ -240,6 +250,10 @@ impl Code {
         Code::RtBitmap,
         Code::RtSummary,
         Code::CounterSbFrextents,
+        Code::RmapMissing,
+        Code::RmapStale,
+        Code::RmapOwner,
+        Code::RmapDuplicate,
         Code::RepairNotExclusive,
         Code::RepairFeature,
         Code::RepairLogDirty,
@@ -304,6 +318,10 @@ impl Code {
             Code::RtBitmap => "rt.bitmap",
             Code::RtSummary => "rt.summary",
             Code::CounterSbFrextents => "counter.sb.frextents",
+            Code::RmapMissing => "rmap.missing",
+            Code::RmapStale => "rmap.stale",
+            Code::RmapOwner => "rmap.owner",
+            Code::RmapDuplicate => "rmap.duplicate",
             Code::RepairNotExclusive => "repair.not-exclusive",
             Code::RepairFeature => "repair.feature",
             Code::RepairLogDirty => "repair.log-dirty",
@@ -530,6 +548,11 @@ struct Checker<'a> {
     /// Every realtime extent a file maps: realtime start block, length in
     /// blocks, and the inode (#381).
     rt_used: Vec<(u64, u64, u64)>,
+    /// Per group, every claim made, as `(start, length, owner)`, for the
+    /// reverse-mapping comparison (#380).
+    claimed: Vec<Vec<(u32, u32, Owner)>>,
+    /// Per group, the reverse-mapping btree's records, when it was read.
+    rmaps: Vec<Option<Vec<crate::rmap::Rmap>>>,
 }
 
 /// Check `fs`. Never writes.
@@ -550,6 +573,8 @@ pub fn check(fs: &Filesystem) -> Report {
         allocated: HashSet::new(),
         free: HashSet::new(),
         rt_used: Vec::new(),
+        claimed: vec![Vec::new(); sb.agcount as usize],
+        rmaps: vec![None; sb.agcount as usize],
     };
     c.secondaries();
     let mut totals = Totals::default();
@@ -560,6 +585,7 @@ pub fn check(fs: &Filesystem) -> Report {
     c.unclaimed();
     c.counters(&totals);
     c.realtime();
+    c.reverse_mappings();
     c.report
 }
 
@@ -572,6 +598,85 @@ fn extent_runs(sorted: &[u64]) -> Vec<(u64, u64)> {
             _ => out.push((x, 1)),
         }
     }
+    out
+}
+
+/// Which fork of its owner a reverse mapping describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Fork {
+    Data,
+    Attr,
+    ExtentTree,
+}
+
+/// An owner as the reverse-mapping btree records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RmapKey {
+    owner: i64,
+    fork: Fork,
+}
+
+impl RmapKey {
+    fn describe(self) -> String {
+        use crate::rmap::{OWN_AG, OWN_FS, OWN_INOBT, OWN_INODES, OWN_LOG, OWN_REFC};
+        match (self.owner, self.fork) {
+            (OWN_FS, _) => "the group headers".into(),
+            (OWN_LOG, _) => "the log".into(),
+            (OWN_AG, _) => "the free-space trees and free list".into(),
+            (OWN_INOBT, _) => "the inode btrees".into(),
+            (OWN_INODES, _) => "an inode chunk".into(),
+            (OWN_REFC, _) => "the refcount btree".into(),
+            (ino, Fork::Data) if ino >= 0 => format!("inode {ino}'s data"),
+            (ino, Fork::Attr) if ino >= 0 => format!("inode {ino}'s attributes"),
+            (ino, Fork::ExtentTree) if ino >= 0 => format!("inode {ino}'s extent tree"),
+            (other, _) => format!("reserved owner {other}"),
+        }
+    }
+}
+
+/// The reverse-mapping owner of what the walk claimed, or `None` for free
+/// or unclaimed space, which no record describes.
+fn rmap_key(owner: Owner) -> Option<RmapKey> {
+    use crate::rmap::{OWN_AG, OWN_FS, OWN_INOBT, OWN_INODES, OWN_LOG, OWN_REFC};
+    let (owner, fork) = match owner {
+        Owner::Unclaimed | Owner::Free => return None,
+        Owner::Headers => (OWN_FS, Fork::Data),
+        Owner::Log => (OWN_LOG, Fork::Data),
+        Owner::FreeList => (OWN_AG, Fork::Data),
+        Owner::Btree("refcount") => (OWN_REFC, Fork::Data),
+        Owner::Btree("inode") | Owner::Btree("free inode") => (OWN_INOBT, Fork::Data),
+        Owner::Btree(_) => (OWN_AG, Fork::Data),
+        Owner::Inodes => (OWN_INODES, Fork::Data),
+        Owner::Data(ino) => (i64::try_from(ino).ok()?, Fork::Data),
+        Owner::Attr(ino) => (i64::try_from(ino).ok()?, Fork::Attr),
+        Owner::ExtentTree(ino) => (i64::try_from(ino).ok()?, Fork::ExtentTree),
+    };
+    Some(RmapKey { owner, fork })
+}
+
+/// The fork a reverse mapping's offset flags name.
+fn fork_of(flags: u64) -> Fork {
+    if flags & crate::rmap::OFF_BMBT_BLOCK != 0 {
+        Fork::ExtentTree
+    } else if flags & crate::rmap::OFF_ATTR_FORK != 0 {
+        Fork::Attr
+    } else {
+        Fork::Data
+    }
+}
+
+/// Sorted `(block, key)` pairs as runs of consecutive blocks with one key.
+fn runs(blocks: &[(u32, RmapKey)]) -> Vec<(u32, u32, RmapKey)> {
+    let mut sorted = blocks.to_vec();
+    sorted.sort_unstable_by_key(|&(b, k)| (k, b));
+    let mut out: Vec<(u32, u32, RmapKey)> = Vec::new();
+    for (b, key) in sorted {
+        match out.last_mut() {
+            Some((start, len, k)) if *k == key && *start + *len == b => *len += 1,
+            _ => out.push((b, 1, key)),
+        }
+    }
+    out.sort_unstable_by_key(|&(start, _, _)| start);
     out
 }
 
@@ -664,6 +769,7 @@ impl Checker<'_> {
             self.find_at(Code::RangeBlock, location, what);
             return;
         }
+        self.claimed[ag as usize].push((start, len, owner));
         let mut clash: Option<(u32, Owner)> = None;
         for b in start..start + len {
             let was = map[b as usize];
@@ -964,13 +1070,14 @@ impl Checker<'_> {
                 agf.roots[which],
                 agf.levels[which],
                 read,
-                |_, _| (),
+                crate::rmap::decode,
             ) {
-                Ok((_, blocks)) => {
+                Ok((records, blocks)) => {
                     btree_blocks += blocks.len() as u32 - 1;
                     for b in blocks {
                         self.claim(ag, b, 1, Owner::Btree("reverse mapping"));
                     }
+                    self.rmaps[ag as usize] = Some(records);
                 }
                 Err(e) => self.failed(
                     Code::BtreeUnreadable,
@@ -1858,6 +1965,134 @@ impl Checker<'_> {
     }
 
     /// A block nothing claimed is lost.
+    /// Every group's reverse-mapping records against the owners the walk
+    /// found (#380).
+    ///
+    /// Both sides are reduced to `(block, owner, fork)` and compared block
+    /// by block: a block the walk found owned and the btree does not
+    /// record is missing, a record for a block nothing owns is stale, a
+    /// block both sides describe with different owners has the wrong
+    /// owner, and a record repeated for one block is a duplicate.
+    /// Consecutive blocks with the same verdict are one finding. Nothing is
+    /// compared after a partial scan, whose claims are not all made.
+    fn reverse_mappings(&mut self) {
+        if self.report.scan != Scan::Partial {
+            for ag in 0..self.rmaps.len() {
+                if let Some(records) = self.rmaps[ag].take() {
+                    self.reverse_mapping_group(ag as u32, &records);
+                }
+            }
+        }
+    }
+
+    fn reverse_mapping_group(&mut self, ag: u32, records: &[crate::rmap::Rmap]) {
+        let length = self.owners[ag as usize].len() as u32;
+        let mut expected: Vec<(u32, RmapKey)> = Vec::new();
+        for &(start, len, owner) in &self.claimed[ag as usize] {
+            if let Some(key) = rmap_key(owner) {
+                expected.extend((start..start + len).map(|b| (b, key)));
+            }
+        }
+        expected.sort_unstable();
+        expected.dedup();
+        let mut actual: Vec<(u32, RmapKey)> = Vec::new();
+        for r in records {
+            if r.owner == crate::rmap::OWN_COW {
+                continue;
+            }
+            let key = RmapKey {
+                owner: r.owner,
+                fork: fork_of(r.flags()),
+            };
+            let end = r.startblock.saturating_add(r.blockcount).min(length);
+            actual.extend((r.startblock..end).map(|b| (b, key)));
+        }
+        actual.sort_unstable();
+        let mut duplicates = Vec::new();
+        for w in actual.windows(2) {
+            if w[0] == w[1] {
+                duplicates.push(w[0]);
+            }
+        }
+        actual.dedup();
+
+        let (mut missing, mut extra) = (Vec::new(), Vec::new());
+        let (mut i, mut j) = (0, 0);
+        while i < expected.len() || j < actual.len() {
+            match (expected.get(i), actual.get(j)) {
+                (Some(e), Some(a)) if e == a => {
+                    i += 1;
+                    j += 1;
+                }
+                (Some(e), Some(a)) if e < a => {
+                    missing.push(*e);
+                    i += 1;
+                }
+                (Some(_), Some(a)) | (None, Some(a)) => {
+                    extra.push(*a);
+                    j += 1;
+                }
+                (Some(e), None) => {
+                    missing.push(*e);
+                    i += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        let missing_blocks: HashSet<u32> = missing.iter().map(|&(b, _)| b).collect();
+        let extra_blocks: HashSet<u32> = extra.iter().map(|&(b, _)| b).collect();
+        let (mut wrong, mut lost, mut stale) = (Vec::new(), Vec::new(), Vec::new());
+        for (b, key) in missing {
+            if extra_blocks.contains(&b) {
+                wrong.push((b, key));
+            } else {
+                lost.push((b, key));
+            }
+        }
+        for (b, key) in extra {
+            if !missing_blocks.contains(&b) {
+                stale.push((b, key));
+            }
+        }
+        let verdicts = [
+            (
+                Code::RmapMissing,
+                lost,
+                "owned by {owner} but the reverse-mapping btree does not record it",
+            ),
+            (
+                Code::RmapOwner,
+                wrong,
+                "owned by {owner} but the reverse-mapping btree records another owner",
+            ),
+            (
+                Code::RmapStale,
+                stale,
+                "recorded for {owner} by the reverse-mapping btree, which does not own it",
+            ),
+            (
+                Code::RmapDuplicate,
+                duplicates,
+                "recorded for {owner} more than once by the reverse-mapping btree",
+            ),
+        ];
+        for (code, blocks, words) in verdicts {
+            for (start, len, key) in runs(&blocks) {
+                let what = words.replace("{owner}", &key.describe());
+                self.find_at(
+                    code,
+                    Location {
+                        ag: Some(ag),
+                        agbno: Some(start),
+                        ino: u64::try_from(key.owner).ok(),
+                        field: None,
+                    },
+                    format!("blocks {start}..{} of group {ag} are {what}", start + len),
+                );
+            }
+        }
+    }
+
     fn unclaimed(&mut self) {
         for ag in 0..self.owners.len() {
             let lost: Vec<u32> = self.owners[ag]
