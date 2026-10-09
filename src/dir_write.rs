@@ -401,6 +401,34 @@ impl Filesystem {
     /// reader's place in the directory, and shuffling the survivors down
     /// would move entries a reader part-way through has already passed,
     /// so it would see them twice.
+    /// The directory's fork with its `..`, which short form keeps in the
+    /// header, naming `parent` instead (#382). Every entry and its cookie
+    /// stay as they were.
+    pub(crate) fn short_form_reparented(
+        &self,
+        parsed: &dir::ShortFormDir,
+        parent: u64,
+        fork_space: usize,
+    ) -> Result<Vec<u8>> {
+        let has_ftype = self.sb.has_ftype();
+        let moved = dir::ShortFormDir {
+            parent_ino: parent,
+            i8count: parsed.i8count,
+            entries: parsed.entries.clone(),
+        };
+        let entries: Vec<SfEntry> = moved
+            .entries
+            .iter()
+            .map(|e| SfEntry {
+                name: &e.name,
+                ino: e.ino,
+                ftype: dir::ftype_to_raw(e.ftype),
+                cookie: e.offset,
+            })
+            .collect();
+        encode_short_form(&moved, has_ftype, &entries, fork_space)
+    }
+
     pub(crate) fn short_form_without_entry(
         &self,
         parsed: &dir::ShortFormDir,

@@ -47,6 +47,13 @@ never does.
   owns, a record under the wrong owner, and a repeated record are the new
   findings `rmap.missing`, `rmap.stale`, `rmap.owner` and `rmap.duplicate`.
 
+- **A name moves across directories (#382).** `Filesystem::rename(from_dir,
+  from, to_dir, to)` removes the name from one directory and adds it to the
+  other in one record, each directory changing in whatever form it is in. A
+  moved directory names its new parent in `..`, and both parents' link counts
+  follow. A directory moved beneath itself, and a target that already exists
+  (#383), are refused before anything is written.
+
 - **Directories past one block (#366).** A create, unlink, rename or rmdir in a
   directory that has left its inode reads it whole and lays it out again: in
   one block while its entries and index fit there, and in leaf form beyond,
