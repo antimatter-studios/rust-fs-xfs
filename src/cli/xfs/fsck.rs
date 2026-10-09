@@ -7,10 +7,12 @@
 //! is a subset of what `xfs_repair -n` checks, and says so: a volume this
 //! calls clean is one on which none of THESE invariants is broken.
 //!
-//! It never writes. `-n` is accepted because scripts pass it; `-y` and
-//! `-p` (repair) are refused, because there is no repair. `--dry-run`
-//! plans one (#375): it takes the target for itself, then prints what a
-//! repair would change and what it would leave, and still writes nothing.
+//! By default it never writes, and `-n` says so for scripts that pass it.
+//! `--dry-run` plans a repair (#375): it takes the target for itself,
+//! then prints what a repair would change and what it would leave, and
+//! still writes nothing. `-y` and `-p` make the plan and apply it (#391):
+//! only what a rule owns is changed, a refused plan changes nothing, and
+//! the volume is checked again afterwards from a fresh mount.
 //!
 //! THE JSON REPORT IS VERSIONED (#363). Its shape is documented in
 //! `docs/fsck-output.md`, and [`SCHEMA_VERSION`] changes only when a key
@@ -19,8 +21,9 @@
 //! beside them is for a person, and may be reworded in any release.
 //!
 //! EXIT STATUS IS fsck(8)'s, because scripts and the `fsck` front-end read
-//! it: 0 clean, 4 errors left uncorrected, 8 an operational error (the
-//! target could not be opened, or is not XFS), 16 a wrong command line.
+//! it: 0 clean, 1 errors corrected, 4 errors left uncorrected (1 and 4 can
+//! both be set), 8 an operational error (the target could not be opened,
+//! or is not XFS), 16 a wrong command line.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -32,6 +35,8 @@ use fs_core::{BlockRead, FileDevice, OwnedSlice};
 
 /// fsck(8): no errors.
 pub const CLEAN: u8 = 0;
+/// fsck(8): filesystem errors corrected.
+pub const CORRECTED: u8 = 1;
 /// fsck(8): filesystem errors left uncorrected.
 pub const UNCORRECTED: u8 = 4;
 /// fsck(8): operational error.
@@ -98,7 +103,7 @@ fn command() -> Cmd {
         .arg(
             Arg::new("no-change")
                 .short('n')
-                .help("Check only (the default, and the only mode)")
+                .help("Check only, which is the default")
                 .action(ArgAction::SetTrue),
         )
         .arg(
@@ -110,13 +115,13 @@ fn command() -> Cmd {
         .arg(
             Arg::new("repair")
                 .short('y')
-                .help("Refused: this checker does not repair")
+                .help("Repair what a rule owns, after planning it; a refused plan writes nothing")
                 .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("preen")
                 .short('p')
-                .help("Refused: this checker does not repair")
+                .help("The same as -y: every repair this makes is one it can make unattended")
                 .action(ArgAction::SetTrue),
         )
         .args(fs_core::cli::format_args())
@@ -130,10 +135,11 @@ fn command() -> Cmd {
 }
 
 fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
-    if matches.get_flag("repair") || matches.get_flag("preen") {
+    let repairing = matches.get_flag("repair") || matches.get_flag("preen");
+    if repairing && (matches.get_flag("no-change") || matches.get_flag("dry-run")) {
         return Err(CliError::usage(
-            "fsck.xfs checks and does not repair: -y and -p are refused rather than \
-             ignored, so a script that asked for a repair is not told one happened",
+            "-y and -p repair, and -n and --dry-run promise not to: asked for both, \
+             fsck.xfs does neither",
         )
         .with_code(USAGE));
     }
@@ -145,7 +151,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     let dry_run = matches.get_flag("dry-run");
 
     // Taken before anything is read, and held until the plan is made.
-    let access = if dry_run {
+    let access = if dry_run || repairing {
         match fs_xfs::repair::Exclusive::claim(std::path::Path::new(target)) {
             Ok(access) => Some(access),
             Err(refusal) => {
@@ -176,10 +182,22 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         None
     };
 
-    let dev: Arc<dyn BlockRead> = Arc::new(
-        FileDevice::open(&*name)
-            .map_err(|e| CliError::failed(format!("open {name}: {e}")).with_code(OPERATIONAL))?,
-    );
+    // Read-write only when a repair was asked for; the mount reads
+    // through it either way.
+    let writable = if repairing {
+        Some(Arc::new(FileDevice::open_rw(&*name).map_err(|e| {
+            CliError::failed(format!("open {name} to repair it: {e}")).with_code(OPERATIONAL)
+        })?))
+    } else {
+        None
+    };
+    let dev: Arc<dyn BlockRead> =
+        match &writable {
+            Some(rw) => rw.clone(),
+            None => Arc::new(FileDevice::open(&*name).map_err(|e| {
+                CliError::failed(format!("open {name}: {e}")).with_code(OPERATIONAL)
+            })?),
+        };
     let dev: Arc<dyn BlockRead> = if offset == 0 {
         dev
     } else {
@@ -246,15 +264,41 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     let planned = access
         .as_ref()
         .map(|access| fs_xfs::repair::plan(&fs, access));
-    let checked = match &planned {
-        Some(plan) => plan.check.clone(),
-        None => fs_xfs::check::check(&fs),
+    // A repair applies the plan, then checks again from a fresh mount: the
+    // report is the volume as the repair left it.
+    let mut applied = None;
+    let checked = match (&planned, &writable, &access) {
+        (Some(plan), Some(rw), Some(access)) => {
+            let ready = plan.status == fs_xfs::repair::Status::Ready;
+            let n = if ready && !plan.changes.is_empty() {
+                fs_xfs::repair::apply(plan, rw.as_ref(), offset, access).map_err(|e| {
+                    CliError::failed(format!("{name}: repair: {e}")).with_code(OPERATIONAL)
+                })?
+            } else {
+                0
+            };
+            applied = Some(n);
+            if n > 0 {
+                drop(fs);
+                recheck(&name, offset)?
+            } else {
+                plan.check.clone()
+            }
+        }
+        (Some(plan), _, _) => plan.check.clone(),
+        _ => fs_xfs::check::check(&fs),
     };
-    let code = if checked.is_clean() {
-        CLEAN
+    let corrected = if applied.unwrap_or(0) > 0 {
+        CORRECTED
     } else {
-        UNCORRECTED
+        CLEAN
     };
+    let code = corrected
+        | if checked.is_clean() {
+            CLEAN
+        } else {
+            UNCORRECTED
+        };
     let mut report = base(
         checked.is_clean(),
         checked.dirty,
@@ -294,6 +338,10 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     if let Some(plan) = &planned {
         report.push(("plan", plan_json(plan)));
         text.extend(plan_text(&name, plan));
+    }
+    if let Some(n) = applied {
+        report.push(("applied", Json::from(n as u64)));
+        text.push(format!("{name}: repair: {n} changes written"));
     }
     Ok(Outcome::report(Json::object(report))
         .with_text(text.join("\n"))
@@ -399,4 +447,22 @@ fn finding(f: &fs_xfs::check::Finding) -> Json {
         ("field", at.field.map(Json::from).unwrap_or(Json::Null)),
         ("what", Json::from(f.what.as_str())),
     ])
+}
+
+/// The volume checked again, through a mount of its own, after a repair
+/// wrote to it.
+fn recheck(name: &str, offset: u64) -> Result<fs_xfs::check::Report, CliError> {
+    let failed = |e: String| {
+        CliError::failed(format!("{name}: after the repair: {e}")).with_code(OPERATIONAL)
+    };
+    let dev: Arc<dyn BlockRead> =
+        Arc::new(FileDevice::open(name).map_err(|e| failed(e.to_string()))?);
+    let dev: Arc<dyn BlockRead> = if offset == 0 {
+        dev
+    } else {
+        let size = dev.size_bytes();
+        Arc::new(OwnedSlice::new(dev, offset, size - offset))
+    };
+    let fs = fs_xfs::Filesystem::mount(dev).map_err(|e| failed(e.to_string()))?;
+    Ok(fs_xfs::check::check(&fs))
 }

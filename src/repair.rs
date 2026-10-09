@@ -264,10 +264,128 @@ impl Proposal<'_> {
     }
 }
 
-/// Plan a repair of `fs` with no rules: the preconditions, and every
-/// error finding listed as unplanned.
+/// Plan a repair of `fs` with every rule this crate has.
 pub fn plan(fs: &Filesystem, access: &Exclusive) -> Plan {
-    plan_with(fs, access, &[])
+    plan_with(fs, access, &[&SuperblockCopies])
+}
+
+/// A secondary superblock rewritten from the primary (#391).
+///
+/// Every allocation group starts with a copy of the superblock, and the
+/// copies are byte for byte the primary: `xfs_repair` rewrites a damaged
+/// one from it, and so does this. The primary is the one the mount
+/// validated, geometry, features and identity, so it is the reference.
+///
+/// It repairs one copy and refuses the rest:
+///
+/// - **A copy with another filesystem's UUID** is not repaired, and
+///   `sb.copy.uuid` stays unowned: a sector naming another filesystem may
+///   be one, and overwriting what this cannot identify is not a repair.
+///   If that copy is the damaged one, the whole plan is refused.
+/// - **More than one damaged copy** refuses the plan: several copies
+///   disagreeing with the primary may mean the primary is the one that is
+///   wrong, and that is not established by one reading.
+pub struct SuperblockCopies;
+
+impl Rule for SuperblockCopies {
+    fn name(&self) -> &'static str {
+        "superblock-copies"
+    }
+
+    fn repairs(&self) -> &'static [Code] {
+        &[Code::SbCopyField, Code::SbCopyUnreadable]
+    }
+
+    fn propose(&self, fs: &Filesystem, report: &Report, proposal: &mut Proposal) -> Result<()> {
+        let damaged: std::collections::BTreeSet<u32> = report
+            .findings
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.code,
+                    Code::SbCopyField | Code::SbCopyUnreadable | Code::SbCopyUuid
+                )
+            })
+            .filter_map(|f| f.location.ag)
+            .collect();
+        if damaged.is_empty() {
+            return Ok(());
+        }
+        if damaged.len() > 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the superblock copies in groups {damaged:?} all disagree with the primary, \
+                 so which is right is not established"
+            )));
+        }
+        let ag = *damaged.first().expect("one");
+        if report
+            .findings
+            .iter()
+            .any(|f| f.code == Code::SbCopyUuid && f.location.ag == Some(ag))
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "the superblock copy in group {ag} names another filesystem, and is not \
+                 overwritten"
+            )));
+        }
+        let sb = fs.superblock();
+        let mut primary = vec![0u8; usize::from(sb.sectsize)];
+        fs.device().read_at(0, &mut primary)?;
+        let at = u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize);
+        let code = report
+            .findings
+            .iter()
+            .find(|f| f.location.ag == Some(ag))
+            .map_or(Code::SbCopyField, |f| f.code);
+        proposal.put(
+            at,
+            primary,
+            code,
+            format!("rewrite group {ag}'s superblock copy from the primary"),
+        )
+    }
+}
+
+/// Write a ready plan's changes to `device`, on which the filesystem
+/// starts `base` bytes in.
+///
+/// Every range is read first and must still hold the bytes the plan saw;
+/// one that does not stops the repair before anything is written, since a
+/// plan made from bytes that have changed since is about another volume.
+/// The device is flushed once every change is written. Returns how many
+/// changes were written.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedFeature`] for a plan that is not ready or has gone
+/// stale, and the device's read, write and flush errors.
+pub fn apply(
+    plan: &Plan,
+    device: &dyn fs_core::BlockDevice,
+    base: u64,
+    _access: &Exclusive,
+) -> Result<usize> {
+    if plan.status != Status::Ready {
+        return Err(Error::UnsupportedFeature(
+            "a refused plan is not applied".into(),
+        ));
+    }
+    for c in &plan.changes {
+        let mut now = vec![0u8; c.before.len()];
+        device.read_at(base + c.offset, &mut now)?;
+        if now != c.before {
+            return Err(Error::UnsupportedFeature(format!(
+                "the {} bytes at {} are not what the plan was made from; nothing was written",
+                c.before.len(),
+                c.offset
+            )));
+        }
+    }
+    for c in &plan.changes {
+        device.write_at(base + c.offset, &c.after)?;
+    }
+    device.flush()?;
+    Ok(plan.changes.len())
 }
 
 /// Plan a repair of `fs` with `rules`, in the order given. Never writes.
