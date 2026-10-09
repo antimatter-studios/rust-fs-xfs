@@ -553,6 +553,10 @@ tasks:
     # (37934328714), 181,833 (37918336667) and, the largest, 2,374 lines /
     # 187,377 bytes (run 37918532099, job 113803432673). Half as much again
     # as the largest is 3,561 lines / 282,000 bytes.
+    # MEASURED again in run 37934328714 (job 113843596052, 2026-10-09),
+    # with the superblock repair oracle in the suite: every test passed and
+    # the release pass printed 2,334 lines / 181,575 bytes; half as much
+    # again is 3,501 lines / 273,000 bytes.
     timeout: 120m
     on_timeout:
       - cmd: 'echo "timeout: reclaiming the harness VM (spent $TIMEOUT)"'
@@ -566,6 +570,7 @@ tasks:
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
       - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 3561 282000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
+      - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 3501 273000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
       - task: test:scripts
       # The command-line tools, built and staged the way an install lays
       # them out, then tested as installed: found on PATH, doctor first.
