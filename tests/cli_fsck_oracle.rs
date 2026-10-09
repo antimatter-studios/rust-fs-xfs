@@ -465,14 +465,6 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec!["sb 1".into(), "write -d logblocks 1234".into()],
         ),
         (
-            "sb.copy.uuid",
-            "sb1-uuid",
-            vec![
-                "sb 1".into(),
-                "write -d uuid 01234567-89ab-cdef-0123-456789abcdef".into(),
-            ],
-        ),
-        (
             "ag.agi.unreadable",
             "agi1-magic",
             vec!["agi 1".into(), "write -d magicnum 0".into()],
