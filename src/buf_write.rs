@@ -123,6 +123,14 @@ impl BufferItem {
             BLFT_AGF => crate::ag::offsets::agf::CRC,
             BLFT_AGI => crate::ag::offsets::agi::CRC,
             BLFT_AGFL => crate::agfl::offsets::CRC,
+            // A block-map node carries 64-bit siblings, which push its
+            // checksum 12 bytes past a group tree's (#367).
+            BLFT_BTREE
+                if self.data.len() >= 4
+                    && crate::endian::be32(&self.data, 0) == crate::bmbt::XFS_BMAP_CRC_MAGIC =>
+            {
+                crate::bmbt::offsets::CRC
+            }
             BLFT_BTREE => crate::ag_btree::offsets::CRC,
             BLFT_DIR_BLOCK => crate::format::dir::offsets::dir3_blk::CRC,
             // A leaf-form directory's data blocks share block form's header
@@ -130,6 +138,9 @@ impl BufferItem {
             // after the two sibling pointers, the magic and its padding.
             BLFT_DIR_DATA => crate::format::dir::offsets::dir3_blk::CRC,
             BLFT_DIR_LEAF1 => crate::format::dir::offsets::da_blk::CRC,
+            // A node-form directory's index and free blocks (#367).
+            BLFT_DIR_LEAFN | BLFT_DA_NODE => crate::format::dir::offsets::da_blk::CRC,
+            BLFT_DIR_FREE => crate::format::dir::offsets::dir3_blk::CRC,
             _ => return self.data.clone(),
         };
         let mut out = self.data.clone();

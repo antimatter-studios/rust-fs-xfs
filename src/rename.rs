@@ -30,7 +30,7 @@ use crate::create::clock_now;
 use crate::dir;
 use crate::dir_block::Entry;
 use crate::error::{Error, Result};
-use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
+use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
 use crate::group_write::Allocations;
 use crate::inode::{stamp_change, Changed, Format, Inode};
@@ -55,16 +55,14 @@ mod at {
     pub const FLAGS2: usize = 120;
 }
 
-/// One change to a directory's entries.
-enum Edit<'a> {
-    Remove(&'a [u8]),
-    Add(Entry),
-    Reparent(u64),
-}
+use crate::dir_edit::DirEdit as Edit;
 
 /// A directory as its edits leave it.
 struct Changed_ {
+    /// The fork as the inode item logs it.
     fork: Vec<u8>,
+    /// The fork as the inode stores it, which a B+tree root is not.
+    disk: Vec<u8>,
     flags: u32,
     format: Format,
     size: u64,
@@ -78,7 +76,7 @@ struct Changed_ {
 struct Logged {
     ino: u64,
     core: Vec<u8>,
-    fork: Option<(u32, Vec<u8>)>,
+    fork: Option<(u32, Vec<u8>, Vec<u8>)>,
 }
 
 impl Filesystem {
@@ -307,7 +305,11 @@ impl Filesystem {
                 when,
                 Changed::Contents,
             )?,
-            fork: Some((src_change.flags, src_change.fork.clone())),
+            fork: Some((
+                src_change.flags,
+                src_change.fork.clone(),
+                src_change.disk.clone(),
+            )),
         });
         if let Some(d) = &dst_change {
             logged.push(Logged {
@@ -321,14 +323,14 @@ impl Filesystem {
                     when,
                     Changed::Contents,
                 )?,
-                fork: Some((d.flags, d.fork.clone())),
+                fork: Some((d.flags, d.fork.clone(), d.disk.clone())),
             });
         }
         logged.push(match &moved_change {
             Some(change) => Logged {
                 ino: moved_ino,
                 core: core_after(&moved_raw, change, None, when, Changed::Status)?,
-                fork: Some((change.flags, change.fork.clone())),
+                fork: Some((change.flags, change.fork.clone(), change.disk.clone())),
             },
             None => {
                 let mut core = moved_raw.clone();
@@ -365,7 +367,7 @@ impl Filesystem {
             let core = log_dinode_from_disk(&l.core)
                 .map_err(|why| Error::UnsupportedFeature(format!("inode {}: {why}", l.ino)))?;
             match &l.fork {
-                Some((flags, fork)) => {
+                Some((flags, fork, _)) => {
                     let mut op = fork.clone();
                     op.resize(fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
                     inode_ops.push(inode_log_format_with_fork(
@@ -433,7 +435,7 @@ impl Filesystem {
             item.apply_overlay(self)?;
         }
         for l in &logged {
-            let fork = l.fork.as_ref().map(|(_, f)| f.as_slice()).unwrap_or(&[]);
+            let fork = l.fork.as_ref().map(|(_, _, d)| d.as_slice()).unwrap_or(&[]);
             self.logged_inode(l.ino, &l.core, fork)?;
         }
         Ok(lsn)
@@ -601,7 +603,7 @@ impl Filesystem {
         for item in &quota_items {
             item.apply_overlay(self)?;
         }
-        self.logged_inode(dir_ino, &dir_core, &change.fork)?;
+        self.logged_inode(dir_ino, &dir_core, &change.disk)?;
         self.logged_inode(ino, &inode_core, &[])?;
         Ok(lsn)
     }
@@ -629,48 +631,57 @@ impl Filesystem {
         let (start, end) = dir.data_fork_range(usize::from(self.sb.inodesize));
         let space = end - start;
         let rewritten = |rw: crate::dir_edit::Rewritten| Changed_ {
-            fork: rw.fork,
-            flags: XFS_ILOG_DEXT,
-            format: Format::Extents,
+            fork: rw.logged_fork,
+            disk: rw.fork,
+            flags: rw.fields,
+            format: rw.format,
             size: rw.size,
             blocks: rw.blocks,
             nextents: rw.nextents,
             items: rw.items,
         };
-        let mut entries = match dir.format {
-            Format::Local => {
-                let parsed = dir::read_short_form(dir, &raw[start..end], &self.sb)?;
-                crate::dir_block::entries_from_short_form(&parsed, ino, None)
-            }
-            Format::Extents => self.entries_in_blocks(dir, raw)?,
-            other => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino} keeps its entries in {other:?} form, which a rename does not \
-                     understand"
-                )))
-            }
-        };
+        if matches!(dir.format, Format::Extents | Format::Btree) {
+            return Ok(rewritten(self.edit_directory(
+                allocations,
+                ino,
+                dir,
+                raw,
+                &edits,
+            )?));
+        }
+        if dir.format != Format::Local {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} keeps its entries in {:?} form, which a rename does not \
+                 understand",
+                dir.format
+            )));
+        }
+        let parsed = dir::read_short_form(dir, &raw[start..end], &self.sb)?;
+        let mut entries = crate::dir_block::entries_from_short_form(&parsed, ino, None);
         for edit in edits {
             match edit {
                 Edit::Remove(name) => entries.retain(|e| e.name != name),
                 Edit::Add(entry) => entries.push(entry),
                 Edit::Reparent(parent) => entries[1].ino = parent,
+                Edit::Rename(from, to) => {
+                    for e in entries.iter_mut().skip(2).filter(|e| e.name == from) {
+                        e.name = to.to_vec();
+                    }
+                }
             }
         }
-        if dir.format == Format::Local {
-            // Short form keeps `..` in its header and neither dot as an entry.
-            let parsed = dir::read_short_form(dir, &raw[start..end], &self.sb)?;
-            if let Some(fork) = self.short_form_of(&parsed, entries[1].ino, &entries[2..], space)? {
-                return Ok(Changed_ {
-                    size: fork.len() as u64,
-                    fork,
-                    flags: XFS_ILOG_DDATA,
-                    format: Format::Local,
-                    blocks: dir.nblocks,
-                    nextents: dir.nextents,
-                    items: Vec::new(),
-                });
-            }
+        // Short form keeps `..` in its header and neither dot as an entry.
+        if let Some(fork) = self.short_form_of(&parsed, entries[1].ino, &entries[2..], space)? {
+            return Ok(Changed_ {
+                size: fork.len() as u64,
+                disk: fork.clone(),
+                fork,
+                flags: XFS_ILOG_DDATA,
+                format: Format::Local,
+                blocks: dir.nblocks,
+                nextents: dir.nextents,
+                items: Vec::new(),
+            });
         }
         Ok(rewritten(self.rewrite_directory(
             allocations,

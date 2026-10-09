@@ -410,37 +410,69 @@ pub fn insert(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
 
 /// Remove the record for a freed extent.
 ///
+/// The freed range may be all of a record or part of one. The kernel
+/// keeps one record per contiguous run of one owner, so a directory whose
+/// blocks happened to land side by side has them in one record, and
+/// giving back one of them cuts the record in two around it — what
+/// `xfs_rmap_unmap` does. A file's data keeps its offsets: the part after
+/// the hole starts that much further into the file.
+///
 /// # What this refuses
 ///
-/// Anything but an exact match. Freeing part of an extent leaves the
-/// rest, which means shortening a record or splitting it in two, and
-/// this driver frees whole extents only — `truncate_to_zero` frees a
-/// file's map entire. A partial free arriving here means something
-/// upstream changed, and saying so is better than trimming a record on a
-/// guess.
+/// A range no record of that owner and those flags contains whole: the
+/// tree and the inode then disagree about who owns the blocks, and
+/// trimming a record on a guess would hide that.
 pub fn remove(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
+    let start = u64::from(rec.startblock);
+    let end = start + u64::from(rec.blockcount);
     let at = records
         .iter()
         .position(|r| {
-            r.startblock == rec.startblock && r.owner == rec.owner && r.flags() == rec.flags()
+            let r_start = u64::from(r.startblock);
+            r.owner == rec.owner
+                && r.flags() == rec.flags()
+                && r_start <= start
+                && end <= r_start + u64::from(r.blockcount)
         })
         .ok_or_else(|| {
             Error::UnsupportedFeature(format!(
-                "freeing group block {} owned by {} but the reverse-mapping tree has no \
-                 record starting there; the tree and the inode disagree about what this \
-                 extent is",
-                rec.startblock, rec.owner
+                "freeing {} blocks at group block {} owned by {} but no reverse-mapping \
+                 record of that owner holds them; the tree and the inode disagree about \
+                 what this extent is",
+                rec.blockcount, rec.startblock, rec.owner
             ))
         })?;
-
-    if records[at].blockcount != rec.blockcount {
-        return Err(Error::UnsupportedFeature(format!(
-            "freeing {} blocks at group block {} but its reverse-mapping record covers {}; \
-             freeing part of an extent is not implemented",
-            rec.blockcount, rec.startblock, records[at].blockcount
-        )));
+    let whole = records.remove(at);
+    let whole_start = u64::from(whole.startblock);
+    let whole_end = whole_start + u64::from(whole.blockcount);
+    let mut put = at;
+    if whole_start < start {
+        records.insert(
+            put,
+            Rmap {
+                blockcount: (start - whole_start) as u32,
+                ..whole
+            },
+        );
+        put += 1;
     }
-    records.remove(at);
+    if end < whole_end {
+        let skip = end - whole_start;
+        let offset = if whole.is_reserved_owner() || whole.offset & OFF_BMBT_BLOCK != 0 {
+            whole.offset
+        } else {
+            ((whole.offset & OFF_MASK) + skip) | whole.flags()
+        };
+        records.insert(
+            put,
+            Rmap {
+                startblock: end as u32,
+                blockcount: (whole_end - end) as u32,
+                owner: whole.owner,
+                offset,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -467,6 +499,27 @@ mod tests {
             offset: u64::from_be_bytes(buf[at + 12..at + 20].try_into().unwrap()),
         };
         (key(0), key(KEY))
+    }
+
+    #[test]
+    fn freeing_part_of_a_record_cuts_it_around_the_hole() {
+        let mut records = vec![rec(10, 6, 131, 4)];
+        remove(&mut records, rec(12, 1, 131, 6)).unwrap();
+        assert_eq!(records, vec![rec(10, 2, 131, 4), rec(13, 3, 131, 7)]);
+        remove(&mut records, rec(10, 2, 131, 4)).unwrap();
+        remove(&mut records, rec(15, 1, 131, 9)).unwrap();
+        assert_eq!(records, vec![rec(13, 2, 131, 7)]);
+        let mut bmbt = vec![rec(40, 3, 95, OFF_BMBT_BLOCK)];
+        remove(&mut bmbt, rec(41, 1, 95, OFF_BMBT_BLOCK)).unwrap();
+        assert_eq!(
+            bmbt,
+            vec![
+                rec(40, 1, 95, OFF_BMBT_BLOCK),
+                rec(42, 1, 95, OFF_BMBT_BLOCK)
+            ]
+        );
+        assert!(remove(&mut bmbt, rec(40, 1, 96, OFF_BMBT_BLOCK)).is_err());
+        assert!(remove(&mut bmbt, rec(40, 2, 95, OFF_BMBT_BLOCK)).is_err());
     }
 
     /// Each rule of `xfs_rmapbt_init_high_key_from_rec`, one record at a
@@ -625,9 +678,11 @@ mod tests {
     /// not guess at.
     #[test]
     fn what_is_not_implemented_is_refused_rather_than_guessed() {
-        // A partial free would have to shorten or split the record.
+        // A partial free shortens or splits the record, as
+        // `xfs_rmap_unmap` does; it is not a refusal any more (#367).
         let mut records = kernel_leaf();
-        let err = remove(
+        let whole = records.clone();
+        remove(
             &mut records,
             Rmap {
                 startblock: 16,
@@ -636,9 +691,19 @@ mod tests {
                 offset: 0,
             },
         )
-        .unwrap_err();
-        assert!(format!("{err}").contains("part of an extent"));
-        assert_eq!(records.len(), 6, "and nothing was removed");
+        .expect("a partial free");
+        let held = |rs: &[Rmap], b: u32| {
+            rs.iter()
+                .any(|r| r.startblock <= b && b < r.startblock + r.blockcount)
+        };
+        assert!((16..20).all(|b| !held(&records, b)), "{records:?}");
+        assert!(
+            (0..64)
+                .filter(|b| !(16..20).contains(b))
+                .all(|b| held(&whole, b) == held(&records, b)),
+            "only the freed blocks changed hands"
+        );
+        let mut records = whole;
 
         // A free with no matching record means the tree and the inode
         // disagree, which is not something to paper over.
@@ -653,8 +718,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{err}").contains("no \n                 record")
-                || format!("{err}").contains("record starting there"),
+            format!("{err}").contains("no reverse-mapping record of that owner holds them"),
             "got: {err}"
         );
 
