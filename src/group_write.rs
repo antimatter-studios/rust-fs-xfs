@@ -582,6 +582,18 @@ impl<'a> GroupAlloc<'a> {
         Ok(())
     }
 
+    /// Put an ownership record into the reverse map: the counterpart of
+    /// [`GroupAlloc::forget_rmap`], for an extent that keeps some of its
+    /// blocks when the rest are freed (#370). Does nothing where the
+    /// filesystem has no reverse-mapping tree.
+    pub(crate) fn remember_rmap(&mut self, record: crate::rmap::Rmap) -> Result<()> {
+        if let Some((records, _)) = self.rmap.as_mut() {
+            crate::rmap::insert(records, record)?;
+            self.took = true;
+        }
+        Ok(())
+    }
+
     /// Give up one reference to `startblock..+blockcount`, and say which
     /// of those blocks may go back to free space.
     ///
