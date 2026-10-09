@@ -61,6 +61,7 @@ pub mod rmap;
 pub mod super_write;
 pub mod superblock;
 pub mod truncate;
+mod truncate_to;
 pub mod unlink;
 pub mod write;
 

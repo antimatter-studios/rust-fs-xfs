@@ -15,6 +15,16 @@ never does.
   to a prefix of the sequence, the interrupted operation whole or absent, and
   `xfs_repair -n` must call it clean.
 
+- **Truncate to any length (#370).** `Filesystem::truncate_to(ino, size)`
+  shortens or lengthens a file in one record. Blocks wholly past the new end
+  go back to free space, an extent that straddles it keeps only its part in
+  the file with its reverse mapping replaced to match, and the reference-count
+  tree keeps blocks another file shares. The last block's bytes past the new
+  end are zeroed first, so a later grow shows zeros. An extent B+tree left
+  small enough becomes an inline list again, its tree freed with the data;
+  one that would still need a tree, and a cut inside a block another file
+  shares, are refused by name.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount

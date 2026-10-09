@@ -81,7 +81,7 @@ only.
 | Extents across allocation groups | Upcoming | | #388 | `crossag_oracle.rs` (freeing only) |
 | Truncate to zero, including a B+tree data fork | Supported | 0.5.1 (#30); bmbt 0.8.0 (#222) | | `truncate_replay_oracle.rs`, `truncate_btree_fork.rs` |
 | Shorten in place, without freeing blocks (C ABI `fs_xfs_truncate`) | Partial: the blocks stay allocated | 0.5.0 | #370 | `capi.rs` |
-| Truncate to any length, freeing blocks | Upcoming | | #370 | |
+| Truncate to any length (`Filesystem::truncate_to`), shorter or longer, freeing the blocks past the new end, cutting a straddling extent, zeroing the last block's tail; an extent B+tree left small enough returned to an inline list; shared blocks kept, and a cut inside one refused | Experimental: a B+tree that would still need a tree after freeing is refused | Unreleased (#370) | | `truncate_to.rs`, `truncate_to_oracle.rs` |
 | Create a file | Supported | 0.5.1 (#36) | | `create_replay_oracle.rs`, `create_free_slot_oracle.rs` |
 | Create in a directory with a default ACL | Refused | 0.10.0 (#284) | #390 | `create_default_acl_oracle.rs` |
 | Unlink a file | Supported | 0.5.1 (#37) | | `unlink_replay_oracle.rs` |
