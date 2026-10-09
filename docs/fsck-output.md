@@ -248,6 +248,12 @@ code has neither a case nor a reason.
 | `rt.bitmap` | `realtime_check_oracle.rs`: a bitmap bit freeing a mapped extent |
 | `rt.summary` | `realtime_check_oracle.rs`: a wrong summary count |
 | `counter.sb.frextents` | `realtime_check_oracle.rs`: a wrong free extent count |
+| `rmap.missing` | `rmap_check_oracle.rs`: a record that stops short of its extent |
+| `rmap.stale` | `rmap_check_oracle.rs`: a record moved onto free space |
+| `rmap.owner` | `rmap_check_oracle.rs`: a record naming the wrong owner |
+| `rmap.duplicate` | none: no damage case yet. A second record for blocks one already covers can only be made with `xfs_db` by rewriting another record, whose own blocks then go missing, so such a case would be graded on `rmap.missing` before this. |
+| `refcount.count` | `refcount_check_oracle.rs`: a count lower than the mappings |
+| `refcount.stale` | `refcount_check_oracle.rs`: a record moved onto free space |
 | `quota.flags` | `quota_records_oracle.rs`, by finding text |
 | `quota.inode` | `quota_records_oracle.rs`, by finding text |
 | `quota.unreadable` | `quota_records_oracle.rs`, by finding text |
