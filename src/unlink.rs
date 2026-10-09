@@ -41,7 +41,6 @@
 //!   well and is a bigger transaction than this one;
 //! - a file with more than one link, where the inode survives and only
 //!   the count moves;
-//! - a parent that has outgrown its inode;
 //! - inode trees more than one level deep, or a root with no room for
 //!   the chunk this may put back;
 //! - a v4 filesystem.
@@ -49,7 +48,7 @@
 use crate::create::clock_now;
 use crate::dir;
 use crate::error::{Error, Result};
-use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
+use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
@@ -66,6 +65,8 @@ mod core_at {
     pub const MODE: usize = 2;
     pub const NLINK: usize = 16;
     pub const SIZE: usize = 56;
+    /// `di_nblocks`: the blocks the inode owns.
+    pub const NBLOCKS: usize = 64;
     pub const GEN: usize = 92;
     pub const CHANGECOUNT: usize = 104;
     /// `di_nextents`, then `di_anextents`: the extent counts. Under
@@ -114,6 +115,21 @@ fn emptied_core(raw: &[u8]) -> Vec<u8> {
 
 /// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
 const AFORMAT_EXTENTS: u8 = 2;
+
+/// Set `di_nextents`, wherever the inode's own feature bits put it.
+fn set_nextents(core: &mut [u8], count: u64) {
+    const NEXTENTS: usize = 76;
+    const NEXTENTS64: usize = 24;
+    const FLAGS2: usize = 120;
+    let nrext64 = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"))
+        & crate::format::log_items::log_dinode::flags2::DI_FLAGS2_NREXT64
+        != 0;
+    if nrext64 {
+        core[NEXTENTS64..NEXTENTS64 + 8].copy_from_slice(&count.to_be_bytes());
+    } else {
+        core[NEXTENTS..NEXTENTS + 4].copy_from_slice(&(count as u32).to_be_bytes());
+    }
+}
 
 /// What a removal expects the name to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,21 +189,35 @@ impl Filesystem {
         if !dir_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if dir_inode.format != Format::Local {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {parent} has outgrown the inode, so removing an entry rewrites a \
-                 directory block rather than the inode's own fork"
-            )));
-        }
-
         let (fork_start, fork_end) = dir_inode.data_fork_range(usize::from(self.sb.inodesize));
-        let parsed = dir::read_short_form(&dir_inode, &dir_raw[fork_start..fork_end], &self.sb)?;
-        let entry = parsed
-            .entries
-            .iter()
-            .find(|e| e.name == name)
-            .ok_or(Error::NotFound)?;
-        let ino = entry.ino;
+        // A directory in its inode loses the name from its fork; one past
+        // its inode is read whole and laid out again without it (#366).
+        let (parsed, in_blocks) = match dir_inode.format {
+            Format::Local => (
+                Some(dir::read_short_form(
+                    &dir_inode,
+                    &dir_raw[fork_start..fork_end],
+                    &self.sb,
+                )?),
+                None,
+            ),
+            Format::Extents => (None, Some(self.entries_in_blocks(&dir_inode, &dir_raw)?)),
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {parent} keeps its entries in {other:?} form, which removing an \
+                     entry here does not understand"
+                )))
+            }
+        };
+        let ino = match (&parsed, &in_blocks) {
+            (Some(p), _) => p.entries.iter().find(|e| e.name == name).map(|e| e.ino),
+            (None, Some(entries)) => entries
+                .iter()
+                .find(|e| e.name == name && name != b"." && name != b"..")
+                .map(|e| e.ino),
+            (None, None) => unreachable!("one form or the other"),
+        }
+        .ok_or(Error::NotFound)?;
 
         let (victim, victim_raw) = self.read_inode_raw(ino)?;
         match target {
@@ -274,10 +304,46 @@ impl Filesystem {
         trees.set_counts(count, freecount, None);
         let group_items = trees.into_items()?;
 
-        let fork = self.short_form_without_entry(&parsed, name, fork_end - fork_start)?;
+        let mut allocations = crate::group_write::Allocations::new();
+        let (fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) =
+            match (&parsed, in_blocks) {
+                (Some(p), _) => {
+                    let fork = self.short_form_without_entry(p, name, fork_end - fork_start)?;
+                    let size = fork.len() as u64;
+                    (
+                        fork,
+                        XFS_ILOG_DDATA,
+                        size,
+                        dir_inode.nblocks,
+                        dir_inode.nextents,
+                        Vec::new(),
+                    )
+                }
+                (None, Some(mut entries)) => {
+                    entries.retain(|e| e.name != name);
+                    let rw = self.rewrite_directory(
+                        &mut allocations,
+                        parent,
+                        &dir_inode,
+                        &dir_raw,
+                        &entries,
+                    )?;
+                    (
+                        rw.fork,
+                        XFS_ILOG_DEXT,
+                        rw.size,
+                        rw.blocks,
+                        rw.nextents,
+                        rw.items,
+                    )
+                }
+                (None, None) => unreachable!("one form or the other"),
+            };
+        let allocation_items = allocations.into_items()?;
         let mut dir_core = dir_raw.clone();
-        dir_core[core_at::SIZE..core_at::SIZE + 8]
-            .copy_from_slice(&(fork.len() as u64).to_be_bytes());
+        dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
+        dir_core[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&dir_blocks.to_be_bytes());
+        set_nextents(&mut dir_core, dir_nextents);
         let at = core_at::CHANGECOUNT;
         let now = u64::from_be_bytes(dir_core[at..at + 8].try_into().expect("8 bytes"));
         dir_core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
@@ -297,16 +363,24 @@ impl Filesystem {
         }
 
         let victim_core = emptied_core(&victim_raw);
-        let quota_items = crate::quota::accounting_items(
-            self,
-            &[crate::quota::QuotaChange {
-                uid: victim.uid,
-                gid: victim.gid,
-                project_id: crate::quota::project_id(&victim_raw),
-                blocks_fs: 0,
-                inodes: -1,
-            }],
-        )?;
+        let mut quota_changes = vec![crate::quota::QuotaChange {
+            uid: victim.uid,
+            gid: victim.gid,
+            project_id: crate::quota::project_id(&victim_raw),
+            blocks_fs: 0,
+            inodes: -1,
+        }];
+        // A directory that gave blocks back, or took them, charges its owner.
+        if dir_blocks != dir_inode.nblocks {
+            quota_changes.push(crate::quota::QuotaChange {
+                uid: dir_inode.uid,
+                gid: dir_inode.gid,
+                project_id: crate::quota::project_id(&dir_raw),
+                blocks_fs: dir_blocks as i64 - dir_inode.nblocks as i64,
+                inodes: 0,
+            });
+        }
+        let quota_items = crate::quota::accounting_items(self, &quota_changes)?;
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {parent}: {why}")))?;
@@ -322,6 +396,8 @@ impl Filesystem {
         fork_op.resize(dsize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
 
         let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + 2;
@@ -346,6 +422,12 @@ impl Filesystem {
             for item in &group_items {
                 ops.extend(item.ops());
             }
+            for item in &allocation_items {
+                ops.extend(item.ops());
+            }
+            for item in &dir_items {
+                ops.extend(item.ops());
+            }
             for item in &quota_items {
                 ops.extend(item.ops());
             }
@@ -353,7 +435,7 @@ impl Filesystem {
                 flags: 0,
                 data: inode_log_format_with_fork(
                     parent,
-                    XFS_ILOG_CORE | XFS_ILOG_DDATA,
+                    XFS_ILOG_CORE | dir_flags,
                     &dir_buf,
                     dsize as u16,
                 ),
@@ -383,6 +465,8 @@ impl Filesystem {
 
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&group_items);
+        self.logged_buffers(&allocation_items);
+        self.logged_buffers(&dir_items);
         for item in &quota_items {
             item.apply_overlay(self)?;
         }

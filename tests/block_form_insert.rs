@@ -73,14 +73,15 @@ fn a_directory_takes_entries_after_it_leaves_the_inode() {
             let file = format!("entry_{i:04}");
             match fs.create_file(dir, file.as_bytes(), 0o100644) {
                 Ok((ino, _)) => made.push((file, ino)),
-                // THE BLOCK FILLING IS NOT A FAILURE. What this pins is
-                // that it is refused cleanly, naming what is missing, and
-                // that the directory is still exactly what it was — the
-                // kernel checks that below.
+                // A FULL BLOCK NOW MOVES INTO LEAF FORM (#366), so every
+                // name here goes in. Past what one leaf indexes is the node
+                // form (#367), which is refused cleanly, naming it, with the
+                // directory still exactly what it was — the kernel checks
+                // that below.
                 Err(e) => {
                     let said = e.to_string();
                     assert!(
-                        said.contains("leaf-form"),
+                        said.contains("node form"),
                         "the refusal should name what is not implemented: {said}"
                     );
                     break;

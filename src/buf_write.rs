@@ -125,6 +125,11 @@ impl BufferItem {
             BLFT_AGFL => crate::agfl::offsets::CRC,
             BLFT_BTREE => crate::ag_btree::offsets::CRC,
             BLFT_DIR_BLOCK => crate::format::dir::offsets::dir3_blk::CRC,
+            // A leaf-form directory's data blocks share block form's header
+            // (#366); its leaf block keeps the checksum in `xfs_da3_blkinfo`,
+            // after the two sibling pointers, the magic and its padding.
+            BLFT_DIR_DATA => crate::format::dir::offsets::dir3_blk::CRC,
+            BLFT_DIR_LEAF1 => crate::format::dir::offsets::da_blk::CRC,
             _ => return self.data.clone(),
         };
         let mut out = self.data.clone();
