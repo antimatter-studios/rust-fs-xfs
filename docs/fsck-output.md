@@ -242,6 +242,12 @@ code has neither a case nor a reason.
 | `dir.reached-twice` | `cli_fsck_oracle.rs`: dir-two-parents |
 | `dir.unreached` | `cli_fsck_oracle.rs`: entry-to-free-inode |
 | `mount` | `cli_fsck_oracle.rs`: agi-freecount |
+| `rt.geometry` | `realtime_check_oracle.rs`: realtime geometry that disagrees with itself |
+| `rt.extent` | `realtime_check_oracle.rs`: a realtime extent past the section |
+| `rt.cross-link` | `realtime_check_oracle.rs`: two files mapping one realtime extent |
+| `rt.bitmap` | `realtime_check_oracle.rs`: a bitmap bit freeing a mapped extent |
+| `rt.summary` | `realtime_check_oracle.rs`: a wrong summary count |
+| `counter.sb.frextents` | `realtime_check_oracle.rs`: a wrong free extent count |
 | `quota.flags` | `quota_records_oracle.rs`, by finding text |
 | `quota.inode` | `quota_records_oracle.rs`, by finding text |
 | `quota.unreadable` | `quota_records_oracle.rs`, by finding text |
