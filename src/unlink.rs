@@ -280,13 +280,6 @@ impl Filesystem {
                          unlink_file only a regular file"
                     )));
                 }
-                if victim.nlink != 1 {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino} has {} links, so removing this name leaves the inode \
-                         alive and only moves the count",
-                        victim.nlink
-                    )));
-                }
             }
             Target::Directory => {
                 if !victim.is_dir() {
@@ -294,12 +287,6 @@ impl Filesystem {
                 }
                 if !self.read_dir(&victim, &victim_raw)?.is_empty() {
                     return Err(Error::DirectoryNotEmpty);
-                }
-                if victim.format != Format::Local {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino} is an empty directory still in block form, whose \
-                         blocks would have to be freed as well"
-                    )));
                 }
                 // Its own `.` and the parent's entry naming it. Anything
                 // else is a count this does not know how to account for.
@@ -312,15 +299,29 @@ impl Filesystem {
                 }
             }
         }
-        if victim.nblocks != 0 || victim.nextents != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} still holds {} blocks in {} extents, which would have to be \
-                 freed as well; truncate it first",
-                victim.nblocks, victim.nextents
-            )));
+        // A file with another name keeps living, a link fewer (#384); its
+        // last name, or a directory, frees it with everything it owns.
+        let freed = target == Target::Directory || victim.nlink <= 1;
+        if freed {
+            if victim.format == Format::Btree {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} keeps its extents in a B+tree, which freeing it here does \
+                     not undo"
+                )));
+            }
+            if victim.anextents > 0 && victim.aformat != Format::Local {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} has attribute blocks, which freeing it here does not give \
+                     back"
+                )));
+            }
         }
 
-        let group_items = self.freed_inode_items(ino)?;
+        let group_items = if freed {
+            self.freed_inode_items(ino)?
+        } else {
+            Vec::new()
+        };
 
         let mut allocations = crate::group_write::Allocations::new();
         let (fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) =
@@ -357,6 +358,10 @@ impl Filesystem {
                 }
                 (None, None) => unreachable!("one form or the other"),
             };
+        if freed && victim.format == Format::Extents {
+            let extents = self.data_extents(&victim, &victim_raw)?;
+            self.free_file_extents(&mut allocations, ino, &extents)?;
+        }
         let allocation_items = allocations.into_items()?;
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
@@ -380,14 +385,28 @@ impl Filesystem {
             dir_core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&now.to_be_bytes());
         }
 
-        let victim_core = emptied_core(&victim_raw);
-        let mut quota_changes = vec![crate::quota::QuotaChange {
-            uid: victim.uid,
-            gid: victim.gid,
-            project_id: crate::quota::project_id(&victim_raw),
-            blocks_fs: 0,
-            inodes: -1,
-        }];
+        let victim_core = if freed {
+            emptied_core(&victim_raw)
+        } else {
+            let mut core = victim_raw.clone();
+            core[core_at::NLINK..core_at::NLINK + 4]
+                .copy_from_slice(&(victim.nlink - 1).to_be_bytes());
+            let at = core_at::CHANGECOUNT;
+            let now = u64::from_be_bytes(core[at..at + 8].try_into().expect("8 bytes"));
+            core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+            stamp_change(&mut core, clock_now(), Changed::Status);
+            core
+        };
+        let mut quota_changes = Vec::new();
+        if freed {
+            quota_changes.push(crate::quota::QuotaChange {
+                uid: victim.uid,
+                gid: victim.gid,
+                project_id: crate::quota::project_id(&victim_raw),
+                blocks_fs: -(victim.nblocks as i64),
+                inodes: -1,
+            });
+        }
         // A directory that gave blocks back, or took them, charges its owner.
         if dir_blocks != dir_inode.nblocks {
             quota_changes.push(crate::quota::QuotaChange {
