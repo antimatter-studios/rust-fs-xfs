@@ -624,36 +624,46 @@ fn one_damage_per_code(base: &str) -> Vec<Case> {
 fn every_code_fires_on_damage_the_reference_finds() {
     let source = fixture("xfsdata-default.img");
     let base = source.to_str().unwrap();
+    let counted = fixture("xfsfeat-finobt-inobtcount.img");
     let mut wrong = Vec::new();
+    // Each case's damage, made when its turn comes so one copy is on disk
+    // at a time.
+    type Damage<'a> = Box<dyn Fn() -> scratch::Volume + 'a>;
+    let mut cases: Vec<(&str, &str, String, Damage)> = Vec::new();
+    for (code, name, commands) in one_damage_per_code(base) {
+        let what = format!("{commands:?}");
+        let source = source.as_path();
+        cases.push((
+            code,
+            name,
+            what,
+            Box::new(move || damaged(source, name, &commands)),
+        ));
+    }
     // The inode btree block counts mean something only where the volume
     // keeps them (`inobtcount`), which the data fixture does not, so those
-    // two codes are damaged on a fixture that does.
-    let counted = fixture("xfsfeat-finobt-inobtcount.img");
-    let mut cases: Vec<(&std::path::Path, Case)> = one_damage_per_code(base)
-        .into_iter()
-        .map(|c| (source.as_path(), c))
-        .collect();
-    for case in [
-        (
-            "counter.agi.iblocks",
-            "agi1-iblocks",
-            vec!["agi 1".to_string(), "write -d iblocks 5".to_string()],
-        ),
-        (
-            "counter.agi.fblocks",
-            "agi1-fblocks",
-            vec!["agi 1".to_string(), "write -d fblocks 5".to_string()],
-        ),
+    // two codes are damaged on a fixture that does. The guest's `xfs_db`
+    // names neither field, so each is changed by its bytes.
+    for (code, name, at) in [
+        ("counter.agi.iblocks", "agi1-iblocks", AGI_IBLOCKS),
+        ("counter.agi.fblocks", "agi1-fblocks", AGI_IBLOCKS + 4),
     ] {
-        cases.push((counted.as_path(), case));
+        let what = format!("group 1's AGI, {at} bytes in, raised by 77");
+        let counted = counted.as_path();
+        cases.push((
+            code,
+            name,
+            what,
+            Box::new(move || agi_count_damaged(counted, name, 1, at)),
+        ));
     }
-    for (source, (code, name, commands)) in &cases {
-        let image = damaged(source, name, commands);
+    for (code, name, commands, damage) in &cases {
+        let image = damage();
         let image = image.path().to_str().unwrap();
         let (clean, said) = repair(image);
         if clean {
             wrong.push(format!(
-                "{code} ({name}): xfs_repair -n finds nothing wrong after {commands:?}"
+                "{code} ({name}): xfs_repair -n finds nothing wrong after {commands}"
             ));
             continue;
         }
@@ -680,6 +690,30 @@ fn every_code_fires_on_damage_the_reference_finds() {
         cases.len(),
         wrong.join("\n\n")
     );
+}
+
+/// Where `agi_iblocks` sits in an AGI: after `agi_free_level`.
+const AGI_IBLOCKS: usize = fs_xfs::ag::offsets::agi::FREE_LEVEL + 4;
+
+/// A copy of `source` with the 32-bit count `at` bytes into group `ag`'s
+/// AGI raised by 77 and the header's checksum stamped again, so the count
+/// is the only damage. The geometry is `xfs_db`'s.
+fn agi_count_damaged(source: &std::path::Path, name: &str, ag: u64, at: usize) -> scratch::Volume {
+    use fs_core::{BlockDevice, BlockRead};
+    let copy =
+        scratch::Volume::copy_of(SUITE, source, &format!("{}-{name}.img", std::process::id()));
+    let image = copy.path().to_str().unwrap();
+    let sb = |field: &str| db_value(image, &["sb 0", &format!("p {field}")]);
+    let sect = sb("sectsize");
+    let offset = ag * sb("agblocks") * sb("blocksize") + 2 * sect;
+    let dev = fs_core::FileDevice::open_rw(copy.path()).unwrap();
+    let mut agi = vec![0u8; sect as usize];
+    dev.read_at(offset, &mut agi).unwrap();
+    let count = u32::from_be_bytes(agi[at..at + 4].try_into().unwrap());
+    agi[at..at + 4].copy_from_slice(&(count + 77).to_be_bytes());
+    fs_xfs::group_write::restamp_crc(&mut agi, fs_xfs::ag::offsets::agi::CRC);
+    dev.write_at(offset, &agi).unwrap();
+    copy
 }
 
 /// A copy of `source` damaged by `commands`, run through `xfs_db -x`.
