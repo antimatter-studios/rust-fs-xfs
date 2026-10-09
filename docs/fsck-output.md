@@ -171,6 +171,12 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `rt.bitmap` | error | no | The realtime bitmap calls an extent free that a file maps, or in use when nothing maps it. |
 | `rt.summary` | error | no | The realtime summary is not what the bitmap adds up to. |
 | `counter.sb.frextents` | error | no | The superblock's free realtime extent count is not what the bitmap holds. |
+| `rmap.missing` | error | no | A block has an owner the reverse-mapping btree does not record. |
+| `rmap.stale` | error | no | The reverse-mapping btree records an owner for a block nothing owns, or that is free. |
+| `rmap.owner` | error | no | The reverse-mapping btree records a block under one owner while the walk found it owned by another. |
+| `rmap.duplicate` | error | no | The reverse-mapping btree records the same owner of a block twice. |
+| `refcount.stale` | error | no | The refcount btree records blocks as shared that one owner or none holds. |
+| `refcount.count` | error | no | The refcount btree's count for shared blocks is not the number of file mappings the walk finds. |
 | `repair.not-exclusive` | warning | no | No repair was planned: another holder has the target, or it is mounted. |
 | `repair.feature` | warning | no | No repair was planned: the volume uses a feature the planner does not reason about. |
 | `repair.log-dirty` | warning | no | No repair was planned: the log needed replay. |
