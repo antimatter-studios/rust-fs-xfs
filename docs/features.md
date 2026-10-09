@@ -90,7 +90,7 @@ only.
 | mkdir, and a directory converted to block form | Supported | 0.5.1 (#38) | | `dir_block_oracle.rs` |
 | Entries in a block-form directory | Supported | 0.8.0 (#215) | | `block_form_insert.rs` |
 | Create, unlink, rename and rmdir in block- and leaf-form directories: the directory laid out again in block form while one block holds it and in leaf form beyond, blocks taken and given back as it grows and shrinks | Experimental | Unreleased (#366) | | `leaf_directories.rs`, `leaf_directories_oracle.rs`, `block_form_insert.rs` |
-| Create, unlink, rename and rmdir in node-form directories: edited in place, with leaf and node splits, joins and root collapse, free-index upkeep, transitions to and from leaf form, and a block-map B+tree for a map that outgrows the inode | Experimental | Unreleased (#424) | | `node_directories.rs`, `node_directories_oracle.rs` |
+| Create, unlink, rename and rmdir in node-form directories: edited in place, with leaf and node splits, joins and root collapse, free-index upkeep, transitions to and from leaf form, and a block-map B+tree for a map that outgrows the inode; a link or a move finds its names through the hash index, at a cost that does not grow with the directory | Experimental | Unreleased (#424) | | `node_directories.rs`, `node_directories_oracle.rs` |
 | Rename within a short-form directory | Supported | 0.5.1 (#25) | #368 | `rename_oracle.rs` |
 | Move a name across directories (`Filesystem::rename`), a directory taking its `..` and both parents' link counts with it, in any directory form; a move beneath itself refused | Experimental | Unreleased (#382) | | `cross_directory_rename.rs`, `cross_directory_rename_oracle.rs` |
 | Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | Unreleased (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |
@@ -99,7 +99,7 @@ only.
 | Extended attribute and ACL writes | Upcoming | | #389, #390 | |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
 | Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
-| Log reuse in bounded memory (`sync`) | Supported | 0.8.0 (#89) | | `log_reuse.rs` |
+| Log reuse in bounded memory (`sync`); a checkpoint that would leave a gap no pad record fits wraps first | Supported | 0.8.0 (#89); gap fixed Unreleased (#424) | | `log_reuse.rs`, `log_write` unit tests |
 | A checkpoint split across several log records | Supported | 0.8.0 (#216) | | `split_checkpoint.rs` |
 | A checkpoint whose flush fails | Supported: the kernel replays to a consistent volume | 0.8.0 | | `torn_checkpoint_oracle.rs` |
 | Writing after a failed log write or push | Refused (`Error::Io`, EIO): the mount reads and writes nothing more, as the kernel shuts down | Unreleased (#400) | | `log_write_failure.rs`, `torn_checkpoint_oracle.rs` |
