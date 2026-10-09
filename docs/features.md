@@ -85,7 +85,7 @@ only.
 | Shorten in place, without freeing blocks (C ABI `fs_xfs_truncate`) | Partial: the blocks stay allocated | 0.5.0 | #370 | `capi.rs` |
 | Truncate to any length (`Filesystem::truncate_to`), shorter or longer, freeing the blocks past the new end, cutting a straddling extent, zeroing the last block's tail; an extent B+tree left small enough returned to an inline list; shared blocks kept, and a cut inside one refused | Experimental: a B+tree that would still need a tree after freeing is refused | Unreleased (#370) | | `truncate_to.rs`, `truncate_to_oracle.rs` |
 | Create a file | Supported | 0.5.1 (#36) | | `create_replay_oracle.rs`, `create_free_slot_oracle.rs` |
-| Create in a directory with a default ACL | Refused | 0.10.0 (#284) | #390 | `create_default_acl_oracle.rs` |
+| Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | Unreleased (#PR) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
 | Unlink a file | Supported | 0.5.1 (#37) | | `unlink_replay_oracle.rs` |
 | mkdir, and a directory converted to block form | Supported | 0.5.1 (#38) | | `dir_block_oracle.rs` |
 | Entries in a block-form directory | Supported | 0.8.0 (#215) | | `block_form_insert.rs` |
@@ -96,7 +96,7 @@ only.
 | Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
 | Hard links | Upcoming | | #384 | |
 | Extended attribute writes: set, create-only, replace-only and remove in `user.`, `trusted.` and `security.`, across short-form, leaf, node and remote forks, values to 64 KiB, quota charged for attribute blocks; C ABI `fs_xfs_setxattr`/`getxattr`/`listxattr`/`removexattr` | Experimental: the rebuilt attribute fork needs one free run | Unreleased (#389) | | `xattr_write_oracle.rs`, `xattr_capi.rs`, `oracle_vm_fixtures.rs` |
-| ACL writes | Upcoming | | #390 | |
+| ACL writes: `set_acl`, `remove_acl` and `chmod`, access and default, kept in step with the mode; `set_attributes` refuses a permission change under an access ACL | Experimental | Unreleased (#PR) | | `acl_write_oracle.rs`, `acl_write.rs` |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
 | Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
 | Log reuse in bounded memory (`sync`) | Supported | 0.8.0 (#89) | | `log_reuse.rs` |

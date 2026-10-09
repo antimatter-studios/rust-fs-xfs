@@ -271,6 +271,18 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for a v1 or v2 inode, which has no
     /// CRC and predates the fields this writes.
     pub fn set_attributes(&self, inode: &Inode, change: &AttrChange) -> Result<()> {
+        // The mode's permission bits are an access ACL's owner, group-class
+        // and other entries (#390). Changing them here, in place, would leave
+        // the ACL saying something else; `chmod` changes both in one record.
+        if change.permissions.is_some()
+            && self.acl(inode.ino, crate::acl::AclKind::Access)?.is_some()
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} has an access ACL; Filesystem::chmod keeps it in step with the \
+                 mode",
+                inode.ino
+            )));
+        }
         let device = self.writable_device()?;
         if change.is_empty() {
             return Ok(());

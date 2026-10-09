@@ -45,8 +45,6 @@
 //!   (see `convert_to_block_form`), which is a feature of this module
 //!   rather than a limit of it;
 //! - a name that is already in the directory;
-//! - a parent carrying a default ACL (`SGI_ACL_DEFAULT`), which the new
-//!   inode would inherit as attributes this driver cannot write (#284);
 //! - inode trees more than one level deep. A root with no room is not
 //!   checked here — the capacity refusal lives in `unlink`, and this
 //!   list previously promised a guard `create` does not have;
@@ -70,7 +68,6 @@
 use crate::dir;
 use crate::dir_block;
 use crate::error::{Error, Result};
-use crate::format::acl::POSIX_ACL_DEFAULT;
 use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
 use crate::inode::{offsets as inode_offsets, stamp_change, Changed, Format, Timestamp};
@@ -521,7 +518,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn create_file(&self, parent: u64, name: &[u8], mode: u16) -> Result<(u64, u64)> {
-        self.create(parent, name, mode, Kind::File)
+        self.create_inheriting(parent, name, mode, Kind::File)
     }
 
     /// Create an empty directory called `name` in `parent`.
@@ -546,7 +543,31 @@ impl Filesystem {
     ///
     /// As [`Filesystem::create_file`].
     pub fn create_directory(&self, parent: u64, name: &[u8], mode: u16) -> Result<(u64, u64)> {
-        self.create(parent, name, mode, Kind::Directory)
+        self.create_inheriting(parent, name, mode, Kind::Directory)
+    }
+
+    /// Create an inode, giving it what `parent`'s default ACL passes on
+    /// (#390, #284).
+    ///
+    /// The inode is made with its mode already narrowed by the default, and
+    /// the inherited ACLs are written after it, so a crash between the two
+    /// leaves it no more open than intended.
+    fn create_inheriting(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u16,
+        kind: Kind,
+    ) -> Result<(u64, u64)> {
+        let inherited = self.inherited_acl(parent, mode & 0o7777, kind == Kind::Directory)?;
+        let mode = inherited
+            .as_ref()
+            .map_or(mode, |(bits, _, _)| (mode & !0o7777) | bits);
+        let made = self.create(parent, name, mode, kind)?;
+        if let Some((_, access, default)) = inherited {
+            self.write_inherited_acl(made.0, access, default)?;
+        }
+        Ok(made)
     }
 
     fn create(&self, parent: u64, name: &[u8], mode: u16, kind: Kind) -> Result<(u64, u64)> {
@@ -568,24 +589,6 @@ impl Filesystem {
         let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
         if !dir_inode.is_dir() {
             return Err(Error::NotADirectory);
-        }
-        // A DEFAULT ACL IS A PROMISE ABOUT THE DIRECTORY'S CONTENTS (#284).
-        // The kernel gives an inode made here an access ACL derived from
-        // it, a directory a copy of it as its own default, and group bits
-        // from its mask rather than the umask (`posix_acl_create`). This
-        // driver writes no attributes, so it would make an inode without
-        // them. An attribute fork that cannot be read is refused too: it
-        // cannot say there is no default ACL.
-        let has_default_acl = self
-            .list_xattrs(&dir_inode, &dir_raw)?
-            .iter()
-            .any(|a| a.name == POSIX_ACL_DEFAULT);
-        if has_default_acl {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {parent} carries a default ACL (SGI_ACL_DEFAULT), which a new \
-                 inode inherits; this driver writes no attributes, so it cannot give \
-                 the new inode the ACL it would inherit"
-            )));
         }
         // A directory past its inode is laid out again by `rewrite_directory`
         // (#366), in block or leaf form; node form is refused there.

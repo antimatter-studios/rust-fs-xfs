@@ -73,6 +73,13 @@ never does.
   group's trees, quota and the inode's whole extent list. A file whose extents
   are in a B+tree, or a write that would need one, is refused by name.
 
+- **POSIX ACLs can be set, changed and removed (#390).** `Filesystem::set_acl`
+  and `remove_acl` write access and default ACLs, an ACL the mode already says
+  is stored as the mode alone, and `chmod` moves the owner, mask and other
+  entries with the mode as the kernel does. A file or directory created under
+  a default ACL inherits it, narrowed by the mode asked for, where it used to
+  be refused (#284).
+
 - **Extended attributes can be written and removed on v5 (#389).** `set_xattr`
   supports insert, create-only and replace-only semantics in the `user.`,
   `trusted.` and `security.` namespaces; `remove_xattr` releases their blocks.

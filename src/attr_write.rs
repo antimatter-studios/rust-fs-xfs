@@ -389,14 +389,28 @@ impl Filesystem {
         name: &[u8],
         change: Option<(&[u8], XattrMode)>,
     ) -> Result<u64> {
+        if matches!(name, b"trusted.SGI_ACL_FILE" | b"trusted.SGI_ACL_DEFAULT") {
+            return Err(unsupported("ACL attributes require an ACL operation"));
+        }
+        self.write_xattr(ino, name, change, None)
+    }
+
+    /// Change one attribute, and with it the inode's permission bits when
+    /// `permissions` is given, in one record (#390). The ACL operations
+    /// come through here, because an access ACL and the mode it implies
+    /// must not be written apart.
+    pub(crate) fn write_xattr(
+        &self,
+        ino: u64,
+        name: &[u8],
+        change: Option<(&[u8], XattrMode)>,
+        permissions: Option<u16>,
+    ) -> Result<u64> {
         self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(unsupported("attribute writes require v5 metadata"));
         }
         name_parts(name)?;
-        if matches!(name, b"trusted.SGI_ACL_FILE" | b"trusted.SGI_ACL_DEFAULT") {
-            return Err(unsupported("ACL attributes require an ACL operation"));
-        }
         if change.is_some_and(|(value, _)| value.len() > attr::XFS_ATTR_VALUE_MAX as usize) {
             return Err(unsupported("attribute values exceed 65536 bytes"));
         }
@@ -575,6 +589,10 @@ impl Filesystem {
                 Error::BadSuperblock("attribute blocks exceed inode block count".into())
             })?;
         raw[64..72].copy_from_slice(&nblocks.to_be_bytes());
+        if let Some(bits) = permissions {
+            let mode = (be16(&raw, 2) & !0o7777) | (bits & 0o7777);
+            raw[2..4].copy_from_slice(&mode.to_be_bytes());
+        }
         // The attribute fork's blocks are the inode's, so its owners' quota
         // is charged for what it gains and credited for what it gives back,
         // and a hard limit refuses before anything is written.
