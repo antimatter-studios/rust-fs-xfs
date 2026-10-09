@@ -438,7 +438,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
     let ino = |name: &str| inode_of(base, name);
     let (small, medium) = (ino("small.txt"), ino("medium.bin"));
     let (fragmented, manyfiles) = (ino("fragmented.bin"), ino("manyfiles"));
-    let (sub, modes) = (ino("sub"), ino("modes"));
+    let sub = ino("sub");
     let root = db_value(base, &["sb 0", "p rootino"]);
     // A free inode in the root's chunk: the fixture allocates its first
     // inodes in order and leaves the end of the chunk free.
@@ -627,7 +627,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             "dir-two-parents",
             vec![
                 format!("inode {sub}"),
-                format!("write -d u3.sfdir3.list[0].inumber.i4 {modes}"),
+                format!("write -d u3.sfdir3.list[0].inumber.i4 {manyfiles}"),
             ],
         ),
     ]
