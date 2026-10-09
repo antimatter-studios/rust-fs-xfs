@@ -157,8 +157,10 @@ fn a_volume_the_reference_calls_clean_plans_nothing() {
     }
 }
 
+/// A counter is derived from the trees it summarises, so its damage is
+/// planned as a change by the counters rule (#392).
 #[test]
-fn damage_no_rule_repairs_is_planned_as_left() {
+fn counter_damage_is_planned_as_a_repair() {
     let volume = copy("xfsdata-default.img", "freeblks");
     let edit = oracle("xfs_db")
         .args(["-x", "-c", "agf 0", "-c", "write -d freeblks 1"])
@@ -174,11 +176,56 @@ fn damage_no_rule_repairs_is_planned_as_left() {
     let (code, plan) = planned_twice(volume.path(), "agf-freeblks");
     assert_eq!(code, Some(4), "{plan}");
     assert!(
+        plan.starts_with(r#"{"status":"ready","changes":[{"#),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(r#""code":"counter.agf.freeblks","rule":"counters""#),
+        "the damage is not planned by the counters rule: {plan}"
+    );
+    assert!(plan.contains(r#""unplanned":[]"#), "{plan}");
+}
+
+/// Damage no rule repairs is listed as left, and nothing is planned for
+/// it: an extent mapped outside every group.
+#[test]
+fn damage_no_rule_repairs_is_planned_as_left() {
+    let source = fixture("xfsdata-default.img");
+    let listing = stdout(&ok(tool("fs.xfs").args([
+        source.to_str().unwrap(),
+        "ls",
+        "/",
+    ])));
+    let at = listing
+        .find("\"name\": \"medium.bin\"")
+        .unwrap_or_else(|| panic!("no medium.bin in the data fixture:\n{listing}"));
+    let medium = json_field(&listing[at..], "inode");
+    let volume = copy("xfsdata-default.img", "extent-range");
+    let edit = oracle("xfs_db")
+        .args([
+            "-x",
+            "-c",
+            &format!("inode {medium}"),
+            "-c",
+            "write -d u3.bmx[0].startblock 4503599627370495",
+        ])
+        .arg(volume.path())
+        .output();
+    assert!(
+        edit.ok(),
+        "xfs_db could not damage the extent:\n{}",
+        edit.stderr
+    );
+    let (clean, said) = reference_clean(volume.path().to_str().unwrap());
+    assert!(!clean, "xfs_repair -n does not see the damage:\n{said}");
+    let (code, plan) = planned_twice(volume.path(), "extent-range");
+    assert_eq!(code, Some(4), "{plan}");
+    assert!(
         plan.starts_with(r#"{"status":"ready","changes":[],"refusals":[]"#),
         "{plan}"
     );
     assert!(
-        plan.contains(r#""code":"counter.agf.freeblks""#),
+        plan.contains(r#""code":"range.extent""#),
         "the damage is not listed as unplanned: {plan}"
     );
 }
