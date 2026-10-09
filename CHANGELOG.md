@@ -8,6 +8,15 @@ never does.
 
 ### Added
 
+- **`fsck.xfs -y` counts group and superblock counters again (#392).** The
+  `Counters` rule derives each AGF, AGI and superblock counter from the trees it
+  summarises, exactly as the checker does, and rewrites only those fields and the
+  header's checksum. The AGF counters are free blocks, longest extent and btree
+  blocks; the AGI counters are inodes, free inodes and inode btree blocks; the
+  superblock's are inodes, free inodes and free blocks. A counter beside any
+  other damage refuses the plan, because a summary of trees the check did not
+  find sound is not a repair.
+
 - **A crash at any checkpoint of a mount is graded by the kernel (#365).**
   `tests/checkpoint_boundary_crash_oracle.rs` runs create, mkdir, a first
   write, rename, unlink and truncate on one mount, and stops the device at each
