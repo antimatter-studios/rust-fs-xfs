@@ -9,23 +9,26 @@
 //! lists once, every name looks up to the inode it lists, nothing else
 //! lists, and the index has the shape the step should have given it.
 //!
-//! A second level of nodes needs some hundred thousand names under 4 KiB
-//! directory blocks, and this crate's `mkfs` makes no smaller ones, so the
-//! two-level tree and what the kernel and `xfs_repair` make of all of it
-//! is `tests/node_directories_oracle.rs`, on 1 KiB directory blocks.
+//! A second level of nodes needs some 175,000 names under 4 KiB directory
+//! blocks, and neither `mkfs.xfs` nor this crate's `mkfs` makes smaller
+//! ones, so the two-level tree and what the kernel and `xfs_repair` make
+//! of all of it is `tests/node_directories_oracle.rs`.
 
 use fs_core::{BlockDevice, BlockRead};
 use fs_xfs::Filesystem;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const BYTES: u64 = 400 * 1024 * 1024;
 const SECTOR: usize = 512;
 
-struct Sparse(Mutex<BTreeMap<u64, Box<[u8; SECTOR]>>>);
+/// Sectors written, and how many bytes have been read.
+struct Sparse(Mutex<BTreeMap<u64, Box<[u8; SECTOR]>>>, AtomicU64);
 
 impl BlockRead for Sparse {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.1.fetch_add(buf.len() as u64, Ordering::Relaxed);
         let sectors = self.0.lock().unwrap();
         let mut done = 0;
         while done < buf.len() {
@@ -67,13 +70,19 @@ impl BlockDevice for Sparse {
 }
 
 fn mounted() -> Filesystem {
-    let dev = Arc::new(Sparse(Mutex::new(BTreeMap::new())));
+    mounted_on().0
+}
+
+/// A mounted volume, and the device under it.
+fn mounted_on() -> (Filesystem, Arc<Sparse>) {
+    let dev = Arc::new(Sparse(Mutex::new(BTreeMap::new()), AtomicU64::new(0)));
     let options = fs_xfs::mkfs::Options {
         block_size: 1024,
         ..fs_xfs::mkfs::Options::default()
     };
     fs_xfs::mkfs::format(dev.as_ref(), &options).expect("mkfs");
-    Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount_rw")
+    let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).expect("mount_rw");
+    (fs, dev)
 }
 
 fn name(i: usize) -> Vec<u8> {
@@ -277,4 +286,42 @@ fn names_renamed_and_moved_in_a_node_directory_are_found_by_their_new_names() {
     assert_eq!(parent, dir);
     want.insert(b"sub".to_vec(), sub);
     assert_eq!(without_dots(listed(&fs, dir)), want);
+}
+
+/// Bytes `op` read from the device.
+fn read_by(dev: &Sparse, op: impl FnOnce()) -> u64 {
+    let before = dev.1.load(Ordering::Relaxed);
+    op();
+    dev.1.load(Ordering::Relaxed) - before
+}
+
+#[test]
+fn a_link_or_a_move_reads_no_more_in_a_directory_four_times_the_size() {
+    let (fs, dev) = mounted_on();
+    let (dir, file) = dir_and_file(&fs);
+    let (other, _) = fs
+        .create_directory(fs.superblock().rootino, b"e", 0o040755)
+        .expect("mkdir");
+    let mut cost = Vec::new();
+    let mut n = 0;
+    for size in [3000, 12000] {
+        while n < size {
+            fs.link(file, dir, &name(n)).expect("link");
+            n += 1;
+        }
+        let link = read_by(&dev, || {
+            fs.link(file, dir, format!("one-more-at-{size}").as_bytes())
+                .expect("link");
+        });
+        let moved = read_by(&dev, || {
+            fs.rename(dir, &name(size - 1), other, &name(size - 1))
+                .expect("move");
+        });
+        cost.push((size, link, moved));
+    }
+    let ((_, link, moved), (_, link4, moved4)) = (cost[0], cost[1]);
+    assert!(
+        link4 < 2 * link && moved4 < 2 * moved,
+        "(names, bytes one link reads, bytes one move reads): {cost:?}"
+    );
 }
