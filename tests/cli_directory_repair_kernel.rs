@@ -22,6 +22,7 @@ fn kernel_contents(image: &str) -> String {
         umount "$m" || {{ echo UMOUNT_FAILED; exit 1; }}
         rmdir "$m"
         rm -f "$img"
+        echo DONE
         "#,
         image = guest_quote(image),
     ));
@@ -158,6 +159,7 @@ fn fault_matrix(dirblock: usize) {
         ln -s sf/entry-00001-abcdefgh "$m/symlink"
         umount "$m" || {{ echo UMOUNT_FAILED; exit 1; }}
         rmdir "$m"
+        echo DONE
     "#,
         image = guest_quote(image)
     ));
