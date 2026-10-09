@@ -63,6 +63,8 @@ const OP_ALIGN: usize = 4;
 /// Offsets within the on-disk inode core that a removal changes.
 mod core_at {
     pub const MODE: usize = 2;
+    /// `di_format`: how the data fork maps its blocks.
+    pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
     pub const SIZE: usize = 56;
     /// `di_nblocks`: the blocks the inode owns.
@@ -104,16 +106,25 @@ pub(crate) fn emptied_core(raw: &[u8]) -> Vec<u8> {
     // A local fork holds no blocks, so a file with attributes passes the
     // "holds no blocks" refusal, and its fork stayed in the free inode.
     // The attribute extent count is the u16 at 80, or, under NREXT64, the
-    // u32 at 76; the data fork's count at 76 is already zero, because a
-    // file with extents is refused.
+    // u32 at 76.
+    //
+    // AND NO BLOCKS, MAPPED AS NO EXTENTS. A rename frees a file that
+    // still held blocks when its core was read, and gives them back in
+    // the same checkpoint, so the count goes with them; `xfs_dinode_verify`
+    // refuses an inode with no extents and blocks still counted, whatever
+    // its mode, and log recovery stopped on it (#383). The data fork is
+    // an empty extent list, as `xfs_ifree` leaves every freed inode.
+    set_nextents(&mut core, 0);
     crate::create::reset_flags(&mut core);
     core[core_at::FORKOFF] = 0;
     core[core_at::AFORMAT] = AFORMAT_EXTENTS;
+    core[core_at::FORMAT] = AFORMAT_EXTENTS;
     core[core_at::NEXTENTS..core_at::FORKOFF].fill(0);
+    core[core_at::NBLOCKS..core_at::NBLOCKS + 8].fill(0);
     core
 }
 
-/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
+/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty fork of either kind.
 const AFORMAT_EXTENTS: u8 = 2;
 
 /// Set `di_nextents`, wherever the inode's own feature bits put it.
@@ -557,6 +568,36 @@ mod tests {
             "the generation must move on, so a reference to the inode's previous life \
              cannot resolve to whatever is put there next"
         );
+    }
+
+    /// A file a rename frees still held blocks when its core was read,
+    /// and they go back in the same checkpoint. The freed core counts
+    /// none and maps them in no format but an empty extent list, as
+    /// `xfs_ifree` leaves it: the kernel's `xfs_dinode_verify` refuses
+    /// an inode with no extents and blocks still counted, whatever its
+    /// mode, so log recovery failed on the replaced file (#383).
+    #[test]
+    fn an_emptied_core_counts_no_blocks_and_maps_none() {
+        let mut raw = vec![0u8; 176];
+        raw[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0o040755u16.to_be_bytes());
+        raw[core_at::FORMAT] = 1; // local
+        raw[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&16u64.to_be_bytes());
+        raw[core_at::NEXTENTS..core_at::NEXTENTS + 4].copy_from_slice(&1u32.to_be_bytes());
+
+        let core = emptied_core(&raw);
+        assert_eq!(
+            u64::from_be_bytes(
+                core[core_at::NBLOCKS..core_at::NBLOCKS + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0,
+            "di_nblocks"
+        );
+        assert_eq!(core[core_at::FORMAT], 2, "di_format: extents");
+        assert!(core[core_at::NEXTENTS..core_at::FORKOFF]
+            .iter()
+            .all(|&b| b == 0));
     }
 
     /// The identity fields survive, because this inode will be handed
