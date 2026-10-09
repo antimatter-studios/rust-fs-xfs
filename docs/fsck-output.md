@@ -24,7 +24,7 @@ Retired codes remain reserved. Human descriptions (`what`) may change freely.
 | `dirty` | boolean | The log required in-memory replay; the target was not changed. |
 | `scan` | string | `complete`, `partial`, or `none`, as below. |
 | `exit` | integer | Process status: `0` clean, `1` findings corrected, `4` findings left uncorrected, `5` both. |
-| `applied` | integer | Only with `-y` or `-p`: how many changes the repair wrote; the rest of the report is the check made after them. |
+| `applied` | integer | Only with `-y` or `-p`: how many changes the repair wrote; the rest of the report is the check made after them. A refused repair writes nothing and exits `4`, even when the check found only warnings. |
 | `inodes` | integer | Allocated inodes walked; omitted when scan is `none`. |
 | `directories` | integer | Directories walked; omitted when scan is `none`. |
 | `free_blocks` | integer | Free blocks counted; omitted when scan is `none`. |

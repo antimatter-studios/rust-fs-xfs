@@ -293,8 +293,15 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     } else {
         CLEAN
     };
+    // A repair asked for and refused leaves whatever the plan would have
+    // dealt with: it is never reported as clean, even when the check alone
+    // found nothing but warnings (a log that needed replay, for one).
+    let refused = applied.is_some()
+        && planned
+            .as_ref()
+            .is_some_and(|p| p.status == fs_xfs::repair::Status::Refused);
     let code = corrected
-        | if checked.is_clean() {
+        | if checked.is_clean() && !refused {
             CLEAN
         } else {
             UNCORRECTED
