@@ -443,7 +443,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
     // A free inode in the root's chunk: the fixture allocates its first
     // inodes in order and leaves the end of the chunk free.
     let free_ino = root + 60;
-    let first_free = db_value(base, &["agf 0", "addr bnoroot", "p recs[0].startblock"]);
+    let first_free = db_value(base, &["agf 0", "addr bnoroot", "p recs[1].startblock"]);
     vec![
         (
             "identity",
@@ -494,7 +494,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agi 0".into(),
                 "addr root".into(),
-                "write -d recs[0].freecount 70".into(),
+                "write -d recs[1].freecount 70".into(),
             ],
         ),
         (
@@ -503,7 +503,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agi 0".into(),
                 "addr root".into(),
-                "write -d recs[0].count 32".into(),
+                "write -d recs[1].count 32".into(),
             ],
         ),
         (
@@ -512,7 +512,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agi 0".into(),
                 "addr free_root".into(),
-                "write -d recs[0].freecount 3".into(),
+                "write -d recs[1].freecount 3".into(),
             ],
         ),
         (
@@ -521,7 +521,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agf 1".into(),
                 "addr bnoroot".into(),
-                "write -d recs[0].blockcount 0".into(),
+                "write -d recs[1].blockcount 0".into(),
             ],
         ),
         (
@@ -530,7 +530,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agf 0".into(),
                 "addr bnoroot".into(),
-                format!("write -d recs[1].startblock {first_free}"),
+                format!("write -d recs[2].startblock {first_free}"),
             ],
         ),
         (
@@ -539,7 +539,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agf 0".into(),
                 "addr cntroot".into(),
-                "write -d recs[0].blockcount 99999".into(),
+                "write -d recs[1].blockcount 99999".into(),
             ],
         ),
         (
@@ -573,7 +573,7 @@ fn one_damage_per_code(base: &str) -> Vec<(&'static str, &'static str, Vec<Strin
             vec![
                 "agf 1".into(),
                 "addr bnoroot".into(),
-                "write -d recs[0].startblock 4000000".into(),
+                "write -d recs[1].startblock 4000000".into(),
             ],
         ),
         (
