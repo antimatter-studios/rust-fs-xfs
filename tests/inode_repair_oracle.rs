@@ -39,6 +39,7 @@ fn build(tag: &str, options: &str) -> scratch::Volume {
         rmdir "$m"
         {repair}
         echo BUILT
+        echo DONE
     "#,
         repair = repair::script(&image)
     ));
@@ -151,6 +152,7 @@ fn repaired(volume: &scratch::Volume, case: &str) {
         echo "NAMES=$(find "$m" -mindepth 1 -printf '%P\n' | sort | tr '\n' ',')"
         umount "$m" || echo UMOUNT_FAILED
         rmdir "$m"
+        echo DONE
     "#,
         repair = repair::script(&image)
     ));
@@ -307,6 +309,7 @@ fn link_census_includes_every_leaf_directory_data_block() {
         umount "$m" || echo UMOUNT_FAILED
         rmdir "$m"
         {repair}
+        echo DONE
     "#,
         repair = repair::script(&image)
     ));
@@ -354,6 +357,7 @@ fn link_census_includes_every_leaf_directory_data_block() {
         umount "$m" || echo UMOUNT_FAILED
         rmdir "$m"
         echo LEAF_NAMESPACE_OK
+        echo DONE
     "#,
         repair = repair::script(&image)
     ));
