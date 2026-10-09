@@ -439,8 +439,21 @@ impl Filesystem {
         .max(8)
         .div_ceil(8)
             * 8;
+        // WHERE THE ATTRIBUTE FORK GOES is the kernel's
+        // `xfs_attr_shortform_bytesfit`: as far right as it fits, so the data
+        // fork keeps every byte it can grow into, and never closer than the
+        // room a small data-fork B+tree root needs (three pointers, 52 bytes,
+        // rounded to 56). Placed straight after what the data fork uses, a
+        // short-form directory that gained an attribute had no room left to
+        // become an extent list (#390). A B+tree data fork keeps the root it
+        // has, whose pointer offsets follow its size.
+        let min_data = if inode.format == Format::Btree {
+            data_required
+        } else {
+            data_required.max(56)
+        };
         let start = XFS_DINODE_V3_SIZE
-            .checked_add(data_required)
+            .checked_add(min_data)
             .filter(|&start| start + 16 <= raw.len())
             .ok_or_else(|| unsupported("no space for an attribute map beside the data fork"))?;
         let inline = shortform(&attrs, raw.len() - start)?;
@@ -517,12 +530,27 @@ impl Filesystem {
         }
         let mut items = allocations.into_items()?;
         items.extend(metadata);
-        raw[start..].fill(0);
+        let litino = raw.len() - XFS_DINODE_V3_SIZE;
+        let forkoff = if inode.format == Format::Btree || fork.is_empty() {
+            data_required
+        } else {
+            let offset = (litino - fork.len()) / 8 * 8;
+            // The attribute fork keeps room for a root of two pointers.
+            let max = (litino - 36) / 8 * 8;
+            offset.min(max).max(min_data)
+        };
+        let start = XFS_DINODE_V3_SIZE + forkoff;
+        if start + fork.len() > raw.len() {
+            return Err(unsupported(
+                "no space for an attribute map beside the data fork",
+            ));
+        }
+        raw[XFS_DINODE_V3_SIZE + data_required..].fill(0);
         if let Some(root) = &data_root {
             raw[XFS_DINODE_V3_SIZE..start].copy_from_slice(root);
         }
         raw[start..start + fork.len()].copy_from_slice(&fork);
-        raw[82] = (data_required / 8) as u8;
+        raw[82] = (forkoff / 8) as u8;
         let count = u32::from(layout.is_some());
         raw[83] = if attrs.is_empty() || layout.is_some() {
             Format::Extents as u8
