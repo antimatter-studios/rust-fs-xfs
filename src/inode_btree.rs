@@ -236,6 +236,51 @@ pub(crate) fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> 
     Ok(chunk)
 }
 
+/// A chunk record as the checker reads it (#393): its free count taken
+/// from its free mask, with what the record itself said when that
+/// disagrees.
+///
+/// The record's identity — first inode, hole mask, free mask — is what
+/// says which inodes it covers and which are free, and a free count beside
+/// it that disagrees is `inobt.chunk-count`, a fault in that record alone.
+/// Refusing the whole record instead, as [`record`] must for a writer,
+/// would leave every inode in the chunk unread and the scan partial.
+///
+/// # Errors
+///
+/// What [`record`] refuses for any other reason: an inode count no chunk
+/// can have, or a packed record read as a plain one.
+pub(crate) fn record_counted(
+    buf: &[u8],
+    at: usize,
+    sparse: bool,
+) -> Result<(InodeChunk, Option<String>)> {
+    match record(buf, at, sparse) {
+        Ok(chunk) => Ok((chunk, None)),
+        Err(e) => {
+            let mut chunk = InodeChunk {
+                startino: be32(buf, at),
+                holemask: if sparse { be16(buf, at + 4) } else { 0 },
+                count: if sparse {
+                    buf[at + 6]
+                } else {
+                    INODES_PER_CHUNK
+                },
+                freecount: 0,
+                free: be64(buf, at + 8),
+            };
+            if !sparse && be32(buf, at + 4) > u32::from(INODES_PER_CHUNK) {
+                return Err(e);
+            }
+            chunk.freecount = (0..INODES_PER_CHUNK)
+                .filter(|&n| chunk.exists(n) && chunk.is_free(n))
+                .count() as u8;
+            check_counts(&chunk)?;
+            Ok((chunk, Some(e.to_string())))
+        }
+    }
+}
+
 /// Refuse a chunk record whose counts disagree with its masks (#314), as
 /// the kernel's `xfs_inobt_check_irec` does: between 4 and 64 inodes, and a
 /// free count equal to the free bits of the inodes the chunk has.

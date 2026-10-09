@@ -8,6 +8,14 @@ never does.
 
 ### Added
 
+- **`fsck.xfs -y` repairs inode allocation and link counts (#393).** The
+  `InodeAllocation` rule sets each inode's allocation bit to whether the inode is
+  in use. Both inode trees, the free counts that follow, and every link count are
+  derived from checksum-valid inodes and a complete directory traversal. An
+  orphan, a directory with two parents, an unused slot still claiming blocks, a
+  metadata inode, or any other finding refuses it. The rule checks a view of the
+  volume with its changes applied before proposing them.
+
 - **`fsck.xfs -y` counts group and superblock counters again (#392).** The
   `Counters` rule derives each AGF, AGI and superblock counter from the trees it
   summarises, exactly as the checker does, and rewrites only those fields and the
@@ -123,6 +131,12 @@ never does.
   request goes into the queue), `ci.yml` triggers on `merge_group`, and a
   `changes` job gates `fixtures` and the VM jobs on `code-changed.sh`, with
   `ci-ok` accepting their skip only for documentation.
+
+- **An inode chunk whose free count disagrees with its free mask is
+  `inobt.chunk-count` (#393),** not `inobt.record`. The record's first inode and
+  masks still say which inodes it covers, so the check reads them and the scan
+  stays complete. An inode the inode btree calls free that is in use is walked
+  through, rather than hiding the directory tree beneath it.
 
 - **A secondary superblock that fails its checksum is `sb.copy.unreadable` (#391),**
   not `checksum`, and no longer makes the scan partial: nothing is reached
