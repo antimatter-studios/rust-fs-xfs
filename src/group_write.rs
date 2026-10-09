@@ -280,6 +280,56 @@ pub fn split_fsblock(sb: &Superblock, fsblock: u64) -> (u32, u32) {
 /// Reading once and taking twice is what makes the second take see the
 /// first, and emitting the items once at the end is what stops two
 /// diffs of the same buffer from reaching the log.
+/// The group's free list, which its free-space and reverse-mapping trees
+/// grow from.
+struct FreeList<'x> {
+    agfl: &'x mut crate::agfl::Agfl,
+    sb: &'x Superblock,
+    agno: u32,
+}
+
+impl crate::ag_btree::BlockSource for FreeList<'_> {
+    fn take(&mut self) -> Result<u32> {
+        self.agfl.take(self.sb, self.agno)
+    }
+
+    fn put(&mut self, agblock: u32) -> Result<()> {
+        self.agfl.put(self.sb, self.agno, agblock)
+    }
+}
+
+/// Blocks for a group's inode trees: from its free space, owned by
+/// `OWN_INOBT`, as `xfs_inobt_alloc_block` and `xfs_inobt_free_block`
+/// take and give them (#423).
+///
+/// Through the operation's one allocator for the group, so the group's
+/// header and free list are logged once, from one copy. The trees used to
+/// keep a free list of their own, read beside the allocator's, and a
+/// create that made an inode chunk and grew the tree in one record logged
+/// the header twice: the later copy undid the earlier one's take, and the
+/// next growth was handed a block the tree already held.
+pub(crate) struct InodeTreeBlocks<'g, 'a>(pub &'g mut GroupAlloc<'a>);
+
+impl crate::ag_btree::BlockSource for InodeTreeBlocks<'_, '_> {
+    fn take(&mut self) -> Result<u32> {
+        self.0.take(1, crate::rmap::OWN_INOBT, 0)
+    }
+
+    fn put(&mut self, agblock: u32) -> Result<()> {
+        self.0.forget_rmap(crate::rmap::Rmap {
+            startblock: agblock,
+            blockcount: 1,
+            owner: crate::rmap::OWN_INOBT,
+            offset: 0,
+        })?;
+        self.0.give_back(FreeExtent {
+            startblock: agblock,
+            blockcount: 1,
+        })?;
+        Ok(())
+    }
+}
+
 pub(crate) struct GroupAlloc<'a> {
     sb: &'a Superblock,
     device: &'a dyn fs_core::BlockRead,
@@ -700,7 +750,11 @@ impl<'a> GroupAlloc<'a> {
             records,
             held,
             &self.before,
-            &mut self.agfl,
+            &mut FreeList {
+                agfl: &mut self.agfl,
+                sb: self.sb,
+                agno: self.agno,
+            },
             encode_record,
             write_keys,
             items,
