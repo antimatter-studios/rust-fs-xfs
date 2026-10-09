@@ -229,26 +229,38 @@ fn a_name_that_is_not_there_is_refused() {
     assert!(matches!(err, fs_xfs::Error::NotFound), "got {err}");
 }
 
-/// A directory past short form is refused by name, not attempted — it
-/// lives in a block, and rewriting one logs a buffer item this cannot
-/// yet produce.
+/// A directory past short form is renamed in, now that a directory in
+/// blocks is laid out again (#366): the new name finds the same inode, the
+/// old one is gone, and the log replays to that. What the kernel and
+/// `xfs_repair` make of a rename in leaf form is
+/// `tests/leaf_directories_oracle.rs`.
 #[test]
-fn a_directory_past_short_form_is_refused() {
+fn a_directory_past_short_form_is_renamed_in() {
     let source = fixture("xfslog-b4096-i512.img");
     let scratch = scratch::Volume::copy_of(SUITE, &source, "xfs-rename-big.img");
     let img = scratch.path();
 
-    let dev = FileDevice::open_rw(img).expect("open read-write");
-    let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
-    // `/logged` holds 200 entries, far past what an inode carries.
-    let big = fs.lookup_path("/logged").expect("find the directory");
-    let err = fs
-        .rename_in_directory(big.ino, b"f1", b"f9999")
-        .expect_err("a directory outside the inode must be refused");
-    assert!(
-        format!("{err}").contains("outgrown the inode"),
-        "the refusal should say why: {err}"
+    let (big, moved) = {
+        let dev = FileDevice::open_rw(img).expect("open read-write");
+        let fs = Filesystem::mount_rw(Arc::new(dev)).expect("mount read-write");
+        // `/logged` holds 200 entries, far past what an inode carries.
+        let big = fs.lookup_path("/logged").expect("find the directory").ino;
+        let moved = fs.lookup_path("/logged/f1").expect("f1").ino;
+        fs.rename_in_directory(big, b"f1", b"f9999")
+            .expect("a rename in a directory outside the inode");
+        (big, moved)
+    };
+    // A read mount replays what was logged.
+    let fs = Filesystem::mount(Arc::new(FileDevice::open(img).expect("open"))).expect("mount");
+    let (dir, raw) = fs.read_inode_raw(big).expect("the directory");
+    assert_eq!(
+        fs.lookup(&dir, &raw, b"f9999").expect("the new name").ino,
+        moved
     );
+    assert!(matches!(
+        fs.lookup(&dir, &raw, b"f1"),
+        Err(fs_xfs::Error::NotFound)
+    ));
 }
 
 /// A read-only mount refuses before reading anything.

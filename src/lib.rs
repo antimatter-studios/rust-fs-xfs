@@ -39,6 +39,8 @@ pub mod check;
 pub mod create;
 pub mod dir;
 pub mod dir_block;
+mod dir_edit;
+pub mod dir_leaf;
 pub mod dir_write;
 pub mod endian;
 pub mod error;

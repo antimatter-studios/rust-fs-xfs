@@ -89,7 +89,8 @@ only.
 | Unlink a file | Supported | 0.5.1 (#37) | | `unlink_replay_oracle.rs` |
 | mkdir, and a directory converted to block form | Supported | 0.5.1 (#38) | | `dir_block_oracle.rs` |
 | Entries in a block-form directory | Supported | 0.8.0 (#215) | | `block_form_insert.rs` |
-| Leaf- and node-form directory changes | Refused by name | 0.8.0 (#215) | #366, #367 | `block_form_insert.rs` |
+| Create, unlink, rename and rmdir in block- and leaf-form directories: the directory laid out again in block form while one block holds it and in leaf form beyond, blocks taken and given back as it grows and shrinks | Experimental | Unreleased (#366) | | `leaf_directories.rs`, `leaf_directories_oracle.rs`, `block_form_insert.rs` |
+| Node-form directory changes | Refused by name | 0.8.0 (#215) | #367 | `leaf_directories.rs` |
 | Rename within a short-form directory | Supported | 0.5.1 (#25) | #368 | `rename_oracle.rs` |
 | Rename across directories, or over an existing target | Upcoming | | #382, #383 | |
 | Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |

@@ -47,6 +47,16 @@ never does.
   owns, a record under the wrong owner, and a repeated record are the new
   findings `rmap.missing`, `rmap.stale`, `rmap.owner` and `rmap.duplicate`.
 
+- **Directories past one block (#366).** A create, unlink, rename or rmdir in a
+  directory that has left its inode reads it whole and lays it out again: in
+  one block while its entries and index fit there, and in leaf form beyond,
+  with data blocks and a leaf block holding the hash index and each data
+  block's longest free region. Blocks are taken from the directory's group as
+  it grows and given back as it shrinks, back to block form when it fits one
+  again. Unlink and rename in a block-form directory, refused until now, go the
+  same way. A directory that needs more than one leaf block, the node form, is
+  refused by name (#367).
+
 - **An empty directory can be removed (#385).** `Filesystem::remove_directory`
   logs the same transaction as an unlink, frees the directory's inode with its
   `.` and `..`, and takes one off the parent's link count for the `..` that

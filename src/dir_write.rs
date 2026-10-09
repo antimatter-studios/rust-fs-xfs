@@ -39,7 +39,7 @@ use crate::error::{Error, Result};
 use crate::format::dir::{
     XFS_DIR2_DATA_ALIGN, XFS_DIR2_SF_HDR_SIZE_4, XFS_DIR2_SF_HDR_SIZE_8, XFS_DIR3_DATA_HDR_SIZE,
 };
-use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
+use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
@@ -108,25 +108,85 @@ impl Filesystem {
         if !dir.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if dir.format != Format::Local {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {dir_ino}: the directory has outgrown the inode, so renaming in it \
-                 rewrites a directory block rather than the inode's own fork"
-            )));
-        }
-
         let (fork_start, fork_end) = dir.data_fork_range(usize::from(self.sb.inodesize));
-        let parsed = dir::read_short_form(&dir, &dir_raw[fork_start..fork_end], &self.sb)?;
-
-        if parsed.entries.iter().any(|e| e.name == to) {
-            return Err(Error::AlreadyExists);
-        }
-        let Some(target) = parsed.entries.iter().find(|e| e.name == from) else {
-            return Err(Error::NotFound);
+        let mut allocations = crate::group_write::Allocations::new();
+        // A directory in its inode is renamed in its fork; one past its
+        // inode is read whole and laid out again with the name changed
+        // (#366).
+        let (moved_ino, fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) = match dir
+            .format
+        {
+            Format::Local => {
+                let parsed = dir::read_short_form(&dir, &dir_raw[fork_start..fork_end], &self.sb)?;
+                if parsed.entries.iter().any(|e| e.name == to) {
+                    return Err(Error::AlreadyExists);
+                }
+                let Some(target) = parsed.entries.iter().find(|e| e.name == from) else {
+                    return Err(Error::NotFound);
+                };
+                let moved = target.ino;
+                let fork =
+                    self.short_form_after_rename(&parsed, from, to, fork_end - fork_start)?;
+                let size = fork.len() as u64;
+                (
+                    moved,
+                    fork,
+                    XFS_ILOG_DDATA,
+                    size,
+                    dir.nblocks,
+                    dir.nextents,
+                    Vec::new(),
+                )
+            }
+            Format::Extents => {
+                let mut entries = self.entries_in_blocks(&dir, &dir_raw)?;
+                if entries.iter().any(|e| e.name == to) {
+                    return Err(Error::AlreadyExists);
+                }
+                let Some(at) = entries
+                    .iter()
+                    .position(|e| e.name == from && from != b"." && from != b"..")
+                else {
+                    return Err(Error::NotFound);
+                };
+                let mut moved = entries.remove(at);
+                let moved_ino = moved.ino;
+                moved.name = to.to_vec();
+                entries.push(moved);
+                let rw =
+                    self.rewrite_directory(&mut allocations, dir_ino, &dir, &dir_raw, &entries)?;
+                (
+                    moved_ino,
+                    rw.fork,
+                    XFS_ILOG_DEXT,
+                    rw.size,
+                    rw.blocks,
+                    rw.nextents,
+                    rw.items,
+                )
+            }
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {dir_ino} keeps its entries in {other:?} form, which renaming \
+                         in does not understand"
+                )))
+            }
         };
-        let moved_ino = target.ino;
-
-        let fork = self.short_form_after_rename(&parsed, from, to, fork_end - fork_start)?;
+        let allocation_items = allocations.into_items()?;
+        let quota_items = if dir_blocks == dir.nblocks {
+            Vec::new()
+        } else {
+            crate::quota::accounting_items(
+                self,
+                &[crate::quota::QuotaChange {
+                    uid: dir.uid,
+                    gid: dir.gid,
+                    project_id: crate::quota::project_id(&dir_raw),
+                    blocks_fs: dir_blocks as i64 - dir.nblocks as i64,
+                    inodes: 0,
+                }],
+            )?
+        };
 
         // The directory's core changes: its size follows the fork, and
         // its timestamps follow the change.
@@ -134,7 +194,9 @@ impl Filesystem {
         // both with one (#279).
         let when = clock_now();
         let mut dir_core = dir_raw[..].to_vec();
-        set_size(&mut dir_core, fork.len() as u64);
+        set_size(&mut dir_core, dir_size);
+        dir_core[64..72].copy_from_slice(&dir_blocks.to_be_bytes());
+        set_nextents(&mut dir_core, dir_nextents);
         bump_changecount(&mut dir_core, self.sb.is_v5());
         stamp_change(&mut dir_core, when, Changed::Contents);
 
@@ -165,23 +227,35 @@ impl Filesystem {
         // Every refusal this operation has is behind us and the next
         // statement writes. See `Filesystem::commit_record`.
         let logged_fork = fork_op[..dsize].to_vec();
+        let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
+            // The directory's format, core and fork, then the moved inode's
+            // format and core.
+            + 5;
         let lsn = self.commit_record(|tid| {
-            vec![
+            let mut ops = vec![
                 Op {
                     flags: XLOG_START_TRANS,
                     data: Vec::new(),
                 },
                 Op {
                     flags: 0,
-                    // Five item operations: the directory's format, core
-                    // and fork, then the moved inode's format and core.
-                    data: trans_header(tid, XFS_TRANS_CHECKPOINT, 5),
+                    data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
+            ];
+            for item in allocation_items.iter().chain(&dir_items) {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
+                ops.extend(item.ops());
+            }
+            ops.extend([
                 Op {
                     flags: 0,
                     data: inode_log_format_with_fork(
                         dir_ino,
-                        XFS_ILOG_CORE | XFS_ILOG_DDATA,
+                        XFS_ILOG_CORE | dir_flags,
                         &dir_buf,
                         dsize as u16,
                     ),
@@ -206,10 +280,16 @@ impl Filesystem {
                     flags: XLOG_COMMIT_TRANS,
                     data: Vec::new(),
                 },
-            ]
+            ]);
+            ops
         })?;
 
         // What the record says is now what this mount reads (#89).
+        self.logged_buffers(&allocation_items);
+        self.logged_buffers(&dir_items);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
         self.logged_inode(dir_ino, &dir_core, &logged_fork)?;
         self.logged_inode(moved_ino, &moved_core, &[])?;
 
@@ -520,6 +600,21 @@ fn encode_short_form(
 }
 
 /// Set `di_size` in an on-disk inode's bytes.
+/// Set `di_nextents`, wherever the inode's own feature bits put it.
+fn set_nextents(core: &mut [u8], count: u64) {
+    const NEXTENTS: usize = 76;
+    const NEXTENTS64: usize = 24;
+    const FLAGS2: usize = 120;
+    let nrext64 = u64::from_be_bytes(core[FLAGS2..FLAGS2 + 8].try_into().expect("8 bytes"))
+        & crate::format::log_items::log_dinode::flags2::DI_FLAGS2_NREXT64
+        != 0;
+    if nrext64 {
+        core[NEXTENTS64..NEXTENTS64 + 8].copy_from_slice(&count.to_be_bytes());
+    } else {
+        core[NEXTENTS..NEXTENTS + 4].copy_from_slice(&(count as u32).to_be_bytes());
+    }
+}
+
 fn set_size(raw: &mut [u8], size: u64) {
     const DI_SIZE: usize = 56;
     raw[DI_SIZE..DI_SIZE + 8].copy_from_slice(&size.to_be_bytes());
