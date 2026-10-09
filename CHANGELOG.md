@@ -47,6 +47,13 @@ never does.
   owns, a record under the wrong owner, and a repeated record are the new
   findings `rmap.missing`, `rmap.stale`, `rmap.owner` and `rmap.duplicate`.
 
+- **An empty directory can be removed (#385).** `Filesystem::remove_directory`
+  logs the same transaction as an unlink, frees the directory's inode with its
+  `.` and `..`, and takes one off the parent's link count for the `..` that
+  went with it. A directory that still holds a name is refused with the new
+  `Error::DirectoryNotEmpty` (ENOTEMPTY in the C ABI), and a name that is not a
+  directory with `Error::NotADirectory`, before anything is written.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount

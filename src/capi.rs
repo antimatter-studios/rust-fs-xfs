@@ -53,6 +53,7 @@ fn errno_for(e: &Error) -> c_int {
         Error::NotFound => libc_enoent(),
         Error::AlreadyExists => libc_eexist(),
         Error::NotADirectory => libc_enotdir(),
+        Error::DirectoryNotEmpty => libc_enotempty(),
         Error::NotAFile => libc_eisdir(),
         Error::ReadOnly => libc_erofs(),
         Error::UnsupportedFeature(_) => libc_enotsup(),
@@ -110,6 +111,14 @@ const fn libc_einval() -> c_int {
 }
 /// `ERANGE` — a result did not fit the caller's buffer.
 const ERANGE: c_int = 34;
+/// `ENOTEMPTY` is 66 on Darwin and 39 on Linux.
+const fn libc_enotempty() -> c_int {
+    if cfg!(target_os = "macos") {
+        66
+    } else {
+        39
+    }
+}
 /// `ENOTSUP` is 45 on Darwin and 95 on Linux.
 const fn libc_enotsup() -> c_int {
     if cfg!(target_os = "macos") {

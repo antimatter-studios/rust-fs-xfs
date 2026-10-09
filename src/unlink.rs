@@ -41,8 +41,6 @@
 //!   well and is a bigger transaction than this one;
 //! - a file with more than one link, where the inode survives and only
 //!   the count moves;
-//! - a directory, which has `.` and `..` to account for and a parent
-//!   whose link count changes;
 //! - a parent that has outgrown its inode;
 //! - inode trees more than one level deep, or a root with no room for
 //!   the chunk this may put back;
@@ -117,6 +115,13 @@ fn emptied_core(raw: &[u8]) -> Vec<u8> {
 /// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
 const AFORMAT_EXTENTS: u8 = 2;
 
+/// What a removal expects the name to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    File,
+    Directory,
+}
+
 impl Filesystem {
     /// Remove `name` from `parent`, freeing the inode it names.
     ///
@@ -132,6 +137,31 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn unlink_file(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
+        self.remove_name(parent, name, Target::File)
+    }
+
+    /// Remove the empty directory `name` from `parent` (#385).
+    ///
+    /// The same transaction as [`Filesystem::unlink_file`], with two more
+    /// things kept right: the directory's `.` and `..` go with its inode,
+    /// and its `..` was a link to `parent`, so the parent's link count
+    /// falls by one.
+    ///
+    /// Returns the removed directory's inode number and the sequence
+    /// number the record was given.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DirectoryNotEmpty`] if the directory still holds a name,
+    /// [`Error::NotADirectory`] if `name` is not a directory or `parent`
+    /// is not one, [`Error::NotFound`] if the name is not there, and the
+    /// rest as [`Filesystem::unlink_file`]. Every refusal comes before
+    /// anything is written.
+    pub fn remove_directory(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
+        self.remove_name(parent, name, Target::Directory)
+    }
+
+    fn remove_name(&self, parent: u64, name: &[u8], target: Target) -> Result<(u64, u64)> {
         self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
@@ -160,18 +190,45 @@ impl Filesystem {
         let ino = entry.ino;
 
         let (victim, victim_raw) = self.read_inode_raw(ino)?;
-        if victim.is_dir() {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} is a directory, which has `.` and `..` to account for and a \
-                 parent whose link count changes; only a regular file is supported"
-            )));
-        }
-        if victim.nlink != 1 {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} has {} links, so removing this name leaves the inode alive \
-                 and only moves the count",
-                victim.nlink
-            )));
+        match target {
+            Target::File => {
+                if victim.is_dir() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino} is a directory; remove_directory removes one, and \
+                         unlink_file only a regular file"
+                    )));
+                }
+                if victim.nlink != 1 {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino} has {} links, so removing this name leaves the inode \
+                         alive and only moves the count",
+                        victim.nlink
+                    )));
+                }
+            }
+            Target::Directory => {
+                if !victim.is_dir() {
+                    return Err(Error::NotADirectory);
+                }
+                if !self.read_dir(&victim, &victim_raw)?.is_empty() {
+                    return Err(Error::DirectoryNotEmpty);
+                }
+                if victim.format != Format::Local {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino} is an empty directory still in block form, whose \
+                         blocks would have to be freed as well"
+                    )));
+                }
+                // Its own `.` and the parent's entry naming it. Anything
+                // else is a count this does not know how to account for.
+                if victim.nlink != 2 {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "empty directory inode {ino} has {} links, not the 2 its own `.` \
+                         and its parent's entry make",
+                        victim.nlink
+                    )));
+                }
+            }
         }
         if victim.nblocks != 0 || victim.nextents != 0 {
             return Err(Error::UnsupportedFeature(format!(
@@ -227,6 +284,17 @@ impl Filesystem {
         // The directory lost an entry, and the kernel's `xfs_remove` stamps
         // its mtime and ctime with the moment it did (#279).
         stamp_change(&mut dir_core, clock_now(), Changed::Contents);
+        // A removed subdirectory's `..` was a link to this one.
+        if target == Target::Directory {
+            let was = dir_inode.nlink;
+            let now = was.checked_sub(1).filter(|&n| n >= 2).ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "directory inode {parent} has {was} links, too few to hold a \
+                     subdirectory's `..`"
+                ))
+            })?;
+            dir_core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&now.to_be_bytes());
+        }
 
         let victim_core = emptied_core(&victim_raw);
         let quota_items = crate::quota::accounting_items(

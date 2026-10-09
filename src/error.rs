@@ -70,6 +70,8 @@ pub enum Error {
 
     /// A path component exists but is not a directory.
     NotADirectory,
+    /// A directory to be removed still holds a name (#385).
+    DirectoryNotEmpty,
 
     /// The operation requires a regular file.
     NotAFile,
@@ -134,6 +136,7 @@ impl fmt::Display for Error {
             Error::DirtyLog => f.write_str("XFS log is dirty and needs replay before mount"),
             Error::NotFound => f.write_str("no such file or directory"),
             Error::AlreadyExists => f.write_str("a file of that name already exists"),
+            Error::DirectoryNotEmpty => f.write_str("the directory is not empty"),
             Error::NotADirectory => f.write_str("not a directory"),
             Error::NotAFile => f.write_str("not a regular file"),
             Error::ReadOnly => f.write_str("filesystem is read-only"),
