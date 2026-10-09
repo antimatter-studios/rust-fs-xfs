@@ -95,7 +95,8 @@ only.
 | Rename across directories, or over an existing target | Upcoming | | #382, #383 | |
 | Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
 | Hard links | Upcoming | | #384 | |
-| Extended attribute and ACL writes | Upcoming | | #389, #390 | |
+| Extended attribute writes: set, create-only, replace-only and remove in `user.`, `trusted.` and `security.`, across short-form, leaf, node and remote forks, values to 64 KiB, quota charged for attribute blocks; C ABI `fs_xfs_setxattr`/`getxattr`/`listxattr`/`removexattr` | Experimental: the rebuilt attribute fork needs one free run | Unreleased (#389) | | `xattr_write_oracle.rs`, `xattr_capi.rs`, `oracle_vm_fixtures.rs` |
+| ACL writes | Upcoming | | #390 | |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
 | Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
 | Log reuse in bounded memory (`sync`) | Supported | 0.8.0 (#89) | | `log_reuse.rs` |
