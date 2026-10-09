@@ -545,6 +545,17 @@ impl Filesystem {
             log::inspect(device.as_ref(), &sb)?,
             log::LogState::NeedsReplay
         );
+        // A log-incompatible bit says the log may hold items of a kind this
+        // driver has no recovery for (#359). A clean log holds none, which
+        // is why the kernel clears the bits at unmount; a log that needs
+        // replay may, so it is refused before a record is read.
+        if replayed && sb.features_log_incompat != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the log needs replay and carries log-incompatible features {:#010x}, \
+                 whose items are not implemented",
+                sb.features_log_incompat
+            )));
+        }
         let device: Arc<dyn BlockRead> = if replayed {
             let into = crate::overlay::Overlay::new(device.clone());
             crate::log_recover::replay(device.as_ref(), &sb, &into)?;
@@ -774,6 +785,14 @@ impl Filesystem {
         if unknown_quota != 0 {
             return Err(Error::UnsupportedFeature(format!(
                 "unknown quota flags {unknown_quota:#x} are not maintained by writes"
+            )));
+        }
+        // A log-incompatible bit is a promise about the log's contents that
+        // this driver's records do not keep (#359).
+        if self.sb.features_log_incompat != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "log-incompatible features {:#010x} are not maintained by writes",
+                self.sb.features_log_incompat
             )));
         }
         // Readable incompat bits whose structures no write here keeps

@@ -131,6 +131,11 @@ never does.
   while recognized quota flags retain supported accounting operations.
 - Volumes carrying unsupported log-incompatible features are refused before
   either mount can inspect or replay the log or issue a write.
+
+  refuse mounting.
+- A log-incompatible feature refuses a writable mount, and a read mount whose
+  log needs replay, before a record is read or written; a read mount of a clean
+  log, which holds nothing those bits describe, goes ahead.
 - Feature-matrix fixtures retain their row names after creating mixed-case
   directory entries, so the final image evidence is recorded for each recipe.
 - The stripe fixture explicitly requests a 64 MiB log, satisfying the pinned

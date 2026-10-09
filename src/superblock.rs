@@ -528,15 +528,6 @@ impl Superblock {
             };
 
         reject_unsupported_features(features_incompat)?;
-        // No log-incompatible extension has a recovery implementation here.
-        // Refuse before either mount can inspect/replay records or write a
-        // checkpoint. A clean-looking log is not evidence that a new record
-        // encoding was understood.
-        if features_log_incompat != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "log-incompatible features not implemented: {features_log_incompat:#010x}"
-            )));
-        }
 
         let uuid = uuid_at(buf, offsets::UUID);
         let meta_uuid: [u8; 16] = if is_v5 && features_incompat & incompat::META_UUID != 0 {
@@ -1676,19 +1667,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_every_log_incompatible_feature_before_recovery() {
+    fn log_incompatible_features_are_parsed_and_kept() {
+        // Refused by the mounts, where whether the log needs replay is
+        // known: a clean log carries nothing those bits describe.
         for index in 0..32 {
             let mut bytes = v5_superblock();
             bytes[offsets::FEATURES_LOG_INCOMPAT..offsets::FEATURES_LOG_INCOMPAT + 4]
                 .copy_from_slice(&(1u32 << index).to_be_bytes());
             let crc = crc32c_with_zeroed_crc(&bytes, SB_CRC_OFFSET);
             bytes[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-            match Superblock::parse(&bytes) {
-                Err(Error::UnsupportedFeature(message)) => {
-                    assert!(message.contains("log-incompatible"));
-                }
-                other => panic!("log feature bit {index} was not refused: {other:?}"),
-            }
+            let sb = Superblock::parse(&bytes).expect("parsed");
+            assert_eq!(sb.features_log_incompat, 1u32 << index);
         }
     }
 

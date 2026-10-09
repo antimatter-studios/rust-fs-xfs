@@ -209,18 +209,16 @@ fn readable_unmaintained_features_refuse_write_before_mutation() {
     }
 }
 
+/// A clean log holds nothing a log-incompatible bit describes, so it is
+/// read; a writer cannot keep the bit's promise, so it is refused.
 #[test]
-fn every_unsupported_log_incompat_bit_refuses_before_mutation() {
+fn every_log_incompat_bit_reads_a_clean_log_and_refuses_writes_before_mutation() {
     for index in 0..32 {
         let bit = 1u32 << index;
         let device = Probe::with_bit(offsets::FEATURES_LOG_INCOMPAT, bit);
-        assert!(
-            matches!(
-                Filesystem::mount(device.clone()),
-                Err(Error::UnsupportedFeature(_))
-            ),
-            "read accepted log incompat {bit:#x}"
-        );
+        let read = Filesystem::mount(device.clone())
+            .unwrap_or_else(|e| panic!("a clean log with log incompat {bit:#x} refused: {e}"));
+        assert_eq!(read.superblock().features_log_incompat, bit);
         assert!(
             matches!(
                 Filesystem::mount_rw(device.clone()),
@@ -287,8 +285,9 @@ fn gate_errors_are_exact_and_accepted_mounts_read_without_changing_the_fixture()
             assert_eq!(device.writes.load(Ordering::SeqCst), 0);
         }
         let device = Probe::with_bit(offsets::FEATURES_LOG_INCOMPAT, bit);
-        let expected = format!("log-incompatible features not implemented: {bit:#010x}");
-        unsupported(Filesystem::mount(device.clone()), &expected);
+        let expected =
+            format!("log-incompatible features {bit:#010x} are not maintained by writes");
+        read_populated_file(&Filesystem::mount(device.clone()).unwrap());
         unsupported(Filesystem::mount_rw(device.clone()), &expected);
         assert_eq!(device.writes.load(Ordering::SeqCst), 0);
         if bit & ro_compat::SUPPORTED == 0 {
@@ -380,4 +379,63 @@ fn realtime_data_mutations_refuse_before_writes_with_named_errors() {
     );
     assert_eq!(device.writes.load(Ordering::SeqCst), 0);
     assert_eq!(fixture_digest(), before);
+}
+/// A sparse in-memory device, for a volume this test makes and dirties.
+struct Memory(std::sync::Mutex<std::collections::BTreeMap<u64, Box<[u8; 512]>>>);
+
+impl BlockRead for Memory {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        let sectors = self.0.lock().unwrap();
+        for (i, b) in buf.iter_mut().enumerate() {
+            let at = offset + i as u64;
+            *b = sectors
+                .get(&(at / 512))
+                .map_or(0, |s| s[(at % 512) as usize]);
+        }
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        300 << 20
+    }
+}
+
+impl BlockDevice for Memory {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        let mut sectors = self.0.lock().unwrap();
+        for (i, b) in buf.iter().enumerate() {
+            let at = offset + i as u64;
+            sectors
+                .entry(at / 512)
+                .or_insert_with(|| Box::new([0; 512]))[(at % 512) as usize] = *b;
+        }
+        Ok(())
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+/// A log that needs replay may hold items a log-incompatible bit
+/// describes, which have no recovery here: the read mount refuses it before
+/// reading a record.
+#[test]
+fn a_log_needing_replay_with_a_log_incompat_bit_is_refused() {
+    let dev = Arc::new(Memory(Default::default()));
+    fs_xfs::mkfs::format(dev.as_ref(), &fs_xfs::mkfs::Options::default()).expect("mkfs");
+    {
+        let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).expect("mount_rw");
+        let root = fs.superblock().rootino;
+        fs.create_file(root, b"f", 0o100644).expect("create");
+    }
+    Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).expect("a dirty log is replayed");
+    let mut sector = vec![0u8; 512];
+    dev.read_at(0, &mut sector).unwrap();
+    sector[offsets::FEATURES_LOG_INCOMPAT..offsets::FEATURES_LOG_INCOMPAT + 4]
+        .copy_from_slice(&1u32.to_be_bytes());
+    fs_xfs::super_write::stamp_crc(&mut sector);
+    dev.write_at(0, &sector).unwrap();
+    assert!(matches!(
+        Filesystem::mount(dev as Arc<dyn BlockRead>),
+        Err(Error::UnsupportedFeature(_))
+    ));
 }

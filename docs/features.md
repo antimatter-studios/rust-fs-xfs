@@ -49,7 +49,8 @@ States:
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | Reverse-mapping and reference-count trees | Supported | 0.7.0 | | `rmap_oracle.rs`, `refcount_oracle.rs` |
 | Filesystems shaped by the stress generators | Supported | 0.8.0 | | `stress_oracle.rs` |
-| `finobt`, `rmapbt`, `reflink`, `inobtcnt`, `ftype`, sparse inodes, metadata UUID | Supported | 0.1.0 | #359 | `feature_matrix_oracle.rs` |
+| `finobt`, `rmapbt`, `reflink`, `inobtcnt`, `ftype`, sparse inodes, metadata UUID | Supported | 0.1.0; pinned matrix with provenance Unreleased (#428) | | `feature_matrix_oracle.rs`, `feature_bit_contract.rs` |
+| Legacy shared superblocks and advertised unknown `features2` bits; any `log_incompat` bit on a writable mount or a log that needs replay | Refused at mount, before the log is read | Unreleased (#428) | | `feature_bit_contract.rs` |
 | An unknown incompatible feature bit | Refused | 0.1.0 | #360 | `src/superblock.rs` unit tests |
 | Fuzzed parsers: superblock, group headers, inodes, directories, btrees | Supported | 0.8.0 (#96) | | `fuzz_decoders.rs` |
 
