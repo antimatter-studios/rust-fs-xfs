@@ -48,7 +48,7 @@
 use crate::create::clock_now;
 use crate::dir;
 use crate::error::{Error, Result};
-use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
+use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
@@ -66,6 +66,8 @@ mod core_at {
     /// `di_format`: how the data fork maps its blocks.
     pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
+    /// `di_format`: how the data fork is kept.
+    pub const FORMAT: usize = 5;
     pub const SIZE: usize = 56;
     /// `di_nblocks`: the blocks the inode owns.
     pub const NBLOCKS: usize = 64;
@@ -243,7 +245,7 @@ impl Filesystem {
         }
         let (fork_start, fork_end) = dir_inode.data_fork_range(usize::from(self.sb.inodesize));
         // A directory in its inode loses the name from its fork; one past
-        // its inode is read whole and laid out again without it (#366).
+        // its inode loses it in whichever form it is in (#366, #367).
         let (parsed, in_blocks) = match dir_inode.format {
             Format::Local => (
                 Some(dir::read_short_form(
@@ -251,9 +253,9 @@ impl Filesystem {
                     &dir_raw[fork_start..fork_end],
                     &self.sb,
                 )?),
-                None,
+                false,
             ),
-            Format::Extents => (None, Some(self.entries_in_blocks(&dir_inode, &dir_raw)?)),
+            Format::Extents | Format::Btree => (None, true),
             other => {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {parent} keeps its entries in {other:?} form, which removing an \
@@ -261,15 +263,17 @@ impl Filesystem {
                 )))
             }
         };
-        let ino = match (&parsed, &in_blocks) {
-            (Some(p), _) => p.entries.iter().find(|e| e.name == name).map(|e| e.ino),
-            (None, Some(entries)) => entries
+        // Found through the hash index past the inode, which never names
+        // `.` or `..`.
+        let ino = match &parsed {
+            Some(p) => p
+                .entries
                 .iter()
-                .find(|e| e.name == name && name != b"." && name != b"..")
-                .map(|e| e.ino),
-            (None, None) => unreachable!("one form or the other"),
-        }
-        .ok_or(Error::NotFound)?;
+                .find(|e| e.name == name)
+                .map(|e| e.ino)
+                .ok_or(Error::NotFound)?,
+            None => self.lookup(&dir_inode, &dir_raw, name)?.ino,
+        };
 
         let (victim, victim_raw) = self.read_inode_raw(ino)?;
         match target {
@@ -324,39 +328,42 @@ impl Filesystem {
         };
 
         let mut allocations = crate::group_write::Allocations::new();
-        let (fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) =
+        let (fork, disk_fork, dir_flags, dir_format, dir_size, dir_blocks, dir_nextents, dir_items) =
             match (&parsed, in_blocks) {
                 (Some(p), _) => {
                     let fork = self.short_form_without_entry(p, name, fork_end - fork_start)?;
                     let size = fork.len() as u64;
                     (
+                        fork.clone(),
                         fork,
                         XFS_ILOG_DDATA,
+                        Format::Local,
                         size,
                         dir_inode.nblocks,
                         dir_inode.nextents,
                         Vec::new(),
                     )
                 }
-                (None, Some(mut entries)) => {
-                    entries.retain(|e| e.name != name);
-                    let rw = self.rewrite_directory(
+                (None, true) => {
+                    let rw = self.edit_directory(
                         &mut allocations,
                         parent,
                         &dir_inode,
                         &dir_raw,
-                        &entries,
+                        &[crate::dir_edit::DirEdit::Remove(name)],
                     )?;
                     (
+                        rw.logged_fork,
                         rw.fork,
-                        XFS_ILOG_DEXT,
+                        rw.fields,
+                        rw.format,
                         rw.size,
                         rw.blocks,
                         rw.nextents,
                         rw.items,
                     )
                 }
-                (None, None) => unreachable!("one form or the other"),
+                (None, false) => unreachable!("one form or the other"),
             };
         if freed && victim.format == Format::Extents {
             let extents = self.data_extents(&victim, &victim_raw)?;
@@ -365,6 +372,7 @@ impl Filesystem {
         let allocation_items = allocations.into_items()?;
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
+        dir_core[core_at::FORMAT] = dir_format as u8;
         dir_core[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&dir_blocks.to_be_bytes());
         set_nextents(&mut dir_core, dir_nextents);
         let at = core_at::CHANGECOUNT;
@@ -444,7 +452,7 @@ impl Filesystem {
         // here rather than on the way in: a refusal must not spend it.
         // Kept for the overlay, which needs the same bytes the record
         // carries (#89).
-        let logged_fork = fork_op[..dsize].to_vec();
+        let logged_fork = disk_fork;
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {

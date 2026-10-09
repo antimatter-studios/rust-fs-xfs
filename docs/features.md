@@ -35,7 +35,7 @@ States:
 | Inodes: v1, v2, v3 cores, `bigtime`, 64-bit extent counts | Supported | 0.1.0 | | `oracle_vm_fixtures.rs`, `inode_version_oracle.rs` |
 | An inode version the filesystem does not use | Refused | 0.11.0 (#92) | | `inode_version_oracle.rs` |
 | Directories: short form, block, leaf and node | Supported | 0.1.0 | | `dir_oracle.rs`, `endtoend_oracle.rs` |
-| Lookup through the directory's hash index | Supported | 0.8.0 | | `lookup_by_hash_oracle.rs` |
+| Lookup through the directory's hash index | Supported | 0.8.0; node form over blocks smaller than a directory block Unreleased (#PR) | | `lookup_by_hash_oracle.rs`, `node_directories_oracle.rs` |
 | Extent-format data forks | Supported | 0.1.0 | | `endtoend_oracle.rs` |
 | B+tree-format data forks (bmbt), one and two levels | Supported | 0.4.0 | | `bmbt_two_level_oracle.rs`, `endtoend_oracle.rs` |
 | Symlinks, inline and remote (`XSLM`) | Supported | 0.1.0; readlink contract 0.8.0 (#259) | | `capi.rs`, `endtoend_oracle.rs` |
@@ -90,7 +90,7 @@ only.
 | mkdir, and a directory converted to block form | Supported | 0.5.1 (#38) | | `dir_block_oracle.rs` |
 | Entries in a block-form directory | Supported | 0.8.0 (#215) | | `block_form_insert.rs` |
 | Create, unlink, rename and rmdir in block- and leaf-form directories: the directory laid out again in block form while one block holds it and in leaf form beyond, blocks taken and given back as it grows and shrinks | Experimental | Unreleased (#366) | | `leaf_directories.rs`, `leaf_directories_oracle.rs`, `block_form_insert.rs` |
-| Node-form directory changes | Refused by name | 0.8.0 (#215) | #367 | `leaf_directories.rs` |
+| Create, unlink, rename and rmdir in node-form directories: edited in place, with leaf and node splits, joins and root collapse, free-index upkeep, transitions to and from leaf form, and a block-map B+tree for a map that outgrows the inode | Experimental | Unreleased (#PR) | | `node_directories.rs`, `node_directories_oracle.rs` |
 | Rename within a short-form directory | Supported | 0.5.1 (#25) | #368 | `rename_oracle.rs` |
 | Move a name across directories (`Filesystem::rename`), a directory taking its `..` and both parents' link counts with it, in any directory form; a move beneath itself refused | Experimental | Unreleased (#382) | | `cross_directory_rename.rs`, `cross_directory_rename_oracle.rs` |
 | Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | Unreleased (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |

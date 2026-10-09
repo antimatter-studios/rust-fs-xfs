@@ -76,8 +76,19 @@ never does.
   block's longest free region. Blocks are taken from the directory's group as
   it grows and given back as it shrinks, back to block form when it fits one
   again. Unlink and rename in a block-form directory, refused until now, go the
-  same way. A directory that needs more than one leaf block, the node form, is
-  refused by name (#367).
+  same way. A directory that needs more than one leaf block moves into node
+  form (#367).
+
+- **Node-form directories are changed in place (#367).** A name is added to or
+  removed from the blocks it touches: its data block, the free-index block
+  that keeps that block's longest free region, and its index leaf. A full leaf
+  or node splits, and a root that splits moves down a level. An emptied block
+  is unlinked and given back, an under-full one joins its neighbour at the
+  kernel's thresholds, and a root left with one child takes its place. A
+  directory down to one leaf's worth of names returns to leaf form. A
+  directory's extent map that outgrows its inode is written as a block-map
+  B+tree, so directories the kernel made, which keep their map that way, can
+  be changed too.
 
 - **An empty directory can be removed (#385).** `Filesystem::remove_directory`
   logs the same transaction as an unlink, frees the directory's inode with its
@@ -134,6 +145,15 @@ never does.
   Rust API break. The C ABI is unchanged.
 
 ### Fixed
+
+- **Lookups in node-form directories over small blocks (#367).** A node's child
+  pointers and a leaf's sibling pointers count filesystem blocks, not
+  directory blocks. With 1 KiB blocks under 4 KiB directory blocks, which
+  `mkfs.xfs` makes by default, a lookup followed them to the wrong block.
+- **A block-map root in the log (#367).** Recovery copied a logged B+tree root
+  into the inode as it was. The log carries it in its in-memory shape, with
+  the pointers straight after the keys, and it is now converted as
+  `xfs_bmbt_to_bmdr` converts it.
 
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and
