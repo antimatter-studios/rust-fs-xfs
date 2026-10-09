@@ -439,6 +439,173 @@ impl Filesystem {
         Ok(lsn)
     }
 
+    /// Give inode `ino` another name: `name` in directory `dir_ino` (#384).
+    ///
+    /// The directory gains the entry, in whatever form it is in, and the
+    /// inode's link count rises by one, in one record. Returns the
+    /// sequence number the record was given.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
+    /// [`Error::NotADirectory`] if `dir_ino` is not one,
+    /// [`Error::AlreadyExists`] if `name` is taken, and
+    /// [`Error::UnsupportedFeature`] for a directory, which cannot have a
+    /// second name, a link count already at its limit, and the shapes the
+    /// directory cannot be rewritten in. Every refusal comes before
+    /// anything is written.
+    pub fn link(&self, ino: u64, dir_ino: u64, name: &[u8]) -> Result<u64> {
+        self.writable_device()?;
+        if !self.sb.is_v5() {
+            return Err(Error::UnsupportedFeature(
+                "linking writes v5 metadata; a v4 filesystem is not supported".into(),
+            ));
+        }
+        if !dir::entry_name_is_valid(name) {
+            return Err(Error::UnsupportedFeature(format!(
+                "{:?} is not a name a directory entry can hold",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        let (dir, dir_raw) = self.read_inode_raw(dir_ino)?;
+        if !dir.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        let (inode, raw) = self.read_inode_raw(ino)?;
+        if inode.is_dir() {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} is a directory, which has one name and cannot be given another"
+            )));
+        }
+        if inode.nlink == 0 {
+            return Err(Error::NotFound);
+        }
+        // XFS_MAXLINK: the most names one inode may have.
+        if inode.nlink >= (1 << 31) - 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} already has {} links, the most it may have",
+                inode.nlink
+            )));
+        }
+        if self
+            .read_dir(&dir, &dir_raw)?
+            .iter()
+            .any(|e| e.name == name)
+        {
+            return Err(Error::AlreadyExists);
+        }
+
+        let mut allocations = Allocations::new();
+        let change = self.change_directory(
+            &mut allocations,
+            dir_ino,
+            &dir,
+            &dir_raw,
+            vec![Edit::Add(Entry {
+                name: name.to_vec(),
+                ino,
+                ftype: crate::dir::ftype_to_raw(inode.file_type()),
+            })],
+        )?;
+        let allocation_items = allocations.into_items()?;
+        let quota_items = if change.blocks == dir.nblocks {
+            Vec::new()
+        } else {
+            crate::quota::accounting_items(
+                self,
+                &[crate::quota::QuotaChange {
+                    uid: dir.uid,
+                    gid: dir.gid,
+                    project_id: crate::quota::project_id(&dir_raw),
+                    blocks_fs: change.blocks as i64 - dir.nblocks as i64,
+                    inodes: 0,
+                }],
+            )?
+        };
+
+        let when = clock_now();
+        let dir_core = core_after(&dir_raw, &change, None, when, Changed::Contents)?;
+        let mut inode_core = raw.clone();
+        inode_core[at::NLINK..at::NLINK + 4].copy_from_slice(&(inode.nlink + 1).to_be_bytes());
+        bump(&mut inode_core);
+        stamp_change(&mut inode_core, when, Changed::Status);
+
+        let cluster = self.sb.inode_cluster_bytes();
+        let dir_buf = InodeBuffer::containing(self.inode_offset(dir_ino)?, cluster);
+        let inode_buf = InodeBuffer::containing(self.inode_offset(ino)?, cluster);
+        let dir_logged = log_dinode_from_disk(&dir_core)
+            .map_err(|why| Error::UnsupportedFeature(format!("inode {dir_ino}: {why}")))?;
+        let inode_logged = log_dinode_from_disk(&inode_core)
+            .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
+        let mut fork_op = change.fork.clone();
+        fork_op.resize(change.fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+        let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + change.items.iter().map(|i| i.op_count()).sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + 3
+            + 2;
+        let lsn = self.commit_record(|tid| {
+            let mut ops = vec![
+                Op {
+                    flags: XLOG_START_TRANS,
+                    data: Vec::new(),
+                },
+                Op {
+                    flags: 0,
+                    data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
+                },
+            ];
+            for item in allocation_items.iter().chain(&change.items) {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
+                ops.extend(item.ops());
+            }
+            ops.extend([
+                Op {
+                    flags: 0,
+                    data: inode_log_format_with_fork(
+                        dir_ino,
+                        XFS_ILOG_CORE | change.flags,
+                        &dir_buf,
+                        change.fork.len() as u16,
+                    ),
+                },
+                Op {
+                    flags: 0,
+                    data: dir_logged,
+                },
+                Op {
+                    flags: 0,
+                    data: fork_op,
+                },
+                Op {
+                    flags: 0,
+                    data: inode_log_format(ino, XFS_ILOG_CORE, &inode_buf),
+                },
+                Op {
+                    flags: 0,
+                    data: inode_logged,
+                },
+                Op {
+                    flags: XLOG_COMMIT_TRANS,
+                    data: Vec::new(),
+                },
+            ]);
+            ops
+        })?;
+
+        // What the record says is now what this mount reads (#89).
+        self.logged_buffers(&allocation_items);
+        self.logged_buffers(&change.items);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
+        self.logged_inode(dir_ino, &dir_core, &change.fork)?;
+        self.logged_inode(ino, &inode_core, &[])?;
+        Ok(lsn)
+    }
+
     /// The inode `..` names in directory `dir`.
     fn parent_of(&self, dir: &Inode, raw: &[u8]) -> Result<u64> {
         match dir.format {
