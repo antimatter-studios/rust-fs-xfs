@@ -268,7 +268,7 @@ impl Filesystem {
         // records — leaving recovery to find a transaction that starts
         // after its own beginning, which it discards. So the space for
         // every record is found before any of them is written.
-        if needed > head.free_blocks {
+        if crate::log_write::wraps_first(needed, head.free_blocks, tid) {
             self.sync()?;
             // THE GAP AT THE END IS FILLED, NOT LEFT. A reader walks the
             // cycle number stamped in every block and expects one place

@@ -146,6 +146,12 @@ never does.
 
 ### Fixed
 
+- **A checkpoint never leaves a gap at the end of the log too small to pad.**
+  One that fitted with a single basic block to spare left a gap the next wrap
+  could not fill, and the mount stopped with "the gap at the end of the log is
+  0 bytes and an empty record needs 52". A checkpoint that would leave less
+  than a pad record now wraps first, and the pad covers the larger gap.
+
 - **Lookups in node-form directories over small blocks (#367).** A node's child
   pointers and a leaf's sibling pointers count filesystem blocks, not
   directory blocks. With 1 KiB blocks under 4 KiB directory blocks, which
