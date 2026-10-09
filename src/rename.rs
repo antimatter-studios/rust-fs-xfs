@@ -82,9 +82,7 @@ impl Filesystem {
         if from_dir == to_dir {
             return self.rename_in_directory(from_dir, from, to);
         }
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "renaming writes v5 metadata; a v4 filesystem is not supported".into(),
