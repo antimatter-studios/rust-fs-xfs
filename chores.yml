@@ -466,8 +466,13 @@ tasks:
           case "$arg" in --verbose|-v) continue ;; esac
           guest_args="$guest_args $arg"
         done
+        # MEASURED on 2026-10-09 as the suites under review added their
+        # oracles: every test passed in the guest, which printed 2,607 lines
+        # (run 37952408330) and, the largest, 3,134 lines / 218,235 bytes
+        # (run 37944786229, job 113899115614). Half as much again as the
+        # largest is 4,701 lines / 328,000 bytes.
         # shellcheck disable=SC2086  # the words are the point
-        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 2600 190000 -- \
+        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 4701 328000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
