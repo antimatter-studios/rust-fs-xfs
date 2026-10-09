@@ -553,6 +553,10 @@ tasks:
     # (37934328714), 181,833 (37918336667) and, the largest, 2,374 lines /
     # 187,377 bytes (run 37918532099, job 113803432673). Half as much again
     # as the largest is 3,561 lines / 282,000 bytes.
+    # MEASURED again in run 37918532099 (job 113803432673, 2026-10-09),
+    # with the attribute-write oracles in the suite: every test passed and
+    # the release pass printed 2,374 lines / 187,377 bytes; half as much
+    # again is 3,561 lines / 282,000 bytes.
     timeout: 120m
     on_timeout:
       - cmd: 'echo "timeout: reclaiming the harness VM (spent $TIMEOUT)"'
