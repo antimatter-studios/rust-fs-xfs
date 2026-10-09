@@ -130,10 +130,16 @@ fn one_damaged_copy_is_rewritten_and_the_reference_agrees() {
 
 #[test]
 fn a_foreign_copy_or_two_damaged_copies_are_refused_and_nothing_is_written() {
-    for (name, commands) in [
+    // (case, damage, whether xfs_repair -n calls it damage). It does not
+    // compare a secondary superblock's UUID, so a copy naming another
+    // filesystem is not damage to it; this checker reports it, and the
+    // repair refuses to overwrite what it cannot identify, which is what
+    // the case is for.
+    for (name, commands, reference_damage) in [
         (
             "foreign",
             vec!["sb 1", "write -d uuid 01234567-89ab-cdef-0123-456789abcdef"],
+            false,
         ),
         (
             "two",
@@ -143,14 +149,17 @@ fn a_foreign_copy_or_two_damaged_copies_are_refused_and_nothing_is_written() {
                 "sb 3",
                 "write -d logblocks 4321",
             ],
+            true,
         ),
     ] {
         let volume = damaged(name, &commands);
         let image = volume.path().to_str().unwrap();
         let report = oracle("xfs_repair").args(["-n", image]).output();
-        assert!(
+        assert_eq!(
             !report.ok(),
-            "{name}: xfs_repair -n finds nothing wrong after {commands:?}"
+            reference_damage,
+            "{name}: xfs_repair -n does not say what this case expects of {commands:?}:\n{}",
+            report.repair_report()
         );
         let before = std::fs::read(image).unwrap();
         let (code, said) = fsck_y(image);
