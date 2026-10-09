@@ -1,12 +1,14 @@
 //! `fsck.xfs` checks the reverse-mapping btree against the owners it
 //! walks, and agrees with `xfs_repair -n` about what is wrong (#380).
 //!
-//! The volume is the `reflink` fixture, made by `mkfs.xfs -m
-//! reflink=1,rmapbt=1` and filled by the kernel. That it is clean, to the
-//! reference and to `fsck.xfs`, is `tests/cli_fsck_oracle.rs`. Here one
-//! reverse-mapping record of a file's data is damaged at a time with
-//! `xfs_db -x`, which recomputes the block's checksum, so each case is the
-//! damage it names and not a checksum failure:
+//! The volume is made in the harness guest by `mkfs.xfs -m rmapbt=1`,
+//! and the kernel writes three files of several blocks next to the root,
+//! so group 0's reverse-mapping btree holds records of file data. That
+//! every clean fixture with a reverse-mapping btree is clean to `fsck.xfs`
+//! is `tests/cli_fsck_oracle.rs`. Here one reverse-mapping record of a
+//! file's data is damaged at a time with `xfs_db -x`, which recomputes the
+//! block's checksum, so each case is the damage it names and not a
+//! checksum failure:
 //!
 //! - **wrong owner**: the record names an inode that does not own the
 //!   blocks;
@@ -21,7 +23,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
-use common::{fixture, oracle, scratch};
+use common::{kernel_run, oracle, scratch};
 
 const SUITE: &str = "rmap_check_oracle";
 
@@ -75,11 +77,41 @@ fn records(image: &str) -> Vec<Record> {
     out
 }
 
-/// A copy of the fixture with `commands` applied to AG 0's rmap root.
-fn damaged(name: &str, commands: &[String]) -> scratch::Volume {
+/// A volume with a reverse-mapping btree and three files of several
+/// blocks each, written by the kernel next to the root, in group 0.
+fn rmap_volume(tag: &str) -> scratch::Volume {
+    let volume = scratch::Volume::empty(
+        SUITE,
+        &format!("{}-{tag}-base.img", std::process::id()),
+        300 * 1024 * 1024,
+    );
+    let image = volume.guest();
+    let built = kernel_run(&format!(
+        r#"
+        mkfs.xfs -q -f -m rmapbt=1 {image} 2>&1 && echo MKFS_OK
+        m=$(mktemp -d)
+        mount -o loop {image} "$m" && echo MOUNT_OK
+        for f in a b c; do
+            xfs_io -f -c 'pwrite -q -S 0x5a 0 256k' -c fsync "$m/$f"
+        done
+        sync
+        umount "$m" || echo UMOUNT_FAILED
+        rmdir "$m"
+        echo DONE
+        "#
+    ));
+    assert!(
+        built.contains("MKFS_OK") && built.contains("MOUNT_OK"),
+        "building the volume failed:\n{built}"
+    );
+    volume
+}
+
+/// A copy of `source` with `commands` applied to AG 0's rmap root.
+fn damaged(source: &scratch::Volume, name: &str, commands: &[String]) -> scratch::Volume {
     let copy = scratch::Volume::copy_of(
         SUITE,
-        &fixture("xfs-reflink.img"),
+        source.path(),
         &format!("{}-{name}.img", std::process::id()),
     );
     let mut db = oracle("xfs_db").args(["-x", "-c", "agf 0", "-c", "addr rmaproot"]);
@@ -130,9 +162,10 @@ fn file_record(image: &str) -> Record {
 
 #[test]
 fn a_record_naming_the_wrong_owner_is_found() {
-    let source = fixture("xfs-reflink.img");
-    let r = file_record(source.to_str().unwrap());
+    let source = rmap_volume("owner");
+    let r = file_record(source.path().to_str().unwrap());
     let volume = damaged(
+        &source,
         "owner",
         &[format!("write -d recs[{}].owner {}", r.index, r.owner + 7)],
     );
@@ -141,9 +174,10 @@ fn a_record_naming_the_wrong_owner_is_found() {
 
 #[test]
 fn a_record_that_stops_short_of_its_extent_is_found() {
-    let source = fixture("xfs-reflink.img");
-    let r = file_record(source.to_str().unwrap());
+    let source = rmap_volume("short");
+    let r = file_record(source.path().to_str().unwrap());
     let volume = damaged(
+        &source,
         "short",
         &[format!(
             "write -d recs[{}].blockcount {}",
@@ -156,8 +190,8 @@ fn a_record_that_stops_short_of_its_extent_is_found() {
 
 #[test]
 fn a_record_moved_onto_free_space_is_found() {
-    let source = fixture("xfs-reflink.img");
-    let image = source.to_str().unwrap();
+    let source = rmap_volume("stale");
+    let image = source.path().to_str().unwrap();
     // The last file record, moved onto the last free extent, which lies
     // past every allocation, so the records stay in order and only the
     // owner of the blocks is wrong.
@@ -179,6 +213,7 @@ fn a_record_moved_onto_free_space_is_found() {
         "the last free extent is not past the last file record"
     );
     let volume = damaged(
+        &source,
         "stale",
         &[
             format!("write -d recs[{}].startblock {start}", r.index),
