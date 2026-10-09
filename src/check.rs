@@ -144,6 +144,20 @@ pub enum Code {
     LogReplayed,
     /// The filesystem could not be mounted, so nothing was checked.
     Mount,
+    /// The superblock's realtime fields disagree with each other (#381).
+    RtGeometry,
+    /// A realtime file maps an extent outside the realtime section.
+    RtExtent,
+    /// Two realtime files map one realtime extent.
+    RtCrossLink,
+    /// The realtime bitmap calls an extent free that a file maps, or in use
+    /// when nothing maps it.
+    RtBitmap,
+    /// The realtime summary is not what the bitmap adds up to.
+    RtSummary,
+    /// The superblock's free realtime extent count is not what the bitmap
+    /// holds.
+    CounterSbFrextents,
     /// No repair was planned: another holder has the target, or it is
     /// mounted or attached to a loop device (#375).
     RepairNotExclusive,
@@ -220,6 +234,12 @@ impl Code {
         Code::DirUnreached,
         Code::LogReplayed,
         Code::Mount,
+        Code::RtGeometry,
+        Code::RtExtent,
+        Code::RtCrossLink,
+        Code::RtBitmap,
+        Code::RtSummary,
+        Code::CounterSbFrextents,
         Code::RepairNotExclusive,
         Code::RepairFeature,
         Code::RepairLogDirty,
@@ -278,6 +298,12 @@ impl Code {
             Code::DirUnreached => "dir.unreached",
             Code::LogReplayed => "log.replayed",
             Code::Mount => "mount",
+            Code::RtGeometry => "rt.geometry",
+            Code::RtExtent => "rt.extent",
+            Code::RtCrossLink => "rt.cross-link",
+            Code::RtBitmap => "rt.bitmap",
+            Code::RtSummary => "rt.summary",
+            Code::CounterSbFrextents => "counter.sb.frextents",
             Code::RepairNotExclusive => "repair.not-exclusive",
             Code::RepairFeature => "repair.feature",
             Code::RepairLogDirty => "repair.log-dirty",
@@ -501,6 +527,9 @@ struct Checker<'a> {
     /// call free.
     allocated: HashSet<u64>,
     free: HashSet<u64>,
+    /// Every realtime extent a file maps: realtime start block, length in
+    /// blocks, and the inode (#381).
+    rt_used: Vec<(u64, u64, u64)>,
 }
 
 /// Check `fs`. Never writes.
@@ -520,6 +549,7 @@ pub fn check(fs: &Filesystem) -> Report {
         counted: HashMap::new(),
         allocated: HashSet::new(),
         free: HashSet::new(),
+        rt_used: Vec::new(),
     };
     c.secondaries();
     let mut totals = Totals::default();
@@ -529,7 +559,20 @@ pub fn check(fs: &Filesystem) -> Report {
     c.inodes();
     c.unclaimed();
     c.counters(&totals);
+    c.realtime();
     c.report
+}
+
+/// Sorted extent numbers as runs of consecutive ones.
+fn extent_runs(sorted: &[u64]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &x in sorted {
+        match out.last_mut() {
+            Some((start, len)) if *start + *len == x => *len += 1,
+            _ => out.push((x, 1)),
+        }
+    }
+    out
 }
 
 /// The length of group `ag`: every group is `agblocks` but the last.
@@ -1438,8 +1481,10 @@ impl Checker<'_> {
         let sb = self.fs.superblock().clone();
         let ino = inode.ino;
         let isz = usize::from(sb.inodesize);
-        if !inode.is_realtime() {
-            let (start, end) = inode.data_fork_range(isz);
+        let (start, end) = inode.data_fork_range(isz);
+        if inode.is_realtime() {
+            self.realtime_fork(ino, inode.format, &raw[start..end], inode.nextents);
+        } else {
             self.fork(
                 ino,
                 inode.format,
@@ -1497,6 +1542,318 @@ impl Checker<'_> {
                 Some(ino),
                 format!("inode {ino}'s extents: {e}"),
             ),
+        }
+    }
+
+    /// A realtime file's data fork (#381): its extent tree, if it has one,
+    /// is on the data device and claimed like any other; its extents are
+    /// on the realtime device and are recorded for [`Checker::realtime`].
+    fn realtime_fork(&mut self, ino: u64, format: Format, fork: &[u8], nextents: u64) {
+        let sb = self.fs.superblock().clone();
+        let (ag, _, _) = sb.split_ino(ino);
+        let walked = match format {
+            Format::Extents => crate::extent::parse_list(fork, nextents).map(|e| (e, Vec::new())),
+            Format::Btree => {
+                crate::bmbt::walk_with_blocks(fork, nextents, &sb, ino, |b| self.fs.read_fsblock(b))
+            }
+            _ => return,
+        };
+        match walked {
+            Ok((extents, tree)) => {
+                for b in tree {
+                    self.claim_fsblocks(b, 1, Owner::ExtentTree(ino));
+                }
+                for e in extents {
+                    let inside = e
+                        .startblock
+                        .checked_add(e.blockcount)
+                        .is_some_and(|end| e.blockcount > 0 && end <= sb.rblocks);
+                    if inside {
+                        self.rt_used.push((e.startblock, e.blockcount, ino));
+                    } else {
+                        self.find(
+                            Code::RtExtent,
+                            Some(ag),
+                            Some(ino),
+                            format!(
+                                "realtime inode {ino} maps {} blocks at realtime block {}, \
+                                 outside the {}-block realtime section",
+                                e.blockcount, e.startblock, sb.rblocks
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => self.failed(
+                Code::ExtentUnreadable,
+                &e,
+                Some(ag),
+                Some(ino),
+                format!("realtime inode {ino}'s extents: {e}"),
+            ),
+        }
+    }
+
+    /// The realtime section's geometry, bitmap, summary and free count
+    /// against the extents realtime files map (#381).
+    ///
+    /// The bitmap holds one bit per realtime extent, set when the extent
+    /// is free. The summary counts, for each power of two and each bitmap
+    /// block, the free runs of that size class that start in that block.
+    /// Both are read through their inodes on the data device, so no
+    /// realtime device is needed to check them.
+    ///
+    /// THE WORDS ARE LITTLE-ENDIAN HERE. Before realtime groups, both files
+    /// were written in the host's own byte order, an `xfs_rtword_t` and a
+    /// `__u32` with no conversion. Every volume this crate is validated
+    /// against was made on a little-endian host, and so is every host it
+    /// targets; a big-endian one's volume would read as damaged here, not
+    /// as clean.
+    fn realtime(&mut self) {
+        let sb = self.fs.superblock().clone();
+        if sb.rblocks == 0 {
+            return;
+        }
+        let bs = u64::from(sb.blocksize);
+        let rextsize = u64::from(sb.rextsize);
+        let geometry = |what: String, field: &'static str| Finding {
+            code: Code::RtGeometry,
+            location: Location {
+                field: Some(field),
+                ..Location::default()
+            },
+            what,
+        };
+        let mut broken = Vec::new();
+        if rextsize == 0 || !(4096..=1 << 30).contains(&(rextsize * bs)) {
+            broken.push(geometry(
+                format!("a realtime extent of {rextsize} blocks is outside 4 KiB..1 GiB"),
+                "sb_rextsize",
+            ));
+        } else {
+            let rextents = sb.rblocks / rextsize;
+            if sb.rextents != rextents {
+                broken.push(geometry(
+                    format!(
+                        "sb_rextents is {}, and {} blocks of {rextsize} make {rextents}",
+                        sb.rextents, sb.rblocks
+                    ),
+                    "sb_rextents",
+                ));
+            }
+            let log = if rextents == 0 {
+                0
+            } else {
+                63 - rextents.leading_zeros()
+            };
+            if u32::from(sb.rextslog) != log {
+                broken.push(geometry(
+                    format!(
+                        "sb_rextslog is {}, and {rextents} extents need {log}",
+                        sb.rextslog
+                    ),
+                    "sb_rextslog",
+                ));
+            }
+            let bitmap_blocks = rextents.div_ceil(bs * 8);
+            if u64::from(sb.rbmblocks) != bitmap_blocks {
+                broken.push(geometry(
+                    format!(
+                        "sb_rbmblocks is {}, and a bitmap of {rextents} extents needs \
+                         {bitmap_blocks} blocks",
+                        sb.rbmblocks
+                    ),
+                    "sb_rbmblocks",
+                ));
+            }
+        }
+        if sb.rbmino == 0 || sb.rsumino == 0 || sb.rbmino == sb.rsumino {
+            broken.push(geometry(
+                format!(
+                    "the realtime bitmap inode {} and summary inode {} are not two inodes",
+                    sb.rbmino, sb.rsumino
+                ),
+                "sb_rbmino",
+            ));
+        }
+        let geometry_ok = broken.is_empty();
+        for f in broken {
+            self.find_at(f.code, f.location, f.what);
+        }
+        if !geometry_ok {
+            return;
+        }
+
+        let rextents = sb.rextents as usize;
+        let mut users = vec![0u8; rextents];
+        let mut user_of = vec![0u64; rextents];
+        let mut crossed = Vec::new();
+        for &(start, len, ino) in &self.rt_used {
+            for x in start / rextsize..=(start + len - 1) / rextsize {
+                let x = x as usize;
+                if users[x] > 0 && user_of[x] != ino {
+                    crossed.push((x as u64, ino));
+                }
+                users[x] = users[x].saturating_add(1);
+                user_of[x] = ino;
+            }
+        }
+        for (x, ino) in crossed.into_iter().take(PER_KIND) {
+            self.find(
+                Code::RtCrossLink,
+                None,
+                Some(ino),
+                format!("realtime extent {x} is mapped by inode {ino} and another file"),
+            );
+        }
+
+        let read = |ino: u64| -> Result<Vec<u8>> {
+            let (inode, raw) = self.fs.read_inode_raw(ino)?;
+            self.fs.read_file(&inode, &raw)
+        };
+        let bitmap = match read(sb.rbmino) {
+            Ok(b) => b,
+            Err(e) => {
+                self.failed(
+                    Code::InodeUnreadable,
+                    &e,
+                    None,
+                    Some(sb.rbmino),
+                    format!("the realtime bitmap inode {}: {e}", sb.rbmino),
+                );
+                return;
+            }
+        };
+        let words_needed = rextents.div_ceil(32);
+        if bitmap.len() < words_needed * 4 {
+            self.find(
+                Code::RtBitmap,
+                None,
+                Some(sb.rbmino),
+                format!(
+                    "the realtime bitmap holds {} bytes, too few for {rextents} extents",
+                    bitmap.len()
+                ),
+            );
+            return;
+        }
+        let free_at = |x: usize| -> bool {
+            let w = u32::from_le_bytes(bitmap[x / 32 * 4..x / 32 * 4 + 4].try_into().expect("4"));
+            w >> (x % 32) & 1 == 1
+        };
+        let mut free_count = 0u64;
+        let (mut marked_free_used, mut marked_used_free) = (Vec::new(), Vec::new());
+        for (x, &mapped_by) in users.iter().enumerate() {
+            let free = free_at(x);
+            if free {
+                free_count += 1;
+            }
+            match (free, mapped_by > 0) {
+                (true, true) => marked_free_used.push(x as u64),
+                (false, false) => marked_used_free.push(x as u64),
+                _ => {}
+            }
+        }
+        for (blocks, words) in [
+            (
+                marked_free_used,
+                "are free in the realtime bitmap and mapped by a file",
+            ),
+            (
+                marked_used_free,
+                "are in use in the realtime bitmap and mapped by nothing",
+            ),
+        ] {
+            for (start, len) in extent_runs(&blocks) {
+                self.find(
+                    Code::RtBitmap,
+                    None,
+                    None,
+                    format!("realtime extents {start}..{} {words}", start + len),
+                );
+            }
+        }
+        if !self.report.dirty && free_count != sb.frextents {
+            self.find_at(
+                Code::CounterSbFrextents,
+                Location {
+                    field: Some("sb_frextents"),
+                    ..Location::default()
+                },
+                format!(
+                    "sb_frextents is {}, and the realtime bitmap holds {free_count} free extents",
+                    sb.frextents
+                ),
+            );
+        }
+
+        // The summary: a count per (size class, bitmap block) of the free
+        // runs whose first extent lies in that bitmap block.
+        let levels = usize::from(sb.rextslog) + 1;
+        let bitmap_blocks = sb.rbmblocks as usize;
+        let mut want = vec![0u32; levels * bitmap_blocks];
+        let per_block = (bs * 8) as usize;
+        let mut x = 0;
+        while x < rextents {
+            if !free_at(x) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < rextents && free_at(x) {
+                x += 1;
+            }
+            let len = (x - start) as u64;
+            let log = (63 - len.leading_zeros()) as usize;
+            if log < levels {
+                want[log * bitmap_blocks + start / per_block] += 1;
+            }
+        }
+        let summary = match read(sb.rsumino) {
+            Ok(s) => s,
+            Err(e) => {
+                self.failed(
+                    Code::InodeUnreadable,
+                    &e,
+                    None,
+                    Some(sb.rsumino),
+                    format!("the realtime summary inode {}: {e}", sb.rsumino),
+                );
+                return;
+            }
+        };
+        if summary.len() < want.len() * 4 {
+            self.find(
+                Code::RtSummary,
+                None,
+                Some(sb.rsumino),
+                format!(
+                    "the realtime summary holds {} bytes, too few for {levels} size classes \
+                     over {bitmap_blocks} bitmap blocks",
+                    summary.len()
+                ),
+            );
+            return;
+        }
+        let mut wrong = 0;
+        for (i, &w) in want.iter().enumerate() {
+            let got = u32::from_le_bytes(summary[i * 4..i * 4 + 4].try_into().expect("4"));
+            if got != w {
+                if wrong < PER_KIND {
+                    self.find(
+                        Code::RtSummary,
+                        None,
+                        Some(sb.rsumino),
+                        format!(
+                            "the realtime summary counts {got} free runs of 2^{} extents \
+                             starting in bitmap block {}, and the bitmap holds {w}",
+                            i / bitmap_blocks,
+                            i % bitmap_blocks
+                        ),
+                    );
+                }
+                wrong += 1;
+            }
         }
     }
 
