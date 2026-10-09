@@ -315,7 +315,7 @@ impl<'a> Layout<'a> {
     }
 
     fn write_remote(&self, fs: &Filesystem, ino: u64, start: u64) -> Result<()> {
-        let device = fs.writable.as_ref().ok_or(Error::ReadOnly)?;
+        let device = fs.writable_device()?;
         let bs = fs.sb.blocksize as usize;
         for entry in self.entries.iter().filter(|e| !e.local) {
             for (n, payload) in entry.value.chunks(bs - 56).enumerate() {
@@ -389,9 +389,7 @@ impl Filesystem {
         name: &[u8],
         change: Option<(&[u8], XattrMode)>,
     ) -> Result<u64> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(unsupported("attribute writes require v5 metadata"));
         }
@@ -544,6 +542,23 @@ impl Filesystem {
                 Error::BadSuperblock("attribute blocks exceed inode block count".into())
             })?;
         raw[64..72].copy_from_slice(&nblocks.to_be_bytes());
+        // The attribute fork's blocks are the inode's, so its owners' quota
+        // is charged for what it gains and credited for what it gives back,
+        // and a hard limit refuses before anything is written.
+        let quota_items = if nblocks == inode.nblocks {
+            Vec::new()
+        } else {
+            crate::quota::accounting_items(
+                self,
+                &[crate::quota::QuotaChange {
+                    uid: inode.uid,
+                    gid: inode.gid,
+                    project_id: crate::quota::project_id(&raw),
+                    blocks_fs: nblocks as i64 - inode.nblocks as i64,
+                    inodes: 0,
+                }],
+            )?
+        };
         stamp_change(&mut raw, crate::create::clock_now(), Changed::Status);
         let changecount = be64(&raw, 104).wrapping_add(1);
         raw[104..112].copy_from_slice(&changecount.to_be_bytes());
@@ -581,6 +596,7 @@ impl Filesystem {
             .chain(&cancels)
             .map(BufferItem::op_count)
             .sum::<usize>()
+            + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + inode_ops;
         // All fallible preparation precedes the ordered remote writes.
         if let Some(location) = remote_start {
@@ -601,6 +617,9 @@ impl Filesystem {
                 },
             ];
             for item in items.iter().chain(&cancels) {
+                ops.extend(item.ops());
+            }
+            for item in &quota_items {
                 ops.extend(item.ops());
             }
             ops.push(Op {
@@ -632,6 +651,9 @@ impl Filesystem {
             ops
         })?;
         self.logged_buffers(&items);
+        for item in &quota_items {
+            item.apply_overlay(self)?;
+        }
         self.logged_inode(ino, &raw, &[])?;
         Ok(lsn)
     }
