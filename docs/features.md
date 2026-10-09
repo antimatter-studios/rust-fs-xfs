@@ -93,7 +93,7 @@ only.
 | Hard links, rmdir | Upcoming | | #384, #385 | |
 | Extended attribute and ACL writes | Upcoming | | #389, #390 | |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
-| Many journalled operations in one mount, each built on the ones before | Supported | 0.8.0 (#89) | #365 (crash at each checkpoint boundary) | `many_ops_per_mount.rs`, `random_operations_replay.rs` |
+| Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
 | Log reuse in bounded memory (`sync`) | Supported | 0.8.0 (#89) | | `log_reuse.rs` |
 | A checkpoint split across several log records | Supported | 0.8.0 (#216) | | `split_checkpoint.rs` |
 | A checkpoint whose flush fails | Supported: the kernel replays to a consistent volume | 0.8.0 | | `torn_checkpoint_oracle.rs` |
