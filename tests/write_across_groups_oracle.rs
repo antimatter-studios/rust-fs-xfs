@@ -1,8 +1,8 @@
 //! A file this driver places across allocation groups is the file the
 //! Linux kernel reads (#388).
 //!
-//! `mkfs.xfs -d agcount=8` in the harness guest makes groups of about
-//! 37 MiB, and the driver writes one 50 MiB file: more than the inode's
+//! `mkfs.xfs -d agcount=8` on 600 MiB in the harness guest makes groups
+//! of 75 MiB, and the driver writes one 100 MiB file: more than the inode's
 //! own group can hold, so it is placed across groups. The kernel then
 //! mounts the volume, which replays the record, and must read the file to
 //! the hash of what was written; `xfs_bmap -v` must show it in more than
@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const SUITE: &str = "write_across_groups_oracle";
-const FILE_BYTES: usize = 50 * 1024 * 1024;
+// Larger than a group's 75 MiB, so no one group can hold it.
+const FILE_BYTES: usize = 100 * 1024 * 1024;
 
 fn pattern(len: usize) -> Vec<u8> {
     (0..len)
@@ -28,10 +29,13 @@ fn pattern(len: usize) -> Vec<u8> {
 
 #[test]
 fn the_kernel_reads_a_file_placed_across_groups() {
-    let volume = scratch::Volume::empty(SUITE, "groups.img", 300 * 1024 * 1024);
+    let volume = scratch::Volume::empty(SUITE, "groups.img", 600 * 1024 * 1024);
     let image = volume.guest();
     let built = kernel_run(&format!(
         r#"
+        # Eight groups of 75 MiB: an internal log lives inside one group,
+        # and mkfs.xfs will not make one under 64 MiB, so eight groups in
+        # 300 MiB were refused outright.
         mkfs.xfs -q -f -d agcount=8 {image} 2>&1 && echo MKFS_OK
         echo DONE
         "#
@@ -44,7 +48,7 @@ fn the_kernel_reads_a_file_placed_across_groups() {
         let fs = Filesystem::mount_rw(Arc::new(dev) as Arc<dyn BlockDevice>).expect("mount_rw");
         let root = fs.superblock().rootino;
         let (ino, _) = fs.create_file(root, b"big", 0o100644).expect("create");
-        fs.write(ino, 0, &data).expect("write 50 MiB");
+        fs.write(ino, 0, &data).expect("write 100 MiB");
     }
 
     let out = kernel_run(&format!(
