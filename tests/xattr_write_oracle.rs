@@ -315,30 +315,6 @@ fn c_abi_preserves_binary_names_values_and_buffer_contracts() {
 #[test]
 fn file_extent_arrays_and_btree_roots_preserve_contents() {
     let volume = fresh("file-data.img");
-    // Replay the uncheckpointed inode root through the driver's reader as
-    // well as the kernel, including capacity-based bmbt pointer offsets.
-    {
-        let fs = Filesystem::mount(Arc::new(FileDevice::open(volume.path()).unwrap())).unwrap();
-        for (name, count) in [("extents", 4), ("tree", 40)] {
-            let file = fs.lookup_path(&format!("/{name}")).unwrap();
-            let (inode, raw) = fs.read_inode_raw(file.ino).unwrap();
-            assert_eq!(
-                fs.get_xattr(&inode, &raw, b"user.payload")
-                    .unwrap()
-                    .unwrap()
-                    .len(),
-                65536
-            );
-            for i in 0..count {
-                let mut bytes = [0; 4096];
-                assert_eq!(
-                    fs.read_at(&inode, &raw, i * 8192, &mut bytes).unwrap(),
-                    4096
-                );
-                assert!(bytes.iter().all(|&b| b == i as u8));
-            }
-        }
-    }
     check_kernel(
         &volume,
         &[],
@@ -370,6 +346,30 @@ for name, count in [('extents', 4), ('tree', 40)]:
                     bytes.iter().all(|&b| b == i as u8),
                     "{name}: data block {i} changed"
                 );
+            }
+        }
+    }
+    // Replay the uncheckpointed inode root through the driver's reader as
+    // well as the kernel, including capacity-based bmbt pointer offsets.
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(volume.path()).unwrap())).unwrap();
+        for (name, count) in [("extents", 4), ("tree", 40)] {
+            let file = fs.lookup_path(&format!("/{name}")).unwrap();
+            let (inode, raw) = fs.read_inode_raw(file.ino).unwrap();
+            assert_eq!(
+                fs.get_xattr(&inode, &raw, b"user.payload")
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                65536
+            );
+            for i in 0..count {
+                let mut bytes = [0; 4096];
+                assert_eq!(
+                    fs.read_at(&inode, &raw, i * 8192, &mut bytes).unwrap(),
+                    4096
+                );
+                assert!(bytes.iter().all(|&b| b == i as u8));
             }
         }
     }

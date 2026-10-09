@@ -447,7 +447,12 @@ impl Filesystem {
         // short-form directory that gained an attribute had no room left to
         // become an extent list (#390). A B+tree data fork keeps the root it
         // has, whose pointer offsets follow its size.
-        let min_data = if inode.format == Format::Btree {
+        // A device inode's attribute fork starts straight after its eight
+        // bytes of device number: the kernel's verifier requires exactly
+        // that offset (`xfs_dinode_verify_forkoff`), with no room kept for
+        // a B+tree root it can never have.
+        let fixed = matches!(inode.format, Format::Btree | Format::Dev);
+        let min_data = if fixed {
             data_required
         } else {
             data_required.max(56)
@@ -531,7 +536,7 @@ impl Filesystem {
         let mut items = allocations.into_items()?;
         items.extend(metadata);
         let litino = raw.len() - XFS_DINODE_V3_SIZE;
-        let forkoff = if inode.format == Format::Btree || fork.is_empty() {
+        let forkoff = if fixed || fork.is_empty() {
             data_required
         } else {
             let offset = (litino - fork.len()) / 8 * 8;
