@@ -108,7 +108,7 @@ fn list(key: &str, dir: &str) -> String {
 
 #[test]
 fn a_two_level_index_the_driver_builds_is_one_the_kernel_reads_and_edits() {
-    let volume = scratch::Volume::empty(SUITE, "node4k.img", 300 * 1024 * 1024);
+    let volume = scratch::Volume::empty(SUITE, "two-level.img", 300 * 1024 * 1024);
     let image = volume.guest();
     let built = kernel_run(&format!(
         r#"
