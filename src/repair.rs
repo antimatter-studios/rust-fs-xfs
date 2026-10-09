@@ -191,6 +191,15 @@ pub trait Rule {
     /// plan is then refused: a rule that planned half a repair has not
     /// planned one.
     fn propose(&self, fs: &Filesystem, report: &Report, proposal: &mut Proposal) -> Result<()>;
+
+    /// Findings that stop the check's walk which this rule accounts for:
+    /// it reads what the check could not, and refuses unless the volume
+    /// with its changes applied checks complete. A partial scan whose
+    /// every such finding some rule accounts for is planned rather than
+    /// refused (#394).
+    fn completes(&self) -> &'static [Code] {
+        &[]
+    }
 }
 
 /// The changes the rules have proposed so far.
@@ -272,6 +281,7 @@ pub fn plan(fs: &Filesystem, access: &Exclusive) -> Plan {
         &[
             &SuperblockCopies,
             &crate::inode_repair::InodeAllocation,
+            &crate::directory_repair::DirectoryMetadata,
             &Counters,
         ],
     )
@@ -687,7 +697,11 @@ pub fn apply(
 /// Plan a repair of `fs` with `rules`, in the order given. Never writes.
 pub fn plan_with(fs: &Filesystem, _access: &Exclusive, rules: &[&dyn Rule]) -> Plan {
     let report = check::check(fs);
-    let mut refusals = preconditions(fs, &report);
+    let completed: Vec<Code> = rules
+        .iter()
+        .flat_map(|r| r.completes().iter().copied())
+        .collect();
+    let mut refusals = preconditions(fs, &report, &completed);
     let mut changes = BTreeMap::new();
     if refusals.is_empty() {
         let mut proposal = Proposal {
@@ -736,7 +750,7 @@ pub fn plan_with(fs: &Filesystem, _access: &Exclusive, rules: &[&dyn Rule]) -> P
 }
 
 /// Everything that stops a plan being made, before any rule is asked.
-fn preconditions(fs: &Filesystem, report: &Report) -> Vec<Finding> {
+fn preconditions(fs: &Filesystem, report: &Report, completed: &[Code]) -> Vec<Finding> {
     let sb = fs.superblock();
     let mut refusals = Vec::new();
     let mut feature = |field: &'static str, what: String| {
@@ -814,7 +828,12 @@ fn preconditions(fs: &Filesystem, report: &Report) -> Vec<Finding> {
                 .into(),
         });
     }
-    if report.scan == Scan::Partial {
+    let accounted = report
+        .findings
+        .iter()
+        .filter(|f| f.code.stops_the_walk())
+        .all(|f| completed.contains(&f.code));
+    if report.scan == Scan::Partial && !accounted {
         refusals.push(Finding {
             code: Code::RepairIncomplete,
             location: Location::default(),

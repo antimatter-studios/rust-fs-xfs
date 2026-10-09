@@ -540,3 +540,34 @@ fn real_inode_rejects_wrong_number() {
         "the root inode was accepted under the wrong inode number"
     );
 }
+
+/// The repair planner proposes nothing for the kernel's complete directory
+/// layouts (#394): their inode and directory fields are independently
+/// dumped by xfs_db when the fixtures are built, rather than produced by
+/// this driver.
+#[test]
+fn kernel_directory_buffers_need_no_repair() {
+    use fs_core::FileDevice;
+    use std::sync::Arc;
+    for name in ["xfsdata-default.img", "xfsdata-1k.img", "xfsdata-ftype.img"] {
+        let fs =
+            fs_xfs::Filesystem::mount(Arc::new(FileDevice::open(common::fixture(name)).unwrap()))
+                .unwrap();
+        let access = fs_xfs::repair::Exclusive::asserted_by_caller();
+        let plan = fs_xfs::repair::plan(&fs, &access);
+        assert_eq!(
+            plan.status,
+            fs_xfs::repair::Status::Ready,
+            "{name}: {:?}",
+            plan.refusals
+        );
+        assert!(
+            plan.changes.is_empty(),
+            "{name}: clean kernel metadata would be rewritten: {:?}",
+            plan.changes
+                .iter()
+                .map(|c| (c.offset, c.rule))
+                .collect::<Vec<_>>()
+        );
+    }
+}

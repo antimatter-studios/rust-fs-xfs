@@ -8,6 +8,15 @@ never does.
 
 ### Added
 
+- **`fsck.xfs -y` repairs redundant directory metadata (#394).** The
+  `DirectoryMetadata` rule rebuilds entry types, entry tags, dot and dot-dot
+  entries and hash indexes. Their sources are the validated inodes, the directory
+  topology and the entries' own data; names and entry inode numbers are never
+  changed. A duplicate name, a dangling entry, uncertain topology, or a preview
+  that does not check complete and free of directory findings refuses it. A rule
+  may now account for findings that stop the check's walk, and a partial scan
+  whose every such finding a rule accounts for is planned rather than refused.
+
 - **`fsck.xfs -y` repairs inode allocation and link counts (#393).** The
   `InodeAllocation` rule sets each inode's allocation bit to whether the inode is
   in use. Both inode trees, the free counts that follow, and every link count are

@@ -42,6 +42,7 @@ pub mod dir_block;
 mod dir_edit;
 pub mod dir_leaf;
 pub mod dir_write;
+mod directory_repair;
 pub mod endian;
 pub mod error;
 pub mod extent;
