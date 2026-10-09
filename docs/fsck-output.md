@@ -203,7 +203,7 @@ code has neither a case nor a reason.
 | `identity` | `cli_fsck_oracle.rs`: bnobt-owner |
 | `sb.copy.unreadable` | `cli_fsck_oracle.rs`: sb1-magic |
 | `sb.copy.field` | `cli_fsck_oracle.rs`: sb1-logblocks |
-| `sb.copy.uuid` | `cli_fsck_oracle.rs`: sb1-uuid |
+| `sb.copy.uuid` | none: `xfs_repair -n` does not compare a secondary superblock's UUID, so there is no reference verdict to hold this to; this checker reports a copy naming another filesystem, and the repair refuses to overwrite it (`cli_superblock_repair_oracle.rs`). |
 | `ag.agf.unreadable` | `cli_fsck_oracle.rs`: a group that cannot be read |
 | `ag.agi.unreadable` | `cli_fsck_oracle.rs`: agi1-magic |
 | `ag.agfl.unreadable` | `cli_fsck_oracle.rs`: agfl1-magic |
