@@ -104,6 +104,13 @@ fn rmap_volume(tag: &str) -> scratch::Volume {
         built.contains("MKFS_OK") && built.contains("MOUNT_OK"),
         "building the volume failed:\n{built}"
     );
+    // Clean before any damage, by the reference: a case that finds a
+    // fault has to be finding the one it made.
+    let baseline = oracle("xfs_repair")
+        .args(["-n", volume.path().to_str().unwrap()])
+        .output()
+        .repair_report();
+    common::repair::assert_agreed(&baseline, &format!("{tag}: the volume before any damage"));
     volume
 }
 
