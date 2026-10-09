@@ -483,6 +483,10 @@ tasks:
         # (run 37952408330) and, the largest, 3,134 lines / 218,235 bytes
         # (run 37944786229, job 113899115614). Half as much again as the
         # largest is 4,701 lines / 328,000 bytes.
+        # MEASURED in run 37944786229 (job 113899115614, 2026-10-09), with
+        # the expanded feature matrix in the guest suite: every test passed
+        # and it printed 3,134 lines / 218,235 bytes; half as much again is
+        # 4,701 lines / 328,000 bytes.
         # shellcheck disable=SC2086  # the words are the point
         CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 4701 328000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
