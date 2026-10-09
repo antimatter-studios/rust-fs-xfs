@@ -8,6 +8,13 @@ never does.
 
 ### Added
 
+- **A crash at any checkpoint of a mount is graded by the kernel (#365).**
+  `tests/checkpoint_boundary_crash_oracle.rs` runs create, mkdir, a first
+  write, rename, unlink and truncate on one mount, and stops the device at each
+  of its flushes in turn. After every crash the kernel must replay the volume
+  to a prefix of the sequence, the interrupted operation whole or absent, and
+  `xfs_repair -n` must call it clean.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
