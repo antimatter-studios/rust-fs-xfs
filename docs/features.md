@@ -92,7 +92,8 @@ only.
 | Leaf- and node-form directory changes | Refused by name | 0.8.0 (#215) | #366, #367 | `block_form_insert.rs` |
 | Rename within a short-form directory | Supported | 0.5.1 (#25) | #368 | `rename_oracle.rs` |
 | Rename across directories, or over an existing target | Upcoming | | #382, #383 | |
-| Hard links, rmdir | Upcoming | | #384, #385 | |
+| Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
+| Hard links | Upcoming | | #384 | |
 | Extended attribute and ACL writes | Upcoming | | #389, #390 | |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
 | Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
