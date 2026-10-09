@@ -162,9 +162,7 @@ impl Filesystem {
     }
 
     pub fn truncate_to_zero(&self, ino: u64) -> Result<u64> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "truncating writes v5 metadata; a v4 filesystem is not supported".into(),

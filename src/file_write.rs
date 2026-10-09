@@ -132,9 +132,7 @@ impl Filesystem {
     /// [`Error::UnsupportedFeature`] for each of the shapes listed in
     /// this module's documentation.
     pub fn write_into_empty_file(&self, ino: u64, data: &[u8]) -> Result<u64> {
-        let Some(device) = self.writable.as_ref() else {
-            return Err(Error::ReadOnly);
-        };
+        let device = self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
                 "writing allocates v5 metadata; a v4 filesystem is not supported".into(),

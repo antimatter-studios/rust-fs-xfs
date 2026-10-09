@@ -106,6 +106,11 @@ pub struct Filesystem {
     /// an in-place write has since put there. So the in-place fence looks
     /// at this, and nothing clears it.
     pub(crate) logged_anything: std::sync::atomic::AtomicBool,
+    /// A log write or a push of logged metadata failed (#400). The mount
+    /// writes nothing after that, as the kernel shuts a filesystem down on
+    /// a log I/O error: where the failed record ended, and so where the
+    /// next one could safely start, is no longer known.
+    pub(crate) write_failed: std::sync::atomic::AtomicBool,
     /// The realtime device, when the volume has a realtime section and the
     /// caller supplied it (#98). A realtime inode's extents are addressed
     /// there, in filesystem blocks from its start; everything else,
@@ -148,6 +153,35 @@ impl Filesystem {
     ///
     /// [`Error::UnsupportedFeature`] if a checkpoint has already been
     /// written by this mount.
+    /// The device this mount writes to, unless it cannot write.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] on a read-only mount, and [`Error::Io`] once a
+    /// log write or a push has failed on this one (#400): from then on the
+    /// mount reads and does not write, and a fresh mount reads the log as
+    /// a crash would have left it.
+    pub(crate) fn writable_device(&self) -> Result<&Arc<dyn BlockDevice>> {
+        if self.write_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Io(
+                "this mount stopped writing after a log write failed; mount the volume \
+                 again to read what the log holds"
+                    .into(),
+            ));
+        }
+        self.writable.as_ref().ok_or(Error::ReadOnly)
+    }
+
+    /// Run `write`, and stop this mount writing if it fails (#400).
+    fn or_stop_writing<T>(&self, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        let result = write();
+        if result.is_err() {
+            self.write_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
+
     pub(crate) fn refuse_after_checkpoint(&self) -> Result<()> {
         if self
             .logged_anything
@@ -205,7 +239,7 @@ impl Filesystem {
     where
         F: FnOnce(u32) -> Vec<crate::log_write::Op>,
     {
-        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?.clone();
+        let device = self.writable_device()?.clone();
         let mut head = match *self.next_head.lock().expect("next head poisoned") {
             Some(known) => known,
             None => crate::log::head(device.as_ref(), &self.sb)?,
@@ -250,7 +284,9 @@ impl Filesystem {
                     .lock()
                     .expect("oldest record poisoned")
                     .unwrap_or(pad_lsn);
-                crate::log_write::append_pad(device.as_ref(), &self.sb, &head, tid, tail)?;
+                self.or_stop_writing(|| {
+                    crate::log_write::append_pad(device.as_ref(), &self.sb, &head, tid, tail)
+                })?;
                 // The record after the wrap follows the pad, not whatever
                 // came before it.
                 previous = head.block;
@@ -288,14 +324,18 @@ impl Filesystem {
         let mut first = None;
         let mut lsn = 0;
         for group in &groups {
-            lsn = crate::log_write::append_at_with_tail(
-                device.as_ref(),
-                &self.sb,
-                &at,
-                tid,
-                group,
-                tail,
-            )?;
+            // A record that failed may be on the device whole, in part or
+            // not at all, so nothing is written after it (#400).
+            lsn = self.or_stop_writing(|| {
+                crate::log_write::append_at_with_tail(
+                    device.as_ref(),
+                    &self.sb,
+                    &at,
+                    tid,
+                    group,
+                    tail,
+                )
+            })?;
             first.get_or_insert(lsn);
             let used = crate::log_write::record_blocks(tid, group, at.iclog_size)?;
             at = crate::log::Head {
@@ -365,9 +405,11 @@ impl Filesystem {
     /// device returns. Nothing is dropped from memory unless its write
     /// succeeded.
     pub fn sync(&self) -> Result<()> {
-        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?.clone();
+        let device = self.writable_device()?.clone();
         if let Some(overlay) = &self.overlay {
-            overlay.push(device.as_ref())?;
+            // A push that failed part way leaves metadata on disk that no
+            // record describes, so nothing is written after it either.
+            self.or_stop_writing(|| overlay.push(device.as_ref()).map_err(Error::from))?;
         }
         *self.oldest_record.lock().expect("oldest record poisoned") = None;
         Ok(())
@@ -507,6 +549,7 @@ impl Filesystem {
             next_head: Mutex::new(None),
             wraps: std::sync::atomic::AtomicUsize::new(0),
             logged_anything: std::sync::atomic::AtomicBool::new(false),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             realtime: None,
         };
         // THE UNLINKED LIST IS ONLY CHECKED ON A VOLUME NOTHING
@@ -661,6 +704,7 @@ impl Filesystem {
             next_head: Mutex::new(None),
             wraps: std::sync::atomic::AtomicUsize::new(0),
             logged_anything: std::sync::atomic::AtomicBool::new(false),
+            write_failed: std::sync::atomic::AtomicBool::new(false),
             realtime: None,
         };
         fs.refuse_unmaintained_features()?;
@@ -908,7 +952,7 @@ impl Filesystem {
     /// Whatever reading or writing the device returns.
     pub fn set_label(&self, label: &str) -> Result<()> {
         use crate::superblock::offsets::{FNAME, FNAME_LEN};
-        let device = self.writable.as_ref().ok_or(Error::ReadOnly)?;
+        let device = self.writable_device()?;
         if label.len() > FNAME_LEN || label.contains('\0') {
             return Err(Error::UnsupportedFeature(format!(
                 "an XFS label is at most {FNAME_LEN} bytes, with no NUL; this one is {}",

@@ -64,6 +64,7 @@ fn model() -> (Filesystem, BTreeMap<u64, Inode>, HashMap<u64, Vec<u8>>) {
         next_head: std::sync::Mutex::new(None),
         wraps: std::sync::atomic::AtomicUsize::new(0),
         logged_anything: std::sync::atomic::AtomicBool::new(false),
+        write_failed: std::sync::atomic::AtomicBool::new(false),
         realtime: None,
     };
     let time = crate::inode::Timestamp { sec: 0, nsec: 0 };

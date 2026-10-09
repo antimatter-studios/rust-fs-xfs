@@ -911,9 +911,7 @@ impl Filesystem {
     /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
     /// and as [`append`] otherwise.
     pub fn log_inode_core(&self, ino: u64, disk_core: &[u8]) -> Result<u64> {
-        if self.writable.is_none() {
-            return Err(Error::ReadOnly);
-        }
+        self.writable_device()?;
         let core = log_dinode_from_disk(disk_core).map_err(|why| {
             Error::UnsupportedFeature(format!("inode {ino} cannot be logged: {why}"))
         })?;

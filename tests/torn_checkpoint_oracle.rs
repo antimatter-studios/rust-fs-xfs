@@ -48,6 +48,9 @@ struct TornCheckpoint {
     wrote_log: AtomicBool,
     dead: AtomicBool,
     tripped: AtomicBool,
+    /// After the failed flush, accept every later write instead of
+    /// stopping, as a device with a transient error would (#400).
+    keeps_going: bool,
 }
 
 impl BlockRead for TornCheckpoint {
@@ -78,8 +81,8 @@ impl BlockDevice for TornCheckpoint {
                 "the device has stopped",
             )));
         }
-        if self.wrote_log.swap(false, Ordering::SeqCst) {
-            self.dead.store(true, Ordering::SeqCst);
+        if self.wrote_log.swap(false, Ordering::SeqCst) && !self.tripped.load(Ordering::SeqCst) {
+            self.dead.store(!self.keeps_going, Ordering::SeqCst);
             self.tripped.store(true, Ordering::SeqCst);
             return Err(fs_core::Error::Io(std::io::Error::other(
                 "the flush after the log record failed",
@@ -134,6 +137,17 @@ fn base_image(tag: &str) -> scratch::Volume {
 /// Run `op` through a device that tears the checkpoint, on a copy of
 /// `base`, and return that copy.
 fn tear(base: &Path, name: &str, op: impl FnOnce(&Filesystem)) -> scratch::Volume {
+    tear_with(base, name, false, op)
+}
+
+/// [`tear`], with a device that either stops after the failed flush or
+/// keeps accepting writes.
+fn tear_with(
+    base: &Path,
+    name: &str,
+    keeps_going: bool,
+    op: impl FnOnce(&Filesystem),
+) -> scratch::Volume {
     let volume = scratch::Volume::copy_of(SUITE, base, name);
     let (log_start, log_end) = {
         let fs = Filesystem::mount(Arc::new(
@@ -154,6 +168,7 @@ fn tear(base: &Path, name: &str, op: impl FnOnce(&Filesystem)) -> scratch::Volum
         wrote_log: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         tripped: AtomicBool::new(false),
+        keeps_going,
     });
     {
         let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).expect("mount rw");
@@ -289,6 +304,45 @@ fn a_torn_truncate_to_zero_is_whole_or_absent() {
     assert!(
         has(&out, "BIG_SIZE 0") || has(&out, &format!("BIG_SIZE {BIG}")),
         "truncate: the file is neither empty nor whole:\n{out}"
+    );
+}
+
+/// The device recovers after the failed flush, and the mount is asked
+/// for more (#400). It must refuse: the next record would start where the
+/// failed one did, over whatever part of it reached the device.
+#[test]
+fn a_mount_whose_log_write_failed_writes_nothing_more() {
+    let base = base_image("keeps-going");
+    let torn = tear_with(base.path(), "keeps-going.img", true, |fs| {
+        let root = fs.superblock().rootino;
+        let ino = fs.lookup_path("/big").expect("the file").ino;
+        let _ = fs.truncate_to_zero(ino);
+        let after = fs.create_file(root, b"after", 0o100644);
+        assert!(
+            matches!(&after, Err(fs_xfs::Error::Io(m)) if m.contains("log write failed")),
+            "a create after the failed log write was not refused: {after:?}"
+        );
+        let unlink = fs.unlink_file(root, b"gone");
+        assert!(
+            matches!(&unlink, Err(fs_xfs::Error::Io(m)) if m.contains("log write failed")),
+            "an unlink after the failed log write was not refused: {unlink:?}"
+        );
+    });
+    let out = replay(
+        &torn,
+        "keeps going",
+        "keeps-going",
+        r#"stat -c 'BIG_SIZE %s' "$m/big"
+            [ -e "$m/after" ] && echo AFTER_PRESENT || echo AFTER_ABSENT
+            [ -e "$m/gone" ] && echo GONE_PRESENT || echo GONE_ABSENT"#,
+    );
+    assert!(
+        has(&out, "BIG_SIZE 0") || has(&out, &format!("BIG_SIZE {BIG}")),
+        "keeps going: the truncated file is neither empty nor whole:\n{out}"
+    );
+    assert!(
+        has(&out, "AFTER_ABSENT") && has(&out, "GONE_PRESENT"),
+        "keeps going: a change refused after the failure reached the volume:\n{out}"
     );
 }
 

@@ -49,7 +49,7 @@ Read at `c8dab2e` (#92). The earlier passes asked whether each edit's logic is r
 **Still not reached:**
 - `write_at` and `truncate` take the caller's `&Inode` and raw bytes and do not re-read them. `set_attributes` and the C ABI do re-read. Whether the Rust API should is a contract question, not a misread.
 - `refcount::release`'s records, which are part of #314's class.
-- The fourth pass's torn checkpoint: a record written and its flush then failing.
+- The fourth pass's torn checkpoint: a record written and its flush then failing. Reached by #331 for a device that stops, and by #400 for one that keeps going: the mount now writes nothing after a failed log write or push.
 
 ## 2026-09-30, fourth pass: block-form insert, many records per mount, the B+tree-fork free
 
