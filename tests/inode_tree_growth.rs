@@ -95,3 +95,40 @@ fn creates_go_on_past_one_block_of_inode_tree() {
     let d0 = fs.lookup(&root_inode, &root_raw, b"d0").expect("d0");
     assert!(d0.is_dir());
 }
+
+/// A create that takes an inode from a chunk the group already has takes
+/// no blocks, and so has no business reading the group's free space: one
+/// with a damaged free-space record still succeeds (#423), as
+/// `tests/free_space_record_oracle.rs` requires of a kernel-made volume.
+#[test]
+fn a_create_that_takes_no_blocks_does_not_read_free_space() {
+    let dev = Arc::new(Sparse(Mutex::new(BTreeMap::new())));
+    let options = fs_xfs::mkfs::Options {
+        block_size: 1024,
+        ..fs_xfs::mkfs::Options::default()
+    };
+    fs_xfs::mkfs::format(dev.as_ref(), &options).expect("mkfs");
+    // Group 0's first free-space record moved onto the group's headers.
+    let (bs, sect) = {
+        let fs = Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).expect("mount");
+        (
+            u64::from(fs.superblock().blocksize),
+            u64::from(fs.superblock().sectsize),
+        )
+    };
+    let mut agf = vec![0u8; sect as usize];
+    dev.read_at(sect, &mut agf).unwrap();
+    let at = fs_xfs::ag::offsets::agf::ROOTS;
+    let bno_root = u64::from(u32::from_be_bytes(agf[at..at + 4].try_into().unwrap()));
+    let mut block = vec![0u8; bs as usize];
+    dev.read_at(bno_root * bs, &mut block).unwrap();
+    let record = fs_xfs::ag_btree::V5_HEADER_LEN;
+    block[record..record + 4].copy_from_slice(&0u32.to_be_bytes());
+    fs_xfs::group_write::restamp_crc(&mut block, fs_xfs::ag_btree::offsets::CRC);
+    dev.write_at(bno_root * bs, &block).unwrap();
+
+    let fs = Filesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount_rw");
+    let root = fs.superblock().rootino;
+    fs.create_file(root, b"f", 0o100644)
+        .expect("the create takes an inode, not blocks");
+}

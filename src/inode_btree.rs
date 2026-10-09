@@ -717,9 +717,9 @@ impl<'a> Trees<'a> {
     /// allocator to [`Trees::into_items_in`] instead, so the group's
     /// header is logged once.
     pub fn into_items(self) -> Result<Vec<crate::buf_write::BufferItem>> {
-        let mut group = crate::group_write::GroupAlloc::open(self.sb, self.device, self.agno)?;
-        let mut items = self.into_items_in(&mut group)?;
-        items.extend(group.into_items()?);
+        let mut allocations = crate::group_write::Allocations::new();
+        let mut items = self.into_items_in(&mut allocations)?;
+        items.extend(allocations.into_items()?);
         Ok(items)
     }
 
@@ -727,7 +727,7 @@ impl<'a> Trees<'a> {
     /// `group`, and those it shrinks by given back to it, which logs them.
     pub(crate) fn into_items_in(
         mut self,
-        group: &mut crate::group_write::GroupAlloc<'_>,
+        allocations: &mut crate::group_write::Allocations<'a>,
     ) -> Result<Vec<crate::buf_write::BufferItem>> {
         use crate::ag::offsets::agi;
         use crate::format::log_items::buf_log_format::buf_type::BLFT_AGI;
@@ -736,7 +736,12 @@ impl<'a> Trees<'a> {
         if !self.changed {
             return Ok(Vec::new());
         }
-        let mut source = crate::group_write::InodeTreeBlocks(group);
+        let mut source = crate::group_write::InodeTreeBlocks {
+            allocations,
+            sb: self.sb,
+            device: self.device,
+            agno: self.agno,
+        };
 
         let sparse = self.sb.has_sparse_inodes();
         let mut items = Vec::new();

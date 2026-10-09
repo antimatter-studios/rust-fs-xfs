@@ -768,8 +768,7 @@ impl Filesystem {
         // Through the operation's own allocator for the group: a new chunk
         // was taken from it, and the trees' blocks come from it too, so
         // the group's header is logged once (#423).
-        let inode_tree_items =
-            trees.into_items_in(allocations.group(&self.sb, self.device(), agno)?)?;
+        let inode_tree_items = trees.into_items_in(&mut allocations)?;
 
         // The parent gains an entry, so its fork and its size change —
         // unless the entry will not fit, in which case the directory

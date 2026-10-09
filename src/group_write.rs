@@ -308,21 +308,39 @@ impl crate::ag_btree::BlockSource for FreeList<'_> {
 /// create that made an inode chunk and grew the tree in one record logged
 /// the header twice: the later copy undid the earlier one's take, and the
 /// next growth was handed a block the tree already held.
-pub(crate) struct InodeTreeBlocks<'g, 'a>(pub &'g mut GroupAlloc<'a>);
+///
+/// The group is opened only when a tree actually grows or shrinks: opening
+/// it reads and checks the group's free-space trees, and a create that
+/// takes an inode from a chunk it has already has no business refusing
+/// over a free-space record it never uses.
+pub(crate) struct InodeTreeBlocks<'g, 'a> {
+    pub allocations: &'g mut Allocations<'a>,
+    pub sb: &'a Superblock,
+    pub device: &'a dyn fs_core::BlockRead,
+    pub agno: u32,
+}
+
+impl<'a> InodeTreeBlocks<'_, 'a> {
+    fn group(&mut self) -> Result<&mut GroupAlloc<'a>> {
+        let (sb, device, agno) = (self.sb, self.device, self.agno);
+        self.allocations.group(sb, device, agno)
+    }
+}
 
 impl crate::ag_btree::BlockSource for InodeTreeBlocks<'_, '_> {
     fn take(&mut self) -> Result<u32> {
-        self.0.take(1, crate::rmap::OWN_INOBT, 0)
+        self.group()?.take(1, crate::rmap::OWN_INOBT, 0)
     }
 
     fn put(&mut self, agblock: u32) -> Result<()> {
-        self.0.forget_rmap(crate::rmap::Rmap {
+        let group = self.group()?;
+        group.forget_rmap(crate::rmap::Rmap {
             startblock: agblock,
             blockcount: 1,
             owner: crate::rmap::OWN_INOBT,
             offset: 0,
         })?;
-        self.0.give_back(FreeExtent {
+        group.give_back(FreeExtent {
             startblock: agblock,
             blockcount: 1,
         })?;
