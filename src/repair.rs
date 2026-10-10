@@ -266,7 +266,7 @@ impl Proposal<'_> {
 
 /// Plan a repair of `fs` with every rule this crate has.
 pub fn plan(fs: &Filesystem, access: &Exclusive) -> Plan {
-    plan_with(fs, access, &[&SuperblockCopies])
+    plan_with(fs, access, &[&SuperblockCopies, &Counters])
 }
 
 /// A secondary superblock rewritten from the primary (#391).
@@ -344,6 +344,283 @@ impl Rule for SuperblockCopies {
             format!("rewrite group {ag}'s superblock copy from the primary"),
         )
     }
+}
+
+/// Every code [`Counters`] repairs.
+const COUNTER_CODES: &[Code] = &[
+    Code::CounterAgfFreeblks,
+    Code::CounterAgfLongest,
+    Code::CounterAgfBtreeblks,
+    Code::CounterAgiInodes,
+    Code::CounterAgiIblocks,
+    Code::CounterAgiFblocks,
+    Code::CounterSbIcount,
+    Code::CounterSbIfree,
+    Code::CounterSbFdblocks,
+];
+
+/// The group and superblock counters, rewritten from the trees they count
+/// (#392).
+///
+/// A counter is a summary: free blocks and the longest free extent from
+/// the free-space btree, the blocks past the roots of the free-space and
+/// reverse-mapping trees, inodes and free inodes from the inode btree,
+/// the inode trees' own blocks, and the superblock's totals of all of
+/// it. Each is derived here exactly as the checker derives the value it
+/// compares, and only the counter fields and the header's checksum change.
+///
+/// A summary is only as good as what it summarises, so the rule repairs
+/// counters on a volume whose trees the check found sound, and refuses
+/// the whole plan when anything but a counter, or a superblock copy that
+/// [`SuperblockCopies`] owns, is wrong: two free-space trees that disagree,
+/// a free inode tree that is not the inode tree's free chunks, a block with
+/// two owners. Rebuilding a tree is not a summary repair.
+pub struct Counters;
+
+/// What a group's headers should say, counted from its trees.
+struct GroupCounts {
+    freeblks: u32,
+    longest: u32,
+    btreeblks: u32,
+    flcount: u32,
+    count: u32,
+    freecount: u32,
+    iblocks: u32,
+    fblocks: u32,
+}
+
+fn count_group(fs: &Filesystem, ag: u32) -> Result<GroupCounts> {
+    use crate::alloc_btree::Order;
+    let sb = fs.superblock();
+    let ag_start = u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize);
+    let sector = u64::from(sb.sectsize);
+    let header = |at: u64| -> Result<Vec<u8>> {
+        let mut raw = vec![0u8; usize::from(sb.sectsize)];
+        fs.device().read_at(ag_start + at, &mut raw)?;
+        Ok(raw)
+    };
+    let agf = crate::ag::Agf::parse(&header(sector)?, sb, ag)?;
+    let agi = crate::ag::Agi::parse(&header(2 * sector)?, sb, ag)?;
+    let read = |agblock: u32| -> Result<Vec<u8>> {
+        let mut raw = vec![0u8; sb.blocksize as usize];
+        fs.device().read_at(
+            ag_start + u64::from(agblock) * u64::from(sb.blocksize),
+            &mut raw,
+        )?;
+        Ok(raw)
+    };
+    let mut btreeblks = 0u32;
+    let mut by_block = Vec::new();
+    for (order, which) in [
+        (Order::ByBlock, crate::ag::agf_btree::BNO),
+        (Order::ByCount, crate::ag::agf_btree::CNT),
+    ] {
+        let (records, blocks) = crate::ag_btree::walk_blocks(
+            sb,
+            order.shape(),
+            ag,
+            agf.roots[which],
+            agf.levels[which],
+            read,
+            crate::alloc_btree::decode_free_extent,
+        )?;
+        btreeblks += blocks.len() as u32 - 1;
+        if matches!(order, Order::ByBlock) {
+            by_block = records;
+        }
+    }
+    let rmap = crate::ag::agf_btree::RMAP;
+    if sb.has_rmapbt() && agf.levels[rmap] > 0 {
+        let (_, blocks) = crate::ag_btree::walk_blocks(
+            sb,
+            crate::rmap::shape(),
+            ag,
+            agf.roots[rmap],
+            agf.levels[rmap],
+            read,
+            |_, _| (),
+        )?;
+        btreeblks += blocks.len() as u32 - 1;
+    }
+    let sparse = sb.has_sparse_inodes();
+    let shape = |which| crate::inode_btree::shape(which, sb.is_v5());
+    let (chunks, iblocks) = crate::ag_btree::walk_blocks(
+        sb,
+        shape(crate::inode_btree::Which::All),
+        ag,
+        agi.root,
+        agi.level,
+        read,
+        |buf, at| crate::inode_btree::record(buf, at, sparse),
+    )?;
+    let fblocks = if sb.has_finobt() && agi.free_level > 0 {
+        crate::ag_btree::walk_blocks(
+            sb,
+            shape(crate::inode_btree::Which::WithFreeInodes),
+            ag,
+            agi.free_root,
+            agi.free_level,
+            read,
+            |_, _| (),
+        )?
+        .1
+        .len() as u32
+    } else {
+        0
+    };
+    let (mut count, mut freecount) = (0u32, 0u32);
+    for chunk in chunks {
+        let chunk = chunk?;
+        count += u32::from(chunk.count);
+        freecount += u32::from(chunk.freecount);
+    }
+    Ok(GroupCounts {
+        freeblks: by_block.iter().map(|e| e.blockcount).sum(),
+        longest: by_block.iter().map(|e| e.blockcount).max().unwrap_or(0),
+        btreeblks,
+        flcount: agf.flcount,
+        count,
+        freecount,
+        iblocks: iblocks.len() as u32,
+        fblocks,
+    })
+}
+
+/// `sector` with each `(offset, value)` written big-endian and its
+/// checksum at `crc` stamped again.
+fn restamped(mut sector: Vec<u8>, fields: &[(usize, u64, usize)], crc: usize) -> Vec<u8> {
+    for &(at, value, width) in fields {
+        let bytes = value.to_be_bytes();
+        sector[at..at + width].copy_from_slice(&bytes[8 - width..]);
+    }
+    crate::group_write::restamp_crc(&mut sector, crc);
+    sector
+}
+
+impl Rule for Counters {
+    fn name(&self) -> &'static str {
+        "counters"
+    }
+
+    fn repairs(&self) -> &'static [Code] {
+        COUNTER_CODES
+    }
+
+    fn propose(&self, fs: &Filesystem, report: &Report, proposal: &mut Proposal) -> Result<()> {
+        if !report
+            .findings
+            .iter()
+            .any(|f| COUNTER_CODES.contains(&f.code))
+        {
+            return Ok(());
+        }
+        let others: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity() == Severity::Error)
+            .filter(|f| !COUNTER_CODES.contains(&f.code))
+            .filter(|f| !SuperblockCopies.repairs().contains(&f.code))
+            .map(|f| f.code.as_str())
+            .collect();
+        if !others.is_empty() {
+            return Err(Error::UnsupportedFeature(format!(
+                "counters are summaries of trees the check did not find sound ({}), and \
+                 are not repaired from them",
+                others.join(", ")
+            )));
+        }
+        let sb = fs.superblock();
+        let sector = u64::from(sb.sectsize);
+        let lazy = crate::check::has_lazy_counters(sb);
+        let inobt_counts = crate::check::has_inobt_counts(sb);
+        let (mut icount, mut ifree, mut fdblocks) = (0u64, 0u64, 0u64);
+        for ag in 0..sb.agcount {
+            let c = count_group(fs, ag)?;
+            let ag_start = u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize);
+            let read = |at: u64| -> Result<Vec<u8>> {
+                let mut raw = vec![0u8; usize::from(sb.sectsize)];
+                fs.device().read_at(at, &mut raw)?;
+                Ok(raw)
+            };
+            {
+                use crate::ag::offsets::agf;
+                let btreeblks = if lazy {
+                    c.btreeblks
+                } else {
+                    crate::ag::Agf::parse(&read(ag_start + sector)?, sb, ag)?.btreeblks
+                };
+                let after = restamped(
+                    read(ag_start + sector)?,
+                    &[
+                        (agf::FREEBLKS, c.freeblks.into(), 4),
+                        (agf::LONGEST, c.longest.into(), 4),
+                        (agf::BTREEBLKS, btreeblks.into(), 4),
+                    ],
+                    agf::CRC,
+                );
+                if after != read(ag_start + sector)? {
+                    proposal.put(
+                        ag_start + sector,
+                        after,
+                        Code::CounterAgfFreeblks,
+                        format!("count group {ag}'s free space again from its btrees"),
+                    )?;
+                }
+                fdblocks += u64::from(c.freeblks) + u64::from(c.flcount) + u64::from(btreeblks);
+            }
+            {
+                use crate::ag::offsets::agi;
+                let mut fields = vec![
+                    (agi::COUNT, u64::from(c.count), 4),
+                    (agi::FREECOUNT, u64::from(c.freecount), 4),
+                ];
+                if inobt_counts {
+                    fields.push((agi::FREE_LEVEL + 4, c.iblocks.into(), 4));
+                    fields.push((agi::FREE_LEVEL + 8, c.fblocks.into(), 4));
+                }
+                let before = read(ag_start + 2 * sector)?;
+                let after = restamped(before.clone(), &fields, agi::CRC);
+                if after != before {
+                    proposal.put(
+                        ag_start + 2 * sector,
+                        after,
+                        Code::CounterAgiInodes,
+                        format!("count group {ag}'s inodes again from its inode btrees"),
+                    )?;
+                }
+            }
+            icount += u64::from(c.count);
+            ifree += u64::from(c.freecount);
+        }
+        // The superblock's totals, unless a log replay owes them: the
+        // planner refuses a dirty log before any rule is asked.
+        use crate::superblock::offsets as so;
+        let before = read_primary(fs)?;
+        let after = restamped(
+            before.clone(),
+            &[
+                (so::ICOUNT, icount, 8),
+                (so::IFREE, ifree, 8),
+                (so::FDBLOCKS, fdblocks, 8),
+            ],
+            so::CRC,
+        );
+        if after != before {
+            proposal.put(
+                0,
+                after,
+                Code::CounterSbIcount,
+                "add the superblock's counters up again from the groups",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn read_primary(fs: &Filesystem) -> Result<Vec<u8>> {
+    let mut raw = vec![0u8; usize::from(fs.superblock().sectsize)];
+    fs.device().read_at(0, &mut raw)?;
+    Ok(raw)
 }
 
 /// Write a ready plan's changes to `device`, on which the filesystem

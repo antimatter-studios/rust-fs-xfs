@@ -2254,11 +2254,11 @@ fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(b[at..at + 4].try_into().expect("4 bytes"))
 }
 
-fn has_inobt_counts(sb: &crate::superblock::Superblock) -> bool {
+pub(crate) fn has_inobt_counts(sb: &crate::superblock::Superblock) -> bool {
     sb.features_ro_compat & crate::superblock::ro_compat::INOBTCNT != 0
 }
 
-fn has_lazy_counters(sb: &crate::superblock::Superblock) -> bool {
+pub(crate) fn has_lazy_counters(sb: &crate::superblock::Superblock) -> bool {
     sb.features2 & crate::superblock::features2_flags::LAZYSBCOUNT != 0
 }
 
