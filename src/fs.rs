@@ -253,7 +253,22 @@ impl Filesystem {
         // does not fit an in-core buffer, and the kernel writes several
         // records rather than refusing.
         let groups = crate::log_write::split_into_records(&ops, head.iclog_size)?;
-        let needed = crate::log_write::blocks_for_records(tid, &groups) as u32;
+        let record_lengths: Vec<u32> = groups
+            .iter()
+            .map(|group| {
+                crate::log_write::record_blocks_for_log(
+                    tid,
+                    group,
+                    head.iclog_size,
+                    self.sb.logsunit,
+                )
+            })
+            .collect::<Result<_>>()?;
+        let needed = record_lengths.iter().try_fold(0u32, |total, length| {
+            total.checked_add(*length).ok_or_else(|| {
+                Error::UnsupportedFeature("checkpoint log-space reservation overflows".into())
+            })
+        })?;
 
         // THE RING IS REUSED RATHER THAN EXHAUSTED. A record may not
         // straddle the wrap, so one that will not fit in what is left
@@ -323,7 +338,7 @@ impl Filesystem {
         let mut at = head;
         let mut first = None;
         let mut lsn = 0;
-        for group in &groups {
+        for (group, used) in groups.iter().zip(record_lengths) {
             // A record that failed may be on the device whole, in part or
             // not at all, so nothing is written after it (#400).
             lsn = self.or_stop_writing(|| {
@@ -337,7 +352,6 @@ impl Filesystem {
                 )
             })?;
             first.get_or_insert(lsn);
-            let used = crate::log_write::record_blocks(tid, group, at.iclog_size)?;
             at = crate::log::Head {
                 block: at.block + used,
                 cycle: at.cycle,
@@ -531,6 +545,17 @@ impl Filesystem {
             log::inspect(device.as_ref(), &sb)?,
             log::LogState::NeedsReplay
         );
+        // A log-incompatible bit says the log may hold items of a kind this
+        // driver has no recovery for (#359). A clean log holds none, which
+        // is why the kernel clears the bits at unmount; a log that needs
+        // replay may, so it is refused before a record is read.
+        if replayed && sb.features_log_incompat != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "the log needs replay and carries log-incompatible features {:#010x}, \
+                 whose items are not implemented",
+                sb.features_log_incompat
+            )));
+        }
         let device: Arc<dyn BlockRead> = if replayed {
             let into = crate::overlay::Overlay::new(device.clone());
             crate::log_recover::replay(device.as_ref(), &sb, &into)?;
@@ -754,6 +779,22 @@ impl Filesystem {
     /// the failure the bit exists to prevent — and worse than a refusal,
     /// because nothing reports it and `xfs_repair` finds it weeks later.
     fn refuse_unmaintained_features(&self) -> Result<()> {
+        // Known quota accounting is maintained by the quota module. Future
+        // flags still require a refusal before journal inspection or writes.
+        let unknown_quota = self.sb.qflags & !0x07ff;
+        if unknown_quota != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "unknown quota flags {unknown_quota:#x} are not maintained by writes"
+            )));
+        }
+        // A log-incompatible bit is a promise about the log's contents that
+        // this driver's records do not keep (#359).
+        if self.sb.features_log_incompat != 0 {
+            return Err(Error::UnsupportedFeature(format!(
+                "log-incompatible features {:#010x} are not maintained by writes",
+                self.sb.features_log_incompat
+            )));
+        }
         // Readable incompat bits whose structures no write here keeps
         // (#99). Parent pointers need an attribute added, moved or removed
         // by every create, rename and unlink; exchange-range is refused

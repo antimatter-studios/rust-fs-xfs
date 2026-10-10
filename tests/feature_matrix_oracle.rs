@@ -30,6 +30,8 @@
 //! reasoning about the format.
 
 mod common;
+#[path = "common/feature_expectations.rs"]
+mod contract;
 use common::{fixture, kernel_run, scratch};
 
 /// Where this suite'''s scratch volumes live, under
@@ -37,11 +39,65 @@ use common::{fixture, kernel_run, scratch};
 /// fixtures beside them (#223).
 const SUITE: &str = "feature_matrix_oracle";
 
-use fs_core::FileDevice;
+use fs_core::{BlockDevice, BlockRead, FileDevice};
 use fs_xfs::write::AttrChange;
 use fs_xfs::{Error, Filesystem};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+struct MutationProbe {
+    source: FileDevice,
+    writes: AtomicUsize,
+}
+
+impl BlockRead for MutationProbe {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.source.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        self.source.size_bytes()
+    }
+}
+
+impl BlockDevice for MutationProbe {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.source.write_at(offset, buf)
+    }
+    fn flush(&self) -> fs_core::Result<()> {
+        self.source.flush()
+    }
+    fn is_writable(&self) -> bool {
+        self.source.is_writable()
+    }
+}
+
+#[test]
+fn all_feature_fixtures_read_and_check_without_mutation() {
+    let combos = selected("XFS_MATRIX_COMBOS", COMBOS);
+    assert!(!combos.is_empty(), "no feature fixture selected");
+    for combo in combos {
+        let device = Arc::new(MutationProbe {
+            source: FileDevice::open(fixture(&format!("xfsfeat-{combo}.img"))).unwrap(),
+            writes: AtomicUsize::new(0),
+        });
+        let fs = Filesystem::mount(device.clone()).unwrap();
+        let file = fs.lookup_path("/sf/data.bin").unwrap();
+        assert_eq!(file.size, 32 * 4096, "{combo}: populated file");
+        let report = fs_xfs::check::check(&fs);
+        assert!(!report.dirty, "{combo}: dirty source fixture");
+        assert!(report.inodes > 0 && report.directories > 0);
+        assert!(report.is_clean(), "{combo}: {:?}", report.findings);
+        assert_eq!(
+            device.writes.load(Ordering::SeqCst),
+            0,
+            "{combo}: check wrote"
+        );
+    }
+}
 
 /// A copy of a fixture, removed when it goes out of scope.
 ///
@@ -63,7 +119,11 @@ const COMBOS: &[&str] = &[
     "finobt-inobtcount",
     "reflink",
     "reflink-finobt",
+    "reflink-finobt-inobtcount",
     "rmapbt",
+    "rmapbt-finobt",
+    "rmapbt-finobt-inobtcount",
+    "rmapbt-reflink-nofinobt",
     "rmapbt-reflink",
     "everything",
     // How things are encoded, with the features held still.
@@ -78,6 +138,10 @@ const COMBOS: &[&str] = &[
     "dirblock8k",
     "ci",
     "fullinodes",
+    "meta_uuid",
+    "quota",
+    "stripe",
+    "sector4k",
 ];
 
 /// What happened to one combination.
@@ -117,7 +181,7 @@ const OPS: &[&str] = &[
 
 /// The rows and columns this run covers.
 ///
-/// The whole matrix is twenty images times eleven operations, and every
+/// The whole matrix is twenty-eight images times eleven operations, and every
 /// pair is a copy, a mount and a check inside the kernel. Iterating on
 /// one failing pair should not cost the other two hundred, so
 /// `XFS_MATRIX_COMBOS` and `XFS_MATRIX_OPS` take a comma-separated list
@@ -222,6 +286,9 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
         // use, which is the worst outcome available here and one that
         // only shows up on a filesystem where sharing happened.
         "truncate_shared" => {
+            if fs.superblock().features_ro_compat & fs_xfs::superblock::ro_compat::REFLINK == 0 {
+                return Err("not applicable: no shared extent on this filesystem".into());
+            }
             let shared = match fs.lookup_path("/sf/shared.bin") {
                 Ok(i) => i.ino,
                 // No shared file: this row's filesystem does not permit
@@ -265,11 +332,38 @@ fn perform(fs: &Filesystem, op: &str) -> Result<(), String> {
 
 /// Mount, perform one operation, and ask the kernel and the checker what
 /// it left behind.
-fn exercise(img: &Path, op: &str) -> Outcome {
-    let dev = FileDevice::open_rw(img).expect("open read-write");
-    let fs = match Filesystem::mount_rw(Arc::new(dev)) {
+fn image_digest(img: &Path) -> Vec<u8> {
+    let mut source = std::fs::File::open(img).unwrap();
+    let mut digest = Sha256::new();
+    let mut buf = vec![0; 1024 * 1024];
+    loop {
+        let n = source.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    digest.finalize().to_vec()
+}
+
+fn exercise(img: &Path, combo: &str, op: &str) -> Outcome {
+    let before = image_digest(img);
+    let dev = Arc::new(MutationProbe {
+        source: FileDevice::open_rw(img).expect("open read-write"),
+        writes: AtomicUsize::new(0),
+    });
+    let fs = match Filesystem::mount_rw(dev.clone()) {
         Ok(fs) => fs,
-        Err(Error::UnsupportedFeature(why)) => return Outcome::Refused(why),
+        Err(Error::UnsupportedFeature(why)) => {
+            assert_eq!(dev.writes.load(Ordering::SeqCst), 0, "mount refusal wrote");
+            assert_eq!(
+                image_digest(img),
+                before,
+                "mount refusal changed image bytes"
+            );
+            contract::require_expected(combo, op, Some(&why));
+            return Outcome::Refused(why);
+        }
         Err(e) => panic!("a read-write mount failed for a reason other than a refusal: {e}"),
     };
 
@@ -279,8 +373,20 @@ fn exercise(img: &Path, op: &str) -> Outcome {
     // A refused operation wrote nothing, so there is nothing to judge
     // and nothing wrong: refusing is one of the two acceptable answers.
     if let Err(why) = result {
+        assert_eq!(
+            dev.writes.load(Ordering::SeqCst),
+            0,
+            "{op} refused after mutating the image: {why}"
+        );
+        assert_eq!(
+            image_digest(img),
+            before,
+            "operation refusal changed image bytes"
+        );
+        contract::require_expected(combo, op, Some(&why));
         return Outcome::Refused(why);
     }
+    contract::require_expected(combo, op, None);
 
     // The kernel replays what was logged, then the checker judges. Both
     // are the reference implementation; neither is this repository.
@@ -288,6 +394,8 @@ fn exercise(img: &Path, op: &str) -> Outcome {
     let script = format!(
         r#"
         img=$(mktemp -u /tmp/feat-XXXXXX.img)
+        export PATH=/usr/local/xfsprogs-parent/sbin:$PATH
+        [ "$(xfs_repair -V 2>&1)" = "xfs_repair version 6.13.0" ] || exit 1
         cp {image} "$img"
         m=$(mktemp -d)
 
@@ -368,7 +476,7 @@ fn every_feature_combination_is_written_correctly_or_refused() {
             );
             checked += 1;
 
-            match exercise(scratch.path(), op) {
+            match exercise(scratch.path(), combo, op) {
                 Outcome::Refused(why) => {
                     // "Not applicable" is the test saying this row has
                     // nothing to exercise -- a filesystem that cannot
@@ -415,7 +523,7 @@ fn every_feature_combination_is_written_correctly_or_refused() {
                         unjudged += 1;
                         eprintln!(
                             "{combo:22} {op:22} NOT JUDGED: the log was not replayed, so \
-                             xfs_repair is describing that rather than this driver"
+                             xfs_repair is describing that rather than this driver\n{repair}"
                         );
                         continue;
                     }
@@ -470,12 +578,8 @@ fn every_feature_combination_is_written_correctly_or_refused() {
          {refused} refused by name, {not_applicable} not applicable, {unjudged} unjudged"
     );
 
-    // Unjudged is not the same as sound, and a run where several pairs
-    // went unjudged has proved less than it looks like it has.
-    assert!(
-        unjudged * 4 < checked,
-        "{unjudged} of {checked} pairs went unjudged — too many to call this run a check"
-    );
+    // Every selected pair needs a verdict; even one unjudged pair fails.
+    require_every_pair_judged(unjudged, checked);
 
     assert!(
         broken.is_empty(),
@@ -483,6 +587,146 @@ fn every_feature_combination_is_written_correctly_or_refused() {
          properly or refused before the write:\n  {}",
         broken.join("\n  ")
     );
+}
+
+#[test]
+fn declared_contract_covers_exactly_every_matrix_row_and_operation() {
+    assert_eq!(OPS, contract::OPS);
+    let rows: Vec<_> = contract::ROWS.iter().map(|(name, _)| *name).collect();
+    assert_eq!(COMBOS, rows);
+}
+
+#[test]
+fn pinned_feature_geometry_matches_independent_reference() {
+    for combo in selected("XFS_MATRIX_COMBOS", COMBOS) {
+        let image = fixture(&format!("xfsfeat-{combo}.img"));
+        let evidence =
+            std::fs::read_to_string(fixture(&format!("xfsfeat-{combo}.provenance"))).unwrap();
+        for tool in ["mkfs.xfs", "xfs_info", "xfs_db", "xfs_quota", "xfs_repair"] {
+            assert!(evidence
+                .lines()
+                .any(|line| line == format!("{tool} version 6.13.0")));
+        }
+        let hash: String = image_digest(&image)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(evidence
+            .lines()
+            .any(|line| line.starts_with(&format!("{hash}  "))));
+        let reference =
+            std::fs::read_to_string(fixture(&format!("xfsfeat-{combo}.sbdump"))).unwrap();
+        let field = |name: &str| -> u64 {
+            let value = reference
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name} = ")))
+                .expect("missing independent field");
+            // xfs_db appends decoded flag names after the numeric value.
+            let value = value
+                .split_whitespace()
+                .next()
+                .expect("empty independent field");
+            if value == "null" {
+                u64::MAX // xfs_db's NULLFSINO spelling
+            } else if let Some(hex) = value.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).unwrap()
+            } else {
+                value.parse().unwrap()
+            }
+        };
+        let fs = Filesystem::mount(Arc::new(FileDevice::open(image).unwrap())).unwrap();
+        let sb = fs.superblock();
+        for (name, ours) in [
+            ("versionnum", u64::from(sb.versionnum)),
+            ("features2", u64::from(sb.features2)),
+            ("bad_features2", u64::from(sb.bad_features2)),
+            ("features_compat", u64::from(sb.features_compat)),
+            ("features_ro_compat", u64::from(sb.features_ro_compat)),
+            ("features_incompat", u64::from(sb.features_incompat)),
+            ("features_log_incompat", u64::from(sb.features_log_incompat)),
+            ("qflags", u64::from(sb.qflags)),
+            ("blocksize", u64::from(sb.blocksize)),
+            ("sectsize", u64::from(sb.sectsize)),
+            ("inodesize", u64::from(sb.inodesize)),
+            ("dirblklog", u64::from(sb.dirblklog)),
+            ("unit", u64::from(sb.unit)),
+            ("width", u64::from(sb.width)),
+            ("rootino", sb.rootino),
+            ("uquotino", sb.uquotino),
+        ] {
+            assert_eq!(ours, field(name), "{combo}: {name} disagrees with xfs_db");
+        }
+        match combo {
+            "meta_uuid" => {
+                assert_ne!(sb.uuid, sb.meta_uuid);
+                assert_ne!(sb.features_incompat & 4, 0);
+            }
+            "quota" => {
+                assert_ne!(sb.qflags, 0);
+                assert!(sb.uquotino != 0 && sb.uquotino != u64::MAX);
+            }
+            "stripe" => {
+                assert_eq!(field("unit"), 16);
+                assert_eq!(field("width"), 64);
+            }
+            "sector4k" => {
+                assert_eq!(sb.sectsize, 4096);
+                assert_eq!(field("sectsize"), 4096);
+            }
+            _ => (),
+        }
+    }
+}
+
+/// Local return values only; this does not establish Linux correctness.
+#[test]
+fn selected_fixture_operations_match_declared_local_contracts() {
+    let mut mismatches = Vec::new();
+    for combo in selected("XFS_MATRIX_COMBOS", COMBOS) {
+        let source = fixture(&format!("xfsfeat-{combo}.img"));
+        for op in selected("XFS_MATRIX_OPS", OPS) {
+            let scratch =
+                scratch::Volume::copy_of(SUITE, &source, &format!("local-{combo}-{op}.img"));
+            let dev = Arc::new(MutationProbe {
+                source: FileDevice::open_rw(scratch.path()).unwrap(),
+                writes: AtomicUsize::new(0),
+            });
+            let refusal = match Filesystem::mount_rw(dev.clone()) {
+                Ok(fs) => perform(&fs, op).err(),
+                Err(Error::UnsupportedFeature(why)) => Some(why),
+                Err(e) => panic!("unexpected mount error: {e}"),
+            };
+            eprintln!("local {combo}/{op}: {refusal:?}");
+            if std::panic::catch_unwind(|| {
+                contract::require_expected(combo, op, refusal.as_deref())
+            })
+            .is_err()
+            {
+                mismatches.push(format!("{combo}/{op}: {refusal:?}"));
+            }
+            if refusal.is_some() {
+                assert_eq!(dev.writes.load(Ordering::SeqCst), 0);
+                assert_eq!(image_digest(scratch.path()), image_digest(&source));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "local operation mismatches: {mismatches:?}"
+    );
+}
+
+fn require_every_pair_judged(unjudged: usize, checked: usize) {
+    assert_eq!(
+        unjudged, 0,
+        "{unjudged} of {checked} pairs went unjudged; every pair needs an oracle verdict"
+    );
+}
+
+#[test]
+#[should_panic(expected = "unjudged")]
+fn even_one_unjudged_pair_fails_the_matrix() {
+    require_every_pair_judged(1, 220);
 }
 
 /// The first line of a refusal, for a readable table.

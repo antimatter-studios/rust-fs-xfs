@@ -79,13 +79,21 @@ fn every_record_the_kernel_wrote_verifies() {
                 continue;
             }
             let h_len = u32::from_be_bytes(blk[12..16].try_into().unwrap()) as usize;
-            let data_at = (i + 1) * BBSIZE;
+            let version = u32::from_be_bytes(blk[8..12].try_into().unwrap());
+            let size = u32::from_be_bytes(blk[320..324].try_into().unwrap()) as usize;
+            let header_blocks = if version & 2 != 0 {
+                size.div_ceil(32 * 1024).max(1)
+            } else {
+                1
+            };
+            let header_at = i * BBSIZE;
+            let data_at = (i + header_blocks) * BBSIZE;
             let padded = h_len.div_ceil(BBSIZE) * BBSIZE;
             if data_at + padded > log.len() {
                 continue;
             }
 
-            let got = record_checksum(blk, &log[data_at..data_at + h_len]);
+            let got = record_checksum(&log[header_at..data_at], &log[data_at..data_at + h_len]);
             assert_eq!(
                 got, stored,
                 "{name}: record at basic block {i} (h_len {h_len}) checksums to {got:#010x}, \

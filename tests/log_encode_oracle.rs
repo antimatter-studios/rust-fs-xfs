@@ -14,17 +14,18 @@
 //! them fails here rather than passing having re-encoded nothing.
 
 use fs_core::{BlockRead, FileDevice};
-use fs_xfs::log::{BBSIZE, XLOG_HEADER_MAGIC};
-use fs_xfs::log_write::{encode_record, Placement};
+use fs_xfs::log::{record_checksum, BBSIZE, XLOG_HEADER_MAGIC};
+use fs_xfs::log_write::{encode_record, max_payload, Placement};
 use fs_xfs::superblock::Superblock;
 
 mod common;
 use common::fixtures_matching;
 
-/// Re-encode every checksummed record and require byte equality.
+/// Re-encode admitted records and require explicit refusals for unsupported headers.
 #[test]
 fn re_encoding_reproduces_records_byte_for_byte() {
     let mut checked = 0usize;
+    let mut refused = 0usize;
     for p in fixtures_matching("", ".img") {
         let Ok(dev) = FileDevice::open(&p) else {
             continue;
@@ -64,10 +65,32 @@ fn re_encoding_reproduces_records_byte_for_byte() {
                 continue; // mkfs's unmount record carries no checksum
             }
             let h_len = u32::from_be_bytes(blk[12..16].try_into().unwrap()) as usize;
+            let iclog_size = u32::from_be_bytes(blk[320..324].try_into().unwrap());
+            let version = u32::from_be_bytes(blk[8..12].try_into().unwrap());
+            let headers = if version & 2 != 0 {
+                (iclog_size as usize).div_ceil(32 * 1024).max(1)
+            } else {
+                1
+            };
             let padded = h_len.div_ceil(BBSIZE) * BBSIZE;
-            let data_at = (i + 1) * BBSIZE;
+            let data_at = (i + headers) * BBSIZE;
             if data_at + padded > log.len() {
                 continue;
+            }
+
+            if let Err(error) = max_payload(iclog_size) {
+                assert!(
+                    matches!(&error, fs_xfs::Error::UnsupportedFeature(reason)
+                    if reason.contains("multi-block record header")),
+                    "{name}: {error}"
+                );
+                assert_eq!(
+                    record_checksum(&log[i * BBSIZE..data_at], &log[data_at..data_at + h_len]),
+                    stored_crc,
+                    "{name}: refused encoding must still describe a valid kernel record"
+                );
+                refused += 1;
+                continue; // A checked refusal, not an unjudged record.
             }
 
             // Recover the payload as it was before stamping: each block's
@@ -85,7 +108,7 @@ fn re_encoding_reproduces_records_byte_for_byte() {
                 prev_block: u32::from_be_bytes(blk[36..40].try_into().unwrap()),
                 tail_lsn: u64::from_be_bytes(blk[24..32].try_into().unwrap()),
                 uuid: sb.uuid,
-                iclog_size: u32::from_be_bytes(blk[320..324].try_into().unwrap()),
+                iclog_size,
             };
             let num_logops = u32::from_be_bytes(blk[40..44].try_into().unwrap());
 
@@ -122,4 +145,5 @@ fn re_encoding_reproduces_records_byte_for_byte() {
          the kernel wrote. `chore fixtures` rebuilds them."
     );
     eprintln!("{checked} records re-encoded byte-for-byte");
+    eprintln!("{refused} valid kernel records explicitly refused for multi-block headers");
 }

@@ -294,8 +294,8 @@ fn each_carried_field_lands_at_its_own_offset() {
 
     let mut sb = Superblock::parse(original).expect("parse the v5 fixture");
 
-    // Distinct so a transposition cannot pass, and none of them is a
-    // value `validate` constrains — validation already ran, above.
+    // Distinct so a transposition cannot pass. The legacy feature mirror
+    // must use admitted bits so the rewritten sector still parses.
     sb.rextents = 0x1122_3344_5566_7701;
     sb.rbmino = 0x1122_3344_5566_7702;
     sb.rsumino = 0x1122_3344_5566_7703;
@@ -313,7 +313,7 @@ fn each_carried_field_lands_at_its_own_offset() {
     sb.width = 0x1122_330f;
     sb.logsectlog = 0x10;
     sb.logsectsize = 0x1111;
-    sb.bad_features2 = 0x1122_3312;
+    sb.bad_features2 = fs_xfs::superblock::features2_flags::FTYPE;
     sb.pquotino = 0x1122_3344_5566_7713;
     sb.lsn = 0x1122_3344_5566_7714;
 

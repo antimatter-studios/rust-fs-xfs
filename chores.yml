@@ -409,18 +409,24 @@ tasks:
     # makes sense. These tests write with the Rust API, have the guest
     # mount the result, and compare what came back.
     #
-    # MEASURED in run 35435470063 on 2026-09-19: 482 lines / 26,812 bytes;
-    # budget half as much again.
+    # MEASURED in run 37765095462, job 113272789103, head b2c8b8e,
+    # on 2026-10-08: all 74 tests passed; 1013 lines / 58,883 bytes.
+    # The expanded matrix judges 308 pairs with zero unjudged. Retain
+    # all per-pair evidence with about 10% output headroom.
     # The floor is 36: 41 executed (job 105877826105), less the margin.
     # Budget: 738 lines / 51,109 bytes measured with the quota record oracle
     # in the tier (run 37791688001), every byte of its growth an `[oracle vm]`
     # line naming a tool call and its verdict; half as much again, so 1110
     # lines / 77,000 bytes.
+    # MEASURED in run 37926110493 (job 113842031600, 2026-10-09), with the
+    # expanded matrix and the quota record oracle together on current main:
+    # every test passed and the tier printed 1,234 lines / 79,160 bytes;
+    # half as much again is 1,851 lines / 119,000 bytes.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1110 77000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1851 119000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -477,6 +483,10 @@ tasks:
         # (run 37952408330) and, the largest, 3,134 lines / 218,235 bytes
         # (run 37944786229, job 113899115614). Half as much again as the
         # largest is 4,701 lines / 328,000 bytes.
+        # MEASURED in run 37944786229 (job 113899115614, 2026-10-09), with
+        # the expanded feature matrix in the guest suite: every test passed
+        # and it printed 3,134 lines / 218,235 bytes; half as much again is
+        # 4,701 lines / 328,000 bytes.
         # shellcheck disable=SC2086  # the words are the point
         CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 4701 328000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
@@ -497,14 +507,14 @@ tasks:
     # the packaging and cli-tier guards (#271): inside the budget, which is
     # not raised, and nearer it than it was.
     #
-    # MEASURED, 2026-10-08, arm64 macOS: 43 lines / 2,464 bytes across
-    # fourteen shell tests, including the numeric quota report regression
-    # and the held-VM session messages. Both budgets carry 50% headroom,
-    # rounded up; the full raw output remains in the tier log.
+    # MEASURED, 2026-10-08, on arm64 macOS: 48 lines / 2,815 bytes across
+    # fifteen shell tests, including the two feature-matrix guards (#359).
+    # Full output: tmp/logs/359-scripts-budget-red.log. The budget is half
+    # as much again, with bytes rounded up to the next hundred.
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 65 3700 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 72 4300 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"

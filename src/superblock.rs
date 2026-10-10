@@ -188,6 +188,11 @@ pub mod version_flags {
     /// case-insensitively, for ASCII letters only.
     pub const BORGBIT: u16 = 0x4000;
     pub const MOREBITSBIT: u16 = 0x8000;
+    /// Historical shared-superblock encoding; unsupported by Linux too.
+    pub const SHAREDBIT: u16 = 0x0200;
+    /// Extent state flags and version 2 directories are understood layouts.
+    pub const EXTFLGBIT: u16 = 0x1000;
+    pub const DIRV2BIT: u16 = 0x2000;
 }
 
 /// `sb_features_incompat` bits. A volume setting a bit this driver does
@@ -250,6 +255,9 @@ pub mod features2_flags {
     pub const ATTR2: u32 = 0x0000_0008;
     /// 32-bit project identifiers.
     pub const PROJID32BIT: u32 = 0x0000_0080;
+    /// Metadata CRC marker, valid only on v5.
+    pub const CRCBIT: u32 = 0x0000_0100;
+    pub const SUPPORTED: u32 = LAZYSBCOUNT | ATTR2 | PROJID32BIT | FTYPE;
 }
 
 /// `sb_features_ro_compat` bits. Unknown bits here still permit a
@@ -484,6 +492,27 @@ impl Superblock {
         }
         if is_v5 {
             verify_checksum(buf, sectsize)?;
+        }
+
+        // All legacy version bits have defined meanings; SHAREDBIT is the
+        // historical exception Linux also excludes from VERSION_OKBITS.
+        if versionnum & version_flags::SHAREDBIT != 0 {
+            return Err(Error::UnsupportedFeature(
+                "legacy shared superblock (sharedbit)".into(),
+            ));
+        }
+        if versionnum & version_flags::MOREBITSBIT != 0 {
+            // The historical mirror must not smuggle an unknown layout past
+            // the gate. Unadvertised words are retained but have no meaning.
+            let known =
+                features2_flags::SUPPORTED | if is_v5 { features2_flags::CRCBIT } else { 0 };
+            let unknown =
+                (be32(buf, offsets::FEATURES2) | be32(buf, offsets::BAD_FEATURES2)) & !known;
+            if unknown != 0 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "unknown legacy features2 bits {unknown:#010x}"
+                )));
+            }
         }
 
         let (features_compat, features_ro_compat, features_incompat, features_log_incompat) =
@@ -1195,6 +1224,49 @@ mod tests {
         b
     }
 
+    #[test]
+    fn legacy_unknown_features_are_refused_when_advertised() {
+        for version in [4u16, 5] {
+            for index in 0..32 {
+                let bit = 1u32 << index;
+                let known = 0x28a | if version == 5 { 0x100 } else { 0 };
+                if bit & known != 0 {
+                    continue;
+                }
+                for field in [offsets::FEATURES2, offsets::BAD_FEATURES2] {
+                    let mut bytes = v4_superblock();
+                    bytes[100..102].copy_from_slice(&(version | 0x8000).to_be_bytes());
+                    bytes[field..field + 4].copy_from_slice(&bit.to_be_bytes());
+                    crate::super_write::stamp_crc(&mut bytes);
+                    assert!(
+                        matches!(Superblock::parse(&bytes), Err(Error::UnsupportedFeature(_))),
+                        "legacy version {version}, field {field}, bit {bit:#x} accepted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_shared_superblock_is_refused() {
+        for version in [4u16, 5] {
+            let mut bytes = v4_superblock();
+            bytes[100..102].copy_from_slice(&(version | 0x0200).to_be_bytes());
+            crate::super_write::stamp_crc(&mut bytes);
+            assert!(matches!(
+                Superblock::parse(&bytes),
+                Err(Error::UnsupportedFeature(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unadvertised_legacy_features2_is_retained_and_ignored() {
+        let mut bytes = v4_superblock();
+        bytes[offsets::FEATURES2..offsets::FEATURES2 + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(Superblock::parse(&bytes).unwrap().features2, u32::MAX);
+    }
+
     /// Promote a v4 test superblock to v5 and fix up its CRC.
     fn v5_superblock() -> Vec<u8> {
         let mut b = v4_superblock();
@@ -1592,6 +1664,21 @@ mod tests {
             Superblock::parse(&b),
             Err(Error::UnsupportedFeature(_))
         ));
+    }
+
+    #[test]
+    fn log_incompatible_features_are_parsed_and_kept() {
+        // Refused by the mounts, where whether the log needs replay is
+        // known: a clean log carries nothing those bits describe.
+        for index in 0..32 {
+            let mut bytes = v5_superblock();
+            bytes[offsets::FEATURES_LOG_INCOMPAT..offsets::FEATURES_LOG_INCOMPAT + 4]
+                .copy_from_slice(&(1u32 << index).to_be_bytes());
+            let crc = crc32c_with_zeroed_crc(&bytes, SB_CRC_OFFSET);
+            bytes[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+            let sb = Superblock::parse(&bytes).expect("parsed");
+            assert_eq!(sb.features_log_incompat, 1u32 << index);
+        }
     }
 
     #[test]
