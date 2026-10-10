@@ -64,6 +64,11 @@ never does.
   `Error::DirectoryNotEmpty` (ENOTEMPTY in the C ABI), and a name that is not a
   directory with `Error::NotADirectory`, before anything is written.
 
+- **A write is placed across allocation groups (#388).** A hole the inode's
+  own group cannot hold in one free run is given blocks one run at a time,
+  from that group while it has any and then from each other group in turn, and
+  every group it took from is logged in the one record.
+
 - **A write anywhere in a file (#387).** `Filesystem::write(ino, offset,
   data)` is the journalled write `write_at` cannot make: a hole is given
   blocks from the inode's group, the covered part of an unwritten extent
