@@ -73,6 +73,14 @@ never does.
   group's trees, quota and the inode's whole extent list. A file whose extents
   are in a B+tree, or a write that would need one, is refused by name.
 
+- **`fsck.xfs -y` and `-p` repair a damaged secondary superblock (#391).** The
+  repair plan of #375 is applied: `fs_xfs::repair::apply` reads every range
+  again and writes only if it still holds the bytes the plan saw. The volume is
+  then checked again. The first rule, `SuperblockCopies`, rewrites one damaged
+  copy from the primary, as `xfs_repair` does. A copy naming another filesystem,
+  or more than one damaged copy, refuses the plan, and nothing is written. Exit
+  status 1 means corrected; it adds to 4 when errors are left.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
@@ -106,6 +114,13 @@ never does.
   request goes into the queue), `ci.yml` triggers on `merge_group`, and a
   `changes` job gates `fixtures` and the VM jobs on `code-changed.sh`, with
   `ci-ok` accepting their skip only for documentation.
+
+- **A secondary superblock that fails its checksum is `sb.copy.unreadable` (#391),**
+  not `checksum`, and no longer makes the scan partial: nothing is reached
+  through a copy, so only the copy went unchecked. `-y` and `-p` are no longer
+  refused with 16; they repair, and only asking for them with `-n` or
+  `--dry-run` is.
+
 - **The Rust checker reports structured findings.** `Finding` now exposes
   `code` and `location` instead of its separate `ag` and `ino` fields; `Report`
   adds scan status and suppression counts. The version moves to 0.13.0 for this

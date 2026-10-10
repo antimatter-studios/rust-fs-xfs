@@ -366,7 +366,6 @@ impl Code {
             self,
             Code::Checksum
                 | Code::Identity
-                | Code::SbCopyUnreadable
                 | Code::AgfUnreadable
                 | Code::AgiUnreadable
                 | Code::AgflUnreadable
@@ -844,12 +843,15 @@ impl Checker<'_> {
                 );
                 continue;
             }
+            // A copy that fails its checksum is this code too, not
+            // `checksum`: nothing is reached through a copy, so it is the
+            // copy alone that went unchecked, and a repair from the primary
+            // owns it (#391).
             let copy = match crate::superblock::Superblock::parse_copy(&raw) {
                 Ok(copy) => copy,
                 Err(e) => {
-                    self.failed(
+                    self.find(
                         Code::SbCopyUnreadable,
-                        &e,
                         Some(ag),
                         None,
                         format!("the superblock copy: {e}"),
