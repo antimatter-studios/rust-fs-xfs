@@ -495,15 +495,16 @@ fn check_parent(fs: &Filesystem, inode: &Inode, raw: &[u8], parent: u64) -> Resu
             return Err(refused("a directory has no first data block"));
         }
         for b in blocks {
-            let offset = b * u64::from(sb.dirblocksize());
             let phys = extents
                 .iter()
                 .find_map(|e| e.map(b * stride))
                 .ok_or_else(|| refused("a directory data block is incomplete"))?;
+            // From the device, at the block the map gives, as `read_dir`
+            // reads it: `read_at` reads regular files and refuses a
+            // directory, which failed this rule on every volume with a
+            // directory past short form.
             let mut block = vec![0; sb.dirblocksize() as usize];
-            if fs.read_at(inode, raw, offset, &mut block)? != block.len() {
-                return Err(refused("a directory data block is incomplete"));
-            }
+            fs.device().read_at(sb.fsblock_offset(phys), &mut block)?;
             crate::dir::verify_data_block(&block, sb, sb.fsblock_offset(phys) / 512, inode.ino)?;
             let entries = crate::dir::parse_data_block(&block, sb)?;
             for (name, want) in [(b".".as_slice(), inode.ino), (b"..".as_slice(), parent)] {
