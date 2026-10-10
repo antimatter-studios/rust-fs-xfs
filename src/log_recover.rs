@@ -743,8 +743,27 @@ fn apply_inode(
             ));
         };
         region += 1;
-        let take = dsize.min(fork.len()).min(inode.len() - fork_start);
-        inode[fork_start..fork_start + take].copy_from_slice(&fork[..take]);
+        if fields & FORK_FIELDS == XFS_ILOG_DBROOT {
+            // A B+tree root is logged as the kernel holds it in memory, a
+            // full block header and its pointers straight after its keys,
+            // and stored in the inode in its short form (#367).
+            let forkoff = usize::from(inode[crate::inode::offsets::FORKOFF]) * 8;
+            let fork_len = if forkoff == 0 {
+                inode.len() - fork_start
+            } else {
+                forkoff
+            };
+            let v5 = inode[crate::inode::offsets::VERSION] >= 3;
+            let disk = crate::bmbt_write::logged_root_to_disk(
+                &fork[..dsize.min(fork.len())],
+                v5,
+                fork_len,
+            )?;
+            inode[fork_start..fork_start + fork_len].copy_from_slice(&disk);
+        } else {
+            let take = dsize.min(fork.len()).min(inode.len() - fork_start);
+            inode[fork_start..fork_start + take].copy_from_slice(&fork[..take]);
+        }
     }
     if fields & ATTR_FORK_FIELDS != 0 && asize > 0 {
         if let Some(fork) = item.regions.get(region) {
@@ -765,6 +784,9 @@ fn apply_inode(
 /// `XFS_ILOG_DDATA | XFS_ILOG_DEXT | XFS_ILOG_DBROOT` — the three ways a
 /// data fork is logged. Only one is ever set at a time.
 const FORK_FIELDS: u32 = 0x02 | 0x04 | 0x08;
+
+/// `XFS_ILOG_DBROOT`, of those three.
+const XFS_ILOG_DBROOT: u32 = 0x08;
 
 /// `XFS_ILOG_ADATA | XFS_ILOG_AEXT | XFS_ILOG_ABROOT`, the same for the
 /// attribute fork.

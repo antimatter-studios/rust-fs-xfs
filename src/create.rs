@@ -587,11 +587,12 @@ impl Filesystem {
                  the new inode the ACL it would inherit"
             )));
         }
-        // A directory past its inode is laid out again by `rewrite_directory`
-        // (#366), in block or leaf form; node form is refused there.
+        // A directory past its inode is changed by `edit_directory`, in
+        // block, leaf or node form (#366, #367), mapped by an extent list
+        // or a B+tree.
         let in_block = match dir_inode.format {
             Format::Local => false,
-            Format::Extents => true,
+            Format::Extents | Format::Btree => true,
             other => {
                 return Err(Error::UnsupportedFeature(format!(
                     "inode {parent} keeps its entries in {other:?} form, which adding an \
@@ -777,24 +778,19 @@ impl Filesystem {
             self.short_form_with_entry(&parsed, name, ino, kind.ftype(), fork_space)?
         };
 
-        // A directory past its inode is read whole and laid out again with
-        // the entry in it, in block or leaf form, whichever holds it (#366).
-        let inserted = if in_block {
-            let mut entries = self.entries_in_blocks(&dir_inode, &dir_raw)?;
-            if entries.iter().any(|e| e.name == name) {
-                return Err(Error::AlreadyExists);
-            }
-            entries.push(dir_block::Entry {
-                name: name.to_vec(),
-                ino,
-                ftype: kind.ftype(),
-            });
-            Some(self.rewrite_directory(
+        // A directory past its inode gains the entry in whichever form
+        // holds it (#366, #367).
+        let mut inserted = if in_block {
+            Some(self.edit_directory(
                 &mut allocations,
                 parent,
                 &dir_inode,
                 &dir_raw,
-                &entries,
+                &[crate::dir_edit::DirEdit::Add(dir_block::Entry {
+                    name: name.to_vec(),
+                    ino,
+                    ftype: kind.ftype(),
+                })],
             )?)
         } else {
             None
@@ -819,15 +815,16 @@ impl Filesystem {
         // and a converted one's is the block it now occupies.
         let (fork, dir_fields, dir_size, dir_blocks, dir_nextents, dir_format) =
             if let Some(rw) = &inserted {
-                // The directory as it was laid out again: its extents, its
-                // data space and its blocks.
+                // The directory as it was changed: its map, its data space
+                // and its blocks. A B+tree root is logged in another shape
+                // than it is stored, and the log gets the logged one.
                 (
-                    rw.fork.clone(),
-                    XFS_ILOG_DEXT,
+                    rw.logged_fork.clone(),
+                    rw.fields,
                     rw.size,
                     rw.blocks,
                     rw.nextents,
-                    Format::Extents,
+                    rw.format,
                 )
             } else {
                 match (&short_form, &converted) {
@@ -965,9 +962,9 @@ impl Filesystem {
         // create's shape is unchanged by any of this. What the
         // allocation touched is not here -- it is in `allocation_items`,
         // once for the operation however many takes it made.
-        let extra: Vec<crate::buf_write::BufferItem> = match (converted, inserted) {
+        let extra: Vec<crate::buf_write::BufferItem> = match (converted, &mut inserted) {
             (Some(c), _) => c.items,
-            (_, Some(i)) => i.items,
+            (_, Some(i)) => std::mem::take(&mut i.items),
             _ => Vec::new(),
         };
 
@@ -986,7 +983,10 @@ impl Filesystem {
         // here rather than on the way in: a refusal must not spend it.
         // Kept for the overlay, which needs the same bytes the record
         // carries (#89).
-        let logged_fork = fork_op[..dsize].to_vec();
+        let logged_fork = match &inserted {
+            Some(rw) => rw.fork.clone(),
+            None => fork_op[..dsize].to_vec(),
+        };
         let logged_new_fork = new_fork_op[..new_dsize].to_vec();
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![

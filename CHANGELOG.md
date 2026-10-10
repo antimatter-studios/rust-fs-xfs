@@ -47,6 +47,28 @@ never does.
   owns, a record under the wrong owner, and a repeated record are the new
   findings `rmap.missing`, `rmap.stale`, `rmap.owner` and `rmap.duplicate`.
 
+- **Hard links (#384).** `Filesystem::link(ino, dir, name)` gives a file or
+  symlink another name in any directory form and raises its link count, in one
+  record. `unlink_file` of a file with another name now takes one link away
+  instead of being refused, and a file's last name frees it with its blocks
+  and quota rather than asking for a truncate first. An empty directory still
+  in block form is freed with its blocks the same way.
+
+- **A rename replaces a name that is already there (#383).** A file replaces a
+  file and a directory an empty directory, in the same record as the move. The
+  replaced inode loses the link, and one left with none is freed: its slot goes
+  back to its chunk, its extents to free space, its quota with them. A file
+  over a directory, a directory over a file and a directory over a non-empty
+  one are refused as `NotAFile`, `NotADirectory` and `DirectoryNotEmpty`
+  before anything is written.
+
+- **A name moves across directories (#382).** `Filesystem::rename(from_dir,
+  from, to_dir, to)` removes the name from one directory and adds it to the
+  other in one record, each directory changing in whatever form it is in. A
+  moved directory names its new parent in `..`, and both parents' link counts
+  follow. A directory moved beneath itself, and a target that already exists
+  (#383), are refused before anything is written.
+
 - **Directories past one block (#366).** A create, unlink, rename or rmdir in a
   directory that has left its inode reads it whole and lays it out again: in
   one block while its entries and index fit there, and in leaf form beyond,
@@ -54,8 +76,19 @@ never does.
   block's longest free region. Blocks are taken from the directory's group as
   it grows and given back as it shrinks, back to block form when it fits one
   again. Unlink and rename in a block-form directory, refused until now, go the
-  same way. A directory that needs more than one leaf block, the node form, is
-  refused by name (#367).
+  same way. A directory that needs more than one leaf block moves into node
+  form (#367).
+
+- **Node-form directories are changed in place (#367).** A name is added to or
+  removed from the blocks it touches: its data block, the free-index block
+  that keeps that block's longest free region, and its index leaf. A full leaf
+  or node splits, and a root that splits moves down a level. An emptied block
+  is unlinked and given back, an under-full one joins its neighbour at the
+  kernel's thresholds, and a root left with one child takes its place. A
+  directory down to one leaf's worth of names returns to leaf form. A
+  directory's extent map that outgrows its inode is written as a block-map
+  B+tree, so directories the kernel made, which keep their map that way, can
+  be changed too.
 
 - **An empty directory can be removed (#385).** `Filesystem::remove_directory`
   logs the same transaction as an unlink, frees the directory's inode with its
@@ -112,6 +145,27 @@ never does.
   Rust API break. The C ABI is unchanged.
 
 ### Fixed
+
+- **A checkpoint never leaves a gap at the end of the log too small to pad.**
+  One that fitted with a single basic block to spare left a gap the next wrap
+  could not fill, and the mount stopped with "the gap at the end of the log is
+  0 bytes and an empty record needs 52". A checkpoint that would leave less
+  than a pad record now wraps first, and the pad covers the larger gap.
+
+- **A link or a move costs as much in a big directory as in a small one
+  (#367).** Each listed the whole directory to see whether the name was there,
+  reading every data block, so growing a directory to a two-level index took
+  quadratic time. Both now find the name through the hash index, as a lookup
+  does, and one link reads 39 KiB at 12,000 names where it read 715 KiB.
+
+- **Lookups in node-form directories over small blocks (#367).** A node's child
+  pointers and a leaf's sibling pointers count filesystem blocks, not
+  directory blocks. With 1 KiB blocks under 4 KiB directory blocks, which
+  `mkfs.xfs` makes by default, a lookup followed them to the wrong block.
+- **A block-map root in the log (#367).** Recovery copied a logged B+tree root
+  into the inode as it was. The log carries it in its in-memory shape, with
+  the pointers straight after the keys, and it is now converted as
+  `xfs_bmbt_to_bmdr` converts it.
 
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and

@@ -48,7 +48,7 @@
 use crate::create::clock_now;
 use crate::dir;
 use crate::error::{Error, Result};
-use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
+use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
@@ -63,6 +63,8 @@ const OP_ALIGN: usize = 4;
 /// Offsets within the on-disk inode core that a removal changes.
 mod core_at {
     pub const MODE: usize = 2;
+    /// `di_format`: how the data fork maps its blocks.
+    pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
     pub const SIZE: usize = 56;
     /// `di_nblocks`: the blocks the inode owns.
@@ -81,7 +83,7 @@ mod core_at {
 /// The identity fields are left exactly as they are: this inode will be
 /// handed out again, and `di_ino` and `di_uuid` are as correct now as
 /// they will be then.
-fn emptied_core(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn emptied_core(raw: &[u8]) -> Vec<u8> {
     let mut core = raw.to_vec();
     core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0u16.to_be_bytes());
     core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&0u32.to_be_bytes());
@@ -104,16 +106,25 @@ fn emptied_core(raw: &[u8]) -> Vec<u8> {
     // A local fork holds no blocks, so a file with attributes passes the
     // "holds no blocks" refusal, and its fork stayed in the free inode.
     // The attribute extent count is the u16 at 80, or, under NREXT64, the
-    // u32 at 76; the data fork's count at 76 is already zero, because a
-    // file with extents is refused.
+    // u32 at 76.
+    //
+    // AND NO BLOCKS, MAPPED AS NO EXTENTS. A rename frees a file that
+    // still held blocks when its core was read, and gives them back in
+    // the same checkpoint, so the count goes with them; `xfs_dinode_verify`
+    // refuses an inode with no extents and blocks still counted, whatever
+    // its mode, and log recovery stopped on it (#383). The data fork is
+    // an empty extent list, as `xfs_ifree` leaves every freed inode.
+    set_nextents(&mut core, 0);
     crate::create::reset_flags(&mut core);
     core[core_at::FORKOFF] = 0;
     core[core_at::AFORMAT] = AFORMAT_EXTENTS;
+    core[core_at::FORMAT] = AFORMAT_EXTENTS;
     core[core_at::NEXTENTS..core_at::FORKOFF].fill(0);
+    core[core_at::NBLOCKS..core_at::NBLOCKS + 8].fill(0);
     core
 }
 
-/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
+/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty fork of either kind.
 const AFORMAT_EXTENTS: u8 = 2;
 
 /// Set `di_nextents`, wherever the inode's own feature bits put it.
@@ -177,97 +188,10 @@ impl Filesystem {
         self.remove_name(parent, name, Target::Directory)
     }
 
-    fn remove_name(&self, parent: u64, name: &[u8], target: Target) -> Result<(u64, u64)> {
-        self.writable_device()?;
-        if !self.sb.is_v5() {
-            return Err(Error::UnsupportedFeature(
-                "removing writes v5 metadata; a v4 filesystem is not supported".into(),
-            ));
-        }
-
-        let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
-        if !dir_inode.is_dir() {
-            return Err(Error::NotADirectory);
-        }
-        let (fork_start, fork_end) = dir_inode.data_fork_range(usize::from(self.sb.inodesize));
-        // A directory in its inode loses the name from its fork; one past
-        // its inode is read whole and laid out again without it (#366).
-        let (parsed, in_blocks) = match dir_inode.format {
-            Format::Local => (
-                Some(dir::read_short_form(
-                    &dir_inode,
-                    &dir_raw[fork_start..fork_end],
-                    &self.sb,
-                )?),
-                None,
-            ),
-            Format::Extents => (None, Some(self.entries_in_blocks(&dir_inode, &dir_raw)?)),
-            other => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {parent} keeps its entries in {other:?} form, which removing an \
-                     entry here does not understand"
-                )))
-            }
-        };
-        let ino = match (&parsed, &in_blocks) {
-            (Some(p), _) => p.entries.iter().find(|e| e.name == name).map(|e| e.ino),
-            (None, Some(entries)) => entries
-                .iter()
-                .find(|e| e.name == name && name != b"." && name != b"..")
-                .map(|e| e.ino),
-            (None, None) => unreachable!("one form or the other"),
-        }
-        .ok_or(Error::NotFound)?;
-
-        let (victim, victim_raw) = self.read_inode_raw(ino)?;
-        match target {
-            Target::File => {
-                if victim.is_dir() {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino} is a directory; remove_directory removes one, and \
-                         unlink_file only a regular file"
-                    )));
-                }
-                if victim.nlink != 1 {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino} has {} links, so removing this name leaves the inode \
-                         alive and only moves the count",
-                        victim.nlink
-                    )));
-                }
-            }
-            Target::Directory => {
-                if !victim.is_dir() {
-                    return Err(Error::NotADirectory);
-                }
-                if !self.read_dir(&victim, &victim_raw)?.is_empty() {
-                    return Err(Error::DirectoryNotEmpty);
-                }
-                if victim.format != Format::Local {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "inode {ino} is an empty directory still in block form, whose \
-                         blocks would have to be freed as well"
-                    )));
-                }
-                // Its own `.` and the parent's entry naming it. Anything
-                // else is a count this does not know how to account for.
-                if victim.nlink != 2 {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "empty directory inode {ino} has {} links, not the 2 its own `.` \
-                         and its parent's entry make",
-                        victim.nlink
-                    )));
-                }
-            }
-        }
-        if victim.nblocks != 0 || victim.nextents != 0 {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {ino} still holds {} blocks in {} extents, which would have to be \
-                 freed as well; truncate it first",
-                victim.nblocks, victim.nextents
-            )));
-        }
-
+    /// The inode-tree items that give inode `ino` back to its chunk: the
+    /// chunk's free mask and count, both inode trees, and the group's
+    /// header. Nothing is written.
+    pub(crate) fn freed_inode_items(&self, ino: u64) -> Result<Vec<crate::buf_write::BufferItem>> {
         let (agno, _, _) = self.sb.split_ino(ino);
 
         // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
@@ -302,46 +226,151 @@ impl Filesystem {
         let count = trees.agi().count;
         let freecount: u32 = trees.chunks().iter().map(|c| u32::from(c.freecount)).sum();
         trees.set_counts(count, freecount, None);
-        let group_items = trees.into_items()?;
+        trees.into_items()
+    }
+
+    fn remove_name(&self, parent: u64, name: &[u8], target: Target) -> Result<(u64, u64)> {
+        self.writable_device()?;
+        if !self.sb.is_v5() {
+            return Err(Error::UnsupportedFeature(
+                "removing writes v5 metadata; a v4 filesystem is not supported".into(),
+            ));
+        }
+
+        let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
+        if !dir_inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        let (fork_start, fork_end) = dir_inode.data_fork_range(usize::from(self.sb.inodesize));
+        // A directory in its inode loses the name from its fork; one past
+        // its inode loses it in whichever form it is in (#366, #367).
+        let (parsed, in_blocks) = match dir_inode.format {
+            Format::Local => (
+                Some(dir::read_short_form(
+                    &dir_inode,
+                    &dir_raw[fork_start..fork_end],
+                    &self.sb,
+                )?),
+                false,
+            ),
+            Format::Extents | Format::Btree => (None, true),
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {parent} keeps its entries in {other:?} form, which removing an \
+                     entry here does not understand"
+                )))
+            }
+        };
+        // Found through the hash index past the inode, which never names
+        // `.` or `..`.
+        let ino = match &parsed {
+            Some(p) => p
+                .entries
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.ino)
+                .ok_or(Error::NotFound)?,
+            None => self.lookup(&dir_inode, &dir_raw, name)?.ino,
+        };
+
+        let (victim, victim_raw) = self.read_inode_raw(ino)?;
+        match target {
+            Target::File => {
+                if victim.is_dir() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "inode {ino} is a directory; remove_directory removes one, and \
+                         unlink_file only a regular file"
+                    )));
+                }
+            }
+            Target::Directory => {
+                if !victim.is_dir() {
+                    return Err(Error::NotADirectory);
+                }
+                if !self.read_dir(&victim, &victim_raw)?.is_empty() {
+                    return Err(Error::DirectoryNotEmpty);
+                }
+                // Its own `.` and the parent's entry naming it. Anything
+                // else is a count this does not know how to account for.
+                if victim.nlink != 2 {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "empty directory inode {ino} has {} links, not the 2 its own `.` \
+                         and its parent's entry make",
+                        victim.nlink
+                    )));
+                }
+            }
+        }
+        // A file with another name keeps living, a link fewer (#384); its
+        // last name, or a directory, frees it with everything it owns.
+        let freed = target == Target::Directory || victim.nlink <= 1;
+        if freed {
+            if victim.format == Format::Btree {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} keeps its extents in a B+tree, which freeing it here does \
+                     not undo"
+                )));
+            }
+            if victim.anextents > 0 && victim.aformat != Format::Local {
+                return Err(Error::UnsupportedFeature(format!(
+                    "inode {ino} has attribute blocks, which freeing it here does not give \
+                     back"
+                )));
+            }
+        }
+
+        let group_items = if freed {
+            self.freed_inode_items(ino)?
+        } else {
+            Vec::new()
+        };
 
         let mut allocations = crate::group_write::Allocations::new();
-        let (fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) =
+        let (fork, disk_fork, dir_flags, dir_format, dir_size, dir_blocks, dir_nextents, dir_items) =
             match (&parsed, in_blocks) {
                 (Some(p), _) => {
                     let fork = self.short_form_without_entry(p, name, fork_end - fork_start)?;
                     let size = fork.len() as u64;
                     (
+                        fork.clone(),
                         fork,
                         XFS_ILOG_DDATA,
+                        Format::Local,
                         size,
                         dir_inode.nblocks,
                         dir_inode.nextents,
                         Vec::new(),
                     )
                 }
-                (None, Some(mut entries)) => {
-                    entries.retain(|e| e.name != name);
-                    let rw = self.rewrite_directory(
+                (None, true) => {
+                    let rw = self.edit_directory(
                         &mut allocations,
                         parent,
                         &dir_inode,
                         &dir_raw,
-                        &entries,
+                        &[crate::dir_edit::DirEdit::Remove(name)],
                     )?;
                     (
+                        rw.logged_fork,
                         rw.fork,
-                        XFS_ILOG_DEXT,
+                        rw.fields,
+                        rw.format,
                         rw.size,
                         rw.blocks,
                         rw.nextents,
                         rw.items,
                     )
                 }
-                (None, None) => unreachable!("one form or the other"),
+                (None, false) => unreachable!("one form or the other"),
             };
+        if freed && victim.format == Format::Extents {
+            let extents = self.data_extents(&victim, &victim_raw)?;
+            self.free_file_extents(&mut allocations, ino, &extents)?;
+        }
         let allocation_items = allocations.into_items()?;
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
+        dir_core[core_at::FORMAT] = dir_format as u8;
         dir_core[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&dir_blocks.to_be_bytes());
         set_nextents(&mut dir_core, dir_nextents);
         let at = core_at::CHANGECOUNT;
@@ -362,14 +391,28 @@ impl Filesystem {
             dir_core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&now.to_be_bytes());
         }
 
-        let victim_core = emptied_core(&victim_raw);
-        let mut quota_changes = vec![crate::quota::QuotaChange {
-            uid: victim.uid,
-            gid: victim.gid,
-            project_id: crate::quota::project_id(&victim_raw),
-            blocks_fs: 0,
-            inodes: -1,
-        }];
+        let victim_core = if freed {
+            emptied_core(&victim_raw)
+        } else {
+            let mut core = victim_raw.clone();
+            core[core_at::NLINK..core_at::NLINK + 4]
+                .copy_from_slice(&(victim.nlink - 1).to_be_bytes());
+            let at = core_at::CHANGECOUNT;
+            let now = u64::from_be_bytes(core[at..at + 8].try_into().expect("8 bytes"));
+            core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
+            stamp_change(&mut core, clock_now(), Changed::Status);
+            core
+        };
+        let mut quota_changes = Vec::new();
+        if freed {
+            quota_changes.push(crate::quota::QuotaChange {
+                uid: victim.uid,
+                gid: victim.gid,
+                project_id: crate::quota::project_id(&victim_raw),
+                blocks_fs: -(victim.nblocks as i64),
+                inodes: -1,
+            });
+        }
         // A directory that gave blocks back, or took them, charges its owner.
         if dir_blocks != dir_inode.nblocks {
             quota_changes.push(crate::quota::QuotaChange {
@@ -407,7 +450,7 @@ impl Filesystem {
         // here rather than on the way in: a refusal must not spend it.
         // Kept for the overlay, which needs the same bytes the record
         // carries (#89).
-        let logged_fork = fork_op[..dsize].to_vec();
+        let logged_fork = disk_fork;
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
@@ -550,6 +593,36 @@ mod tests {
             "the generation must move on, so a reference to the inode's previous life \
              cannot resolve to whatever is put there next"
         );
+    }
+
+    /// A file a rename frees still held blocks when its core was read,
+    /// and they go back in the same checkpoint. The freed core counts
+    /// none and maps them in no format but an empty extent list, as
+    /// `xfs_ifree` leaves it: the kernel's `xfs_dinode_verify` refuses
+    /// an inode with no extents and blocks still counted, whatever its
+    /// mode, so log recovery failed on the replaced file (#383).
+    #[test]
+    fn an_emptied_core_counts_no_blocks_and_maps_none() {
+        let mut raw = vec![0u8; 176];
+        raw[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0o040755u16.to_be_bytes());
+        raw[core_at::FORMAT] = 1; // local
+        raw[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&16u64.to_be_bytes());
+        raw[core_at::NEXTENTS..core_at::NEXTENTS + 4].copy_from_slice(&1u32.to_be_bytes());
+
+        let core = emptied_core(&raw);
+        assert_eq!(
+            u64::from_be_bytes(
+                core[core_at::NBLOCKS..core_at::NBLOCKS + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0,
+            "di_nblocks"
+        );
+        assert_eq!(core[core_at::FORMAT], 2, "di_format: extents");
+        assert!(core[core_at::NEXTENTS..core_at::FORKOFF]
+            .iter()
+            .all(|&b| b == 0));
     }
 
     /// The identity fields survive, because this inode will be handed

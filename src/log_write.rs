@@ -637,6 +637,37 @@ pub fn append_at(
     append_at_with_tail(device, sb, head, tid, ops, lsn_of(head))
 }
 
+/// The empty transaction [`append_pad`] fills the end of the ring with.
+fn pad_ops(tid: u32) -> Vec<Op> {
+    vec![
+        Op {
+            flags: XLOG_START_TRANS,
+            data: Vec::new(),
+        },
+        Op {
+            flags: 0,
+            data: trans_header(tid, XFS_TRANS_CHECKPOINT, 0),
+        },
+        Op {
+            flags: XLOG_COMMIT_TRANS,
+            data: Vec::new(),
+        },
+    ]
+}
+
+/// Whether a checkpoint of `needed` basic blocks starts again at the
+/// beginning of the ring rather than at a head with `free` left before
+/// the wrap.
+///
+/// It does when it does not fit, and also when it would fit but leave a
+/// gap no [`append_pad`] record fits in: the next wrap has to fill that
+/// gap, and a header block alone holds no transaction. Wrapping now pads
+/// the larger gap in front of it instead.
+pub fn wraps_first(needed: u32, free: u32, tid: u32) -> bool {
+    let pad = 1 + payload(tid, &pad_ops(tid)).len().div_ceil(BBSIZE) as u32;
+    needed > free || (free > needed && free - needed < pad)
+}
+
 /// Fill the ring from `head` to its end with one record that does nothing.
 ///
 /// A record may not straddle the wrap, so a writer that will not split one
@@ -662,20 +693,7 @@ pub fn append_pad(
     tid: u32,
     tail_lsn: u64,
 ) -> Result<u64> {
-    let ops = vec![
-        Op {
-            flags: XLOG_START_TRANS,
-            data: Vec::new(),
-        },
-        Op {
-            flags: 0,
-            data: trans_header(tid, XFS_TRANS_CHECKPOINT, 0),
-        },
-        Op {
-            flags: XLOG_COMMIT_TRANS,
-            data: Vec::new(),
-        },
-    ];
+    let ops = pad_ops(tid);
     let payload = payload(tid, &ops);
     // The header block, then everything left of the ring.
     let want = (head.free_blocks as usize - 1) * BBSIZE;
@@ -1219,6 +1237,30 @@ mod tests {
     fn an_ordinary_buffer_size_yields_its_capacity() {
         assert_eq!(max_payload(BBSIZE as u32).expect("exactly a header"), 0);
         assert_eq!(max_payload(32 * 1024).expect("32 KiB"), 32 * 1024 - BBSIZE);
+    }
+
+    /// The gap a checkpoint leaves at the end of the ring is filled by a
+    /// pad record before the next one wraps, so it has to be nothing or
+    /// room for one: a header block alone holds no transaction, and a
+    /// mount that left one stopped with "the gap at the end of the log is
+    /// 0 bytes".
+    #[test]
+    fn no_checkpoint_leaves_a_gap_too_small_to_pad() {
+        let tid = 0x1234_5678;
+        let pad = 1 + payload(tid, &pad_ops(tid)).len().div_ceil(BBSIZE) as u32;
+        assert!(pad >= 2, "a pad is a header and a transaction");
+        for needed in 1..40u32 {
+            for free in 0..80u32 {
+                if wraps_first(needed, free, tid) {
+                    continue;
+                }
+                let gap = free - needed;
+                assert!(
+                    gap == 0 || gap >= pad,
+                    "{needed} blocks at a head with {free} free leave {gap}, and a pad needs {pad}"
+                );
+            }
+        }
     }
 
     /// An identifier that ties a checkpoint's operations together, and
