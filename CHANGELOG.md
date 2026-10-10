@@ -73,6 +73,13 @@ never does.
   group's trees, quota and the inode's whole extent list. A file whose extents
   are in a B+tree, or a write that would need one, is refused by name.
 
+- **In-place overwrites are graded case by case (#386).**
+  `tests/overwrite_ranges_oracle.rs` overwrites a kernel-made file of four
+  extents exactly one block, at each edge of an extent, across a block boundary
+  unaligned at both ends, and five times over one range, and requires the
+  kernel to read every byte as written with the extent map and size unchanged,
+  `xfs_repair -n` to agree, and a range across a hole to be refused.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
