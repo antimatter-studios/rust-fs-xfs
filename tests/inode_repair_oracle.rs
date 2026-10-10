@@ -111,6 +111,14 @@ fn damage(volume: &scratch::Volume, commands: &[String]) {
     );
 }
 
+/// A 64-bit free mask as `xfs_db write` stores it bit for bit: signed,
+/// after `--`. It reads an unsigned value through `strtoll`, so a mask
+/// with the top bit set, which is every chunk's, saturated to
+/// `0x7fffffffffffffff` and freed nearly every inode in the chunk.
+fn mask(free: u64) -> String {
+    (free as i64).to_string()
+}
+
 /// `fsck.xfs -y` refuses the repair (exit 4) and the volume is byte for
 /// byte what it was.
 fn refused_unchanged(volume: &scratch::Volume, case: &str) {
@@ -252,13 +260,13 @@ fn allocation_bits_counts_and_finobt_are_repaired_on_sparse_and_plain_chunks() {
                 "referenced-inode-marked-free",
                 "root",
                 "free",
-                format!("0x{:x}", chunk.free | (1u64 << file_bit)),
+                mask(chunk.free | (1u64 << file_bit)),
             ),
             (
                 "unused-inode-marked-allocated",
                 "root",
                 "free",
-                format!("0x{:x}", chunk.free & !(1u64 << 63)),
+                mask(chunk.free & !(1u64 << 63)),
             ),
             ("inobt-freecount", "root", "freecount", "0".into()),
         ];
@@ -267,7 +275,7 @@ fn allocation_bits_counts_and_finobt_are_repaired_on_sparse_and_plain_chunks() {
                 "finobt-free-mask",
                 "free_root",
                 "free",
-                format!("0x{:x}", chunk.free & !(1u64 << 63)),
+                mask(chunk.free & !(1u64 << 63)),
             ));
             cases.push(("finobt-freecount", "free_root", "freecount", "0".into()));
             cases.push(("finobt-membership", "free_root", "numrecs", "0".into()));
@@ -286,7 +294,7 @@ fn allocation_bits_counts_and_finobt_are_repaired_on_sparse_and_plain_chunks() {
                     if field == "numrecs" {
                         format!("write -d numrecs {value}")
                     } else {
-                        format!("write -d recs[1].{field} {value}")
+                        format!("write -d -- recs[1].{field} {value}")
                     },
                 ],
             );
@@ -312,7 +320,7 @@ fn allocation_bits_counts_and_finobt_are_repaired_on_sparse_and_plain_chunks() {
                 commands.extend([
                     "agi 0".into(),
                     format!("addr {tree}"),
-                    format!("write -d recs[1].free 0x{free:x}"),
+                    format!("write -d -- recs[1].free {}", mask(free)),
                     format!("write -d recs[1].freecount {}", chunk.freecount - 1),
                 ]);
             }
