@@ -180,6 +180,9 @@ fn fault_matrix(dirblock: usize) {
             format!("inode {}", inodes["node"]),
             format!("dblock {leaf_da}"),
             "p".into(),
+            // A whole node prints its entries as one array, `0:[hash,before]`;
+            // a field asked for by name prints as `name = value`.
+            "p nbtree[0].before".into(),
         ],
         false,
     );

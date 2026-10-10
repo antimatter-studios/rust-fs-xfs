@@ -1524,7 +1524,45 @@ impl Checker<'_> {
                 continue;
             }
             self.report.directories += 1;
-            let entries = match fs.read_dir(&inode, &raws[&dir]) {
+            // A short-form directory is read past an undefined file type
+            // byte, which is reported below, so the repair that sets it from
+            // the inode has a complete walk to plan from (#394).
+            let mut tolerated = crate::dir::Tolerated::default();
+            let listed = if inode.format == Format::Local {
+                let (start, end) = inode.data_fork_range(usize::from(sb.inodesize));
+                crate::dir::read_short_form_lenient(&inode, &raws[&dir][start..end], &sb).map(
+                    |(sf, t)| {
+                        tolerated = t;
+                        sf.entries
+                    },
+                )
+            } else {
+                fs.read_dir(&inode, &raws[&dir])
+            };
+            // A parent that is no inode number is a directory the kernel
+            // will not read, and the repair that gives it its parent back
+            // owns the code; the entries below it are still walked.
+            if let Some(why) = &tolerated.parent {
+                self.find(
+                    Code::DirUnreadable,
+                    None,
+                    Some(dir),
+                    format!("directory {dir}: {why}"),
+                );
+            }
+            for (name, byte) in &tolerated.types {
+                self.find(
+                    Code::DirEntryFtype,
+                    None,
+                    Some(dir),
+                    format!(
+                        "directory {dir}: entry {:?} has file type {byte}, which is not a \
+                         defined value",
+                        String::from_utf8_lossy(name)
+                    ),
+                );
+            }
+            let entries = match listed {
                 Ok(e) => e,
                 Err(e) => {
                     self.failed(
