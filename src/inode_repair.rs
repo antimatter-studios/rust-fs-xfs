@@ -92,6 +92,17 @@ impl Rule for InodeAllocation {
         if !report.findings.iter().any(|f| CODES.contains(&f.code)) {
             return Ok(());
         }
+        // A DAMAGED DIRECTORY IS REPAIRED FIRST (#394). Links counted
+        // through it are not the volume's links: a directory the walk could
+        // not read leaves everything below it unreached. The directory
+        // repair puts it right, and the check after it finds the counts.
+        if report
+            .findings
+            .iter()
+            .any(|f| crate::directory_repair::CODES.contains(&f.code))
+        {
+            return Ok(());
+        }
         for (at, patch, code) in plan_changes(fs)? {
             proposal.put(
                 at,

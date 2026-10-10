@@ -46,8 +46,25 @@ struct Directory {
     original: Vec<u8>,
     entries: Vec<(u32, DirEntry)>,
     blocks: BTreeMap<u32, Block>,
+    /// Filesystem blocks in one directory block. `blocks` is keyed by
+    /// directory block; the index's child and sibling pointers count
+    /// filesystem blocks, as every `xfs_dablk_t` does.
+    per: u32,
     /// Parent inode field: inode-relative for short form, block-relative otherwise.
     parent: Option<(Option<u32>, usize, usize)>,
+}
+
+impl Directory {
+    /// The directory block an index pointer names, which has to be the
+    /// first filesystem block of one.
+    fn block_of(&self, dablk: u32) -> Result<u32> {
+        if !dablk.is_multiple_of(self.per) {
+            return Err(refuse(
+                "index pointer is not the start of a directory block",
+            ));
+        }
+        Ok(dablk / self.per)
+    }
 }
 
 fn refuse(what: impl Into<String>) -> Error {
@@ -257,6 +274,7 @@ fn read_directory(
         original: raw.to_vec(),
         entries: Vec::new(),
         blocks: BTreeMap::new(),
+        per: fs.sb.dirblocksize() / fs.sb.blocksize,
         parent: None,
     };
     if inode.format == Format::Local {
@@ -613,8 +631,10 @@ fn repair_index(fs: &Filesystem, directory: &mut Directory) -> Result<()> {
     let mut live_counts = Vec::new();
     for (i, &db) in leaves.iter().enumerate() {
         let block = &directory.blocks[&db].bytes;
-        let expected_back = if i == 0 { 0 } else { leaves[i - 1] };
-        let expected_forw = leaves.get(i + 1).copied().unwrap_or(0);
+        // Sibling pointers count filesystem blocks.
+        let per = directory.per;
+        let expected_back = if i == 0 { 0 } else { leaves[i - 1] * per };
+        let expected_forw = leaves.get(i + 1).map_or(0, |&db| db * per);
         if be32(block, offsets::da_blk::BACK) != expected_back
             || be32(block, offsets::da_blk::FORW) != expected_forw
         {
@@ -666,16 +686,16 @@ fn repair_index(fs: &Filesystem, directory: &mut Directory) -> Result<()> {
     for db in nodes {
         let block = &directory.blocks[&db].bytes;
         let count = be16(block, offsets::da_counts(XFS_DA3_NODE_HDR_SIZE, true)) as usize;
-        let children: Vec<u32> = (0..count)
+        let children = (0..count)
             .map(|i| {
-                be32(
+                directory.block_of(be32(
                     block,
                     XFS_DA3_NODE_HDR_SIZE
                         + i * XFS_DA_NODE_ENTRY_SIZE
                         + offsets::node_entry::BEFORE,
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<u32>>>()?;
         let mut bounds = Vec::new();
         for child in children {
             let bytes = &directory.blocks[&child].bytes;
@@ -752,10 +772,10 @@ fn visit_index(
         return Err(refuse("invalid node height or count"));
     }
     for i in 0..n {
-        let child = be32(
+        let child = directory.block_of(be32(
             block,
             XFS_DA3_NODE_HDR_SIZE + i * XFS_DA_NODE_ENTRY_SIZE + offsets::node_entry::BEFORE,
-        );
+        ))?;
         visit_index(directory, child, Some(height - 1), visited, leaves, nodes)?;
     }
     nodes.push(db);
