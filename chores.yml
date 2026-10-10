@@ -113,8 +113,10 @@ vars:
   # v0.2.11 is the release that packages ../rust-fs-core/scripts/output-budget.sh, which
   # ../rust-fs-core/scripts/tier.sh resolves and verifies. v0.2.10 does not
   # contain it, so this pin cannot go back below v0.2.11 while the tiers read
-  # the wrapper from core.
-  FS_CORE_REF: v0.3.7
+  # the wrapper from core. v0.3.8 carries the agent-core v5 block that
+  # AGENTS.md mirrors (sync before every push; main merges through a merge
+  # queue) and scripts/code-changed.sh, which the CI changes job reads.
+  FS_CORE_REF: v0.3.8
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -321,8 +323,12 @@ tasks:
     #
     # The floor is 380: 427 executed in run 35435470063 on 2026-09-19
     # (job 105877256028), less the usual margin. Raise it deliberately.
+    #
+    # Budget: 828 lines / 50,167 bytes measured on rust-fs-core v0.3.8 (run
+    # 38030776962), every test passing; half as much again, so 1250 lines /
+    # 76,000 bytes.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 1250 76000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
       - 'scripts/ci-test.sh --gate 380 tmp/logs/unit.log "the debug unit tier"'
 
   test:images:
