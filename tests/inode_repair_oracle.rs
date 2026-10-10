@@ -111,6 +111,25 @@ fn damage(volume: &scratch::Volume, commands: &[String]) {
     );
 }
 
+/// `fsck.xfs -y` refuses the repair (exit 4) and the volume is byte for
+/// byte what it was.
+fn refused_unchanged(volume: &scratch::Volume, case: &str) {
+    let before = hash(volume);
+    let out = tool("fsck.xfs")
+        .arg("-y")
+        .arg(volume.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{case}: {}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(hash(volume) == before, "{case}: a refused repair wrote");
+}
+
 fn repaired(volume: &scratch::Volume, case: &str) {
     let out = tool("fsck.xfs")
         .arg("-y")
@@ -271,7 +290,13 @@ fn allocation_bits_counts_and_finobt_are_repaired_on_sparse_and_plain_chunks() {
                     },
                 ],
             );
-            repaired(&volume, &format!("{geometry}/{case}"));
+            if geometry == "rmap" {
+                // A plan is not made under a reverse-mapping btree (#375),
+                // so the same damage is refused and nothing is written.
+                refused_unchanged(&volume, &format!("{geometry}/{case}"));
+            } else {
+                repaired(&volume, &format!("{geometry}/{case}"));
+            }
         }
         if geometry == "sparse" {
             // One allocation mistake, consistently mirrored in both trees
@@ -305,7 +330,7 @@ fn allocation_bits_counts_and_finobt_are_repaired_on_sparse_and_plain_chunks() {
 
 #[test]
 fn link_census_includes_every_leaf_directory_data_block() {
-    let volume = build("leaf-directory", "-m rmapbt=1");
+    let volume = build("leaf-directory", "-m rmapbt=0");
     let image = volume.guest();
     let out = kernel_run(&format!(
         r#"
