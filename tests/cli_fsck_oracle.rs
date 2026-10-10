@@ -424,6 +424,298 @@ fn every_damage_the_reference_finds_is_found() {
     }
 }
 
+/// A damage case: the code it is for, its name, and the `xfs_db` commands.
+type Case = (&'static str, &'static str, Vec<String>);
+
+/// One damage per checker code (#364): `(code, case, xfs_db commands)`.
+///
+/// Each is damage `xfs_repair -n` must find, and the report must carry
+/// the code it is named for, whatever else the damage also breaks. Unlike
+/// the golden cases above, the rest of the report is not pinned: these
+/// prove that a check exists and fires, not what it says around it.
+///
+/// `docs/fsck-output.md` lists every code, the case here (or above) that
+/// damages it, or why none does; `tests/fsck_coverage_contract.rs`
+/// holds the two to each other.
+fn one_damage_per_code(base: &str) -> Vec<Case> {
+    let ino = |name: &str| inode_of(base, name);
+    let (small, medium) = (ino("small.txt"), ino("medium.bin"));
+    let (fragmented, manyfiles) = (ino("fragmented.bin"), ino("manyfiles"));
+    let sub = ino("sub");
+    let root = db_value(base, &["sb 0", "p rootino"]);
+    let agi0_count = db_value(base, &["agi 0", "p count"]);
+    // A free inode in the root's chunk: the fixture allocates its first
+    // inodes in order and leaves the end of the chunk free.
+    let free_ino = root + 60;
+    let first_free = db_value(base, &["agf 0", "addr bnoroot", "p recs[1].startblock"]);
+    vec![
+        (
+            "identity",
+            "bnobt-owner",
+            vec![
+                "agf 1".into(),
+                "addr bnoroot".into(),
+                "write -d owner 0".into(),
+            ],
+        ),
+        (
+            "sb.copy.unreadable",
+            "sb1-magic",
+            vec!["sb 1".into(), "write -d magicnum 0".into()],
+        ),
+        (
+            "sb.copy.field",
+            "sb1-logblocks",
+            vec!["sb 1".into(), "write -d logblocks 1234".into()],
+        ),
+        (
+            "ag.length",
+            "agi1-length",
+            vec!["agi 1".into(), "write -d length 1000".into()],
+        ),
+        (
+            "btree.unreadable",
+            "cntbt-magic",
+            vec![
+                "agf 1".into(),
+                "addr cntroot".into(),
+                "write -d magic 0".into(),
+            ],
+        ),
+        (
+            "inobt.record",
+            "inobt-freecount",
+            vec![
+                "agi 0".into(),
+                "addr root".into(),
+                "write -d recs[1].freecount 70".into(),
+            ],
+        ),
+        (
+            "inobt.chunk-count",
+            "inobt-count",
+            vec![
+                "agi 0".into(),
+                "addr root".into(),
+                "write -d recs[1].count 32".into(),
+            ],
+        ),
+        (
+            "finobt.mismatch",
+            "finobt-freecount",
+            vec![
+                "agi 0".into(),
+                "addr free_root".into(),
+                "write -d recs[1].freecount 3".into(),
+            ],
+        ),
+        (
+            "freesp.empty",
+            "bnobt-empty",
+            vec![
+                "agf 1".into(),
+                "addr bnoroot".into(),
+                "write -d recs[1].blockcount 0".into(),
+            ],
+        ),
+        (
+            "freesp.overlap",
+            "bnobt-overlap",
+            vec![
+                "agf 0".into(),
+                "addr bnoroot".into(),
+                format!("write -d recs[2].startblock {first_free}"),
+            ],
+        ),
+        (
+            "freesp.cnt-order",
+            "cntbt-order",
+            vec![
+                "agf 0".into(),
+                "addr cntroot".into(),
+                "write -d recs[1].blockcount 99999".into(),
+            ],
+        ),
+        (
+            "counter.agf.btreeblks",
+            "agf1-btreeblks",
+            vec!["agf 1".into(), "write -d btreeblks 7".into()],
+        ),
+        (
+            "counter.agi.inodes",
+            "agi1-count",
+            vec![
+                "agi 0".into(),
+                format!("write -d count {}", agi0_count + 64),
+            ],
+        ),
+        (
+            "counter.sb.ifree",
+            "sb-ifree",
+            vec!["sb 0".into(), "write -d ifree 99999".into()],
+        ),
+        (
+            "range.block",
+            "bnobt-past-end",
+            vec![
+                "agf 1".into(),
+                "addr bnoroot".into(),
+                "write -d recs[1].startblock 4000000".into(),
+            ],
+        ),
+        (
+            "extent.unreadable",
+            "bmbt-magic",
+            vec![
+                format!("inode {fragmented}"),
+                "addr u3.bmbt.ptrs[1]".into(),
+                "write -d magic 0".into(),
+            ],
+        ),
+        (
+            "inode.unreadable",
+            "inode-magic",
+            vec![format!("inode {small}"), "write -d core.magic 0".into()],
+        ),
+        (
+            "inode.free-in-use",
+            "free-inode-mode",
+            vec![
+                format!("inode {free_ino}"),
+                "write -d core.mode 0100644".into(),
+            ],
+        ),
+        (
+            "inode.allocated-unused",
+            "inode-mode-zero",
+            vec![format!("inode {medium}"), "write -d core.mode 0".into()],
+        ),
+        (
+            "dir.root",
+            "sb-rootino",
+            vec!["sb 0".into(), format!("write -d rootino {free_ino}")],
+        ),
+        (
+            "dir.not-a-directory",
+            "root-mode",
+            vec![format!("inode {root}"), "write -d core.mode 0100755".into()],
+        ),
+        (
+            "dir.unreadable",
+            "dir-data-magic",
+            vec![
+                format!("inode {manyfiles}"),
+                "dblock 0".into(),
+                "write -d dhdr.hdr.magic 0".into(),
+            ],
+        ),
+        (
+            "dir.reached-twice",
+            "dir-two-parents",
+            vec![
+                format!("inode {sub}"),
+                format!("write -d u3.sfdir3.list[0].inumber.i4 {manyfiles}"),
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn every_code_fires_on_damage_the_reference_finds() {
+    let source = fixture("xfsdata-default.img");
+    let base = source.to_str().unwrap();
+    let counted = fixture("xfsfeat-finobt-inobtcount.img");
+    let mut wrong = Vec::new();
+    // Each case's damage, made when its turn comes so one copy is on disk
+    // at a time.
+    type Damage<'a> = Box<dyn Fn() -> scratch::Volume + 'a>;
+    let mut cases: Vec<(&str, &str, String, Damage)> = Vec::new();
+    for (code, name, commands) in one_damage_per_code(base) {
+        let what = format!("{commands:?}");
+        let source = source.as_path();
+        cases.push((
+            code,
+            name,
+            what,
+            Box::new(move || damaged(source, name, &commands)),
+        ));
+    }
+    // The inode btree block counts mean something only where the volume
+    // keeps them (`inobtcount`), which the data fixture does not, so those
+    // two codes are damaged on a fixture that does. The guest's `xfs_db`
+    // names neither field, so each is changed by its bytes.
+    for (code, name, at) in [
+        ("counter.agi.iblocks", "agi1-iblocks", AGI_IBLOCKS),
+        ("counter.agi.fblocks", "agi1-fblocks", AGI_IBLOCKS + 4),
+    ] {
+        let what = format!("group 1's AGI, {at} bytes in, raised by 77");
+        let counted = counted.as_path();
+        cases.push((
+            code,
+            name,
+            what,
+            Box::new(move || agi_count_damaged(counted, name, 1, at)),
+        ));
+    }
+    for (code, name, commands, damage) in &cases {
+        let image = damage();
+        let image = image.path().to_str().unwrap();
+        let (clean, said) = repair(image);
+        if clean {
+            wrong.push(format!(
+                "{code} ({name}): xfs_repair -n finds nothing wrong after {commands}"
+            ));
+            continue;
+        }
+        let got = report_of(image);
+        let codes: Vec<&str> = got.findings.iter().map(|r| r.code.as_str()).collect();
+        // A traversal that failed is never a clean verdict.
+        if got.clean || got.exit != Some(4) {
+            wrong.push(format!(
+                "{code} ({name}): xfs_repair -n finds damage and fsck.xfs exits {:?}, clean {}:\n{}\n--- xfs_repair -n:\n{said}",
+                got.exit, got.clean, got.json
+            ));
+        } else if !codes.contains(code) {
+            wrong.push(format!(
+                "{code} ({name}): the report has {codes:?} and not {code}:\n{}",
+                got.json
+            ));
+        }
+    }
+    // Every mismatch at once, so one run shows them all.
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases disagree with the reference:\n\n{}",
+        wrong.len(),
+        cases.len(),
+        wrong.join("\n\n")
+    );
+}
+
+/// Where `agi_iblocks` sits in an AGI: after `agi_free_level`.
+const AGI_IBLOCKS: usize = fs_xfs::ag::offsets::agi::FREE_LEVEL + 4;
+
+/// A copy of `source` with the 32-bit count `at` bytes into group `ag`'s
+/// AGI raised by 77 and the header's checksum stamped again, so the count
+/// is the only damage. The geometry is `xfs_db`'s.
+fn agi_count_damaged(source: &std::path::Path, name: &str, ag: u64, at: usize) -> scratch::Volume {
+    use fs_core::{BlockDevice, BlockRead};
+    let copy =
+        scratch::Volume::copy_of(SUITE, source, &format!("{}-{name}.img", std::process::id()));
+    let image = copy.path().to_str().unwrap();
+    let sb = |field: &str| db_value(image, &["sb 0", &format!("p {field}")]);
+    let sect = sb("sectsize");
+    let offset = ag * sb("agblocks") * sb("blocksize") + 2 * sect;
+    let dev = fs_core::FileDevice::open_rw(copy.path()).unwrap();
+    let mut agi = vec![0u8; sect as usize];
+    dev.read_at(offset, &mut agi).unwrap();
+    let count = u32::from_be_bytes(agi[at..at + 4].try_into().unwrap());
+    agi[at..at + 4].copy_from_slice(&(count + 77).to_be_bytes());
+    fs_xfs::group_write::restamp_crc(&mut agi, fs_xfs::ag::offsets::agi::CRC);
+    dev.write_at(offset, &agi).unwrap();
+    copy
+}
+
 /// A copy of `source` damaged by `commands`, run through `xfs_db -x`.
 fn damaged(source: &std::path::Path, name: &str, commands: &[String]) -> scratch::Volume {
     let copy =
