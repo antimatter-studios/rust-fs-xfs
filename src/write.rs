@@ -300,6 +300,19 @@ impl Filesystem {
             }
         }
 
+        // The mode's permission bits are an access ACL's owner, group-class
+        // and other entries (#390), read only once every other
+        // refusal has passed. Changing them here, in place, would leave
+        // the ACL saying something else; `chmod` changes both in one record.
+        if change.permissions.is_some()
+            && self.acl(inode.ino, crate::acl::AclKind::Access)?.is_some()
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} has an access ACL; Filesystem::chmod keeps it in step with the \
+                 mode",
+                inode.ino
+            )));
+        }
         let _ = device;
         self.update_inode(inode.ino, |raw, current, bigtime| {
             if let Some(perms) = change.permissions {

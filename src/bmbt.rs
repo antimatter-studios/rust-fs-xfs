@@ -153,6 +153,78 @@ fn parse_root(fork: &[u8], ino: u64) -> Result<Node> {
     })
 }
 
+/// Inode roots are compact on disk, but DBROOT/ABROOT journal regions
+/// contain the full in-memory bmbt header. Both arrays retain capacity-
+/// based pointer offsets. Kernel recovery converts that header back to
+/// the four-byte inode root; the #389 kernel oracle exercises both forms.
+pub(crate) fn inode_root_to_log(fork: &[u8], sb: &Superblock, ino: u64) -> Result<Vec<u8>> {
+    let node = parse_root(fork, ino)?;
+    let count = usize::from(node.numrecs);
+    let body = header_len(sb.is_v5());
+    let mut logged = vec![0; body + count * (KEY_LEN + PTR_LEN)];
+    let magic = if sb.is_v5() {
+        XFS_BMAP_CRC_MAGIC
+    } else {
+        XFS_BMAP_MAGIC
+    };
+    logged[offsets::MAGIC..offsets::MAGIC + 4].copy_from_slice(&magic.to_be_bytes());
+    logged[offsets::LEVEL..offsets::LEVEL + 2].copy_from_slice(&node.level.to_be_bytes());
+    logged[offsets::NUMRECS..offsets::NUMRECS + 2].copy_from_slice(&node.numrecs.to_be_bytes());
+    logged[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+    logged[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
+    if sb.is_v5() {
+        logged[offsets::BLKNO..offsets::BLKNO + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        logged[offsets::UUID..offsets::UUID + 16].copy_from_slice(&sb.meta_uuid);
+        logged[offsets::OWNER..offsets::OWNER + 8].copy_from_slice(&ino.to_be_bytes());
+    }
+    logged[body..body + count * KEY_LEN]
+        .copy_from_slice(&fork[node.body..node.body + count * KEY_LEN]);
+    let pointers = node.body + node.maxrecs * KEY_LEN;
+    logged[body + count * KEY_LEN..].copy_from_slice(&fork[pointers..pointers + count * PTR_LEN]);
+    Ok(logged)
+}
+
+pub(crate) fn inode_root_from_log(
+    logged: &[u8],
+    sb: &Superblock,
+    capacity: usize,
+) -> Result<Vec<u8>> {
+    let body = header_len(sb.is_v5());
+    let bad =
+        || Error::CorruptLog("a logged bmbt root does not fit its header or inode fork".into());
+    if logged.len() < body || capacity < ROOT_HEADER_LEN {
+        return Err(bad());
+    }
+    let magic = if sb.is_v5() {
+        XFS_BMAP_CRC_MAGIC
+    } else {
+        XFS_BMAP_MAGIC
+    };
+    let level = be16(logged, offsets::LEVEL);
+    let count = usize::from(be16(logged, offsets::NUMRECS));
+    let source_slots = maxrecs(logged.len() - body);
+    let target_slots = maxrecs(capacity - ROOT_HEADER_LEN);
+    if be32(logged, offsets::MAGIC) != magic
+        || level == 0
+        || level > MAX_LEVELS
+        || count == 0
+        || count > source_slots
+        || count > target_slots
+    {
+        return Err(bad());
+    }
+    let mut fork = vec![0; capacity];
+    fork[0..2].copy_from_slice(&level.to_be_bytes());
+    fork[2..4].copy_from_slice(&(count as u16).to_be_bytes());
+    fork[ROOT_HEADER_LEN..ROOT_HEADER_LEN + count * KEY_LEN]
+        .copy_from_slice(&logged[body..body + count * KEY_LEN]);
+    let source_pointers = body + source_slots * KEY_LEN;
+    let target_pointers = ROOT_HEADER_LEN + target_slots * KEY_LEN;
+    fork[target_pointers..target_pointers + count * PTR_LEN]
+        .copy_from_slice(&logged[source_pointers..source_pointers + count * PTR_LEN]);
+    Ok(fork)
+}
+
 /// `XFS_BMBT_BLOCK_LEN`: where an on-disk node's body starts.
 fn header_len(v5: bool) -> usize {
     if v5 {

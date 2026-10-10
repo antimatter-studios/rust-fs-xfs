@@ -27,11 +27,13 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod acl;
 pub mod ag;
 pub mod ag_btree;
 pub mod agfl;
 pub mod alloc_btree;
 pub mod attr;
+pub mod attr_write;
 pub mod bmbt;
 pub mod buf_write;
 pub mod capi;
