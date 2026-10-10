@@ -27,7 +27,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  FS_CORE_REF: v0.3.7
+  FS_CORE_REF: v0.3.8
   CARGO_INCREMENTAL: 0
 
 # Read-only unless a job asks for more. This repository's default token

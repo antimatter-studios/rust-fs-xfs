@@ -100,6 +100,12 @@ never does.
 
 ### Changed
 
+- **`main` merges through a merge queue, and a change to documentation alone
+  skips the VM.** rust-fs-core is pinned at v0.3.8: `AGENTS.md` carries its
+  agent-core v5 block (bring a branch up to date before every push; a green pull
+  request goes into the queue), `ci.yml` triggers on `merge_group`, and a
+  `changes` job gates `fixtures` and the VM jobs on `code-changed.sh`, with
+  `ci-ok` accepting their skip only for documentation.
 - **The Rust checker reports structured findings.** `Finding` now exposes
   `code` and `location` instead of its separate `ag` and `ino` fields; `Report`
   adds scan status and suppression counts. The version moves to 0.13.0 for this

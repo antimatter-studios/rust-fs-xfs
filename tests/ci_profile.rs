@@ -722,6 +722,33 @@ fn carries_a_non_gating_key(keys: &[String]) -> bool {
     keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()))
 }
 
+/// The one job-level `if:` that still gates: the changes job's verdict
+/// (rust-fs-core v0.3.8, `scripts/code-changed.sh`).
+const PATH_GATE: &str = "needs.changes.outputs.code == 'true'";
+
+/// Whether a job's result gates a pull request.
+///
+/// No `continue-on-error`, and no `if:` but [`PATH_GATE`] on a job that
+/// needs `changes`. That one skips the job only when a change is
+/// documentation alone, and `ci-ok` accepts the skip then and no other
+/// time (`ci-gate.sh` holds the aggregate to it), so for every change to
+/// code the job runs and its result is read exactly as before. Any other
+/// condition is rejected on its presence, as a step's is.
+fn job_gates(job: &Job) -> bool {
+    if job.keys.iter().any(|k| k == "continue-on-error") {
+        return false;
+    }
+    if !job.keys.iter().any(|k| k == "if") {
+        return true;
+    }
+    let condition = job.condition.as_deref().unwrap_or_default().trim();
+    let condition = condition
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .map_or(condition, str::trim);
+    condition == PATH_GATE && job.needs.iter().any(|n| n == "changes")
+}
+
 /// Walk a workflow's steps and collect what `select` finds in each
 /// `run:`.
 ///
@@ -745,7 +772,7 @@ fn scan_steps(workflow: &str, gating: bool, select: impl Fn(&str) -> Vec<String>
     }
     let mut out = Vec::new();
     for job in &wf.jobs {
-        if gating && carries_a_non_gating_key(&job.keys) {
+        if gating && !job_gates(job) {
             continue;
         }
         for step in &job.steps {
@@ -775,7 +802,7 @@ fn gating_jobs_running<'a>(wf: &'a Workflow, task: &str) -> Vec<&'a Job> {
     wf.jobs
         .iter()
         .filter(|job| {
-            !carries_a_non_gating_key(&job.keys)
+            job_gates(job)
                 && job.steps.iter().any(|step| {
                     !carries_a_non_gating_key(&step.keys)
                         && !runs_chore_task(&step.run, task).is_empty()
