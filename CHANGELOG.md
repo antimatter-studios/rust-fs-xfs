@@ -47,6 +47,13 @@ never does.
   owns, a record under the wrong owner, and a repeated record are the new
   findings `rmap.missing`, `rmap.stale`, `rmap.owner` and `rmap.duplicate`.
 
+- **Hard links (#384).** `Filesystem::link(ino, dir, name)` gives a file or
+  symlink another name in any directory form and raises its link count, in one
+  record. `unlink_file` of a file with another name now takes one link away
+  instead of being refused, and a file's last name frees it with its blocks
+  and quota rather than asking for a truncate first. An empty directory still
+  in block form is freed with its blocks the same way.
+
 - **A rename replaces a name that is already there (#383).** A file replaces a
   file and a directory an empty directory, in the same record as the move. The
   replaced inode loses the link, and one left with none is freed: its slot goes

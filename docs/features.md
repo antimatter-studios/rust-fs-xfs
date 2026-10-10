@@ -95,7 +95,7 @@ only.
 | Move a name across directories (`Filesystem::rename`), a directory taking its `..` and both parents' link counts with it, in any directory form; a move beneath itself refused | Experimental | Unreleased (#382) | | `cross_directory_rename.rs`, `cross_directory_rename_oracle.rs` |
 | Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | Unreleased (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |
 | Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
-| Hard links | Upcoming | | #384 | |
+| Hard links: `Filesystem::link` in any directory form; unlink of one of several names; the last name freeing the inode with its blocks and quota | Experimental | Unreleased (#384) | | `hardlinks.rs`, `hardlinks_oracle.rs` |
 | Extended attribute and ACL writes | Upcoming | | #389, #390 | |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
 | Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
