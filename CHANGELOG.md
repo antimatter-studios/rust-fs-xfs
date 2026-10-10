@@ -47,6 +47,14 @@ never does.
   owns, a record under the wrong owner, and a repeated record are the new
   findings `rmap.missing`, `rmap.stale`, `rmap.owner` and `rmap.duplicate`.
 
+- **A rename replaces a name that is already there (#383).** A file replaces a
+  file and a directory an empty directory, in the same record as the move. The
+  replaced inode loses the link, and one left with none is freed: its slot goes
+  back to its chunk, its extents to free space, its quota with them. A file
+  over a directory, a directory over a file and a directory over a non-empty
+  one are refused as `NotAFile`, `NotADirectory` and `DirectoryNotEmpty`
+  before anything is written.
+
 - **A name moves across directories (#382).** `Filesystem::rename(from_dir,
   from, to_dir, to)` removes the name from one directory and adds it to the
   other in one record, each directory changing in whatever form it is in. A

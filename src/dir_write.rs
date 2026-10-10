@@ -360,6 +360,51 @@ impl Filesystem {
     /// repeated here: the fork is built against no limit and its length
     /// is then compared, so there is one description of the layout and
     /// not two that can disagree.
+    /// A short-form fork holding exactly `entries`, with `..` naming
+    /// `parent`, or `None` if it does not fit (#383).
+    ///
+    /// A name the directory already had keeps its cookie; a name new to it
+    /// is given the next one, in the order given, so a reader part-way
+    /// through is never sent back to an entry it has seen.
+    pub(crate) fn short_form_of(
+        &self,
+        parsed: &dir::ShortFormDir,
+        parent: u64,
+        entries: &[crate::dir_block::Entry],
+        fork_space: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let has_ftype = self.sb.has_ftype();
+        let mut next = next_cookie(parsed, has_ftype);
+        let mut sf = Vec::with_capacity(entries.len());
+        for e in entries {
+            let cookie = match parsed
+                .entries
+                .iter()
+                .find(|p| p.name == e.name && p.ino == e.ino)
+            {
+                Some(p) => p.offset,
+                None => {
+                    let c = next;
+                    next += cookie_span(e.name.len(), has_ftype);
+                    c
+                }
+            };
+            sf.push(SfEntry {
+                name: &e.name,
+                ino: e.ino,
+                ftype: e.ftype,
+                cookie,
+            });
+        }
+        let header = dir::ShortFormDir {
+            parent_ino: parent,
+            i8count: parsed.i8count,
+            entries: Vec::new(),
+        };
+        let fork = encode_short_form(&header, has_ftype, &sf, usize::MAX)?;
+        Ok((fork.len() <= fork_space).then_some(fork))
+    }
+
     pub(crate) fn short_form_with_entry(
         &self,
         parsed: &dir::ShortFormDir,
@@ -401,34 +446,6 @@ impl Filesystem {
     /// reader's place in the directory, and shuffling the survivors down
     /// would move entries a reader part-way through has already passed,
     /// so it would see them twice.
-    /// The directory's fork with its `..`, which short form keeps in the
-    /// header, naming `parent` instead (#382). Every entry and its cookie
-    /// stay as they were.
-    pub(crate) fn short_form_reparented(
-        &self,
-        parsed: &dir::ShortFormDir,
-        parent: u64,
-        fork_space: usize,
-    ) -> Result<Vec<u8>> {
-        let has_ftype = self.sb.has_ftype();
-        let moved = dir::ShortFormDir {
-            parent_ino: parent,
-            i8count: parsed.i8count,
-            entries: parsed.entries.clone(),
-        };
-        let entries: Vec<SfEntry> = moved
-            .entries
-            .iter()
-            .map(|e| SfEntry {
-                name: &e.name,
-                ino: e.ino,
-                ftype: dir::ftype_to_raw(e.ftype),
-                cookie: e.offset,
-            })
-            .collect();
-        encode_short_form(&moved, has_ftype, &entries, fork_space)
-    }
-
     pub(crate) fn short_form_without_entry(
         &self,
         parsed: &dir::ShortFormDir,

@@ -63,6 +63,8 @@ const OP_ALIGN: usize = 4;
 /// Offsets within the on-disk inode core that a removal changes.
 mod core_at {
     pub const MODE: usize = 2;
+    /// `di_format`: how the data fork maps its blocks.
+    pub const FORMAT: usize = 5;
     pub const NLINK: usize = 16;
     pub const SIZE: usize = 56;
     /// `di_nblocks`: the blocks the inode owns.
@@ -81,7 +83,7 @@ mod core_at {
 /// The identity fields are left exactly as they are: this inode will be
 /// handed out again, and `di_ino` and `di_uuid` are as correct now as
 /// they will be then.
-fn emptied_core(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn emptied_core(raw: &[u8]) -> Vec<u8> {
     let mut core = raw.to_vec();
     core[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0u16.to_be_bytes());
     core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&0u32.to_be_bytes());
@@ -104,16 +106,25 @@ fn emptied_core(raw: &[u8]) -> Vec<u8> {
     // A local fork holds no blocks, so a file with attributes passes the
     // "holds no blocks" refusal, and its fork stayed in the free inode.
     // The attribute extent count is the u16 at 80, or, under NREXT64, the
-    // u32 at 76; the data fork's count at 76 is already zero, because a
-    // file with extents is refused.
+    // u32 at 76.
+    //
+    // AND NO BLOCKS, MAPPED AS NO EXTENTS. A rename frees a file that
+    // still held blocks when its core was read, and gives them back in
+    // the same checkpoint, so the count goes with them; `xfs_dinode_verify`
+    // refuses an inode with no extents and blocks still counted, whatever
+    // its mode, and log recovery stopped on it (#383). The data fork is
+    // an empty extent list, as `xfs_ifree` leaves every freed inode.
+    set_nextents(&mut core, 0);
     crate::create::reset_flags(&mut core);
     core[core_at::FORKOFF] = 0;
     core[core_at::AFORMAT] = AFORMAT_EXTENTS;
+    core[core_at::FORMAT] = AFORMAT_EXTENTS;
     core[core_at::NEXTENTS..core_at::FORKOFF].fill(0);
+    core[core_at::NBLOCKS..core_at::NBLOCKS + 8].fill(0);
     core
 }
 
-/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty attribute fork.
+/// `XFS_DINODE_FMT_EXTENTS`, the format of an empty fork of either kind.
 const AFORMAT_EXTENTS: u8 = 2;
 
 /// Set `di_nextents`, wherever the inode's own feature bits put it.
@@ -175,6 +186,47 @@ impl Filesystem {
     /// anything is written.
     pub fn remove_directory(&self, parent: u64, name: &[u8]) -> Result<(u64, u64)> {
         self.remove_name(parent, name, Target::Directory)
+    }
+
+    /// The inode-tree items that give inode `ino` back to its chunk: the
+    /// chunk's free mask and count, both inode trees, and the group's
+    /// header. Nothing is written.
+    pub(crate) fn freed_inode_items(&self, ino: u64) -> Result<Vec<crate::buf_write::BufferItem>> {
+        let (agno, _, _) = self.sb.split_ino(ino);
+
+        // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
+        // are. This read the AGI, checked both trees were a single block
+        // deep, edited a chunk and wrote the roots back. A 1 KiB root
+        // holds 60 chunk records and a chunk is 64 inodes, so a group
+        // with four thousand inodes in it already has a deeper tree and
+        // could not be unlinked from.
+        let mut trees = crate::inode_btree::Trees::open(&self.sb, self.device(), agno)?;
+
+        // Which chunk holds it, and where in that chunk.
+        let (_, ag_block, offset) = self.sb.split_ino(ino);
+        let agino = (ag_block << self.sb.inopblog) | offset;
+        let index = trees
+            .chunks()
+            .iter()
+            .position(|c| {
+                agino >= c.startino
+                    && agino - c.startino < u32::from(crate::inode_btree::INODES_PER_CHUNK)
+            })
+            .ok_or_else(|| {
+                Error::CorruptLog(format!(
+                    "inode {ino} is in no chunk of allocation group {agno}'s inode tree"
+                ))
+            })?;
+        let slot = (agino - trees.chunks()[index].startino) as u8;
+        trees.chunks_mut()[index].give_back(slot)?;
+
+        // The count of allocated inodes does not move: freeing one
+        // inside a chunk leaves the chunk where it was, and the count is
+        // of chunks' worth of inodes rather than of inodes in use.
+        let count = trees.agi().count;
+        let freecount: u32 = trees.chunks().iter().map(|c| u32::from(c.freecount)).sum();
+        trees.set_counts(count, freecount, None);
+        trees.into_items()
     }
 
     fn remove_name(&self, parent: u64, name: &[u8], target: Target) -> Result<(u64, u64)> {
@@ -268,41 +320,7 @@ impl Filesystem {
             )));
         }
 
-        let (agno, _, _) = self.sb.split_ino(ino);
-
-        // ONE EDITOR FOR THE GROUP'S INODE TREES, at whatever depth they
-        // are. This read the AGI, checked both trees were a single block
-        // deep, edited a chunk and wrote the roots back. A 1 KiB root
-        // holds 60 chunk records and a chunk is 64 inodes, so a group
-        // with four thousand inodes in it already has a deeper tree and
-        // could not be unlinked from.
-        let mut trees = crate::inode_btree::Trees::open(&self.sb, self.device(), agno)?;
-
-        // Which chunk holds it, and where in that chunk.
-        let (_, ag_block, offset) = self.sb.split_ino(ino);
-        let agino = (ag_block << self.sb.inopblog) | offset;
-        let index = trees
-            .chunks()
-            .iter()
-            .position(|c| {
-                agino >= c.startino
-                    && agino - c.startino < u32::from(crate::inode_btree::INODES_PER_CHUNK)
-            })
-            .ok_or_else(|| {
-                Error::CorruptLog(format!(
-                    "inode {ino} is in no chunk of allocation group {agno}'s inode tree"
-                ))
-            })?;
-        let slot = (agino - trees.chunks()[index].startino) as u8;
-        trees.chunks_mut()[index].give_back(slot)?;
-
-        // The count of allocated inodes does not move: freeing one
-        // inside a chunk leaves the chunk where it was, and the count is
-        // of chunks' worth of inodes rather than of inodes in use.
-        let count = trees.agi().count;
-        let freecount: u32 = trees.chunks().iter().map(|c| u32::from(c.freecount)).sum();
-        trees.set_counts(count, freecount, None);
-        let group_items = trees.into_items()?;
+        let group_items = self.freed_inode_items(ino)?;
 
         let mut allocations = crate::group_write::Allocations::new();
         let (fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) =
@@ -550,6 +568,36 @@ mod tests {
             "the generation must move on, so a reference to the inode's previous life \
              cannot resolve to whatever is put there next"
         );
+    }
+
+    /// A file a rename frees still held blocks when its core was read,
+    /// and they go back in the same checkpoint. The freed core counts
+    /// none and maps them in no format but an empty extent list, as
+    /// `xfs_ifree` leaves it: the kernel's `xfs_dinode_verify` refuses
+    /// an inode with no extents and blocks still counted, whatever its
+    /// mode, so log recovery failed on the replaced file (#383).
+    #[test]
+    fn an_emptied_core_counts_no_blocks_and_maps_none() {
+        let mut raw = vec![0u8; 176];
+        raw[core_at::MODE..core_at::MODE + 2].copy_from_slice(&0o040755u16.to_be_bytes());
+        raw[core_at::FORMAT] = 1; // local
+        raw[core_at::NBLOCKS..core_at::NBLOCKS + 8].copy_from_slice(&16u64.to_be_bytes());
+        raw[core_at::NEXTENTS..core_at::NEXTENTS + 4].copy_from_slice(&1u32.to_be_bytes());
+
+        let core = emptied_core(&raw);
+        assert_eq!(
+            u64::from_be_bytes(
+                core[core_at::NBLOCKS..core_at::NBLOCKS + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0,
+            "di_nblocks"
+        );
+        assert_eq!(core[core_at::FORMAT], 2, "di_format: extents");
+        assert!(core[core_at::NEXTENTS..core_at::FORKOFF]
+            .iter()
+            .all(|&b| b == 0));
     }
 
     /// The identity fields survive, because this inode will be handed

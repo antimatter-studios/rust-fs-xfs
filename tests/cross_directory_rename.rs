@@ -204,10 +204,9 @@ fn what_a_move_cannot_do_is_refused_before_it_writes() {
         .expect("mkdir inner");
     fs.create_file(a, b"x", 0o100644).expect("create x");
     fs.create_file(b, b"x", 0o100644).expect("create x");
-    assert!(matches!(
-        fs.rename(a, b"x", b, b"x"),
-        Err(Error::AlreadyExists)
-    ));
+    // A file over a file is a replacement, which is #383's and is covered
+    // in tests/rename_over_target.rs.
+    fs.rename(a, b"x", b, b"x").expect("a file replaces a file");
     assert!(matches!(
         fs.rename(a, b"nope", b, b"y"),
         Err(Error::NotFound)
