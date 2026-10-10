@@ -23,7 +23,8 @@ Retired codes remain reserved. Human descriptions (`what`) may change freely.
 | `clean` | boolean | Complete scan with no error findings or suppressed findings. |
 | `dirty` | boolean | The log required in-memory replay; the target was not changed. |
 | `scan` | string | `complete`, `partial`, or `none`, as below. |
-| `exit` | integer | Process status: `0` clean or `4` findings left uncorrected. |
+| `exit` | integer | Process status: `0` clean, `1` findings corrected, `4` findings left uncorrected, `5` both. |
+| `applied` | integer | Only with `-y` or `-p`: how many changes the repair wrote; the rest of the report is the check made after them. A refused repair writes nothing and exits `4`, even when the check found only warnings. |
 | `inodes` | integer | Allocated inodes walked; omitted when scan is `none`. |
 | `directories` | integer | Directories walked; omitted when scan is `none`. |
 | `free_blocks` | integer | Free blocks counted; omitted when scan is `none`. |
@@ -44,8 +45,8 @@ report describe only the part walked and must not be treated as volume totals.
 A successful mount or an empty finding list alone never establishes clean.
 
 Failure to open/read the target, or a non-XFS target, produces an operational
-error on stderr with exit `8`, without a report. Usage errors and unsupported
-repair requests (`-y`, `-p`) exit `16`. A mount refusal for an unsupported XFS
+error on stderr with exit `8`, without a report. Usage errors, and `-y` or `-p`
+asked for together with `-n` or `--dry-run`, exit `16`. A mount refusal for an unsupported XFS
 feature is currently a `mount` finding, exit `4`; inspect its human description.
 No progress or cancellation API is introduced by this schema. `--dry-run` adds
 a `plan` key, below; nothing is ever written.
@@ -123,7 +124,7 @@ The partial-scan column states whether this finding prevents a complete walk.
 |---|---|---|---|
 | `checksum` | error | yes | A metadata block or inode failed its CRC. |
 | `identity` | error | yes | A metadata block's self-describing header names another place. |
-| `sb.copy.unreadable` | error | yes | A secondary superblock could not be read or parsed. |
+| `sb.copy.unreadable` | error | no | A secondary superblock could not be read or parsed, or failed its checksum. Nothing is reached through a copy, so the scan is not made partial. |
 | `sb.copy.field` | error | no | A secondary superblock disagrees with the primary on a field. |
 | `sb.copy.uuid` | error | no | A secondary superblock carries another filesystem's UUID. |
 | `ag.agf.unreadable` | error | yes | A group's AGF could not be read. |

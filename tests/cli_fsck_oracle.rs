@@ -522,15 +522,27 @@ fn a_volume_that_is_not_xfs_is_an_operational_error() {
 }
 
 #[test]
-fn a_repair_is_refused_not_pretended() {
+fn a_repair_of_a_clean_volume_writes_nothing_and_asking_for_both_is_refused() {
     let copy = scratch::Volume::copy_of(
         SUITE,
         &fixture("xfs-default.img"),
         &format!("{}-y.img", std::process::id()),
     );
-    let out = tool("fsck.xfs")
-        .args(["-y", copy.path().to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(16), "fsck.xfs -y: {}", stderr(&out));
+    let path = copy.path().to_str().unwrap();
+    let before = std::fs::read(path).unwrap();
+    let out = tool("fsck.xfs").args(["-y", path]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "fsck.xfs -y: {}", stderr(&out));
+    assert!(
+        std::fs::read(path).unwrap() == before,
+        "fsck.xfs -y changed a clean volume"
+    );
+    for both in [["-n", "-y"], ["-y", "--dry-run"]] {
+        let out = tool("fsck.xfs").args(both).arg(path).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(16),
+            "fsck.xfs {both:?}: {}",
+            stderr(&out)
+        );
+    }
 }

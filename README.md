@@ -20,7 +20,7 @@ corrupt.
 
 Reading is supported for v5 and v4 volumes, clean or with a dirty log (replayed
 in memory, the device untouched), including extended attributes, POSIX ACLs and
-realtime files. `fsck.xfs` checks without repairing, and `mkfs.xfs` formats v5.
+realtime files. `fsck.xfs` checks, and repairs a damaged secondary superblock, and `mkfs.xfs` formats v5.
 An overwrite of existing bytes is written in place, on v5 and v4; on v5,
 create, unlink, mkdir, rename within a short-form directory, allocating writes
 and truncate to zero are journalled records the Linux kernel replays.
@@ -256,6 +256,7 @@ size zero, including sparse records for high IDs.
 
 ```sh
 fsck.xfs disk.img          # exit 0 clean, 4 problems found, 8 could not check
+fsck.xfs -y disk.img       # repair what a rule owns: exit 1 corrected, 5 with errors left
 fsck.xfs --text disk.img   # one line per finding
 fsck.xfs --dry-run disk.img  # what a repair would change, writing nothing
 ```
@@ -265,13 +266,18 @@ The `scan` field distinguishes a complete check from a partial scan or a volume
 that could not be mounted. A partial scan is never clean. See
 [the output contract](docs/fsck-output.md) for the schema and code catalogue.
 
-It repairs nothing: `-n` is accepted, and `-y` and `-p` are refused (exit 16)
-rather than ignored. `--dry-run` plans a repair with `fs_xfs::repair` and prints
-it without writing (#375). It first takes the target exclusively, and it refuses
+`--dry-run` plans a repair with `fs_xfs::repair` and prints it without writing
+(#375). `-y` and `-p` make the same plan and apply it (#391). Every range is read
+again first and must still hold the bytes the plan saw, and the volume is then
+checked again from a fresh mount. One rule ships: a single damaged secondary
+superblock is rewritten from the primary. A copy naming another filesystem, or
+more than one damaged copy, refuses the plan, and nothing is written. Asking for
+`-y` or `-p` together with `-n` or `--dry-run` exits 16. It first takes the target exclusively, and it refuses
 with `repair.*` findings a volume it cannot reason about: a feature the checker
 does not validate (such as `rmapbt`), a dirty log, an incomplete scan, or a block
-or directory with two owners. No repair rule ships yet, so a plan lists every
-error it would leave. `tests/cli_repair_plan_oracle.rs` holds the plan to
+or directory with two owners. A plan lists every error no rule repairs.
+`tests/cli_superblock_repair_oracle.rs` repairs a copy, then has `xfs_repair -n`
+and `xfs_db` confirm the repair, and shows that a second run writes nothing. `tests/cli_repair_plan_oracle.rs` holds the plan to
 `xfs_repair -n`, requires it to be the same twice, and requires the image
 unchanged. `tests/cli_fsck_oracle.rs` holds it to `xfs_repair -n` on
 twelve clean fixtures and representative corruption families, including golden

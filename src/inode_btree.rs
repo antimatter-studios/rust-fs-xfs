@@ -236,6 +236,51 @@ pub(crate) fn record(buf: &[u8], at: usize, sparse: bool) -> Result<InodeChunk> 
     Ok(chunk)
 }
 
+/// A chunk record as the checker reads it (#393): its free count taken
+/// from its free mask, with what the record itself said when that
+/// disagrees.
+///
+/// The record's identity — first inode, hole mask, free mask — is what
+/// says which inodes it covers and which are free, and a free count beside
+/// it that disagrees is `inobt.chunk-count`, a fault in that record alone.
+/// Refusing the whole record instead, as [`record`] must for a writer,
+/// would leave every inode in the chunk unread and the scan partial.
+///
+/// # Errors
+///
+/// What [`record`] refuses for any other reason: an inode count no chunk
+/// can have, or a packed record read as a plain one.
+pub(crate) fn record_counted(
+    buf: &[u8],
+    at: usize,
+    sparse: bool,
+) -> Result<(InodeChunk, Option<String>)> {
+    match record(buf, at, sparse) {
+        Ok(chunk) => Ok((chunk, None)),
+        Err(e) => {
+            let mut chunk = InodeChunk {
+                startino: be32(buf, at),
+                holemask: if sparse { be16(buf, at + 4) } else { 0 },
+                count: if sparse {
+                    buf[at + 6]
+                } else {
+                    INODES_PER_CHUNK
+                },
+                freecount: 0,
+                free: be64(buf, at + 8),
+            };
+            if !sparse && be32(buf, at + 4) > u32::from(INODES_PER_CHUNK) {
+                return Err(e);
+            }
+            chunk.freecount = (0..INODES_PER_CHUNK)
+                .filter(|&n| chunk.exists(n) && chunk.is_free(n))
+                .count() as u8;
+            check_counts(&chunk)?;
+            Ok((chunk, Some(e.to_string())))
+        }
+    }
+}
+
 /// Refuse a chunk record whose counts disagree with its masks (#314), as
 /// the kernel's `xfs_inobt_check_irec` does: between 4 and 64 inodes, and a
 /// free count equal to the free bits of the inodes the chunk has.
@@ -564,15 +609,28 @@ pub struct Trees<'a> {
     changed: bool,
 }
 
+/// Whether an inode chunk record may start at `startino`: the first inode
+/// of a block, in a block aligned to `sb_inoalignmt` where the volume
+/// records one.
+///
+/// Not a multiple of [`INODES_PER_CHUNK`]: `mkfs.xfs -i sparse=0` puts the
+/// first chunk at inode 96, block 12 of a four-block alignment, and the
+/// kernel and `xfs_repair` both take it. A sparse volume's records start
+/// on the same alignment; `sb_spino_align` is the grain of what is
+/// allocated inside one.
+pub(crate) fn chunk_start_aligned(sb: &Superblock, startino: u32) -> bool {
+    startino.is_multiple_of(u32::from(sb.inopblock))
+        && (sb.inoalignmt == 0 || (startino >> sb.inopblog).is_multiple_of(sb.inoalignmt))
+}
+
 /// Refuse a chunk record that does not start on a chunk boundary inside
 /// its group (#314).
 ///
 /// A create takes `startino + n` as the new inode's number, so a chunk that
 /// starts anywhere else builds the new file on a slot it does not own. The
 /// kernel's `xfs_inobt_check_irec` requires the chunk's first and last
-/// inode inside the group, past its headers (`xfs_verify_agino`), and
-/// `xfs_repair` refuses a start that is not a multiple of
-/// [`INODES_PER_CHUNK`].
+/// inode inside the group, past its headers (`xfs_verify_agino`); where it
+/// may start is [`chunk_start_aligned`].
 ///
 /// # Errors
 ///
@@ -587,7 +645,7 @@ fn check_chunk_starts(
     for chunk in chunks {
         let start = u64::from(chunk.startino);
         let last = start + u64::from(INODES_PER_CHUNK) - 1;
-        let why = if !start.is_multiple_of(u64::from(INODES_PER_CHUNK)) {
+        let why = if !chunk_start_aligned(sb, chunk.startino) {
             "is not on a chunk boundary"
         } else if start >> sb.inopblog < first_block {
             "is on the group's headers"
@@ -882,6 +940,57 @@ impl<'a> Trees<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v5 superblock with 4 KiB blocks of eight 512-byte inodes, whose
+    /// inode chunks align to `inoalignmt` blocks.
+    fn sb_aligned(inoalignmt: u32) -> Superblock {
+        let mut b = vec![0u8; 512];
+        b[0..4].copy_from_slice(&crate::superblock::XFS_SB_MAGIC.to_be_bytes());
+        b[4..8].copy_from_slice(&4096u32.to_be_bytes()); // blocksize
+        b[8..16].copy_from_slice(&102_400u64.to_be_bytes()); // dblocks
+        b[56..64].copy_from_slice(&96u64.to_be_bytes()); // rootino
+        b[84..88].copy_from_slice(&51_200u32.to_be_bytes()); // agblocks
+        b[88..92].copy_from_slice(&2u32.to_be_bytes()); // agcount
+        let versionnum = 5u16 | crate::superblock::version_flags::MOREBITSBIT;
+        b[100..102].copy_from_slice(&versionnum.to_be_bytes());
+        b[102..104].copy_from_slice(&512u16.to_be_bytes()); // sectsize
+        b[104..106].copy_from_slice(&512u16.to_be_bytes()); // inodesize
+        b[106..108].copy_from_slice(&8u16.to_be_bytes()); // inopblock
+        b[120] = 12; // blocklog
+        b[121] = 9; // sectlog
+        b[122] = 9; // inodelog
+        b[123] = 3; // inopblog
+        b[124] = 16; // agblklog
+        let crc = crate::superblock::crc32c_with_zeroed_crc(&b, 224);
+        b[224..228].copy_from_slice(&crc.to_le_bytes());
+        let mut sb = Superblock::parse(&b).expect("v5 superblock");
+        sb.inoalignmt = inoalignmt;
+        sb
+    }
+
+    fn chunk_at(startino: u32) -> InodeChunk {
+        InodeChunk {
+            startino,
+            holemask: 0,
+            count: INODES_PER_CHUNK,
+            freecount: 0,
+            free: 0,
+        }
+    }
+
+    /// `mkfs.xfs -i sparse=0` puts the first chunk at inode 96: block 12,
+    /// on the four-block alignment it records, and not a multiple of 64.
+    /// `xfs_repair` and the kernel take it; a chunk off its inode block, or
+    /// on a block the alignment does not allow, is still refused.
+    #[test]
+    fn a_chunk_starts_where_the_superblock_aligns_it() {
+        let sb = sb_aligned(4);
+        assert!(check_chunk_starts(&sb, 0, 51_200, &[chunk_at(96)]).is_ok());
+        assert!(check_chunk_starts(&sb, 0, 51_200, &[chunk_at(97)]).is_err());
+        assert!(check_chunk_starts(&sb, 0, 51_200, &[chunk_at(104)]).is_err());
+        let unaligned = sb_aligned(0);
+        assert!(check_chunk_starts(&unaligned, 0, 51_200, &[chunk_at(104)]).is_ok());
+    }
 
     /// The same 61 free inodes of the same chunk, written both ways.
     ///
