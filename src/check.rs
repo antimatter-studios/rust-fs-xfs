@@ -694,6 +694,51 @@ fn runs(blocks: &[(u32, RmapKey)]) -> Vec<(u32, u32, RmapKey)> {
     out
 }
 
+/// Every block a directory maps in its data region parses as a data
+/// block (#364).
+///
+/// `Filesystem::read_dir` lists what it can and passes over a block whose
+/// magic is not a data block's, which suits a reader salvaging names. A
+/// checker cannot: XFS leaves a directory's free space unmapped, so every
+/// mapped block in the data region is entries, and one that does not parse
+/// is a directory read in part. That is `dir.unreadable`, not a clean
+/// directory with names missing from it.
+fn every_data_block_parses(
+    fs: &Filesystem,
+    inode: &crate::inode::Inode,
+    raw: &[u8],
+) -> crate::error::Result<()> {
+    if inode.format == crate::inode::Format::Local {
+        return Ok(());
+    }
+    let sb = fs.superblock();
+    let bs = u64::from(sb.blocksize);
+    let per = u64::from(sb.dirblocksize()) / bs;
+    let limit = crate::format::dir::XFS_DIR2_LEAF_OFFSET / bs;
+    for e in fs.data_extents(inode, raw)? {
+        if e.startoff >= limit || e.is_unwritten() {
+            continue;
+        }
+        let end = e.end_offset().min(limit);
+        let mut at = e.startoff - e.startoff % per;
+        while at < end {
+            let Some(phys) = e.map(at.max(e.startoff)) else {
+                break;
+            };
+            let mut block = vec![0u8; sb.dirblocksize() as usize];
+            fs.device().read_at(sb.fsblock_offset(phys), &mut block)?;
+            crate::dir::parse_data_block(&block, sb).map_err(|why| {
+                crate::error::Error::BadSuperblock(format!(
+                    "directory {}: the data block at file block {at} is not one: {why}",
+                    inode.ino
+                ))
+            })?;
+            at += per;
+        }
+    }
+    Ok(())
+}
+
 /// The length of group `ag`: every group is `agblocks` but the last.
 fn ag_length(fs: &Filesystem, ag: u32) -> u32 {
     let sb = fs.superblock();
@@ -1495,7 +1540,10 @@ impl Checker<'_> {
                 continue;
             }
             self.report.directories += 1;
-            let entries = match fs.read_dir(&inode, &raws[&dir]) {
+            let entries = match fs
+                .read_dir(&inode, &raws[&dir])
+                .and_then(|e| every_data_block_parses(fs, &inode, &raws[&dir]).map(|()| e))
+            {
                 Ok(e) => e,
                 Err(e) => {
                     self.failed(

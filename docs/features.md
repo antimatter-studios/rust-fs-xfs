@@ -59,6 +59,7 @@ States:
 |---|---|---|---|---|
 | `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
 | Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | Unreleased (#403) | | `cli_fsck_oracle.rs` |
+| Every finding code damaged by a case `xfs_repair -n` agrees is damage, or listed with the reason it has none, held by a contract test | Supported | Unreleased (#426) | | `cli_fsck_oracle.rs`, `fsck_coverage_contract.rs` |
 | Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | Unreleased (#402) | #378 | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
 | Realtime metadata checked from the data device: geometry, each realtime file's extents, the bitmap against the extents files map, the summary against the bitmap, and `sb_frextents` (`rt.*`, `counter.sb.frextents`) | Experimental | Unreleased (#381) | | `realtime_check_oracle.rs` |
 | Reverse-mapping btree checked block by block against the owners the walk finds: missing, stale, wrong-owner and duplicate records (`rmap.*`) | Experimental | Unreleased (#380) | | `rmap_check_oracle.rs`, `cli_fsck_oracle.rs` |

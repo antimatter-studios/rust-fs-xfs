@@ -244,3 +244,62 @@ fn a_realtime_extent_past_the_section_is_found() {
     assert!(edit.ok(), "xfs_db: {}{}", edit.stdout, edit.stderr);
     assert_found("realtime extent past the section", &data, &rt, "rt.extent");
 }
+
+#[test]
+fn realtime_geometry_that_disagrees_with_itself_is_found() {
+    let (data, rt) = realtime_volume("geometry");
+    // The log of the extent count, which the count itself decides.
+    let edit = oracle("xfs_db")
+        .args(["-x", "-c", "sb 0", "-c", "write -d rextslog 1"])
+        .arg(data.path())
+        .output();
+    assert!(edit.ok(), "xfs_db: {}{}", edit.stdout, edit.stderr);
+    assert_found("realtime extent log wrong", &data, &rt, "rt.geometry");
+}
+
+#[test]
+fn two_files_mapping_one_realtime_extent_are_found() {
+    let (data, rt) = realtime_volume("cross-link");
+    let (sparse, two) = {
+        let dev = FileDevice::open(data.path().to_str().unwrap()).expect("open");
+        let fs = Filesystem::mount(Arc::new(dev) as Arc<dyn BlockRead>).expect("mount");
+        (
+            fs.lookup_path("/sparse").expect("sparse").ino,
+            fs.lookup_path("/two").expect("two").ino,
+        )
+    };
+    let shown = oracle("xfs_db")
+        .args([
+            "-r",
+            "-c",
+            &format!("inode {sparse}"),
+            "-c",
+            "p u3.bmx[0].startblock",
+        ])
+        .arg(data.path())
+        .output();
+    let start = shown
+        .stdout
+        .split('=')
+        .nth(1)
+        .unwrap_or_else(|| panic!("xfs_db printed no startblock:\n{}", shown.stdout))
+        .trim()
+        .to_string();
+    let edit = oracle("xfs_db")
+        .args([
+            "-x",
+            "-c",
+            &format!("inode {two}"),
+            "-c",
+            &format!("write -d u3.bmx[0].startblock {start}"),
+        ])
+        .arg(data.path())
+        .output();
+    assert!(edit.ok(), "xfs_db: {}{}", edit.stdout, edit.stderr);
+    assert_found(
+        "two files on one realtime extent",
+        &data,
+        &rt,
+        "rt.cross-link",
+    );
+}

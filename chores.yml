@@ -395,11 +395,13 @@ tasks:
     # the binding half.
     # The floor is 16: 18 executed (job 105877826105), less the margin.
     # Budget: 312 lines measured with the mkfs and fsck oracle suites in the
-    # tier (run 37444985503), so 330.
+    # tier (run 37444985503), so 330. Then 339 lines / 54,505 bytes with a
+    # damage case for every checker code (#364, run 37984830147), so 400
+    # lines; the bytes stay where they are.
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 330 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 400 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
