@@ -27,7 +27,7 @@ fn build(tag: &str, options: &str) -> scratch::Volume {
     let image = volume.guest();
     let out = kernel_run(&format!(
         r#"
-        mkfs.xfs -f -q -d agcount=1 {options} {image}
+        mkfs.xfs -f -q -d agcount=2 {options} {image}
         m=$(mktemp -d)
         mount -o loop,nouuid {image} "$m"
         mkdir -p "$m/dir/sub"
