@@ -415,12 +415,14 @@ tasks:
     # Budget: 738 lines / 51,109 bytes measured with the quota record oracle
     # in the tier (run 37791688001), every byte of its growth an `[oracle vm]`
     # line naming a tool call and its verdict; half as much again, so 1110
-    # lines / 77,000 bytes.
+    # lines / 77,000 bytes. Then 997 lines / 83,344 bytes with the inode
+    # repair oracle in the tier (#393, run 38012683420), every test passing;
+    # half as much again, so 1500 lines / 125,000 bytes.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1110 77000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1500 125000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'

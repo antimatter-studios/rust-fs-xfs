@@ -1129,7 +1129,7 @@ impl Checker<'_> {
             agi.root,
             agi.level,
             read,
-            |buf, at| crate::inode_btree::record(buf, at, sparse),
+            |buf, at| crate::inode_btree::record_counted(buf, at, sparse),
         ) {
             Ok((records, blocks)) => {
                 if has_inobt_counts(sb) && blocks.len() as u32 != agi_blocks.0 {
@@ -1150,7 +1150,17 @@ impl Checker<'_> {
                 let mut chunks = Vec::new();
                 for r in records {
                     match r {
-                        Ok(chunk) => chunks.push(chunk),
+                        Ok((chunk, said)) => {
+                            if let Some(said) = said {
+                                self.find(
+                                    Code::InobtChunkCount,
+                                    Some(ag),
+                                    None,
+                                    format!("an inode btree record: {said}"),
+                                );
+                            }
+                            chunks.push(chunk);
+                        }
                         Err(e) => self.failed(
                             Code::InobtRecord,
                             &e,
@@ -1469,6 +1479,23 @@ impl Checker<'_> {
         let mut reached: HashSet<u64> = HashSet::new();
         let mut stack = vec![sb.rootino];
         reached.insert(sb.rootino);
+        // An inode the inode btree calls free and that is in use is
+        // `inode.free-in-use`, found above. It is readable and in use, so
+        // the walk goes through it rather than leaving everything under
+        // it unchecked and the scan partial (#393): only its allocation
+        // bit is wrong.
+        let free: Vec<u64> = self.free.iter().copied().collect();
+        for ino in free {
+            if usable.contains_key(&ino) {
+                continue;
+            }
+            if let Ok((inode, raw)) = fs.read_inode_raw(ino) {
+                if inode.mode != 0 {
+                    raws.insert(ino, raw);
+                    usable.insert(ino, inode);
+                }
+            }
+        }
         if !usable.contains_key(&sb.rootino) {
             let why = if self.allocated.contains(&sb.rootino) {
                 "could not be read"

@@ -266,7 +266,15 @@ impl Proposal<'_> {
 
 /// Plan a repair of `fs` with every rule this crate has.
 pub fn plan(fs: &Filesystem, access: &Exclusive) -> Plan {
-    plan_with(fs, access, &[&SuperblockCopies, &Counters])
+    plan_with(
+        fs,
+        access,
+        &[
+            &SuperblockCopies,
+            &crate::inode_repair::InodeAllocation,
+            &Counters,
+        ],
+    )
 }
 
 /// A secondary superblock rewritten from the primary (#391).
@@ -514,12 +522,23 @@ impl Rule for Counters {
         {
             return Ok(());
         }
+        // An inode-allocation fault moves the AGI's and the superblock's
+        // free counts with it; that rule repairs the ones the fault
+        // corroborates and refuses the rest, so these are left to it.
+        if report
+            .findings
+            .iter()
+            .any(|f| crate::inode_repair::CODES.contains(&f.code))
+        {
+            return Ok(());
+        }
         let others: Vec<&str> = report
             .findings
             .iter()
             .filter(|f| f.severity() == Severity::Error)
             .filter(|f| !COUNTER_CODES.contains(&f.code))
             .filter(|f| !SuperblockCopies.repairs().contains(&f.code))
+            .filter(|f| !crate::inode_repair::CODES.contains(&f.code))
             .map(|f| f.code.as_str())
             .collect();
         if !others.is_empty() {

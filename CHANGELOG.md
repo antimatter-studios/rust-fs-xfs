@@ -8,6 +8,14 @@ never does.
 
 ### Added
 
+- **`fsck.xfs -y` repairs inode allocation and link counts (#393).** The
+  `InodeAllocation` rule sets each inode's allocation bit to whether the inode is
+  in use. Both inode trees, the free counts that follow, and every link count are
+  derived from checksum-valid inodes and a complete directory traversal. An
+  orphan, a directory with two parents, an unused slot still claiming blocks, a
+  metadata inode, or any other finding refuses it. The rule checks a view of the
+  volume with its changes applied before proposing them.
+
 - **`fsck.xfs -y` counts group and superblock counters again (#392).** The
   `Counters` rule derives each AGF, AGI and superblock counter from the trees it
   summarises, exactly as the checker does, and rewrites only those fields and the
@@ -124,6 +132,12 @@ never does.
   `changes` job gates `fixtures` and the VM jobs on `code-changed.sh`, with
   `ci-ok` accepting their skip only for documentation.
 
+- **An inode chunk whose free count disagrees with its free mask is
+  `inobt.chunk-count` (#393),** not `inobt.record`. The record's first inode and
+  masks still say which inodes it covers, so the check reads them and the scan
+  stays complete. An inode the inode btree calls free that is in use is walked
+  through, rather than hiding the directory tree beneath it.
+
 - **A secondary superblock that fails its checksum is `sb.copy.unreadable` (#391),**
   not `checksum`, and no longer makes the scan partial: nothing is reached
   through a copy, so only the copy went unchecked. `-y` and `-p` are no longer
@@ -136,6 +150,12 @@ never does.
   Rust API break. The C ABI is unchanged.
 
 ### Fixed
+
+- **An inode chunk may start wherever the superblock aligns it.** A write
+  refused a group whose first inode chunk did not start at a multiple of 64
+  inodes, but `mkfs.xfs -i sparse=0` puts it at inode 96, block 12 of a
+  four-block alignment, and the kernel and `xfs_repair` take it. A chunk now
+  has to start on an inode block aligned to `sb_inoalignmt`.
 
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and
