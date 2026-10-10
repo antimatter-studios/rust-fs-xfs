@@ -323,8 +323,12 @@ tasks:
     #
     # The floor is 380: 427 executed in run 35435470063 on 2026-09-19
     # (job 105877256028), less the usual margin. Raise it deliberately.
+    #
+    # Budget: 828 lines / 50,167 bytes measured on rust-fs-core v0.3.8 (run
+    # 38030776962), every test passing; half as much again, so 1250 lines /
+    # 76,000 bytes.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 800 50000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
+      - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 1250 76000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
       - 'scripts/ci-test.sh --gate 380 tmp/logs/unit.log "the debug unit tier"'
 
   test:images:
