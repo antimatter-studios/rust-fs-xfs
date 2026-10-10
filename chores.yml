@@ -466,8 +466,13 @@ tasks:
           case "$arg" in --verbose|-v) continue ;; esac
           guest_args="$guest_args $arg"
         done
+        # MEASURED on 2026-10-09 as the suites under review added their
+        # oracles: every test passed in the guest, which printed 2,607 lines
+        # (run 37952408330) and, the largest, 3,134 lines / 218,235 bytes
+        # (run 37944786229, job 113899115614). Half as much again as the
+        # largest is 4,701 lines / 328,000 bytes.
         # shellcheck disable=SC2086  # the words are the point
-        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 2600 190000 -- \
+        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 4701 328000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -536,10 +541,12 @@ tasks:
     # MEASURED in run 35435470063 on 2026-09-19 (job 105877826105): the
     # release pass printed 1,656 lines / 122,595 bytes; budget half as
     # much again. The floor is 525: 586 executed, less the usual margin.
-    # MEASURED again in run 37918336667 (job 113786696594, 2026-10-09),
-    # with the rmap and refcount checker oracles in the suite: every test
-    # passed and the release pass printed 2,325 lines / 181,833 bytes;
-    # half as much again is 3,490 lines / 273,000 bytes.
+    # MEASURED again on 2026-10-09, as the checker, repair and write suites
+    # under review added their oracles: every test passed in each run, and
+    # the release pass printed 180,953 bytes (run 37933633035), 181,575
+    # (37934328714), 181,833 (37918336667) and, the largest, 2,374 lines /
+    # 187,377 bytes (run 37918532099, job 113803432673). Half as much again
+    # as the largest is 3,561 lines / 282,000 bytes.
     timeout: 120m
     on_timeout:
       - cmd: 'echo "timeout: reclaiming the harness VM (spent $TIMEOUT)"'
@@ -552,7 +559,7 @@ tasks:
       - task: test:oracle
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 3490 273000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
+      - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 3561 282000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
       - task: test:scripts
       # The command-line tools, built and staged the way an install lays
       # them out, then tested as installed: found on PATH, doctor first.
