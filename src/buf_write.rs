@@ -130,6 +130,7 @@ impl BufferItem {
             // after the two sibling pointers, the magic and its padding.
             BLFT_DIR_DATA => crate::format::dir::offsets::dir3_blk::CRC,
             BLFT_DIR_LEAF1 => crate::format::dir::offsets::da_blk::CRC,
+            BLFT_ATTR_LEAF | BLFT_DA_NODE => 12,
             _ => return self.data.clone(),
         };
         let mut out = self.data.clone();

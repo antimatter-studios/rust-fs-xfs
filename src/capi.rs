@@ -1162,6 +1162,217 @@ pub unsafe extern "C" fn fs_xfs_set_attributes(
     })
 }
 
+/// Insert or replace an extended attribute. Flags are 0 (upsert), 1
+/// (create only), or 2 (replace only), independent of host OS constants.
+/// Returns 0 or -1; NULL value is allowed only for an empty value.
+///
+/// # Safety
+/// The handle must be live, path/name NUL-terminated, and a nonempty
+/// value must point to `size` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_setxattr(
+    fs: *mut fs_xfs_fs,
+    path: *const c_char,
+    name: *const c_char,
+    value: *const c_void,
+    size: usize,
+    flags: c_int,
+) -> c_int {
+    guard(-1, || {
+        let mode = match flags {
+            0 => crate::attr_write::XattrMode::Set,
+            1 => crate::attr_write::XattrMode::Create,
+            2 => crate::attr_write::XattrMode::Replace,
+            _ => {
+                set_error("invalid xattr flags".into(), libc_einval());
+                return -1;
+            }
+        };
+        if size > crate::format::attr::XFS_ATTR_VALUE_MAX as usize {
+            set_error("attribute value exceeds 65536 bytes".into(), 7); // E2BIG
+            return -1;
+        }
+        if size != 0 && value.is_null() {
+            set_error("attribute value is NULL".into(), libc_einval());
+            return -1;
+        }
+        let Some((fs, inode, _)) = (unsafe { xattr_target(fs, path) }) else {
+            return -1;
+        };
+        let Some(name) = (unsafe { xattr_name(name) }) else {
+            return -1;
+        };
+        let value = if size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) }
+        };
+        match fs.set_xattr(inode.ino, name, value, mode) {
+            Ok(_) => 0,
+            Err(error) => {
+                record_xattr(&error);
+                -1
+            }
+        }
+    })
+}
+
+/// Read an extended attribute; size 0 queries the required byte count.
+/// A small buffer fails with ERANGE without changing it.
+///
+/// # Safety
+/// The handle must be live, path/name NUL-terminated, and the buffer
+/// must hold `size` writable bytes unless size is zero.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_getxattr(
+    fs: *const fs_xfs_fs,
+    path: *const c_char,
+    name: *const c_char,
+    value: *mut c_void,
+    size: usize,
+) -> i64 {
+    guard(-1, || {
+        let Some((fs, inode, raw)) = (unsafe { xattr_target(fs, path) }) else {
+            return -1;
+        };
+        let Some(name) = (unsafe { xattr_name(name) }) else {
+            return -1;
+        };
+        match fs.get_xattr(&inode, &raw, name) {
+            Ok(Some(bytes)) => unsafe { xattr_copy(&bytes, value, size) },
+            Ok(None) => {
+                record_xattr(&Error::NotFound);
+                -1
+            }
+            Err(error) => {
+                record(&error);
+                -1
+            }
+        }
+    })
+}
+
+/// List NUL-separated extended attribute names, including namespace.
+/// Size 0 queries the byte count; a small buffer fails with ERANGE.
+///
+/// # Safety
+/// The handle must be live, path NUL-terminated, and the buffer must
+/// hold `size` writable bytes unless size is zero.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_listxattr(
+    fs: *const fs_xfs_fs,
+    path: *const c_char,
+    names: *mut c_void,
+    size: usize,
+) -> i64 {
+    guard(-1, || {
+        let Some((fs, inode, raw)) = (unsafe { xattr_target(fs, path) }) else {
+            return -1;
+        };
+        match fs.list_xattrs(&inode, &raw) {
+            Ok(attrs) => {
+                let mut bytes = Vec::new();
+                for attr in attrs {
+                    bytes.extend(attr.name);
+                    bytes.push(0);
+                }
+                unsafe { xattr_copy(&bytes, names, size) }
+            }
+            Err(error) => {
+                record(&error);
+                -1
+            }
+        }
+    })
+}
+
+/// Remove a stored extended attribute. Returns 0 or -1.
+///
+/// # Safety
+/// The handle must be live and path/name NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_removexattr(
+    fs: *mut fs_xfs_fs,
+    path: *const c_char,
+    name: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some((fs, inode, _)) = (unsafe { xattr_target(fs, path) }) else {
+            return -1;
+        };
+        let Some(name) = (unsafe { xattr_name(name) }) else {
+            return -1;
+        };
+        match fs.remove_xattr(inode.ino, name) {
+            Ok(_) => 0,
+            Err(error) => {
+                record_xattr(&error);
+                -1
+            }
+        }
+    })
+}
+
+unsafe fn xattr_target<'a>(
+    fs: *const fs_xfs_fs,
+    path: *const c_char,
+) -> Option<(&'a Filesystem, Inode, Vec<u8>)> {
+    if fs.is_null() || path.is_null() {
+        set_error("xattr handle or path is NULL".into(), libc_einval());
+        return None;
+    }
+    let fs = &unsafe { &*fs }.fs;
+    let path = unsafe { CStr::from_ptr(path) }.to_bytes();
+    resolve_for_write(fs, path).map(|(inode, raw)| (fs, inode, raw))
+}
+
+unsafe fn xattr_name<'a>(name: *const c_char) -> Option<&'a [u8]> {
+    if name.is_null() {
+        set_error("attribute name is NULL".into(), libc_einval());
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    if name.is_empty() || name.len() > 255 || matches!(name, b"user." | b"trusted." | b"security.")
+    {
+        set_error("invalid attribute name".into(), libc_einval());
+        return None;
+    }
+    Some(name)
+}
+
+fn record_xattr(error: &Error) {
+    if *error == Error::NotFound {
+        // ENOATTR on Darwin, ENODATA on Linux. Path lookup already
+        // recorded ENOENT, so only a missing attribute reaches here.
+        set_error(
+            "attribute not found".into(),
+            if cfg!(target_os = "macos") { 93 } else { 61 },
+        );
+    } else {
+        record(error);
+    }
+}
+
+unsafe fn xattr_copy(bytes: &[u8], buffer: *mut c_void, size: usize) -> i64 {
+    if size == 0 {
+        return bytes.len() as i64;
+    }
+    if buffer.is_null() {
+        set_error("attribute output buffer is NULL".into(), libc_einval());
+        return -1;
+    }
+    if size < bytes.len() {
+        set_error("attribute output buffer is too small".into(), ERANGE);
+        return -1;
+    }
+    if !bytes.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len());
+        }
+    }
+    bytes.len() as i64
+}
+
 /// Resolve a path to the inode and its bytes, recording any error.
 ///
 /// Shared by the write entry points so a failure to find the file is

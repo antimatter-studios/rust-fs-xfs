@@ -453,8 +453,11 @@ impl Inode {
                 self.ino, self.size
             )));
         }
-        // A device inode has no blocks and no extents.
-        if self.format == Format::Dev && (self.nblocks != 0 || self.nextents != 0) {
+        // A device has no data extents, but its attribute fork can own
+        // blocks; di_nblocks includes both forks (#389).
+        if self.format == Format::Dev
+            && (self.nextents != 0 || (self.nblocks != 0 && self.forkoff == 0))
+        {
             return Err(Error::BadSuperblock(format!(
                 "inode {}: device inode has {} blocks and {} extents",
                 self.ino, self.nblocks, self.nextents

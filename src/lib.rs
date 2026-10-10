@@ -32,6 +32,7 @@ pub mod ag_btree;
 pub mod agfl;
 pub mod alloc_btree;
 pub mod attr;
+pub mod attr_write;
 pub mod bmbt;
 pub mod buf_write;
 pub mod capi;

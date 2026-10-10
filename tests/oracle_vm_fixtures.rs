@@ -16,6 +16,9 @@
 //! fast. The quota comparison additionally builds mounted quota fixtures
 //! and queries `xfs_db` in the guest, so this suite belongs to the kernel tier.
 //!
+//! The attribute writer comparison additionally reaches `xfs_db` in the
+//! guest, checking the shortform, leaf and node layouts this driver writes.
+//!
 //! The fixtures are gitignored and generated: `chore fixtures` builds
 //! every image and its dumps in the harness guest. An empty `.vm-share`
 //! is that build not having happened, so this fails and names the task
@@ -539,4 +542,60 @@ fn real_inode_rejects_wrong_number() {
         matches!(res, Err(fs_xfs::Error::BlockIdentityMismatch { .. })),
         "the root inode was accepted under the wrong inode number"
     );
+}
+
+/// The independently implemented debugger must recognise each written shape.
+#[test]
+fn written_attribute_forks_agree_with_xfs_db() {
+    use fs_core::FileDevice;
+    use fs_xfs::{attr_write::XattrMode, Filesystem};
+    use std::sync::Arc;
+    let volume =
+        common::scratch::Volume::empty("oracle_vm_fixtures", "written-attributes.img", 300 << 20);
+    let made = common::oracle("mkfs.xfs")
+        .args(["-q", "-f"])
+        .arg(volume.path())
+        .output();
+    assert!(made.ok(), "{}{}", made.stdout, made.stderr);
+    let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(volume.path()).unwrap())).unwrap();
+    let ino = fs.superblock().rootino;
+    for (stage, shape) in [(0, "1 (local)"), (1, "0x3bee"), (2, "0x3ebe")] {
+        match stage {
+            0 => {
+                fs.set_xattr(ino, b"user.oracle", b"inline", XattrMode::Create)
+                    .unwrap();
+            }
+            1 => {
+                fs.set_xattr(ino, b"user.oracle", &[7; 65536], XattrMode::Replace)
+                    .unwrap();
+            }
+            2 => {
+                for i in 0..80 {
+                    fs.set_xattr(
+                        ino,
+                        format!("user.node{i:03}").as_bytes(),
+                        &[i as u8; 200],
+                        XattrMode::Create,
+                    )
+                    .unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        fs.sync().unwrap();
+        let db = common::oracle("xfs_db").args(["-r", "-c", &format!("inode {ino}")]);
+        let db = if stage == 0 {
+            db.args(["-c", "p core.aformat"])
+        } else {
+            db.args(["-c", "ablock 0", "-c", "p hdr.info.hdr.magic"])
+        };
+        let report = db.arg(volume.path()).output();
+        assert!(
+            report.ok() && report.stdout.contains(shape),
+            "stage {stage}: {}{}",
+            report.stdout,
+            report.stderr
+        );
+        assert!(!report.stderr.contains("CRC"), "{}", report.stderr);
+    }
 }
