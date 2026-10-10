@@ -9,8 +9,10 @@
 //! - Exchange-range adds log items, and a volume with a dirty log is
 //!   refused before anything reads it.
 //!
-//! So a read accepts both bits. A write does not: every create, rename and
-//! unlink must maintain the parent pointers, and nothing here does.
+//! So a read accepts both bits. A write accepts exchange-range, and an
+//! exchange between two files on such a volume is graded by `xfs_repair
+//! -n` (#374). It refuses parent pointers: every create, rename and unlink
+//! must maintain them, and nothing here does yet.
 //!
 //! The volumes are built without a kernel. A protofile populates them, so
 //! mkfs writes the parent pointers, and `xfs_db -x` adds user attributes
@@ -156,7 +158,16 @@ fn xfs_db_attr_counts(img: &Path, path: &str) -> (usize, usize) {
     (count, parents)
 }
 
-fn check_reads(tag: &str, args: &[&str], bits: u32) {
+/// What a writable mount of the volume should do: be refused, as parent
+/// pointers still are, or exchange a block between two files and leave a
+/// volume `xfs_repair -n` accepts, as exchange-range does (#374).
+#[derive(PartialEq)]
+enum Writes {
+    Refused,
+    ExchangeABlock,
+}
+
+fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
     let (dir, big_bytes) = build(tag, args);
     let img = dir.join("fs.img");
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap()))
@@ -233,15 +244,52 @@ fn check_reads(tag: &str, args: &[&str], bits: u32) {
         }
     }
 
+    let bs = fs.superblock().blocksize as usize;
     drop(fs);
-    match Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap())) {
-        Err(Error::UnsupportedFeature(why)) => assert!(
-            why.contains("can be read but not written"),
-            "{tag}: the refusal should say the volume stays readable: {why}"
-        ),
-        Err(other) => panic!("{tag}: wrong refusal {other:?}"),
-        Ok(_) => panic!("{tag}: a writable mount must be refused"),
+    if writes == Writes::Refused {
+        match Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap())) {
+            Err(Error::UnsupportedFeature(why)) => assert!(
+                why.contains("can be read but not written"),
+                "{tag}: the refusal should say the volume stays readable: {why}"
+            ),
+            Err(other) => panic!("{tag}: wrong refusal {other:?}"),
+            Ok(_) => panic!("{tag}: a writable mount must be refused"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
     }
+
+    // /top.txt's third block and /dir/hello.txt's only one change places.
+    // The volume has a reverse-mapping tree and reflink, as the pinned
+    // mkfs.xfs makes them by default, so the records of both blocks have
+    // to follow, and xfs_repair -n reads them against the files' maps.
+    {
+        let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap()))
+            .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
+        assert!(
+            fs.superblock().has_rmapbt(),
+            "{tag}: no reverse map to keep"
+        );
+        let top = fs.open("/top.txt").unwrap().inode().ino;
+        let hello = fs.open("/dir/hello.txt").unwrap().inode().ino;
+        fs.exchange_range(top, 2 * bs as u64, hello, 0, bs as u64)
+            .unwrap_or_else(|e| panic!("{tag}: the exchange was refused: {e:?}"));
+    }
+    let out = parent_oracle("xfs_repair").arg("-n").arg(&img).output();
+    repair::assert_agreed(&out.repair_report(), &format!("{tag}: after the exchange"));
+    let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap())).unwrap();
+    let hello_text = b"hello, parent pointers\n";
+    assert_eq!(
+        fs.read_path("/dir/hello.txt").unwrap(),
+        big_bytes[2 * bs..2 * bs + hello_text.len()],
+        "{tag}: hello.txt reads top.txt's third block, to its own length"
+    );
+    let top = fs.read_path("/top.txt").unwrap();
+    assert_eq!(&top[2 * bs..2 * bs + hello_text.len()], hello_text, "{tag}");
+    assert!(
+        top[..2 * bs] == big_bytes[..2 * bs] && top[3 * bs..] == big_bytes[3 * bs..],
+        "{tag}: top.txt changed outside the exchanged block"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -251,10 +299,16 @@ fn a_parent_pointer_volume_reads_and_refuses_writes() {
         "parent",
         &["-n", "parent=1"],
         incompat::PARENT | incompat::EXCHRANGE,
+        Writes::Refused,
     );
 }
 
 #[test]
-fn an_exchange_range_volume_reads_and_refuses_writes() {
-    check_reads("exchange", &["-i", "exchange=1"], incompat::EXCHRANGE);
+fn an_exchange_range_volume_reads_and_exchanges_a_block_xfs_repair_accepts() {
+    check_reads(
+        "exchange",
+        &["-i", "exchange=1"],
+        incompat::EXCHRANGE,
+        Writes::ExchangeABlock,
+    );
 }

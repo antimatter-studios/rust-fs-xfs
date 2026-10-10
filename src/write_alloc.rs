@@ -60,7 +60,7 @@ const OP_ALIGN: usize = 4;
 const EXTENT_BYTES: usize = 16;
 
 /// The most blocks one extent record can map: a 21-bit field.
-const MAX_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
+pub(crate) const MAX_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
 
 /// The highest file block an extent can start at: a 54-bit field.
 const MAX_FILE_BLOCK: u64 = (1 << 54) - 1;
@@ -77,7 +77,7 @@ mod at {
 
 /// The inode core of a file now `size` bytes long, holding `blocks`
 /// blocks in `extents` extents.
-fn grown_core(raw: &[u8], size: u64, blocks: u64, extents: u64) -> Result<Vec<u8>> {
+pub(crate) fn grown_core(raw: &[u8], size: u64, blocks: u64, extents: u64) -> Result<Vec<u8>> {
     let mut core = raw.to_vec();
     core[at::SIZE..at::SIZE + 8].copy_from_slice(&size.to_be_bytes());
     core[at::NBLOCKS..at::NBLOCKS + 8].copy_from_slice(&blocks.to_be_bytes());
