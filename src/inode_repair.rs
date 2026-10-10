@@ -156,7 +156,18 @@ fn plan_changes(fs: &Filesystem) -> Result<Vec<(u64, Patch, Code)>> {
             let last = u64::from(chunk.startino) + u64::from(INODES_PER_CHUNK) - 1;
             let length =
                 (sb.dblocks - u64::from(ag) * u64::from(sb.agblocks)).min(u64::from(sb.agblocks));
-            if !chunk.startino.is_multiple_of(u32::from(INODES_PER_CHUNK))
+            // A chunk starts on a block aligned as the superblock says
+            // (`sb_spino_align` under sparse inodes, else `sb_inoalignmt`),
+            // not at an inode number that is a multiple of 64: a plain
+            // chunk at inode 96 is block 12, aligned and legitimate.
+            let align = if sb.has_sparse_inodes() {
+                sb.spino_align
+            } else {
+                sb.inoalignmt
+            };
+            let block = chunk.startino >> sb.inopblog;
+            if !chunk.startino.is_multiple_of(u32::from(sb.inopblock))
+                || (align != 0 && !block.is_multiple_of(align))
                 || u64::from(chunk.startino >> sb.inopblog)
                     <= u64::from(crate::agfl::last_header_block(sb))
                 || last >> sb.inopblog >= length
