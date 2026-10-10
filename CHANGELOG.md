@@ -120,6 +120,16 @@ never does.
 
 ### Fixed
 
+- **Creates past one block of inode tree (#423).** A create that made an inode
+  chunk and grew the group's inode tree in one record logged the group's
+  free-space header twice. One copy came from the allocator and one from the
+  inode trees, and the later undid the earlier's take from the free list. The
+  next time the tree grew, it was handed a block it already held, and every
+  create after that failed. On 1 KiB blocks that was the 61st chunk. The inode
+  trees now take their blocks from free space through the operation's own
+  allocator, owned by `OWN_INOBT`, as the kernel's do, and keep `agi_iblocks`
+  and `agi_fblocks` where `inobtcount` asks for them.
+
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and
   the next record went where it started, over whatever of it had landed. Now a

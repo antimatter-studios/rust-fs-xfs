@@ -572,12 +572,27 @@ where
     Ok(out)
 }
 
+/// Where a tree laid out again gets the blocks it grows by, and where the
+/// ones it shrinks by go.
+///
+/// Not the same place for every tree. The free-space and reverse-mapping
+/// trees grow from the group's free list, which exists so that they can
+/// split while free space is itself being changed; the inode trees take
+/// their blocks from free space like any other owner, as
+/// `xfs_inobt_alloc_block` does (#423).
+pub(crate) trait BlockSource {
+    /// A block for the tree.
+    fn take(&mut self) -> Result<u32>;
+    /// A block the tree no longer needs.
+    fn put(&mut self, agblock: u32) -> Result<()>;
+}
+
 /// Lay one of a group's trees out again over the blocks it should
 /// occupy, and collect an item for every block whose bytes changed.
 ///
-/// The blocks it should occupy are the ones it has, with the group's
-/// free list making up any difference: a tree that grew takes from the
-/// list, one that shrank puts back. Surplus comes off the end, so the
+/// The blocks it should occupy are the ones it has, with `source` making
+/// up any difference: a tree that grew takes from it, one that shrank
+/// puts back. Surplus comes off the end, so the
 /// block that was the root is the first to go back -- which block plays
 /// which part does not matter, because every block states its own
 /// address and its parent points at it by number.
@@ -589,9 +604,8 @@ where
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedFeature`] when the free list is empty and a
-/// block is wanted, or full and one is being returned, and whatever
-/// [`plan`] and [`build`] return.
+/// Whatever `source` returns when a block is wanted or given back, and
+/// whatever [`plan`] and [`build`] return.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn relay<T, E, K>(
     sb: &Superblock,
@@ -602,7 +616,7 @@ pub(crate) fn relay<T, E, K>(
     records: &[T],
     held: &[u32],
     before: &std::collections::HashMap<u32, Vec<u8>>,
-    agfl: &mut crate::agfl::Agfl,
+    source: &mut dyn BlockSource,
     encode_record: E,
     write_keys: K,
     items: &mut Vec<crate::buf_write::BufferItem>,
@@ -619,11 +633,11 @@ where
 
     let mut blocks = held.to_vec();
     while blocks.len() < wanted {
-        blocks.push(agfl.take(sb, agno)?);
+        blocks.push(source.take()?);
     }
     while blocks.len() > wanted {
         let spare = blocks.pop().expect("more blocks than wanted");
-        agfl.put(sb, agno, spare)?;
+        source.put(spare)?;
     }
 
     let built = build(sb, shape, agno, records, &blocks, encode_record, write_keys)?;

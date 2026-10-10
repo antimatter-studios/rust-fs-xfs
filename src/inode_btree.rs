@@ -550,13 +550,6 @@ pub struct Trees<'a> {
     /// `mkfs.xfs -m finobt=0` makes and is ordinary.
     finobt_blocks: Vec<u32>,
     before: std::collections::HashMap<u32, Vec<u8>>,
-    /// The group's free list, which is where a growing tree gets a
-    /// block and where a shrinking one puts it back.
-    agfl: crate::agfl::Agfl,
-    agfl_raw: Vec<u8>,
-    /// The group's free-space header, kept only because the free list's
-    /// counters live in it.
-    agf_raw: Vec<u8>,
     /// What the header's counters should say afterwards, where the
     /// caller has decided: allocated inodes, free inodes, and the chunk
     /// most recently made.
@@ -616,14 +609,10 @@ impl<'a> Trees<'a> {
         device.read_at(ag_start + sector * 2, &mut agi_raw)?;
         let agi = Agi::parse(&agi_raw, sb, agno)?;
 
-        // The free list lives with the AGF rather than the AGI, and
-        // both pairs of trees take their blocks from it.
+        // The group's length, which every chunk has to lie within.
         let mut agf_raw = vec![0u8; sb.sectsize as usize];
         device.read_at(ag_start + sector, &mut agf_raw)?;
         let agf = crate::ag::Agf::parse(&agf_raw, sb, agno)?;
-        let mut agfl_raw = vec![0u8; sb.sectsize as usize];
-        device.read_at(ag_start + sector * 3, &mut agfl_raw)?;
-        let agfl = crate::agfl::Agfl::parse(&agfl_raw, sb, &agf, agno)?;
 
         let mut before: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
         let mut read = |agblock: u32| -> Result<Vec<u8>> {
@@ -683,9 +672,6 @@ impl<'a> Trees<'a> {
             inobt_blocks,
             finobt_blocks,
             before,
-            agfl,
-            agfl_raw,
-            agf_raw,
             counts: None,
             changed: false,
         })
@@ -721,13 +707,28 @@ impl<'a> Trees<'a> {
         self.changed = true;
     }
 
-    /// The buffer items: the group's inode header, and every block of
-    /// either tree whose bytes changed.
+    /// The buffer items: the group's inode header, every block of either
+    /// tree whose bytes changed, and the group's free space where a tree
+    /// grew or shrank.
     ///
     /// One item per buffer however many edits there were. Nothing is
     /// written; the items are the change, and the caller puts them in a
-    /// record.
-    pub fn into_items(mut self) -> Result<Vec<crate::buf_write::BufferItem>> {
+    /// record. An operation that also allocates in the group passes its
+    /// allocator to [`Trees::into_items_in`] instead, so the group's
+    /// header is logged once.
+    pub fn into_items(self) -> Result<Vec<crate::buf_write::BufferItem>> {
+        let mut allocations = crate::group_write::Allocations::new();
+        let mut items = self.into_items_in(&mut allocations)?;
+        items.extend(allocations.into_items()?);
+        Ok(items)
+    }
+
+    /// [`Trees::into_items`], with the blocks a tree grows by taken from
+    /// `group`, and those it shrinks by given back to it, which logs them.
+    pub(crate) fn into_items_in(
+        mut self,
+        allocations: &mut crate::group_write::Allocations<'a>,
+    ) -> Result<Vec<crate::buf_write::BufferItem>> {
         use crate::ag::offsets::agi;
         use crate::format::log_items::buf_log_format::buf_type::BLFT_AGI;
         use crate::log::BBSIZE;
@@ -735,6 +736,12 @@ impl<'a> Trees<'a> {
         if !self.changed {
             return Ok(Vec::new());
         }
+        let mut source = crate::group_write::InodeTreeBlocks {
+            allocations,
+            sb: self.sb,
+            device: self.device,
+            agno: self.agno,
+        };
 
         let sparse = self.sb.has_sparse_inodes();
         let mut items = Vec::new();
@@ -750,7 +757,7 @@ impl<'a> Trees<'a> {
             &chunks,
             &held,
             &self.before,
-            &mut self.agfl,
+            &mut source,
             |buf, at, chunk: &InodeChunk| encode(buf, at, chunk, sparse),
             |buf: &mut [u8], at, under: &[InodeChunk]| encode_key(buf, at, &under[0]),
             &mut items,
@@ -773,7 +780,7 @@ impl<'a> Trees<'a> {
                 &with_free,
                 &held,
                 &self.before,
-                &mut self.agfl,
+                &mut source,
                 |buf, at, chunk: &InodeChunk| encode(buf, at, chunk, sparse),
                 |buf: &mut [u8], at, under: &[InodeChunk]| encode_key(buf, at, &under[0]),
                 &mut items,
@@ -828,6 +835,14 @@ impl<'a> Trees<'a> {
                 level_of(&finobt_blocks, Which::WithFreeInodes, with_free.len())?,
             );
         }
+        // How many blocks each tree has, where the filesystem keeps count
+        // (`inobtcount`): a tree that grew or shrank changes it, and
+        // `xfs_repair` checks it against the tree (#423).
+        if self.sb.features_ro_compat & crate::superblock::ro_compat::INOBTCNT != 0 {
+            let iblocks = agi::FREE_LEVEL + 4;
+            put(&mut new_agi, iblocks, inobt_blocks.len() as u32);
+            put(&mut new_agi, iblocks + 4, finobt_blocks.len() as u32);
+        }
         if let Some((count, freecount, newino)) = self.counts {
             put(&mut new_agi, agi::COUNT, count);
             put(&mut new_agi, agi::FREECOUNT, freecount);
@@ -848,32 +863,6 @@ impl<'a> Trees<'a> {
                 BLFT_AGI,
             ),
         );
-
-        // A tree that took a block or gave one back changed the free
-        // list, and the list is the AGF's rather than the AGI's -- so
-        // the counters that describe it are in the AGF, and both have
-        // to be logged.
-        let after = self.agfl.after(self.sb);
-        if after != self.agfl_raw {
-            use crate::ag::offsets::agf;
-            use crate::format::log_items::buf_log_format::buf_type::{BLFT_AGF, BLFT_AGFL};
-            let mut new_agf = self.agf_raw.clone();
-            put(&mut new_agf, agf::FLFIRST, self.agfl.first());
-            put(&mut new_agf, agf::FLLAST, self.agfl.last());
-            put(&mut new_agf, agf::FLCOUNT, self.agfl.count());
-            items.push(crate::group_write::changed_chunks(
-                ag_bb + sector / BBSIZE as u64,
-                &self.agf_raw,
-                new_agf,
-                BLFT_AGF,
-            ));
-            items.push(crate::group_write::changed_chunks(
-                ag_bb + sector * 3 / BBSIZE as u64,
-                &self.agfl_raw,
-                after,
-                BLFT_AGFL,
-            ));
-        }
 
         Ok(items)
     }
