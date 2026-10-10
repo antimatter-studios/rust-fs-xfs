@@ -151,6 +151,12 @@ never does.
 
 ### Fixed
 
+- **An inode chunk may start wherever the superblock aligns it.** A write
+  refused a group whose first inode chunk did not start at a multiple of 64
+  inodes, but `mkfs.xfs -i sparse=0` puts it at inode 96, block 12 of a
+  four-block alignment, and the kernel and `xfs_repair` take it. A chunk now
+  has to start on an inode block aligned to `sb_inoalignmt`.
+
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and
   the next record went where it started, over whatever of it had landed. Now a
