@@ -5,7 +5,7 @@
 mod cli_support;
 mod common;
 
-use cli_support::{stderr, tool};
+use cli_support::{stderr, stdout, tool};
 use common::{kernel_run, oracle, repair, scratch};
 use fs_core::FileDevice;
 use fs_xfs::{
@@ -117,7 +117,13 @@ fn repaired(volume: &scratch::Volume, case: &str) {
         .arg(volume.path())
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{case}: {}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{case}: {}{}",
+        stdout(&out),
+        stderr(&out)
+    );
     assert!(fs_xfs::check::check(&fs(volume)).is_clean(), "{case}");
     let first = hash(volume);
     let out = tool("fsck.xfs")
@@ -332,7 +338,13 @@ fn link_census_includes_every_leaf_directory_data_block() {
         .arg(volume.path())
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
     assert!(fs_xfs::check::check(&fs(&volume)).is_clean());
     let before = hash(&volume);
     let out = tool("fsck.xfs")
@@ -398,7 +410,10 @@ fn ambiguous_inode_ownership_refuses_the_entire_plan_unchanged() {
         ),
         (
             "inode-identity",
-            vec![format!("inode {file}"), format!("write -d v3.ino {other}")],
+            vec![
+                format!("inode {file}"),
+                format!("write -d v3.inumber {other}"),
+            ],
         ),
     ] {
         let volume = scratch::Volume::copy_of(
