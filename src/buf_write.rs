@@ -141,6 +141,8 @@ impl BufferItem {
             // A node-form directory's index and free blocks (#367).
             BLFT_DIR_LEAFN | BLFT_DA_NODE => crate::format::dir::offsets::da_blk::CRC,
             BLFT_DIR_FREE => crate::format::dir::offsets::dir3_blk::CRC,
+            // An attribute fork's leaf block, under the same v3 header (#389).
+            BLFT_ATTR_LEAF => crate::format::attr::offsets::da_blkinfo::CRC,
             _ => return self.data.clone(),
         };
         let mut out = self.data.clone();
