@@ -39,7 +39,7 @@ use crate::error::{Error, Result};
 use crate::format::dir::{
     XFS_DIR2_DATA_ALIGN, XFS_DIR2_SF_HDR_SIZE_4, XFS_DIR2_SF_HDR_SIZE_8, XFS_DIR3_DATA_HDR_SIZE,
 };
-use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA, XFS_ILOG_DEXT};
+use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
@@ -111,11 +111,18 @@ impl Filesystem {
         let (fork_start, fork_end) = dir.data_fork_range(usize::from(self.sb.inodesize));
         let mut allocations = crate::group_write::Allocations::new();
         // A directory in its inode is renamed in its fork; one past its
-        // inode is read whole and laid out again with the name changed
-        // (#366).
-        let (moved_ino, fork, dir_flags, dir_size, dir_blocks, dir_nextents, dir_items) = match dir
-            .format
-        {
+        // inode is renamed in whichever form it is in (#366, #367).
+        let (
+            moved_ino,
+            fork,
+            disk_fork,
+            dir_flags,
+            dir_format,
+            dir_size,
+            dir_blocks,
+            dir_nextents,
+            dir_items,
+        ) = match dir.format {
             Format::Local => {
                 let parsed = dir::read_short_form(&dir, &dir_raw[fork_start..fork_end], &self.sb)?;
                 if parsed.entries.iter().any(|e| e.name == to) {
@@ -130,35 +137,32 @@ impl Filesystem {
                 let size = fork.len() as u64;
                 (
                     moved,
+                    fork.clone(),
                     fork,
                     XFS_ILOG_DDATA,
+                    Format::Local,
                     size,
                     dir.nblocks,
                     dir.nextents,
                     Vec::new(),
                 )
             }
-            Format::Extents => {
-                let mut entries = self.entries_in_blocks(&dir, &dir_raw)?;
-                if entries.iter().any(|e| e.name == to) {
-                    return Err(Error::AlreadyExists);
-                }
-                let Some(at) = entries
-                    .iter()
-                    .position(|e| e.name == from && from != b"." && from != b"..")
-                else {
-                    return Err(Error::NotFound);
-                };
-                let mut moved = entries.remove(at);
-                let moved_ino = moved.ino;
-                moved.name = to.to_vec();
-                entries.push(moved);
-                let rw =
-                    self.rewrite_directory(&mut allocations, dir_ino, &dir, &dir_raw, &entries)?;
+            Format::Extents | Format::Btree => {
+                let rw = self.edit_directory(
+                    &mut allocations,
+                    dir_ino,
+                    &dir,
+                    &dir_raw,
+                    &[crate::dir_edit::DirEdit::Rename(from, to)],
+                )?;
+                // Nothing is written yet, so the name still finds it.
+                let moved_ino = self.lookup(&dir, &dir_raw, from)?.ino;
                 (
                     moved_ino,
+                    rw.logged_fork,
                     rw.fork,
-                    XFS_ILOG_DEXT,
+                    rw.fields,
+                    rw.format,
                     rw.size,
                     rw.blocks,
                     rw.nextents,
@@ -195,6 +199,7 @@ impl Filesystem {
         let when = clock_now();
         let mut dir_core = dir_raw[..].to_vec();
         set_size(&mut dir_core, dir_size);
+        dir_core[5] = dir_format as u8;
         dir_core[64..72].copy_from_slice(&dir_blocks.to_be_bytes());
         set_nextents(&mut dir_core, dir_nextents);
         bump_changecount(&mut dir_core, self.sb.is_v5());
@@ -226,7 +231,7 @@ impl Filesystem {
 
         // Every refusal this operation has is behind us and the next
         // statement writes. See `Filesystem::commit_record`.
-        let logged_fork = fork_op[..dsize].to_vec();
+        let logged_fork = disk_fork;
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
@@ -360,6 +365,51 @@ impl Filesystem {
     /// repeated here: the fork is built against no limit and its length
     /// is then compared, so there is one description of the layout and
     /// not two that can disagree.
+    /// A short-form fork holding exactly `entries`, with `..` naming
+    /// `parent`, or `None` if it does not fit (#383).
+    ///
+    /// A name the directory already had keeps its cookie; a name new to it
+    /// is given the next one, in the order given, so a reader part-way
+    /// through is never sent back to an entry it has seen.
+    pub(crate) fn short_form_of(
+        &self,
+        parsed: &dir::ShortFormDir,
+        parent: u64,
+        entries: &[crate::dir_block::Entry],
+        fork_space: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let has_ftype = self.sb.has_ftype();
+        let mut next = next_cookie(parsed, has_ftype);
+        let mut sf = Vec::with_capacity(entries.len());
+        for e in entries {
+            let cookie = match parsed
+                .entries
+                .iter()
+                .find(|p| p.name == e.name && p.ino == e.ino)
+            {
+                Some(p) => p.offset,
+                None => {
+                    let c = next;
+                    next += cookie_span(e.name.len(), has_ftype);
+                    c
+                }
+            };
+            sf.push(SfEntry {
+                name: &e.name,
+                ino: e.ino,
+                ftype: e.ftype,
+                cookie,
+            });
+        }
+        let header = dir::ShortFormDir {
+            parent_ino: parent,
+            i8count: parsed.i8count,
+            entries: Vec::new(),
+        };
+        let fork = encode_short_form(&header, has_ftype, &sf, usize::MAX)?;
+        Ok((fork.len() <= fork_space).then_some(fork))
+    }
+
     pub(crate) fn short_form_with_entry(
         &self,
         parsed: &dir::ShortFormDir,
