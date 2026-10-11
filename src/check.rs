@@ -603,18 +603,6 @@ pub fn check(fs: &Filesystem) -> Report {
     c.report
 }
 
-/// Sorted extent numbers as runs of consecutive ones.
-fn extent_runs(sorted: &[u64]) -> Vec<(u64, u64)> {
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for &x in sorted {
-        match out.last_mut() {
-            Some((start, len)) if *start + *len == x => *len += 1,
-            _ => out.push((x, 1)),
-        }
-    }
-    out
-}
-
 /// Which fork of its owner a reverse mapping describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Fork {
@@ -1806,29 +1794,12 @@ impl Checker<'_> {
             return;
         }
 
-        let rextents = sb.rextents as usize;
-        let mut users = vec![0u8; rextents];
-        let mut user_of = vec![0u64; rextents];
-        let mut crossed = Vec::new();
-        for &(start, len, ino) in &self.rt_used {
-            for x in start / rextsize..=(start + len - 1) / rextsize {
-                let x = x as usize;
-                if users[x] > 0 && user_of[x] != ino {
-                    crossed.push((x as u64, ino));
-                }
-                users[x] = users[x].saturating_add(1);
-                user_of[x] = ino;
-            }
-        }
-        for (x, ino) in crossed.into_iter().take(PER_KIND) {
-            self.find(
-                Code::RtCrossLink,
-                None,
-                Some(ino),
-                format!("realtime extent {x} is mapped by inode {ino} and another file"),
-            );
-        }
-
+        // NOTHING HERE IS SIZED BY THE SUPERBLOCK'S CLAIM ALONE (#444).
+        // `sb_rextents` agrees with `sb_rblocks`, and `sb_rblocks` is bounded
+        // by nothing when no realtime device is given, so one byte and one
+        // owner per claimed extent asked for gigabytes. The bitmap is read
+        // first, and its length bounds how many extents are walked; what
+        // files map is kept as their ranges, not per extent.
         let read = |ino: u64| -> Result<Vec<u8>> {
             let (inode, raw) = self.fs.read_inode_raw(ino)?;
             self.fs.read_file(&inode, &raw)
@@ -1846,53 +1817,101 @@ impl Checker<'_> {
                 return;
             }
         };
-        let words_needed = rextents.div_ceil(32);
-        if bitmap.len() < words_needed * 4 {
+        if (bitmap.len() as u64) < sb.rextents.div_ceil(32) * 4 {
             self.find(
                 Code::RtBitmap,
                 None,
                 Some(sb.rbmino),
                 format!(
-                    "the realtime bitmap holds {} bytes, too few for {rextents} extents",
-                    bitmap.len()
+                    "the realtime bitmap holds {} bytes, too few for {} extents",
+                    bitmap.len(),
+                    sb.rextents
                 ),
             );
             return;
         }
+        // Bounded now by bytes the bitmap really holds.
+        let rextents = sb.rextents as usize;
+
+        // What files map, in realtime extents, sorted by where it starts.
+        let mut ranges: Vec<(u64, u64, u64)> = self
+            .rt_used
+            .iter()
+            .map(|&(start, len, ino)| (start / rextsize, (start + len - 1) / rextsize + 1, ino))
+            .collect();
+        ranges.sort_unstable();
+        // A range that starts before another file's range has ended shares
+        // extents with it.
+        let mut crossed = Vec::new();
+        let mut reach: Option<(u64, u64)> = None;
+        for &(start, end, ino) in &ranges {
+            if let Some((until, owner)) = reach {
+                if start < until && owner != ino {
+                    crossed.push((start, ino));
+                }
+            }
+            if reach.is_none_or(|(until, _)| end > until) {
+                reach = Some((end, ino));
+            }
+        }
+        for (x, ino) in crossed.into_iter().take(PER_KIND) {
+            self.find(
+                Code::RtCrossLink,
+                None,
+                Some(ino),
+                format!("realtime extent {x} is mapped by inode {ino} and another file"),
+            );
+        }
+
         let free_at = |x: usize| -> bool {
             let w = u32::from_le_bytes(bitmap[x / 32 * 4..x / 32 * 4 + 4].try_into().expect("4"));
             w >> (x % 32) & 1 == 1
         };
+        // The bitmap against the files, extent by extent, each disagreement
+        // reported as a run when it ends, so nothing is kept per extent.
         let mut free_count = 0u64;
-        let (mut marked_free_used, mut marked_used_free) = (Vec::new(), Vec::new());
-        for (x, &mapped_by) in users.iter().enumerate() {
-            let free = free_at(x);
-            if free {
-                free_count += 1;
-            }
-            match (free, mapped_by > 0) {
-                (true, true) => marked_free_used.push(x as u64),
-                (false, false) => marked_used_free.push(x as u64),
-                _ => {}
-            }
-        }
-        for (blocks, words) in [
-            (
-                marked_free_used,
-                "are free in the realtime bitmap and mapped by a file",
-            ),
-            (
-                marked_used_free,
-                "are in use in the realtime bitmap and mapped by nothing",
-            ),
-        ] {
-            for (start, len) in extent_runs(&blocks) {
-                self.find(
-                    Code::RtBitmap,
-                    None,
-                    None,
-                    format!("realtime extents {start}..{} {words}", start + len),
-                );
+        let mut next = 0;
+        let mut mapped_to = 0u64;
+        let mut open: [Option<(u64, u64)>; 2] = [None, None];
+        let words = [
+            "are free in the realtime bitmap and mapped by a file",
+            "are in use in the realtime bitmap and mapped by nothing",
+        ];
+        for x in 0..=rextents {
+            let wrong = if x < rextents {
+                while next < ranges.len() && ranges[next].0 <= x as u64 {
+                    mapped_to = mapped_to.max(ranges[next].1);
+                    next += 1;
+                }
+                let free = free_at(x);
+                if free {
+                    free_count += 1;
+                }
+                match (free, (x as u64) < mapped_to) {
+                    (true, true) => Some(0),
+                    (false, false) => Some(1),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            for kind in 0..2 {
+                match open[kind] {
+                    Some((start, len)) if wrong == Some(kind) && start + len == x as u64 => {
+                        open[kind] = Some((start, len + 1));
+                    }
+                    Some((start, len)) => {
+                        self.find(
+                            Code::RtBitmap,
+                            None,
+                            None,
+                            format!("realtime extents {start}..{} {}", start + len, words[kind]),
+                        );
+                        open[kind] = (wrong == Some(kind)).then_some((x as u64, 1));
+                    }
+                    None if wrong == Some(kind) => open[kind] = Some((x as u64, 1)),
+                    None => {}
+                }
             }
         }
         if !self.report.dirty && free_count != sb.frextents {
