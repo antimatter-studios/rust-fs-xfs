@@ -810,6 +810,52 @@ pub mod scratch {
         format!("/share/{}", under.display())
     }
 
+    /// Where [`copy_sparsely`] puts what it read: a file, or in a test
+    /// something that counts.
+    pub trait WriteAt {
+        fn write_at(&mut self, bytes: &[u8], at: u64) -> std::io::Result<()>;
+    }
+
+    impl WriteAt for std::fs::File {
+        fn write_at(&mut self, bytes: &[u8], at: u64) -> std::io::Result<()> {
+            std::os::unix::fs::FileExt::write_all_at(self, bytes, at)
+        }
+    }
+
+    /// Copy `source` to `dest`, leaving holes where it has them (#454).
+    ///
+    /// Not `std::fs::copy`: where it cannot share extents it writes every
+    /// zero, and a fixture is 400 MiB of image around a few MiB of
+    /// metadata. Over the guest's 9p share that cost 28 seconds a copy.
+    pub fn sparse_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
+        let from = std::fs::File::open(source)?;
+        let len = from.metadata()?.len();
+        let mut to = std::fs::File::create(dest)?;
+        to.set_len(len)?;
+        copy_sparsely(from, len, &mut to)
+    }
+
+    /// The `len` bytes of `from` into `to`, which already reads as zeros
+    /// that long: read in 64 KiB pieces, and write only the pieces holding
+    /// something.
+    pub fn copy_sparsely(
+        mut from: impl std::io::Read,
+        len: u64,
+        to: &mut impl WriteAt,
+    ) -> std::io::Result<()> {
+        let mut piece = vec![0u8; 64 << 10];
+        let mut at = 0u64;
+        while at < len {
+            let want = piece.len().min((len - at) as usize);
+            from.read_exact(&mut piece[..want])?;
+            if piece[..want].iter().any(|&b| b != 0) {
+                to.write_at(&piece[..want], at)?;
+            }
+            at += want as u64;
+        }
+        Ok(())
+    }
+
     /// A scratch volume, removed when this is dropped.
     pub struct Volume {
         path: PathBuf,
@@ -828,7 +874,7 @@ pub mod scratch {
                 source.display()
             );
             let path = dir(suite).join(name);
-            std::fs::copy(source, &path).unwrap_or_else(|e| {
+            sparse_copy(source, &path).unwrap_or_else(|e| {
                 panic!("copying {} to {}: {e}", source.display(), path.display())
             });
             Volume {
