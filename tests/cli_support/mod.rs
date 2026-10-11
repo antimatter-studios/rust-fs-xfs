@@ -42,8 +42,37 @@ pub fn tool(name: &str) -> Command {
 }
 
 /// A fresh directory for one test's scratch files, under the temporary
-/// directory scripts/with-test-temp.sh chose (inside the checkout).
-pub fn scratch_dir(tag: &str) -> PathBuf {
+/// directory: the one scripts/with-test-temp.sh chose inside the checkout
+/// under `chore`, the system's otherwise.
+///
+/// REMOVED WHEN THE TEST IS DONE (#447), pass or fail: the guard deletes
+/// it on drop, unwinding included. Under `chore` the tier's directory went
+/// anyway; a suite run straight through `cargo test` left every case's
+/// volume in the system temp directory, 3.7 GB of them in one session.
+/// It has no `Deref` on purpose: `scratch_dir(..).join(name)` would drop
+/// the guard at the end of that expression and delete the directory
+/// before it was used, so a caller keeps the guard and asks for
+/// [`Scratch::path`].
+pub fn scratch_dir(tag: &str) -> Scratch {
+    Scratch(fresh_dir(tag))
+}
+
+/// A test's scratch directory, removed with this.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fresh_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("cli-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
@@ -56,7 +85,9 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
 pub fn names_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = scratch_dir("names");
+        // Kept for the whole run in a static that is never dropped: a few
+        // symlinks to the build, not volumes.
+        let dir = fresh_dir("names");
         let mut names = dotted_names();
         names.push("rust-fs-xfs".to_string());
         for name in names {
