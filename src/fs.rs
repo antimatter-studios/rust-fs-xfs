@@ -1614,15 +1614,25 @@ impl Filesystem {
                 let mut block = vec![0u8; dir_block_size];
                 self.device.read_at(self.block_offset(phys), &mut block)?;
 
-                // A block in the data region may still be free space
-                // rather than entries. parse_data_block rejects those by
-                // magic, and that rejection is not fatal to the listing.
+                // EVERY MAPPED BLOCK HERE HOLDS ENTRIES (#438). XFS leaves a
+                // directory's free space unmapped: a data block that empties
+                // is given back, and an empty one still parses, as a header
+                // and one free record. So one that does not parse is
+                // damage, and skipping it as free space dropped its names
+                // from the listing without a word.
                 //
-                // ONE WHOSE MAGIC SAYS IT HOLDS ENTRIES IS VERIFIED FIRST
-                // (#287): its checksum, the address it records, the UUID
-                // and the directory that owns it. Listing it unchecked
-                // reported a directory the kernel refuses as corrupt.
-                if let Ok(entries) = dir::parse_data_block(&block, &self.sb) {
+                // IT IS VERIFIED FIRST (#287): its checksum, the address it
+                // records, the UUID and the directory that owns it. Listing
+                // it unchecked reported a directory the kernel refuses as
+                // corrupt.
+                {
+                    let entries = dir::parse_data_block(&block, &self.sb).map_err(|why| {
+                        Error::BadSuperblock(format!(
+                            "directory inode {}: the data block at file block {file_block} \
+                             does not parse: {why}",
+                            inode.ino
+                        ))
+                    })?;
                     self.verify_dir_block(&block, phys, inode.ino)?;
                     // Block and leaf formats store `.` and `..` as real
                     // entries; short form keeps the parent in its header
