@@ -550,9 +550,14 @@ tasks:
     # the task that provides them, rather than letting several hundred
     # tests each fail on the same missing image.
     #
-    # test:oracle and test:kernel run before the whole suite, which runs
-    # those tests again: the price (a few minutes) of their evidence being
-    # in every log, and of `test` staying plainly "everything".
+    # test:oracle and test:kernel run before the release pass, which runs
+    # what they did not: the unit suites again in release, and the fixture
+    # readers (`scripts/test-targets.sh rest`). It used to be the whole
+    # suite and run every oracle and kernel suite a second time, both
+    # times in release: about 20 of an x86_64 job's 55 minutes, and paid
+    # again by the merge queue's run (#437). Every suite still runs once
+    # in `test`; the in-guest suite (scripts/guest-suite.sh) still runs
+    # `all`, because it is the only pass there.
     #
     # MEASURED in run 35435470063 on 2026-09-19 (job 105877826105): the
     # release pass printed 1,656 lines / 122,595 bytes; budget half as
@@ -567,6 +572,11 @@ tasks:
     # with the attribute-write oracles in the suite: every test passed and
     # the release pass printed 2,374 lines / 187,377 bytes; half as much
     # again is 3,561 lines / 282,000 bytes.
+    # MEASURED once the pass ran only the rest (#437), in run 38127233977
+    # on 2026-10-11 (job 114435727147): 1,540 lines / 97,977 bytes, every
+    # test passing, and the x86_64 job took 47 minutes where #449's, the
+    # run before, took 96. Half as much again is 2,310 lines / 147,000
+    # bytes.
     timeout: 120m
     on_timeout:
       - cmd: 'echo "timeout: reclaiming the harness VM (spent $TIMEOUT)"'
@@ -579,7 +589,7 @@ tasks:
       - task: test:oracle
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 3561 282000 -- scripts/ci-test.sh $(scripts/test-targets.sh all)'
+      - 'CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh "test:native (the rest, release)" suite 2310 147000 -- scripts/ci-test.sh $(scripts/test-targets.sh rest)'
       - task: test:scripts
       # The command-line tools, built and staged the way an install lays
       # them out, then tested as installed: found on PATH, doctor first.
