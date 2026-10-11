@@ -186,6 +186,15 @@ never does.
   `read_file` counts the realtime section only when a realtime device is
   attached.
 
+- **A lookup through a looping directory index stops instead of spinning
+  (#443).** The node descent followed a child whatever its level, so a node
+  naming itself as a child was followed forever, and the leaf chain followed
+  forward pointers with no end, so two leaves naming each other did the
+  same. Each step down now has to reach a node one level lower (or a leaf
+  under level 1), the chain reads no leaf twice, and either corruption is
+  reported as one. A lookup through such a directory, on a read-only mount,
+  used to hang the caller.
+
 - **Creates past one block of inode tree (#423).** A create that made an inode
   chunk and grew the group's inode tree in one record logged the group's
   free-space header twice. One copy came from the allocator and one from the

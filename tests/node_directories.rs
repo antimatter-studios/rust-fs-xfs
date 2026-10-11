@@ -325,3 +325,126 @@ fn a_link_or_a_move_reads_no_more_in_a_directory_four_times_the_size() {
         "(names, bytes one link reads, bytes one move reads): {cost:?}"
     );
 }
+
+/// Push everything the mount logged to its home blocks, then log one more
+/// change, so a later mount replays that record alone and reads the
+/// directory from disk, where a test can damage it (#443).
+fn settle(fs: &Filesystem) {
+    fs.sync().expect("sync");
+    fs.create_file(fs.superblock().rootino, b"settled", 0o100644)
+        .expect("a record after the push");
+}
+
+/// Directory `dir`'s directory block starting at file block `dablk`: each
+/// filesystem block's device offset, and the block's bytes.
+fn dir_block(fs: &Filesystem, dir: u64, dablk: u64) -> (Vec<u64>, Vec<u8>) {
+    let (inode, raw) = fs.read_inode_raw(dir).expect("directory");
+    let extents = fs.data_extents(&inode, &raw).expect("extents");
+    let bs = u64::from(fs.superblock().blocksize);
+    let per = u64::from(fs.superblock().dirblocksize()) / bs;
+    let mut at = Vec::new();
+    let mut bytes = Vec::new();
+    for fb in dablk..dablk + per {
+        let e = extents
+            .iter()
+            .find(|e| e.startoff <= fb && fb < e.startoff + e.blockcount)
+            .expect("mapped");
+        let off = fs
+            .superblock()
+            .fsblock_offset(e.startblock + (fb - e.startoff));
+        let mut b = vec![0u8; bs as usize];
+        fs.device().read_at(off, &mut b).expect("read");
+        at.push(off);
+        bytes.extend_from_slice(&b);
+    }
+    (at, bytes)
+}
+
+fn put_dir_block(dev: &Sparse, at: &[u64], mut bytes: Vec<u8>) {
+    fs_xfs::group_write::restamp_crc(&mut bytes, 12);
+    let bs = bytes.len() / at.len();
+    for (i, off) in at.iter().enumerate() {
+        dev.write_at(*off, &bytes[i * bs..(i + 1) * bs])
+            .expect("write");
+    }
+}
+
+/// `lookup_path(path)` on a fresh read-only mount, given 20 seconds.
+fn looked_up(dev: &Arc<Sparse>, path: String) -> Result<String, &'static str> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dev = dev.clone();
+    std::thread::spawn(move || {
+        let fs = Filesystem::mount(dev as Arc<dyn BlockRead>).expect("mount");
+        let _ = tx.send(format!("{:?}", fs.lookup_path(&path).map(|i| i.ino)));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .map_err(|_| "no answer in 20 seconds: the lookup is looping")
+}
+
+const NODE_HDR: usize = 64;
+const LEAF_HDR: usize = 64;
+
+#[test]
+fn a_node_that_names_itself_as_its_child_is_refused_not_followed() {
+    let (fs, dev) = mounted_on();
+    let (dir, file) = dir_and_file(&fs);
+    grow(&fs, dir, file, 4000);
+    settle(&fs);
+    let bs = u64::from(fs.superblock().blocksize);
+    let root = (1u64 << 35) / bs;
+    let (at, mut block) = dir_block(&fs, dir, root);
+    drop(fs);
+    assert_eq!(u16::from_be_bytes([block[8], block[9]]), NODE, "not a node");
+    let count = usize::from(u16::from_be_bytes([block[56], block[57]]));
+    for i in 0..count {
+        let before = NODE_HDR + i * 8 + 4;
+        block[before..before + 4].copy_from_slice(&(root as u32).to_be_bytes());
+    }
+    put_dir_block(&dev, &at, block);
+    let got = looked_up(&dev, format!("/d/{}", String::from_utf8_lossy(&name(7))));
+    assert!(
+        matches!(&got, Ok(r) if r.starts_with("Err")),
+        "a node naming itself must be refused: {got:?}"
+    );
+}
+
+#[test]
+fn a_leaf_chain_that_loops_is_refused_not_followed() {
+    let (fs, dev) = mounted_on();
+    let (dir, file) = dir_and_file(&fs);
+    grow(&fs, dir, file, 4000);
+    settle(&fs);
+    let bs = u64::from(fs.superblock().blocksize);
+    let per = u64::from(fs.superblock().dirblocksize()) / bs;
+    let dbs = u64::from(fs.superblock().dirblocksize());
+    let (_, node) = dir_block(&fs, dir, (1u64 << 35) / bs);
+    let first = u64::from(u32::from_be_bytes(
+        node[NODE_HDR + 4..NODE_HDR + 8].try_into().unwrap(),
+    ));
+    let (at, mut leaf) = dir_block(&fs, dir, first);
+    assert_eq!(
+        u16::from_be_bytes([leaf[8], leaf[9]]),
+        LEAFN,
+        "not a node leaf"
+    );
+    let count = usize::from(u16::from_be_bytes([leaf[56], leaf[57]]));
+    let last = LEAF_HDR + (count - 1) * 8;
+    let address = u64::from(u32::from_be_bytes(
+        leaf[last + 4..last + 8].try_into().unwrap(),
+    ));
+    assert_ne!(address, 0, "the leaf's last record is stale");
+    // The name the last record points at, read from its data block: a
+    // lookup of it has to look past this leaf for more of its hash.
+    let (db, offset) = (address * 8 / dbs, (address * 8 % dbs) as usize);
+    let (_, data) = dir_block(&fs, dir, db * per);
+    let len = usize::from(data[offset + 8]);
+    let wanted = String::from_utf8_lossy(&data[offset + 9..offset + 9 + len]).into_owned();
+    drop(fs);
+    leaf[0..4].copy_from_slice(&(first as u32).to_be_bytes());
+    put_dir_block(&dev, &at, leaf);
+    let got = looked_up(&dev, format!("/d/{wanted}"));
+    assert!(
+        matches!(&got, Ok(r) if r.starts_with("Err")),
+        "a leaf whose forward pointer names itself must be refused: {got:?}"
+    );
+}
