@@ -224,10 +224,18 @@ fi
 # path the tool asked to read an image cannot open. That wrapper is what
 # puts TMPDIR inside the checkout, and this used to call cargo directly —
 # which worked only for as long as the tools ran on the host.
+#
+# STREAMED, NOT HELD (#454). The output used to be captured whole and
+# printed once cargo exited, so a run stopped at its time limit -- the
+# in-guest suite, at 150 minutes -- printed nothing at all, and nothing
+# said which suite it had been in or how long each had taken. It goes
+# out as it comes now, and the checks below read the copy kept beside it.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-out=$("$REPO/scripts/with-test-temp.sh" cargo test --locked --release --features cli "$@" -- --nocapture 2>&1) &&
-    status=0 || status=$?
-echo "$out"
+kept=$(mktemp)
+trap 'rm -f "$kept"' EXIT
+"$REPO/scripts/with-test-temp.sh" cargo test --locked --release --features cli "$@" -- --nocapture 2>&1 |
+    tee "$kept" && status=0 || status=${PIPESTATUS[0]}
+out=$(cat "$kept")
 
 if [ "$status" -ne 0 ]; then
     exit "$status"

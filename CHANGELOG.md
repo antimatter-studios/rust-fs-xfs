@@ -184,6 +184,17 @@ never does.
 
 ### Fixed
 
+- **A scratch volume is copied with its holes left as holes (#454).**
+  `scratch::Volume::copy_of` used `std::fs::copy`. Where that cannot share
+  extents it writes every zero of a 400 MiB fixture: 28 seconds a copy over
+  the guest's 9p share, measured, for hundreds of copies, and the in-guest
+  suite reached its 150-minute limit. It now writes only the 64 KiB pieces
+  that hold data.
+- **A test run that is stopped still shows where it got to (#454).**
+  `scripts/ci-test.sh` held the whole of `cargo test`'s output and printed
+  it when cargo exited, so a run stopped at its time limit left nothing. It
+  streams now, and checks the copy it keeps.
+
 - **A claimed realtime section with no device behind it no longer decides
   memory (#444).** `sb_rblocks` is bounded by the realtime device's size only
   when one is given. Without one, the checker kept a byte and an owner per
