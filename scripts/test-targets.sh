@@ -140,6 +140,17 @@ for f in "$REPO"/tests/*.rs; do
         # `chore test:native`'s release pass, and the in-guest suite,
         # which is how a Mac reaches these tests at all.
         all) is_stress "$name" || args+=(--test "$name") ;;
+        # WHAT THE ORACLE AND KERNEL TIERS DID NOT RUN (#437). test:native
+        # runs those two tiers in release and then a release pass of its
+        # own; given `all`, that pass ran every oracle and kernel suite a
+        # second time, most of an hour's job. `rest` is everything else:
+        # the unit suites again in release, and the fixture readers, which
+        # no other tier in test:native runs.
+        rest)
+            if ! is_stress "$name" && ! grep -qE "$TOOL|$KERNEL" <<<"$calls"; then
+                args+=(--test "$name")
+            fi
+            ;;
         oracle)
             if grep -qE "$TOOL" <<<"$calls" &&
                ! grep -qE "$KERNEL" <<<"$calls"; then
@@ -147,10 +158,10 @@ for f in "$REPO"/tests/*.rs; do
             fi
             ;;
         kernel) grep -qE "$KERNEL" <<<"$calls" && args+=(--test "$name") ;;
-        *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|all" >&2; exit 2 ;;
+        *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|rest|all" >&2; exit 2 ;;
     esac
 done
 case "$tier" in
-    unit|all) printf '%s\n' --lib --bins "${args[@]}" ;;
+    unit|rest|all) printf '%s\n' --lib --bins "${args[@]}" ;;
     *) printf '%s\n' "${args[@]}" ;;
 esac
