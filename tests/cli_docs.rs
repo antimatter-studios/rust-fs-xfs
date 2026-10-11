@@ -6,14 +6,13 @@
 mod cli_support;
 
 use cli_support::*;
-use std::path::PathBuf;
 
-fn generated(tag: &str) -> PathBuf {
-    let share = scratch_dir(&format!("docs-{tag}"));
-    let share_arg = share.to_string_lossy().into_owned();
+fn generated(tag: &str) -> Scratch {
+    let scratch = scratch_dir(&format!("docs-{tag}"));
+    let share_arg = scratch.path().to_string_lossy().into_owned();
     ok(entry().args(["generate", "man", &share_arg]));
     ok(entry().args(["generate", "completions", &share_arg]));
-    share
+    scratch
 }
 
 fn section(name: &str) -> u8 {
@@ -26,7 +25,8 @@ fn section(name: &str) -> u8 {
 
 #[test]
 fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
-    let share = generated("man");
+    let scratch = generated("man");
+    let share = scratch.path();
     let mut names = dotted_names();
     names.push("rust-fs-xfs".to_string());
     for name in &names {
@@ -67,7 +67,8 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
 
 #[test]
 fn every_name_has_a_zsh_bash_and_fish_completion() {
-    let share = generated("completions");
+    let scratch = generated("completions");
+    let share = scratch.path();
     let mut names = dotted_names();
     names.push("rust-fs-xfs".to_string());
     for name in &names {

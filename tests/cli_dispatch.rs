@@ -155,7 +155,8 @@ fn a_wrong_command_line_is_a_structured_error_on_stderr_with_status_2() {
 
 #[test]
 fn a_failed_run_is_a_structured_error_on_stderr_with_status_1() {
-    let missing = scratch_dir("failed-run").join("never-created.img");
+    let scratch = scratch_dir("failed-run");
+    let missing = scratch.path().join("never-created.img");
     let missing = missing.to_str().unwrap();
     let out = tool("fs.xfs").args([missing, "get"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -225,9 +226,10 @@ fn doctor_passes_when_every_name_on_path_is_ours() {
 
 #[test]
 fn doctor_names_a_shadowing_program_and_says_which_path_entry_to_move() {
-    let theirs = scratch_dir("foreign");
+    let scratch = scratch_dir("foreign");
+    let theirs = scratch.path();
     impostor(&theirs.join("fs.xfs"), "fs.xfs from somewhere else 1.0");
-    let (code, json) = doctor(&[&theirs, names_dir()]);
+    let (code, json) = doctor(&[theirs, names_dir()]);
     assert_eq!(code, Some(1), "{json}");
     assert!(json.contains("\"ok\": false"), "{json}");
     assert!(json.contains("\"status\": \"foreign\""), "{json}");
@@ -255,7 +257,8 @@ fn doctor_names_a_shadowing_program_and_says_which_path_entry_to_move() {
 
 #[test]
 fn doctor_names_the_homebrew_formula_to_unlink() {
-    let prefix = scratch_dir("brew");
+    let scratch = scratch_dir("brew");
+    let prefix = scratch.path();
     let real = prefix.join("Cellar/some-xfs-tools/2.0.0/bin/fs.xfs");
     impostor(&real, "some-xfs-tools 2.0.0");
     let bin_dir = prefix.join("bin");
@@ -269,8 +272,9 @@ fn doctor_names_the_homebrew_formula_to_unlink() {
 
 #[test]
 fn doctor_reports_a_missing_name_with_how_to_install_it() {
-    let empty = scratch_dir("empty");
-    let (code, json) = doctor(&[&empty]);
+    let scratch = scratch_dir("empty");
+    let empty = scratch.path();
+    let (code, json) = doctor(&[empty]);
     assert_eq!(code, Some(1), "{json}");
     assert!(json.contains("\"status\": \"missing\""), "{json}");
     assert!(json.contains("chore cli:install"), "{json}");
@@ -282,9 +286,10 @@ fn doctor_reports_a_missing_name_with_how_to_install_it() {
 
 #[test]
 fn doctor_reports_our_program_at_another_version_as_stale() {
-    let old = scratch_dir("stale");
+    let scratch = scratch_dir("stale");
+    let old = scratch.path();
     impostor(&old.join("fs.xfs"), &format!("fs.xfs ({CRATE}) 0.0.1"));
-    let (code, json) = doctor(&[&old, names_dir()]);
+    let (code, json) = doctor(&[old, names_dir()]);
     assert_eq!(code, Some(1), "{json}");
     assert!(json.contains("\"status\": \"stale\""), "{json}");
     assert!(
@@ -295,9 +300,10 @@ fn doctor_reports_our_program_at_another_version_as_stale() {
 
 #[test]
 fn doctor_text_is_for_a_person_and_keeps_the_fix() {
-    let theirs = scratch_dir("text");
+    let scratch = scratch_dir("text");
+    let theirs = scratch.path();
     impostor(&theirs.join("fs.xfs"), "something else entirely");
-    let path = std::env::join_paths([theirs.as_path(), names_dir()]).unwrap();
+    let path = std::env::join_paths([theirs, names_dir()]).unwrap();
     let out = entry()
         .args(["doctor", "--text"])
         .env("PATH", path)
@@ -308,4 +314,31 @@ fn doctor_text_is_for_a_person_and_keeps_the_fix() {
     assert!(text.contains("fs.xfs: foreign ("), "{text}");
     assert!(text.contains("  fix: "), "{text}");
     assert!(!text.contains('{'), "{text}");
+}
+
+/// A test's scratch folder goes with the test (#447): outside `chore`, the
+/// system temp directory is where it lands, and nothing else removes it.
+#[test]
+fn a_scratch_folder_is_gone_once_its_test_is_done() {
+    let kept = {
+        let dir = scratch_dir("gone-afterwards");
+        std::fs::write(dir.path().join("volume.img"), b"a volume").unwrap();
+        dir.path().to_path_buf()
+    };
+    assert!(!kept.exists(), "{} was left behind", kept.display());
+
+    // And when the test fails part way.
+    let kept = std::panic::catch_unwind(|| {
+        let dir = scratch_dir("gone-after-a-panic");
+        std::fs::write(dir.path().join("volume.img"), b"a volume").unwrap();
+        std::panic::panic_any(dir.path().to_path_buf());
+    })
+    .unwrap_err()
+    .downcast::<std::path::PathBuf>()
+    .unwrap();
+    assert!(
+        !kept.exists(),
+        "{} was left behind by a failed test",
+        kept.display()
+    );
 }

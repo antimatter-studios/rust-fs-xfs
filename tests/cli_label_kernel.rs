@@ -92,7 +92,8 @@ fn relabel_is_read_everywhere(name: &str, label: &str) {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let path = scratch_dir(&format!("label-{name}-{tag}")).join(name);
+    let scratch = scratch_dir(&format!("label-{name}-{tag}"));
+    let path = scratch.path().join(name);
     std::fs::copy(fixture(name), &path).expect("copy the fixture");
     let image = path.to_str().expect("a UTF-8 scratch path");
 
@@ -135,7 +136,8 @@ fn a_label_of_exactly_twelve_bytes_fills_the_field() {
 }
 
 fn refused_and_unchanged(name: &str, label: &str, says: &str) {
-    let path = scratch_dir(&format!("label-refused-{name}")).join(name);
+    let scratch = scratch_dir(&format!("label-refused-{name}"));
+    let path = scratch.path().join(name);
     std::fs::copy(fixture(name), &path).expect("copy the fixture");
     let before = std::fs::read(&path).unwrap();
     let out = tool("fs.xfs")
