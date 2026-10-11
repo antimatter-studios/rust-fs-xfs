@@ -81,7 +81,6 @@ only.
 | Change timestamps, permissions and ownership | Supported | 0.5.0; pre-1970 times 0.8.0 | | `capi.rs`, `write_oracle.rs` |
 | Write into an empty file, allocating | Supported | 0.5.1 (#32) | | `file_write_replay_oracle.rs` |
 | Write anywhere in a file (`Filesystem::write`): holes given blocks, unwritten extents converted where covered, the file grown past its end, zeros wherever the write does not reach | Experimental: extent-format files whose extents fit in the inode; a hole is placed across free runs and across allocation groups (#388) | Unreleased (#387, #388) | | `write_through_holes.rs`, `write_holes_oracle.rs`, `write_across_groups.rs`, `write_across_groups_oracle.rs` |
-| Extents across allocation groups | Upcoming | | #388 | `crossag_oracle.rs` (freeing only) |
 | Truncate to zero, including a B+tree data fork | Supported | 0.5.1 (#30); bmbt 0.8.0 (#222) | | `truncate_replay_oracle.rs`, `truncate_btree_fork.rs` |
 | Shorten in place, without freeing blocks (C ABI `fs_xfs_truncate`) | Partial: the blocks stay allocated | 0.5.0 | #370 | `capi.rs` |
 | Truncate to any length (`Filesystem::truncate_to`), shorter or longer, freeing the blocks past the new end, cutting a straddling extent, zeroing the last block's tail; an extent B+tree left small enough returned to an inline list; shared blocks kept, and a cut inside one refused | Experimental: a B+tree that would still need a tree after freeing is refused | Unreleased (#370) | | `truncate_to.rs`, `truncate_to_oracle.rs` |
