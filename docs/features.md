@@ -102,6 +102,7 @@ only.
 | Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
 | Log reuse in bounded memory (`sync`); a checkpoint that would leave a gap no pad record fits wraps first | Supported | 0.8.0 (#89); gap fixed Unreleased (#424) | | `log_reuse.rs`, `log_write` unit tests |
 | A checkpoint split across several log records | Supported | 0.8.0 (#216) | | `split_checkpoint.rs` |
+| Clean unmount (`Filesystem::unmount`): metadata pushed home, the lazy summary counters written to the superblock and an unmount record logged, so `xfs_repair -n` grades the volume and the kernel mounts it with no replay | Supported | Unreleased (#453) | | `clean_unmount.rs`, `clean_unmount_oracle.rs` |
 | A checkpoint whose flush fails | Supported: the kernel replays to a consistent volume | 0.8.0 | | `torn_checkpoint_oracle.rs` |
 | Writing after a failed log write or push | Refused (`Error::Io`, EIO): the mount reads and writes nothing more, as the kernel shuts down | Unreleased (#400) | | `log_write_failure.rs`, `torn_checkpoint_oracle.rs` |
 | In-place writes after a mount has logged a change | Refused | 0.8.0 (#186) | | `in_place_after_checkpoint.rs` |

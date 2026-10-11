@@ -243,6 +243,15 @@ pub mod op_header {
     /// filesystem transaction uses it; no other value was observed.
     pub const XFS_TRANSACTION: u8 = 0x69;
 
+    /// `XFS_LOG` — the client id of an operation the log writes for
+    /// itself rather than for a transaction: the unmount record's (#439).
+    pub const XFS_LOG: u8 = 0xaa;
+
+    /// `XLOG_UNMOUNT_TYPE` — the magic of `xfs_unmount_log_format`, the
+    /// unmount operation's eight bytes: this `u16`, then six of padding,
+    /// in the byte order of the machine that wrote them.
+    pub const XLOG_UNMOUNT_TYPE: u16 = 0x556e;
+
     /// Byte offsets within `xlog_op_header`.
     pub mod offsets {
         /// `oh_tid`, `u32` — the transaction this operation belongs to.

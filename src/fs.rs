@@ -429,6 +429,62 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Unmount cleanly: write everything home, put the superblock's
+    /// summary counters right, and end the log with an unmount record
+    /// (#439).
+    ///
+    /// Without it every volume this driver wrote has a dirty log: only a
+    /// mount that replays it sees the writes, `xfs_repair` will not grade
+    /// it, and a writable mount here refuses it. After it the log says
+    /// nothing is outstanding, as the kernel's own unmount leaves it.
+    ///
+    /// # What it does, in order
+    ///
+    /// 1. **Pushes** every buffer and inode the mount logged to its home
+    ///    block ([`Filesystem::sync`]).
+    /// 2. **Counts** the inodes, free inodes and free blocks the groups'
+    ///    headers hold, and writes them into the primary superblock with
+    ///    its checksum. They are lazy on a v5 volume: kept in memory while
+    ///    mounted and written at unmount, so a mount after a clean one
+    ///    trusts them where a mount after a crash recounts them. Free
+    ///    blocks are each group's free blocks, its free list and its
+    ///    B+tree blocks, as the kernel sums them.
+    /// 3. **Logs** one record holding one operation flagged
+    ///    `XLOG_UNMOUNT_TRANS`, its tail the record itself, since nothing
+    ///    before it is still needed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] for a read-only mount, and whatever reading a
+    /// group's headers or writing the device returns. A failure part way
+    /// leaves a log that still needs replay, which is what it was.
+    pub fn unmount(self) -> Result<()> {
+        let device = self.writable_device()?.clone();
+        self.sync()?;
+
+        let (mut icount, mut ifree, mut fdblocks) = (0u64, 0u64, 0u64);
+        for ag in 0..self.sb.agcount {
+            let agi = self.read_agi(ag)?;
+            let agf = self.read_agf(ag)?;
+            icount += u64::from(agi.count);
+            ifree += u64::from(agi.freecount);
+            fdblocks += u64::from(agf.freeblks) + u64::from(agf.flcount) + u64::from(agf.btreeblks);
+        }
+        use crate::superblock::offsets as sbo;
+        let mut sector = vec![0u8; usize::from(self.sb.sectsize)];
+        self.device.read_at(0, &mut sector)?;
+        sector[sbo::ICOUNT..sbo::ICOUNT + 8].copy_from_slice(&icount.to_be_bytes());
+        sector[sbo::IFREE..sbo::IFREE + 8].copy_from_slice(&ifree.to_be_bytes());
+        sector[sbo::FDBLOCKS..sbo::FDBLOCKS + 8].copy_from_slice(&fdblocks.to_be_bytes());
+        crate::group_write::restamp_crc(&mut sector, sbo::CRC);
+        self.or_stop_writing(|| device.write_at(0, &sector).map_err(Error::from))?;
+        self.or_stop_writing(|| device.flush().map_err(Error::from))?;
+
+        self.commit_record(|_| vec![crate::log_write::unmount_op()])?;
+        self.or_stop_writing(|| device.flush().map_err(Error::from))?;
+        Ok(())
+    }
+
     /// Put every buffer a record carried into the overlay, so the next
     /// operation reads them rather than the disk (#89).
     pub(crate) fn logged_buffers(&self, items: &[crate::buf_write::BufferItem]) {

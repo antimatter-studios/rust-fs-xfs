@@ -63,7 +63,10 @@ pub use crate::format::log_items::{
     inode_log_format::{INODE_LOG_FORMAT_SIZE, XFS_ILOG_CORE},
     item_types::XFS_LI_INODE,
     log_dinode::{LOG_DINODE_SIZE, V2_LOG_DINODE_SIZE},
-    op_header::{OP_HEADER_SIZE, XFS_TRANSACTION, XLOG_COMMIT_TRANS, XLOG_START_TRANS},
+    op_header::{
+        OP_HEADER_SIZE, XFS_LOG, XFS_TRANSACTION, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+        XLOG_UNMOUNT_TRANS, XLOG_UNMOUNT_TYPE,
+    },
     trans_header::{TRANS_HEADER_SIZE, XFS_TRANS_HEADER_MAGIC},
 };
 
@@ -185,12 +188,29 @@ pub fn payload(tid: u32, ops: &[Op]) -> Vec<u8> {
     for op in ops {
         out.extend_from_slice(&tid.to_be_bytes());
         out.extend_from_slice(&(op.data.len() as u32).to_be_bytes());
-        out.push(XFS_TRANSACTION);
+        // The unmount operation is the log's own, not a transaction's.
+        out.push(if op.flags & XLOG_UNMOUNT_TRANS != 0 {
+            XFS_LOG
+        } else {
+            XFS_TRANSACTION
+        });
         out.push(op.flags);
         out.extend_from_slice(&[0, 0]); // oh_res2
         out.extend_from_slice(&op.data);
     }
     out
+}
+
+/// The one operation of the record a clean unmount ends the log with
+/// (#439): `xfs_unmount_log_format`, its magic and padding, in this
+/// machine's byte order as every logged item is.
+pub fn unmount_op() -> Op {
+    let mut data = vec![0u8; 8];
+    data[0..2].copy_from_slice(&XLOG_UNMOUNT_TYPE.to_ne_bytes());
+    Op {
+        flags: XLOG_UNMOUNT_TRANS,
+        data,
+    }
 }
 
 /// Where a record is going, and what the log looked like before it.
