@@ -158,6 +158,16 @@ never does.
 
 ### Fixed
 
+- **A claimed realtime section with no device behind it no longer decides
+  memory (#444).** `sb_rblocks` is bounded by the realtime device's size only
+  when one is given. Without one, the checker kept a byte and an owner per
+  claimed realtime extent, and a whole-file read counted the claimed section
+  in its ceiling, so a superblock describing a large realtime section
+  consistently asked for gigabytes and aborted. The checker now reads the
+  bitmap first, bounds the walk by it, and keeps what files map as ranges;
+  `read_file` counts the realtime section only when a realtime device is
+  attached.
+
 - **Creates past one block of inode tree (#423).** A create that made an inode
   chunk and grew the group's inode tree in one record logged the group's
   free-space header twice. One copy came from the allocator and one from the

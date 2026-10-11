@@ -1317,12 +1317,19 @@ impl Filesystem {
     /// this allocation as "capacity overflow", and merely large values
     /// reached it as an abort.
     pub fn read_file(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<u8>> {
-        // The data section and the realtime section together: a realtime
-        // file can be as large as the second.
+        // The data section, and the realtime section when there is a
+        // realtime device to hold it: a realtime file can be as large as the
+        // second. Without one, `sb_rblocks` is bounded by nothing (#444), and
+        // no realtime file's data can be read anyway.
+        let realtime_blocks = if self.realtime.is_some() {
+            self.sb.rblocks
+        } else {
+            0
+        };
         let filesystem_bytes = self
             .sb
             .dblocks
-            .saturating_add(self.sb.rblocks)
+            .saturating_add(realtime_blocks)
             .saturating_mul(u64::from(self.sb.blocksize));
         if inode.size > filesystem_bytes {
             return Err(Error::BadSuperblock(format!(
