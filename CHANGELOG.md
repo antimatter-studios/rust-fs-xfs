@@ -8,6 +8,14 @@ never does.
 
 ### Added
 
+- **A clean unmount (#439).** `Filesystem::unmount` pushes every logged
+  change home, writes the summary counters (`sb_icount`, `sb_ifree`,
+  `sb_fdblocks`) from the group headers into the superblock, and logs an
+  unmount record, so the log is clean. `xfs_repair -n` grades a volume the
+  driver wrote with no kernel replay first, `xfs_logprint` calls its log
+  clean, and the kernel mounts it without recovery
+  (`tests/clean_unmount_oracle.rs`).
+
 - **A crash at any checkpoint of a mount is graded by the kernel (#365).**
   `tests/checkpoint_boundary_crash_oracle.rs` runs create, mkdir, a first
   write, rename, unlink and truncate on one mount, and stops the device at each
