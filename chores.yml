@@ -438,6 +438,24 @@ tasks:
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
       - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
+  test:kernel-new:
+    desc: 'The kernel tier on the Debian 13 guest: kernel 6.12 reads back what 6.1 cannot mount (parent pointers, exchange-range)'
+    # A SECOND GUEST, NOT A SECOND SUITE. Everything else boots Debian 12,
+    # whose 6.1 kernel refuses the parent-pointer and exchange-range bits at
+    # mount, so it can neither replay this driver's log on such a volume nor
+    # read it back. fs-linux-test-harness.debian-13.toml is this repository's
+    # config with its own machine name and SSH port and `[vm] guest =
+    # "debian-13"`; FLTH_CONFIG points the harness at it, and the suites in
+    # scripts/test-targets.sh's NEW_KERNEL_SUITES run there and nowhere else.
+    #
+    # Budget: 53 lines / 1,900 bytes measured with exchange_range_kernel
+    # alone (#374), on an aarch64 Linux host; half as much again, rounded up,
+    # so 80 lines / 3,000 bytes. The floor is 1, the one suite it holds.
+    cmds:
+      - scripts/tools.sh --check
+      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" ../fs-linux-test-harness/scripts/vm.sh up'
+      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" CI_TEST_FLOOR=1 ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 80 3000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel-new)'
+
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
     # scripts/guest-suite.sh, through the harness's [test] guest_command.

@@ -89,6 +89,11 @@ KERNEL='kernel_run\(|guest_script\('
 # actually naming a corpus image, so the list cannot grow a suite that
 # has nothing to do with it.
 STRESS_SUITES="stress_oracle"
+# Suites that need the Debian 13 guest: kernel 6.12 mounts what 6.1 refuses
+# (parent pointers, exchange-range). They are kernel-new's and nobody
+# else's, because every other tier and the whole-suite run boot Debian 12,
+# where they fail at the mount.
+NEW_KERNEL_SUITES="exchange_range_kernel"
 
 tier="${1:-}"
 args=()
@@ -98,6 +103,12 @@ args=()
 # the call around it is what is being read.
 uncommented() {
     grep -vE '^[[:space:]]*//' "$1"
+}
+
+is_new_kernel() {
+    local suite
+    for suite in $NEW_KERNEL_SUITES; do [ "$suite" = "$1" ] && return 0; done
+    return 1
 }
 
 is_stress() {
@@ -139,7 +150,7 @@ for f in "$REPO"/tests/*.rs; do
         # be everything failed on three missing images instead:
         # `chore test:native`'s release pass, and the in-guest suite,
         # which is how a Mac reaches these tests at all.
-        all) is_stress "$name" || args+=(--test "$name") ;;
+        all) is_stress "$name" || is_new_kernel "$name" || args+=(--test "$name") ;;
         # WHAT THE ORACLE AND KERNEL TIERS DID NOT RUN (#437). test:native
         # runs those two tiers in release and then a release pass of its
         # own; given `all`, that pass ran every oracle and kernel suite a
@@ -157,8 +168,13 @@ for f in "$REPO"/tests/*.rs; do
                 args+=(--test "$name")
             fi
             ;;
-        kernel) grep -qE "$KERNEL" <<<"$calls" && args+=(--test "$name") ;;
-        *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|rest|all" >&2; exit 2 ;;
+        kernel)
+            if grep -qE "$KERNEL" <<<"$calls" && ! is_new_kernel "$name"; then
+                args+=(--test "$name")
+            fi
+            ;;
+        kernel-new) is_new_kernel "$name" && args+=(--test "$name") ;;
+        *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|kernel-new|rest|all" >&2; exit 2 ;;
     esac
 done
 case "$tier" in

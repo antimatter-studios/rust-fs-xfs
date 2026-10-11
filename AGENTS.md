@@ -272,9 +272,10 @@ chore test:unit       # no tool, no fixture, no VM — debug profile, overflow c
 chore test:images     # reads a fixture, needs no VM
 chore test:oracle     # the driver writes, xfsprogs reads back
 chore test:kernel     # the driver writes, the real kernel reads back
+chore test:kernel-new # the same on the Debian 13 guest (kernel 6.12), for what 6.1 cannot mount
 chore test:vm         # the whole suite compiled and run inside the guest
 chore test:scripts    # the shell tests, tests/scripts/*.sh, by glob
-chore test            # all of it, exactly as CI runs it
+chore test            # all of it but test:kernel-new, exactly as CI's x86_64 job runs it
 chore lint            # cargo fmt --check and clippy -D warnings, as CI runs them
 ```
 

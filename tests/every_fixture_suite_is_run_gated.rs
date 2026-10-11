@@ -43,7 +43,7 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-const TIERS: [&str; 5] = ["unit", "images", "stress", "oracle", "kernel"];
+const TIERS: [&str; 6] = ["unit", "images", "stress", "oracle", "kernel", "kernel-new"];
 
 /// The suites `scripts/test-targets.sh` puts in `tier`.
 fn tier_members(tier: &str) -> BTreeSet<String> {
@@ -224,7 +224,7 @@ fn every_tier_runs_through_the_skip_and_floor_gate() {
     // going through scripts/ci-test.sh would take its whole set of
     // suites out of the skip gate at once.
     let mut ungated = Vec::new();
-    for tier in ["images", "stress", "oracle", "kernel"] {
+    for tier in ["images", "stress", "oracle", "kernel", "kernel-new"] {
         let marker = format!("$(scripts/test-targets.sh {tier})");
         let line = chores
             .lines()
