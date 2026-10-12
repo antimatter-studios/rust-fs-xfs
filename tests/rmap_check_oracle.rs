@@ -14,7 +14,10 @@
 //!   blocks;
 //! - **missing**: the record is shortened by a block, which the file still
 //!   owns;
-//! - **stale**: the record is moved onto free space.
+//! - **stale**: the record is moved onto free space;
+//! - **duplicate**: the leaf's last record is written again after it, so
+//!   the same owner of its blocks is recorded twice and no block goes
+//!   unrecorded (#433).
 //!
 //! `xfs_repair -n` must find each one, or the case is not damage and the
 //! test says so; then `fsck.xfs` must exit 4 and report the code.
@@ -135,7 +138,8 @@ fn damaged(source: &scratch::Volume, name: &str, commands: &[String]) -> scratch
     copy
 }
 
-fn assert_found(name: &str, volume: &scratch::Volume, code: &str) {
+/// What `fsck.xfs --text` said, once it has reported `code`.
+fn assert_found(name: &str, volume: &scratch::Volume, code: &str) -> String {
     let image = volume.path().to_str().unwrap();
     let repair = oracle("xfs_repair").args(["-n", image]).output();
     let report = repair.repair_report();
@@ -157,6 +161,7 @@ fn assert_found(name: &str, volume: &scratch::Volume, code: &str) {
         text.contains(&format!(": {code}: ")),
         "{name}: fsck.xfs did not report {code}; xfs_repair -n said:\n{report}\nfsck.xfs said:\n{text}"
     );
+    text
 }
 
 /// The file record to damage: a data extent of more than one block.
@@ -228,6 +233,47 @@ fn a_record_moved_onto_free_space_is_found() {
         ],
     );
     assert_found("record moved onto free space", &volume, "rmap.stale");
+}
+
+#[test]
+fn a_record_written_twice_is_found() {
+    let source = rmap_volume("duplicate");
+    let image = source.path().to_str().unwrap();
+    // `recs[1-N] = [startblock,blockcount,owner,...] 1:[...] ... N:[...]`:
+    // every field of the last record, by the names `xfs_db` gives them.
+    let shown = oracle("xfs_db")
+        .args(["-r", "-c", "agf 0", "-c", "addr rmaproot", "-c", "p recs"])
+        .arg(image)
+        .output();
+    let mut items = shown.stdout.split_whitespace();
+    let names: Vec<&str> = items
+        .find(|i| i.starts_with('['))
+        .expect("xfs_db printed no record fields")
+        .trim_matches(['[', ']'])
+        .split(',')
+        .collect();
+    let (n, values) = items
+        .filter_map(|i| i.split_once(":["))
+        .next_back()
+        .expect("xfs_db printed no records");
+    let n: usize = n.parse().expect("record number");
+    let values: Vec<&str> = values.trim_end_matches(']').split(',').collect();
+    assert_eq!(names.len(), values.len(), "{}", shown.stdout);
+    assert_eq!(n, records(image).len(), "{}", shown.stdout);
+    // One record more, the same as the last: the keys stay in order and
+    // every block the volume owns is still recorded exactly as it was.
+    let mut commands = vec![format!("write -d numrecs {}", n + 1)];
+    for (name, value) in names.iter().zip(&values) {
+        commands.push(format!("write -d recs[{}].{name} {value}", n + 1));
+    }
+    let volume = damaged(&source, "duplicate", &commands);
+    let text = assert_found("record written twice", &volume, "rmap.duplicate");
+    for other in ["rmap.missing", "rmap.stale", "rmap.owner"] {
+        assert!(
+            !text.contains(&format!(": {other}: ")),
+            "a duplicated record also reports {other}, so it is not only a duplicate:\n{text}"
+        );
+    }
 }
 
 /// The number `xfs_db -r` prints for the last of `commands`.

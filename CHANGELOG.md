@@ -144,6 +144,17 @@ never does.
   name and value bytes, support size queries and create/replace flags,
   distinguish missing attributes from missing paths, and reject small buffers
   without partially filling them.
+
+- **Every checker code is checked against `xfs_repair -n` (#364).** One damage
+  per code that had none, 28 in all. Each is damage `xfs_repair -n` finds, and
+  `fsck.xfs` must report the code and never call the volume clean.
+  `docs/fsck-output.md` gains a damage-coverage table. It names each code's
+  case, or why it has none (the planner's warnings and a replayed log), and a
+  contract test fails a code added without one.
+- **`rmap.duplicate` has a damage case (#433).** A copy of the reverse-mapping
+  leaf's last record written after it: `xfs_repair -n` finds it, `fsck.xfs`
+  reports the duplicate and no missing, stale or wrong-owner record.
+
 - **`docs/features.md`, a features page kept current by every pull request.**
   Each feature's state, the release it shipped in, its tracking issue and the
   test that checks it. The README's status table, which still said a mount
@@ -244,6 +255,14 @@ never does.
   into the inode as it was. The log carries it in its in-memory shape, with
   the pointers straight after the keys, and it is now converted as
   `xfs_bmbt_to_bmdr` converts it.
+
+- **A directory data block that does not parse is `dir.unreadable` (#364).**
+  The check listed a directory through the reader, which passes over a block
+  whose magic is not a data block's. So a directory missing a block read as a
+  clean one, its names reported only as unreached inodes. XFS leaves a
+  directory's free space unmapped, so every mapped data-region block must parse,
+  and one that does not now stops the walk as `dir.unreadable`. `xfs_repair -n`
+  agreed in the per-code oracle.
 
 - **A mount writes nothing after a failed log write (#400).** A record whose
   write or flush failed may be on the device whole, in part or not at all, and
