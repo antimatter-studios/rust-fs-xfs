@@ -648,13 +648,10 @@ fn the_label_is_set_before_anything_is_logged_and_refused_after() {
     unsafe { fs_xfs_umount(fs) };
 
     let again = mount_rw(&dev);
-    let name = volume_info(again).volume_name;
-    let name: Vec<u8> = name
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    assert_eq!(name, b"NEWNAME");
+    let info = volume_info(again);
+    // c_char is i8 on Darwin and u8 on aarch64 Linux; CStr reads either.
+    let name = unsafe { std::ffi::CStr::from_ptr(info.volume_name.as_ptr()) };
+    assert_eq!(name.to_bytes(), b"NEWNAME");
     unsafe { fs_xfs_umount(again) };
 
     let handle = FsCoreDevice::into_handle(read_only_copy(&dev) as Arc<dyn BlockDevice>);
