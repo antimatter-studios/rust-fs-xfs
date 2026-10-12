@@ -75,6 +75,11 @@ fn a_volume_changed_through_the_c_abi_is_clean_and_reads_back_in_the_kernel() {
         assert!(!fs.is_null(), "mount: errno {}", fs_xfs_last_errno());
 
         unsafe {
+            // In place, so before anything is logged.
+            ok(
+                fs_xfs_set_label(fs, c("CAPILABEL").as_ptr()).into(),
+                "set the label",
+            );
             made(fs_xfs_mkdir(fs, c("/dir").as_ptr(), 0o755), "mkdir /dir");
             made(fs_xfs_create(fs, c("/dir/file").as_ptr(), 0o644), "create");
             let pattern: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
@@ -221,6 +226,12 @@ fn a_volume_changed_through_the_c_abi_is_clean_and_reads_back_in_the_kernel() {
     repair::assert_agreed(
         &report.repair_report(),
         "a volume changed through the C ABI and released with fs_xfs_umount",
+    );
+    let label = oracle("xfs_db").args(["-r", "-c", "label", path]).output();
+    assert!(
+        label.stdout.contains("label = \"CAPILABEL\""),
+        "xfs_db does not read the label set through the C ABI:\n{}",
+        label.stdout
     );
     let log = oracle("xfs_logprint").args(["-t", path]).output();
     assert!(

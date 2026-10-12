@@ -622,6 +622,52 @@ fn a_released_writable_handle_leaves_a_volume_a_writable_mount_takes() {
     assert!(!again.was_replayed());
 }
 
+fn set_label(fs: *mut fs_xfs_fs, label: &str) -> i32 {
+    let l = c(label);
+    unsafe { fs_xfs_set_label(fs, l.as_ptr()) }
+}
+
+/// The label is written in place, so it is set before the handle logs
+/// anything and refused after; the next mount reads it.
+#[test]
+fn the_label_is_set_before_anything_is_logged_and_refused_after() {
+    let dev = formatted();
+    let fs = mount_rw(&dev);
+    assert_eq!(set_label(fs, "NEWNAME"), 0, "errno {}", fs_xfs_last_errno());
+    assert_errno(
+        set_label(fs, "THIRTEENCHARS").into(),
+        ENAMETOOLONG,
+        "a 13-byte label",
+    );
+    assert_ne!(create(fs, "/f", 0o644), 0);
+    assert_errno(
+        set_label(fs, "LATER").into(),
+        ENOTSUP,
+        "a label after a logged change",
+    );
+    unsafe { fs_xfs_umount(fs) };
+
+    let again = mount_rw(&dev);
+    let name = volume_info(again).volume_name;
+    let name: Vec<u8> = name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    assert_eq!(name, b"NEWNAME");
+    unsafe { fs_xfs_umount(again) };
+
+    let handle = FsCoreDevice::into_handle(read_only_copy(&dev) as Arc<dyn BlockDevice>);
+    let ro = unsafe { fs_xfs_mount_with_fs_core_device(handle) };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+    assert_errno(
+        set_label(ro, "RO").into(),
+        EROFS,
+        "a label on a read-only handle",
+    );
+    unsafe { fs_xfs_umount(ro) };
+}
+
 fn volume_info(fs: *mut fs_xfs_fs) -> fs_xfs_volume_info_t {
     let mut out = std::mem::MaybeUninit::<fs_xfs_volume_info_t>::zeroed();
     assert_eq!(unsafe { fs_xfs_get_volume_info(fs, out.as_mut_ptr()) }, 0);

@@ -1339,6 +1339,43 @@ pub unsafe extern "C" fn fs_xfs_rename2(
     })
 }
 
+/// Set the volume label: `sb_fname` in every group's superblock
+/// ([`Filesystem::set_label`]).
+///
+/// The label is written in place, as the reference tool writes it, so it
+/// must come before the handle logs any change: afterwards a replay of
+/// those records would write over it, and the call is refused with
+/// ENOTSUP. ENAMETOOLONG for a label over 12 bytes, EINVAL for one that
+/// is not UTF-8, EROFS for a read-only handle. [`fs_xfs_get_volume_info`]
+/// reports the old label until the volume is mounted again.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `label` NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_set_label(fs: *mut fs_xfs_fs, label: *const c_char) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return -1;
+        };
+        let Some(bytes) = (unsafe { borrow_bytes(label, "label") }) else {
+            return -1;
+        };
+        let Ok(label) = std::str::from_utf8(bytes) else {
+            set_error("the label is not UTF-8".into(), libc_einval());
+            return -1;
+        };
+        if label.len() > crate::superblock::offsets::FNAME_LEN {
+            set_error(
+                format!("a label of {} bytes; the longest is 12", label.len()),
+                libc_enametoolong(),
+            );
+            return -1;
+        }
+        done(fs.set_label(label))
+    })
+}
+
 /// A writable handle's filesystem, or NULL and EROFS / EINVAL recorded.
 ///
 /// Every mutating entry point asks this first, so a read-only handle

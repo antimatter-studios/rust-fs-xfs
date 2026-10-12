@@ -14,8 +14,9 @@ never does.
   `fs_xfs_create`, `fs_xfs_mkdir`, `fs_xfs_unlink`, `fs_xfs_rmdir`,
   `fs_xfs_link`, `fs_xfs_rename` and `fs_xfs_rename2` (with
   `FS_XFS_RENAME_REPLACE` for `rename(2)`'s replace) change the namespace,
-  each refusal by the errno its POSIX call gives; and `fs_xfs_flush` writes
-  what the handle has logged home. `fs_xfs_umount` unmounts a writable
+  each refusal by the errno its POSIX call gives; `fs_xfs_flush` writes
+  what the handle has logged home; and `fs_xfs_set_label` sets the volume
+  label, before the handle has logged anything. `fs_xfs_umount` unmounts a writable
   handle cleanly, so the volume it leaves needs no replay and a writable
   mount takes it again; before, it was dropped with its log still dirty.
   `tests/capi_write_ops_oracle.rs` has `xfs_repair -n`, `xfs_logprint` and
