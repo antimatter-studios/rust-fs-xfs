@@ -227,58 +227,142 @@ int fs_xfs_readlink(fs_xfs_fs_t *fs, const char *path,
 /* ---- writing ---- */
 
 /*
- * Every function below needs a handle from fs_xfs_mount_rw. One from
- * fs_xfs_mount refuses with EROFS, so a volume cannot be written to by
- * accident: the decision is made once, when it is opened.
+ * Every function below needs a handle from fs_xfs_mount_rw or
+ * fs_xfs_mount_rw_with_fs_core_device. One from a read-only mount refuses
+ * with EROFS, so a volume cannot be written to by accident: the decision
+ * is made once, when it is opened.
  *
- * What can be written is bounded by this driver having no journal. XFS
- * records metadata changes in a log so that a change spanning several
- * structures either happens completely or not at all; without one, only
- * changes that span a single structure are safe. That covers rewriting
- * bytes that already exist, changing an inode's own fields, and
- * shortening a file. It does not cover anything that allocates or frees
- * blocks, or that touches a directory.
+ * Writing is v5 only, and goes through the log: each operation is one
+ * record (two where noted), which a mount after a crash replays whole or
+ * not at all. On v4 only bytes that already exist can be rewritten and a
+ * file shortened, in place. A shape the driver does not write is refused
+ * with ENOTSUP before anything is written, rather than approximated.
  *
- * Everything outside that boundary is refused with ENOTSUP rather than
- * approximated.
+ * Release a writable handle with fs_xfs_umount: it writes everything home
+ * and ends the log with an unmount record. A handle that is never
+ * released leaves a log that needs replay, and a writable mount refuses
+ * such a volume.
  */
 
 /*
  * Mount for reading and writing. Returns NULL if the device cannot be
- * written, if the volume's log holds unapplied records, or for any
- * reason fs_xfs_mount would.
+ * written (EROFS), if the volume's log holds unapplied records, or for
+ * any reason fs_xfs_mount would.
  */
 fs_xfs_fs_t *fs_xfs_mount_rw(const char *device_path);
+
+/*
+ * fs_xfs_mount_rw over an existing fs_core device: how a caller mounts a
+ * device it reaches through callbacks or a partition slice for writing.
+ * The handle keeps its own reference to the device, so `handle` may be
+ * closed once this returns. NULL on failure, as fs_xfs_mount_rw.
+ */
+fs_xfs_fs_t *fs_xfs_mount_rw_with_fs_core_device(struct FsCoreDevice *handle);
 
 /* Whether this handle can write. Ask rather than discover. */
 int fs_xfs_is_writable(fs_xfs_fs_t *fs);
 
 /*
- * Overwrite `length` bytes of an existing file at `offset`. Returns the
- * number written, or -1.
+ * Write everything this handle has logged to its home on the device, so
+ * the log holds nothing the disk does not. Returns 0 or -1. The handle
+ * stays mounted; fs_xfs_umount does this and more.
+ */
+int fs_xfs_flush(fs_xfs_fs_t *fs);
+
+/*
+ * Write `length` bytes into a file at `offset`. Returns the number
+ * written, or -1. The whole range is written or none of it is.
  *
- * The whole range is written or none of it is. Only bytes that already
- * exist can be rewritten: writing past the end of the file, into a hole,
- * or into an extent allocated but never written is refused with ENOTSUP,
- * because each would change metadata.
+ * A hole is given blocks, an unwritten extent becomes written where the
+ * range covers it, and a range ending past the end of the file grows it;
+ * what the range does not reach reads as zeros. The modification and
+ * inode-change times become the time now. A file whose extents are in a
+ * B+tree, and any file on v4, can only have bytes it already holds
+ * rewritten, in place, before the mount has logged anything; anything
+ * else there is ENOTSUP. A directory is EISDIR.
  */
 int64_t fs_xfs_write_file(fs_xfs_fs_t *fs, const char *path,
                           const void *buf, uint64_t offset, uint64_t length);
 
 /*
- * Shorten a file to `new_size`. Returns 0 or -1. Growing is refused with
- * ENOTSUP: it needs blocks that are not allocated.
+ * Set a file's size to `new_size`, shorter or longer. Returns 0 or -1.
  *
- * The file's blocks are NOT released — freeing them is allocation work
- * that needs a journal — so a shortened file still occupies what it did.
+ * Blocks wholly past the new end are freed, the last block's bytes past
+ * it are zeroed, and a longer size reads as zeros. An extent B+tree that
+ * would still need a tree, and any file on v4, can only be shortened, in
+ * place and keeping its blocks, before the mount has logged anything;
+ * anything else there is ENOTSUP. A directory is EISDIR.
  *
- * `mtime_sec` sets the modification and inode-change times; pass
- * FS_XFS_LEAVE_TIME to leave both alone. A NEGATIVE mtime_sec is a date
- * before 1970 and is applied -- it used to mean "leave alone", which
- * made those dates unreachable through this ABI.
+ * `mtime_sec` sets the modification and inode-change times, in a second
+ * record; pass FS_XFS_LEAVE_TIME for the time now when the size changes
+ * and nothing when it does not. A NEGATIVE mtime_sec is a date before
+ * 1970 and is applied -- it used to mean "leave alone", which made those
+ * dates unreachable through this ABI.
  */
 int fs_xfs_truncate(fs_xfs_fs_t *fs, const char *path, uint64_t new_size,
                     int64_t mtime_sec, uint32_t mtime_nsec);
+
+/*
+ * Create an empty regular file, or directory, at `path` with permission
+ * bits `mode` (0644, 0755). Returns the new inode number, or 0 on
+ * failure -- 0 is never an XFS inode. A mode carrying the matching type
+ * bits is accepted, another type's is ENOTSUP. The new inode is owned by
+ * uid 0 and gid 0; fs_xfs_set_attributes changes that. A parent with a
+ * default ACL passes it on, narrowed by `mode`. A new directory has two
+ * links and its parent gains one.
+ *
+ * EEXIST when the name is taken or `path` is the root, ENOENT when the
+ * parent is missing, ENOTDIR when it is not a directory, ENAMETOOLONG for
+ * a name over 255 bytes.
+ */
+uint64_t fs_xfs_create(fs_xfs_fs_t *fs, const char *path, uint16_t mode);
+uint64_t fs_xfs_mkdir(fs_xfs_fs_t *fs, const char *path, uint16_t mode);
+
+/*
+ * Remove the name `path` of a file or symlink; the inode and its blocks
+ * are freed with its last name. Returns 0 or -1. EISDIR for a directory
+ * (fs_xfs_rmdir removes one), ENOENT when nothing is there, EINVAL for
+ * the root, "." or "..".
+ */
+int fs_xfs_unlink(fs_xfs_fs_t *fs, const char *path);
+
+/*
+ * Remove the empty directory `path`; its parent loses a link. Returns 0
+ * or -1. ENOTEMPTY when it holds a name, ENOTDIR when it is not a
+ * directory, ENOENT when nothing is there, EINVAL for the root, "." or
+ * "..".
+ */
+int fs_xfs_rmdir(fs_xfs_fs_t *fs, const char *path);
+
+/*
+ * Give the file or symlink at `src` a second name, `dst`; its link count
+ * goes up by one. Returns 0 or -1. EPERM when `src` is a directory,
+ * EEXIST when `dst` is taken, ENOENT when `src` or `dst`'s parent is
+ * missing.
+ */
+int fs_xfs_link(fs_xfs_fs_t *fs, const char *src, const char *dst);
+
+/* fs_xfs_rename2's flag: replace a `dst` that is there, as rename(2). */
+#define FS_XFS_RENAME_REPLACE 0x01
+
+/*
+ * Move `src` to `dst`, within a directory or across directories, in one
+ * record; a directory takes its ".." with it and both parents' link
+ * counts follow. `flags` is 0 or FS_XFS_RENAME_REPLACE. Without the flag
+ * a taken `dst` is EEXIST; with it, `dst` is replaced as rename(2) does
+ * -- a file by a file, a directory by an empty directory -- and the
+ * replaced inode freed with its last name. Two names for one inode is
+ * success with nothing changed. fs_xfs_rename is fs_xfs_rename2 with no
+ * flags.
+ *
+ * Returns 0 or -1. EINVAL for an unknown flag, a directory moved beneath
+ * itself, and the root, "." or ".."; EISDIR for a file over a directory;
+ * ENOTDIR for a directory over a file; ENOTEMPTY for a directory over one
+ * that is not empty; ENOENT when `src` is missing.
+ */
+int fs_xfs_rename(fs_xfs_fs_t *fs, const char *src, const char *dst);
+int fs_xfs_rename2(fs_xfs_fs_t *fs, const char *src, const char *dst,
+                   int flags);
 
 /*
  * Pass for a mode, uid or gid that should not change. None of the three
@@ -310,6 +394,12 @@ int fs_xfs_truncate(fs_xfs_fs_t *fs, const char *path, uint64_t new_size,
  * refused with ENOTSUP rather than masked: turning a file into a
  * directory is not an attribute change.
  *
+ * On v5 the change is logged, so it works after the mount has logged
+ * anything; a mode change keeps an access ACL in step with it, in a
+ * record of its own, and the inode-change time becomes the time now. On
+ * v4 it is written in place. Changing the owner while quota accounting
+ * is on is ENOTSUP.
+ *
  * Returns 0 or -1.
  */
 int fs_xfs_set_attributes(fs_xfs_fs_t *fs, const char *path,
@@ -325,7 +415,11 @@ int fs_xfs_set_attributes(fs_xfs_fs_t *fs, const char *path,
  * Journalled v5 xattr writes in user., trusted. and security. namespaces.
  * Names include the namespace, at most 255 bytes; values at most 65536.
  * flags: 0 inserts or replaces, CREATE requires absence, REPLACE presence.
- * NULL value is valid with size 0. ACL policy attributes are read-only.
+ * NULL value is valid with size 0. system.posix_acl_access and
+ * system.posix_acl_default take an ACL in the VFS's format -- the one
+ * fs_xfs_getxattr returns -- and set or remove the ACL itself, an access
+ * ACL with the mode it implies; a value not in that format is EINVAL.
+ * The stored trusted.SGI_ACL_* attributes are read-only.
  * These calls resolve the inode itself without following a final symlink.
  * Returns 0 or -1. Missing path: ENOENT; missing attribute: ENODATA on
  * Linux, ENOATTR on Darwin; existing CREATE: EEXIST.

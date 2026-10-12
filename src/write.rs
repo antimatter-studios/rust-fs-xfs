@@ -275,6 +275,105 @@ impl Filesystem {
         if change.is_empty() {
             return Ok(());
         }
+        self.refuse_attribute_change(inode, change)?;
+
+        // The mode's permission bits are an access ACL's owner, group-class
+        // and other entries (#390), read only once every other
+        // refusal has passed. Changing them here, in place, would leave
+        // the ACL saying something else; `chmod` changes both in one record.
+        if change.permissions.is_some()
+            && self.acl(inode.ino, crate::acl::AclKind::Access)?.is_some()
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} has an access ACL; Filesystem::chmod keeps it in step with the \
+                 mode",
+                inode.ino
+            )));
+        }
+        let _ = device;
+        self.update_inode(inode.ino, |raw, current, bigtime| {
+            apply_change(raw, current, bigtime, change);
+            // `di_ctime` records when the inode last changed, which is
+            // now. The caller's value wins; otherwise the latest time
+            // being set, so it is never older than the fields it is
+            // describing the change to.
+            if let Some(t) = derived_ctime(change) {
+                t.encode(raw, inode_offsets::CTIME, bigtime);
+            }
+            Ok(())
+        })
+    }
+
+    /// Change an inode's timestamps, permissions or ownership through the
+    /// log (#460).
+    ///
+    /// The logged counterpart of [`Filesystem::set_attributes`], and the
+    /// one that still works after this mount has logged anything: from
+    /// then on an in-place write is refused, because the disk it would
+    /// read is out of date (#186). The new core is one record, as
+    /// [`Filesystem::chmod`]'s is. A permission change on an inode with an
+    /// access ACL goes through `chmod` first, so the ACL keeps step with
+    /// the mode, and the rest of the change is a second record.
+    ///
+    /// `di_ctime` is the change's own `ctime` when it has one and the time
+    /// now otherwise: the inode changed now, whatever times it was given.
+    /// `di_changecount` goes up by one, as it does for every logged change
+    /// to the core.
+    ///
+    /// Returns the sequence number of the last record written, or 0 when
+    /// the change is empty and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`] unless opened with [`Filesystem::mount_rw`],
+    /// and [`Error::UnsupportedFeature`] on a v4 filesystem, for bits
+    /// outside the permission mask, and for an ownership change while
+    /// quota accounting is on. Every refusal comes before anything is
+    /// written.
+    pub fn change_attributes(&self, ino: u64, change: &AttrChange) -> Result<u64> {
+        self.writable_device()?;
+        if !self.sb.is_v5() {
+            return Err(Error::UnsupportedFeature(
+                "logging an attribute change writes v5 metadata; a v4 filesystem is not supported"
+                    .into(),
+            ));
+        }
+        if change.is_empty() {
+            return Ok(0);
+        }
+        let (inode, _) = self.read_inode_raw(ino)?;
+        self.refuse_attribute_change(&inode, change)?;
+
+        let mut rest = change.clone();
+        if let Some(perms) = change.permissions {
+            if self.acl(ino, crate::acl::AclKind::Access)?.is_some() {
+                let lsn = self.chmod(ino, perms)?;
+                rest.permissions = None;
+                if rest.is_empty() {
+                    return Ok(lsn);
+                }
+            }
+        }
+
+        // Read again: a chmod above has just changed the core.
+        let (current, mut core) = self.read_inode_raw(ino)?;
+        let bigtime = current.flags2 & crate::inode::flags2::BIGTIME != 0;
+        apply_change(&mut core, &current, bigtime, &rest);
+        let at = inode_offsets::CHANGECOUNT;
+        let count = u64::from_be_bytes(core[at..at + 8].try_into().expect("eight bytes"));
+        core[at..at + 8].copy_from_slice(&count.wrapping_add(1).to_be_bytes());
+        rest.ctime.unwrap_or_else(crate::create::clock_now).encode(
+            &mut core,
+            inode_offsets::CTIME,
+            bigtime,
+        );
+        self.log_inode_core(ino, &core)
+    }
+
+    /// The refusals an attribute change has whichever way it is written:
+    /// an ownership change under quota accounting, an inode with no CRC,
+    /// and permission bits that would change the file's type.
+    fn refuse_attribute_change(&self, inode: &Inode, change: &AttrChange) -> Result<()> {
         let quota_accounting = self.sb.qflags & ((1 << 0) | (1 << 3) | (1 << 6)) != 0;
         if quota_accounting
             && (change.uid.is_some_and(|uid| uid != inode.uid)
@@ -299,49 +398,7 @@ impl Filesystem {
                 )));
             }
         }
-
-        // The mode's permission bits are an access ACL's owner, group-class
-        // and other entries (#390), read only once every other
-        // refusal has passed. Changing them here, in place, would leave
-        // the ACL saying something else; `chmod` changes both in one record.
-        if change.permissions.is_some()
-            && self.acl(inode.ino, crate::acl::AclKind::Access)?.is_some()
-        {
-            return Err(Error::UnsupportedFeature(format!(
-                "inode {} has an access ACL; Filesystem::chmod keeps it in step with the \
-                 mode",
-                inode.ino
-            )));
-        }
-        let _ = device;
-        self.update_inode(inode.ino, |raw, current, bigtime| {
-            if let Some(perms) = change.permissions {
-                let kept_type = current.mode & !MODE_PERM_MASK;
-                let mode = kept_type | perms;
-                raw[inode_offsets::MODE..inode_offsets::MODE + 2]
-                    .copy_from_slice(&mode.to_be_bytes());
-            }
-            if let Some(uid) = change.uid {
-                raw[inode_offsets::UID..inode_offsets::UID + 4].copy_from_slice(&uid.to_be_bytes());
-            }
-            if let Some(gid) = change.gid {
-                raw[inode_offsets::GID..inode_offsets::GID + 4].copy_from_slice(&gid.to_be_bytes());
-            }
-            if let Some(t) = change.atime {
-                t.encode(raw, inode_offsets::ATIME, bigtime);
-            }
-            if let Some(t) = change.mtime {
-                t.encode(raw, inode_offsets::MTIME, bigtime);
-            }
-            // `di_ctime` records when the inode last changed, which is
-            // now. The caller's value wins; otherwise the latest time
-            // being set, so it is never older than the fields it is
-            // describing the change to.
-            if let Some(t) = derived_ctime(change) {
-                t.encode(raw, inode_offsets::CTIME, bigtime);
-            }
-            Ok(())
-        })
+        Ok(())
     }
 
     /// Shorten a file, leaving its blocks allocated.
@@ -534,6 +591,29 @@ impl Filesystem {
 /// explicit value wins, and otherwise it takes the latest of the times
 /// being set. Leaving it behind the fields it describes would say the
 /// inode was modified before its own modification time.
+/// Write `change`'s mode, ownership, access and modification times into
+/// an inode core. The file-type bits stay as they are; `di_ctime` is the
+/// caller's, because the two ways of writing a change set it differently.
+fn apply_change(raw: &mut [u8], current: &Inode, bigtime: bool, change: &AttrChange) {
+    if let Some(perms) = change.permissions {
+        let kept_type = current.mode & !MODE_PERM_MASK;
+        let mode = kept_type | perms;
+        raw[inode_offsets::MODE..inode_offsets::MODE + 2].copy_from_slice(&mode.to_be_bytes());
+    }
+    if let Some(uid) = change.uid {
+        raw[inode_offsets::UID..inode_offsets::UID + 4].copy_from_slice(&uid.to_be_bytes());
+    }
+    if let Some(gid) = change.gid {
+        raw[inode_offsets::GID..inode_offsets::GID + 4].copy_from_slice(&gid.to_be_bytes());
+    }
+    if let Some(t) = change.atime {
+        t.encode(raw, inode_offsets::ATIME, bigtime);
+    }
+    if let Some(t) = change.mtime {
+        t.encode(raw, inode_offsets::MTIME, bigtime);
+    }
+}
+
 fn derived_ctime(change: &AttrChange) -> Option<Timestamp> {
     if let Some(c) = change.ctime {
         return Some(c);

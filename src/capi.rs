@@ -26,6 +26,7 @@
 
 #![allow(non_camel_case_types)]
 
+use crate::acl::{AclEntry, AclKind};
 use crate::dir::DirEntry;
 use crate::error::Error;
 use crate::fs::Filesystem;
@@ -82,6 +83,10 @@ fn errno_for(e: &Error) -> c_int {
 // The errno values are spelled out rather than pulled from a crate, to
 // avoid a dependency that exists only for five constants. They are
 // identical across Linux and Darwin except where noted.
+/// `EPERM` — 1 on both Darwin and Linux.
+const fn libc_eperm() -> c_int {
+    1
+}
 const fn libc_enoent() -> c_int {
     2
 }
@@ -111,6 +116,14 @@ const fn libc_einval() -> c_int {
 }
 /// `ERANGE` — a result did not fit the caller's buffer.
 const ERANGE: c_int = 34;
+/// `ENAMETOOLONG` is 63 on Darwin and 36 on Linux.
+const fn libc_enametoolong() -> c_int {
+    if cfg!(target_os = "macos") {
+        63
+    } else {
+        36
+    }
+}
 /// `ENOTEMPTY` is 66 on Darwin and 39 on Linux.
 const fn libc_enotempty() -> c_int {
     if cfg!(target_os = "macos") {
@@ -185,6 +198,20 @@ pub struct fs_xfs_dir_iter {
     /// stays valid until the next call on the same iterator, which is
     /// what the header promises.
     current: fs_xfs_dirent_t,
+}
+
+/// Free blocks, allocated inodes and free inodes, summed from every
+/// group's headers as they are now; `None` if one cannot be read.
+fn live_counts(fs: &Filesystem) -> Option<(u64, u64, u64)> {
+    let (mut free_blocks, mut inodes, mut free_inodes) = (0u64, 0u64, 0u64);
+    for ag in 0..fs.superblock().agcount {
+        let agf = fs.read_agf(ag).ok()?;
+        let agi = fs.read_agi(ag).ok()?;
+        free_blocks += u64::from(agf.freeblks) + u64::from(agf.flcount) + u64::from(agf.btreeblks);
+        inodes += u64::from(agi.count);
+        free_inodes += u64::from(agi.freecount);
+    }
+    Some((free_blocks, inodes, free_inodes))
 }
 
 /// Attributes of one filesystem object.
@@ -547,6 +574,13 @@ pub unsafe extern "C" fn fs_xfs_mount_with_realtime_callbacks(
 
 /// Release a mounted-filesystem handle.
 ///
+/// A handle from a writable mount is unmounted cleanly first
+/// ([`Filesystem::unmount`]): everything it logged is written home, the
+/// superblock's summary counters are put right, and the log ends with an
+/// unmount record, so the next mount, ours or the kernel's, needs no
+/// replay. If that fails the handle is released all the same and
+/// [`fs_xfs_last_errno`] says why; it is 0 after a clean release.
+///
 /// # Safety
 ///
 /// `fs` must be NULL or a handle from a successful mount that has not
@@ -556,7 +590,19 @@ pub unsafe extern "C" fn fs_xfs_umount(fs: *mut fs_xfs_fs) {
     if fs.is_null() {
         return;
     }
-    guard((), || drop(unsafe { Box::from_raw(fs) }));
+    guard((), || {
+        let fs_xfs_fs { fs } = *unsafe { Box::from_raw(fs) };
+        // A writable handle unmounts cleanly: what it logged is pushed
+        // home and the log ends with an unmount record (#460). Dropped
+        // instead, it leaves a log that needs replay, and a writable
+        // mount refuses the volume until something replays it. The
+        // handle is released either way; a failure is the errno.
+        if fs.is_writable() {
+            if let Err(e) = fs.unmount() {
+                record(&e);
+            }
+        }
+    });
 }
 
 /// # Safety
@@ -572,7 +618,15 @@ pub unsafe extern "C" fn fs_xfs_get_volume_info(
             set_error("fs or out is NULL".into(), libc_eio());
             return -1;
         }
-        let sb = unsafe { &*fs }.fs.superblock();
+        let fs = &unsafe { &*fs }.fs;
+        let sb = fs.superblock();
+        // THE SUPERBLOCK'S COUNTERS ARE LAZY on v5: written at unmount, not
+        // as a mount allocates, so on a writable handle they describe the
+        // volume as it was mounted. The group headers are what is free now
+        // (#460). Free blocks are each group's free blocks, free list and
+        // B+tree blocks, the sum an unmount writes into `sb_fdblocks`.
+        let (free_blocks, inode_count, free_inodes) =
+            live_counts(fs).unwrap_or((sb.fdblocks, sb.icount, sb.ifree));
 
         let mut name = [0 as c_char; 13];
         for (slot, b) in name.iter_mut().zip(sb.fname.as_bytes()) {
@@ -585,9 +639,9 @@ pub unsafe extern "C" fn fs_xfs_get_volume_info(
                 sector_size: u32::from(sb.sectsize),
                 inode_size: u32::from(sb.inodesize),
                 total_blocks: sb.dblocks,
-                free_blocks: sb.fdblocks,
-                inode_count: sb.icount,
-                free_inodes: sb.ifree,
+                free_blocks,
+                inode_count,
+                free_inodes,
                 ag_count: sb.agcount,
                 version: sb.version(),
                 volume_name: name,
@@ -903,10 +957,11 @@ pub unsafe extern "C" fn fs_xfs_readlink(
 // ---------------------------------------------------------------------
 // Writing
 //
-// Every entry point here needs a handle opened by `fs_xfs_mount_rw`.
-// One opened by `fs_xfs_mount` refuses with EROFS, so a caller cannot
-// write to a volume by accident — the decision is made once, when the
-// filesystem is opened, rather than at each call.
+// Every entry point here needs a handle opened by `fs_xfs_mount_rw` or
+// `fs_xfs_mount_rw_with_fs_core_device`. One opened by a read-only mount
+// refuses with EROFS, so a caller cannot write to a volume by accident —
+// the decision is made once, when the filesystem is opened, rather than
+// at each call.
 // ---------------------------------------------------------------------
 
 /// Mount the image or device at `device_path` for reading **and
@@ -961,17 +1016,470 @@ pub unsafe extern "C" fn fs_xfs_is_writable(fs: *mut fs_xfs_fs) -> c_int {
     })
 }
 
-/// Overwrite `length` bytes of an existing file at `offset`.
+/// Mount an existing `fs_core` device for reading **and writing**.
+///
+/// The writable counterpart of [`fs_xfs_mount_with_fs_core_device`], for
+/// a caller that reaches its device through callbacks or a partition
+/// slice rather than a path (#460). The handle holds its own reference to
+/// the device, so the caller may close `handle` once this returns.
+///
+/// Returns NULL with EROFS if the device reports that it cannot be
+/// written, and for every reason [`fs_xfs_mount_rw`] would: a log that
+/// needs replay, a feature this driver reads but does not maintain, or a
+/// volume that is not XFS.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live `FsCoreDevice` from `fs_core`.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_mount_rw_with_fs_core_device(
+    handle: *mut fs_core::ffi::FsCoreDevice,
+) -> *mut fs_xfs_fs {
+    guard(std::ptr::null_mut(), || {
+        if handle.is_null() {
+            set_error("fs_core handle is NULL".into(), libc_eio());
+            return std::ptr::null_mut();
+        }
+        let dev: Arc<dyn fs_core::BlockDevice> = unsafe { (*handle).inner().clone() };
+        match Filesystem::mount_rw(dev) {
+            Ok(fs) => Box::into_raw(Box::new(fs_xfs_fs { fs })),
+            Err(e) => {
+                record(&e);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Write everything this handle has logged to its home on the device
+/// ([`Filesystem::sync`]), so the log holds nothing the disk does not.
+///
+/// Returns 0, or −1 with the error recorded: EROFS for a read-only
+/// handle, and the device's own error otherwise. The handle stays
+/// mounted and writable. [`fs_xfs_umount`] does this and more.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_flush(fs: *mut fs_xfs_fs) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return -1;
+        };
+        match fs.sync() {
+            Ok(()) => 0,
+            Err(e) => {
+                record(&e);
+                -1
+            }
+        }
+    })
+}
+
+/// Create an empty regular file at `path` with permission bits `mode`.
+///
+/// Returns the new file's inode number, or 0 with the error recorded — 0
+/// is never an XFS inode. `mode` is the permission bits (`0644`); a mode
+/// that already carries the regular-file type bits is accepted, and one
+/// carrying another type's is refused with ENOTSUP. The new inode is
+/// owned by uid 0, gid 0; [`fs_xfs_set_attributes`] changes that. A
+/// directory with a default ACL passes it on, narrowed by `mode`.
+///
+/// EEXIST when the name is taken (or `path` is the root), ENOENT when the
+/// parent is not there, ENOTDIR when it is not a directory, ENAMETOOLONG
+/// for a name over 255 bytes, EROFS for a read-only handle.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `path` NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_create(fs: *mut fs_xfs_fs, path: *const c_char, mode: u16) -> u64 {
+    guard(0, || unsafe { make(fs, path, mode, false) })
+}
+
+/// Create an empty directory at `path` with permission bits `mode`.
+///
+/// As [`fs_xfs_create`], for a directory: its link count is 2 and its
+/// parent's goes up by one.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `path` NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_mkdir(fs: *mut fs_xfs_fs, path: *const c_char, mode: u16) -> u64 {
+    guard(0, || unsafe { make(fs, path, mode, true) })
+}
+
+/// The body of [`fs_xfs_create`] and [`fs_xfs_mkdir`].
+unsafe fn make(fs: *mut fs_xfs_fs, path: *const c_char, mode: u16, directory: bool) -> u64 {
+    let Some(fs) = (unsafe { writable(fs) }) else {
+        return 0;
+    };
+    let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+        return 0;
+    };
+    let Some((parent, name)) = parent_of(fs, path, Last::New) else {
+        return 0;
+    };
+    let made = if directory {
+        fs.create_directory(parent, name, mode)
+    } else {
+        fs.create_file(parent, name, mode)
+    };
+    match made {
+        Ok((ino, _)) => ino,
+        Err(e) => {
+            record(&e);
+            0
+        }
+    }
+}
+
+/// Remove the name `path` of a file or symlink. The inode is freed with
+/// its blocks when this was its last name.
+///
+/// Returns 0, or −1 with the error recorded: EISDIR for a directory,
+/// which is [`fs_xfs_rmdir`]'s; ENOENT when nothing is there; EINVAL for
+/// the root, `.` or `..`; EROFS for a read-only handle.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `path` NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_unlink(fs: *mut fs_xfs_fs, path: *const c_char) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return -1;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return -1;
+        };
+        let Some((parent, name)) = parent_of(fs, path, Last::Existing) else {
+            return -1;
+        };
+        // Judged here so the errno is the one unlink(2) gives: the library
+        // refuses a directory as a shape it does not remove.
+        match fs.lookup_path_bytes(path) {
+            Ok(target) if target.is_dir() => {
+                set_error(
+                    format!("{} is a directory; fs_xfs_rmdir removes one", shown(path)),
+                    libc_eisdir(),
+                );
+                return -1;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        }
+        done(fs.unlink_file(parent, name).map(|_| ()))
+    })
+}
+
+/// Remove the empty directory `path`. Its parent's link count goes down
+/// by one.
+///
+/// Returns 0, or −1 with the error recorded: ENOTEMPTY when it still
+/// holds a name, ENOTDIR when it is not a directory, ENOENT when nothing
+/// is there, EINVAL for the root, `.` or `..`, EROFS for a read-only
+/// handle.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `path` NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_rmdir(fs: *mut fs_xfs_fs, path: *const c_char) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return -1;
+        };
+        let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
+            return -1;
+        };
+        let Some((parent, name)) = parent_of(fs, path, Last::Existing) else {
+            return -1;
+        };
+        done(fs.remove_directory(parent, name).map(|_| ()))
+    })
+}
+
+/// Give the file or symlink at `src` a second name, `dst`. Its link count
+/// goes up by one.
+///
+/// Returns 0, or −1 with the error recorded: EPERM when `src` is a
+/// directory, which cannot have a second name; EEXIST when `dst` is
+/// taken; ENOENT when `src` or `dst`'s parent is not there; EROFS for a
+/// read-only handle.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `src` and `dst` NULL or
+/// NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_link(
+    fs: *mut fs_xfs_fs,
+    src: *const c_char,
+    dst: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return -1;
+        };
+        let (Some(src), Some(dst)) = (unsafe { borrow_bytes(src, "src") }, unsafe {
+            borrow_bytes(dst, "dst")
+        }) else {
+            return -1;
+        };
+        let source = match fs.lookup_path_bytes(src) {
+            Ok(i) => i,
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        if source.is_dir() {
+            set_error(
+                format!("{} is a directory, which has one name", shown(src)),
+                libc_eperm(),
+            );
+            return -1;
+        }
+        let Some((dir, name)) = parent_of(fs, dst, Last::New) else {
+            return -1;
+        };
+        done(fs.link(source.ino, dir, name).map(|_| ()))
+    })
+}
+
+/// [`fs_xfs_rename2`]'s flag: replace `dst` if it is there, as
+/// `rename(2)` does. Without it a taken `dst` is EEXIST.
+pub const FS_XFS_RENAME_REPLACE: c_int = 0x01;
+
+/// Move `src` to `dst`, refusing a `dst` that is taken (EEXIST).
+///
+/// [`fs_xfs_rename2`] with no flags.
+///
+/// # Safety
+///
+/// As [`fs_xfs_rename2`].
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_rename(
+    fs: *mut fs_xfs_fs,
+    src: *const c_char,
+    dst: *const c_char,
+) -> c_int {
+    unsafe { fs_xfs_rename2(fs, src, dst, 0) }
+}
+
+/// Move `src` to `dst`, within a directory or across directories, in one
+/// record. A directory takes its `..` with it, and both parents' link
+/// counts follow.
+///
+/// `flags` is 0 or [`FS_XFS_RENAME_REPLACE`]. With it, a `dst` that is
+/// there is replaced as `rename(2)` replaces it: a file by a file, a
+/// directory by an empty directory, and the replaced inode freed when it
+/// has no other name. Two names for one inode is success with nothing
+/// changed.
+///
+/// Returns 0, or −1 with the error recorded: EEXIST for a taken `dst`
+/// without the flag; EINVAL for an unknown flag, for a directory moved
+/// beneath itself, and for the root, `.` or `..`; EISDIR for a file over
+/// a directory; ENOTDIR for a directory over a file; ENOTEMPTY for a
+/// directory over one that is not empty; ENOENT when `src` is not there;
+/// EROFS for a read-only handle.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `src` and `dst` NULL or
+/// NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_rename2(
+    fs: *mut fs_xfs_fs,
+    src: *const c_char,
+    dst: *const c_char,
+    flags: c_int,
+) -> c_int {
+    guard(-1, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return -1;
+        };
+        if flags & !FS_XFS_RENAME_REPLACE != 0 {
+            set_error(format!("unknown rename flags {flags:#x}"), libc_einval());
+            return -1;
+        }
+        let (Some(src), Some(dst)) = (unsafe { borrow_bytes(src, "src") }, unsafe {
+            borrow_bytes(dst, "dst")
+        }) else {
+            return -1;
+        };
+        let Some((from_dir, from)) = parent_of(fs, src, Last::Existing) else {
+            return -1;
+        };
+        let Some((to_dir, to)) = parent_of(fs, dst, Last::New) else {
+            return -1;
+        };
+        if let Err(e) = fs.lookup_path_bytes(src) {
+            record(&e);
+            return -1;
+        }
+        if beneath(src, dst) {
+            set_error(
+                format!("{} cannot be moved beneath itself", shown(src)),
+                libc_einval(),
+            );
+            return -1;
+        }
+        if flags & FS_XFS_RENAME_REPLACE == 0 && fs.lookup_path_bytes(dst).is_ok() {
+            set_error(format!("{} is taken", shown(dst)), libc_eexist());
+            return -1;
+        }
+        done(fs.rename(from_dir, from, to_dir, to).map(|_| ()))
+    })
+}
+
+/// A writable handle's filesystem, or NULL and EROFS / EINVAL recorded.
+///
+/// Every mutating entry point asks this first, so a read-only handle
+/// refuses with EROFS before anything else is judged.
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle.
+unsafe fn writable<'a>(fs: *mut fs_xfs_fs) -> Option<&'a Filesystem> {
+    if fs.is_null() {
+        set_error("fs is NULL".into(), libc_einval());
+        return None;
+    }
+    let fs = &unsafe { &*fs }.fs;
+    if !fs.is_writable() {
+        set_error(
+            "this handle was mounted read-only; fs_xfs_mount_rw makes a writable one".into(),
+            libc_erofs(),
+        );
+        return None;
+    }
+    Some(fs)
+}
+
+/// 0 for success, or −1 with the error recorded.
+fn done(result: crate::Result<()>) -> c_int {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            record(&e);
+            -1
+        }
+    }
+}
+
+/// Whether a path's last name is to be made or is already there: the root,
+/// `.` and `..` are taken names to the first (EEXIST) and invalid ones to
+/// the second (EINVAL), as `mkdir(2)` and `rmdir(2)` answer.
+#[derive(Clone, Copy)]
+enum Last {
+    New,
+    Existing,
+}
+
+/// A path's parent directory, resolved, and its last name, checked; or
+/// `None` with the errno recorded.
+fn parent_of<'a>(fs: &Filesystem, path: &'a [u8], last: Last) -> Option<(u64, &'a [u8])> {
+    let unusable = || match last {
+        Last::New => libc_eexist(),
+        Last::Existing => libc_einval(),
+    };
+    let Some((parent, name)) = split_last(path) else {
+        set_error(format!("{} names the root", shown(path)), unusable());
+        return None;
+    };
+    if name == b"." || name == b".." {
+        set_error(
+            format!("{} ends in {}", shown(path), shown(name)),
+            unusable(),
+        );
+        return None;
+    }
+    if name.len() > usize::from(u8::MAX) {
+        set_error(
+            format!("a name of {} bytes; the longest is 255", name.len()),
+            libc_enametoolong(),
+        );
+        return None;
+    }
+    let dir = match fs.lookup_path_bytes(parent) {
+        Ok(i) => i,
+        Err(e) => {
+            record(&e);
+            return None;
+        }
+    };
+    if !dir.is_dir() {
+        set_error(
+            format!("{} is not a directory", shown(parent)),
+            libc_enotdir(),
+        );
+        return None;
+    }
+    Some((dir.ino, name))
+}
+
+/// A path split at its last name, trailing slashes dropped: the parent's
+/// path and the name, or `None` for the root. A path with no slash is a
+/// name in the root.
+fn split_last(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let trimmed = &path[..end];
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.iter().rposition(|&b| b == b'/') {
+        None => Some((b"/", trimmed)),
+        Some(cut) => {
+            let parent = &trimmed[..cut];
+            let parent = if parent.iter().all(|&b| b == b'/') {
+                &b"/"[..]
+            } else {
+                parent
+            };
+            Some((parent, &trimmed[cut + 1..]))
+        }
+    }
+}
+
+/// Whether `dst` is strictly beneath `src`, name by name.
+fn beneath(src: &[u8], dst: &[u8]) -> bool {
+    let names = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|&b| b == b'/')
+            .filter(|n| !n.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let (a, b) = (names(src), names(dst));
+    b.len() > a.len() && b.starts_with(&a)
+}
+
+/// Write `length` bytes into a file at `offset`, allocating as needed.
 ///
 /// Returns the number of bytes written, or −1 with the error recorded.
 /// The whole range is written or none of it is; a short write is not
 /// possible.
 ///
-/// Only bytes that already exist can be rewritten. Writing past the end
-/// of the file, into a hole, or into an extent that was allocated but
-/// never written is refused with ENOTSUP, because each would change the
-/// filesystem's metadata and this driver has no journal to do that
-/// safely.
+/// The write goes through the log ([`Filesystem::write`], #460): a hole
+/// is given blocks, an unwritten extent becomes written where the range
+/// covers it, and a range that ends past the end of the file grows it,
+/// with zeros wherever the range does not reach. The modification and
+/// inode-change times become the time now.
+///
+/// A file the logged write does not edit — one whose extents are in a
+/// B+tree, or any file on a v4 filesystem — can still have bytes it
+/// already holds rewritten in place, before the mount has logged
+/// anything; anything else is refused with ENOTSUP. A directory is
+/// EISDIR.
 ///
 /// # Safety
 ///
@@ -986,20 +1494,36 @@ pub unsafe extern "C" fn fs_xfs_write_file(
     length: u64,
 ) -> i64 {
     guard(-1, || {
-        if fs.is_null() || buf.is_null() {
-            set_error("fs or buf is NULL".into(), libc_eio());
+        let Some(fs) = (unsafe { writable(fs) }) else {
             return -1;
-        }
+        };
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        let fs = &unsafe { &*fs }.fs;
         let Some((inode, raw)) = resolve_for_write(fs, path) else {
             return -1;
         };
+        if length == 0 {
+            return 0;
+        }
+        if buf.is_null() {
+            set_error("buf is NULL".into(), libc_einval());
+            return -1;
+        }
         let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), length as usize) };
-        match fs.write_at(&inode, &raw, offset, data) {
-            Ok(n) => n as i64,
+        match fs.write(inode.ino, offset, data) {
+            Ok(_) => length as i64,
+            // The in-place overwrite reaches what the logged write does
+            // not edit. Both refuse before writing anything, so trying it
+            // second changes nothing when it refuses too, and the error
+            // reported is the logged write's.
+            Err(Error::UnsupportedFeature(why)) => match fs.write_at(&inode, &raw, offset, data) {
+                Ok(n) => n as i64,
+                Err(_) => {
+                    record(&Error::UnsupportedFeature(why));
+                    -1
+                }
+            },
             Err(e) => {
                 record(&e);
                 -1
@@ -1008,19 +1532,23 @@ pub unsafe extern "C" fn fs_xfs_write_file(
     })
 }
 
-/// Shorten a file to `new_size`.
+/// Set a file's size to `new_size`, shorter or longer.
 ///
-/// Returns 0, or −1 with the error recorded. Growing is refused with
-/// ENOTSUP: it needs blocks that are not allocated.
+/// Returns 0, or −1 with the error recorded.
 ///
-/// The file's blocks are **not** released. Freeing them is allocation
-/// work that needs a journal, so a shortened file still occupies what it
-/// did before.
+/// Through the log ([`Filesystem::truncate_to`], #460): blocks wholly past
+/// the new end go back to free space, the last block's bytes past it are
+/// zeroed, and a longer size reads as zeros up to it. A file the logged
+/// truncate does not edit — an extent B+tree that would still need a
+/// tree, or any file on a v4 filesystem — can still be shortened in place
+/// before the mount has logged anything, keeping its blocks; anything
+/// else is refused with ENOTSUP. A directory is EISDIR.
 ///
 /// `mtime_sec` and `mtime_nsec` set the modification and inode-change
-/// times; pass [`FS_XFS_LEAVE_TIME`] to leave both alone. A NEGATIVE
-/// `mtime_sec` is a date before 1970 and is applied -- it used to mean
-/// "leave alone", which made those dates unreachable.
+/// times; pass [`FS_XFS_LEAVE_TIME`] for the time now when the size
+/// changes, and no change when it does not. A NEGATIVE `mtime_sec` is a
+/// date before 1970 and is applied -- it used to mean "leave alone",
+/// which made those dates unreachable.
 ///
 /// # Safety
 ///
@@ -1034,19 +1562,38 @@ pub unsafe extern "C" fn fs_xfs_truncate(
     mtime_nsec: u32,
 ) -> c_int {
     guard(-1, || {
-        if fs.is_null() {
-            set_error("fs is NULL".into(), libc_eio());
+        let Some(fs) = (unsafe { writable(fs) }) else {
             return -1;
-        }
+        };
         let Some(path) = (unsafe { borrow_bytes(path, "path") }) else {
             return -1;
         };
-        let fs = &unsafe { &*fs }.fs;
         let Some((inode, _)) = resolve_for_write(fs, path) else {
             return -1;
         };
         let when = timestamp_arg(mtime_sec, mtime_nsec);
-        match fs.truncate(&inode, new_size, when) {
+        let done = match fs.truncate_to(inode.ino, new_size) {
+            Ok(_) => match when {
+                // The record stamped the time now; the caller asked for
+                // another, which a second record sets.
+                Some(t) => fs
+                    .change_attributes(
+                        inode.ino,
+                        &AttrChange {
+                            mtime: Some(t),
+                            ctime: Some(t),
+                            ..AttrChange::default()
+                        },
+                    )
+                    .map(|_| ()),
+                None => Ok(()),
+            },
+            Err(Error::UnsupportedFeature(why)) if new_size <= inode.size => fs
+                .truncate(&inode, new_size, when)
+                .map_err(|_| Error::UnsupportedFeature(why)),
+            Err(e) => Err(e),
+        };
+        match done {
             Ok(()) => 0,
             Err(e) => {
                 record(&e);
@@ -1115,6 +1662,11 @@ fn timestamp_arg(sec: i64, nsec: u32) -> Option<Timestamp> {
 /// refused with ENOTSUP rather than silently masked: changing a file
 /// into a directory is not an attribute change.
 ///
+/// On a v5 filesystem the change is logged ([`Filesystem::change_attributes`],
+/// #460), so it works after the mount has logged anything, a mode change
+/// keeps an access ACL in step with it, and the inode-change time becomes
+/// the time now. On v4 it is written in place, as before.
+///
 /// Returns 0, or −1 with the error recorded.
 ///
 /// # Safety
@@ -1152,7 +1704,15 @@ pub unsafe extern "C" fn fs_xfs_set_attributes(
             mtime: timestamp_arg(mtime_sec, mtime_nsec),
             ctime: None,
         };
-        match fs.set_attributes(&inode, &change) {
+        // Through the log on v5 (#460), which works however much this
+        // mount has logged before; in place on v4, which has no log
+        // writer.
+        let changed = if fs.superblock().is_v5() {
+            fs.change_attributes(inode.ino, &change).map(|_| ())
+        } else {
+            fs.set_attributes(&inode, &change)
+        };
+        match changed {
             Ok(()) => 0,
             Err(e) => {
                 record(&e);
@@ -1207,6 +1767,9 @@ pub unsafe extern "C" fn fs_xfs_setxattr(
         } else {
             unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) }
         };
+        if let Some(kind) = acl_kind(name) {
+            return set_acl_xattr(fs, inode.ino, kind, value, mode);
+        }
         match fs.set_xattr(inode.ino, name, value, mode) {
             Ok(_) => 0,
             Err(error) => {
@@ -1303,7 +1866,11 @@ pub unsafe extern "C" fn fs_xfs_removexattr(
         let Some(name) = (unsafe { xattr_name(name) }) else {
             return -1;
         };
-        match fs.remove_xattr(inode.ino, name) {
+        let removed = match acl_kind(name) {
+            Some(kind) => fs.remove_acl(inode.ino, kind),
+            None => fs.remove_xattr(inode.ino, name),
+        };
+        match removed {
             Ok(_) => 0,
             Err(error) => {
                 record_xattr(&error);
@@ -1311,6 +1878,90 @@ pub unsafe extern "C" fn fs_xfs_removexattr(
             }
         }
     })
+}
+
+/// Which ACL a `system.posix_acl_*` name is, or `None` for any other
+/// name (#460).
+///
+/// The kernel shows an ACL under these names, in the VFS's format, and
+/// `fs_xfs_getxattr` reads them the same way (#285). Setting or removing
+/// one is an ACL operation rather than an attribute write, because the
+/// access ACL and the mode it implies change together.
+fn acl_kind(name: &[u8]) -> Option<AclKind> {
+    match name {
+        crate::format::acl::POSIX_ACL_ACCESS => Some(AclKind::Access),
+        crate::format::acl::POSIX_ACL_DEFAULT => Some(AclKind::Default),
+        _ => None,
+    }
+}
+
+/// The entries of an ACL in the VFS's format, `posix_acl_xattr_header`: a
+/// little-endian version word, then eight-byte entries of tag and
+/// permissions (16 bits each) and id (32 bits), all little-endian — the
+/// format `fs_xfs_getxattr` hands out. `None` when it is not that format.
+fn vfs_acl_entries(value: &[u8]) -> Option<Vec<AclEntry>> {
+    use crate::format::acl::{POSIX_ACL_XATTR_ENTRY_SIZE, POSIX_ACL_XATTR_VERSION};
+    if value.len() < 4 || !(value.len() - 4).is_multiple_of(POSIX_ACL_XATTR_ENTRY_SIZE) {
+        return None;
+    }
+    if u32::from_le_bytes([value[0], value[1], value[2], value[3]]) != POSIX_ACL_XATTR_VERSION {
+        return None;
+    }
+    Some(
+        value[4..]
+            .chunks_exact(POSIX_ACL_XATTR_ENTRY_SIZE)
+            .map(|e| AclEntry {
+                tag: u32::from(u16::from_le_bytes([e[0], e[1]])),
+                perm: u16::from_le_bytes([e[2], e[3]]),
+                id: u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+            })
+            .collect(),
+    )
+}
+
+/// `fs_xfs_setxattr` of a `system.posix_acl_*` name: the value decoded and
+/// set with [`Filesystem::set_acl`], the create-only and replace-only
+/// flags honoured as for any attribute.
+fn set_acl_xattr(
+    fs: &Filesystem,
+    ino: u64,
+    kind: AclKind,
+    value: &[u8],
+    mode: crate::attr_write::XattrMode,
+) -> c_int {
+    use crate::attr_write::XattrMode;
+    let Some(entries) = vfs_acl_entries(value) else {
+        set_error(
+            "the value is not a POSIX ACL in the VFS format".into(),
+            libc_einval(),
+        );
+        return -1;
+    };
+    let present = match fs.acl(ino, kind) {
+        Ok(found) => found.is_some(),
+        Err(e) => {
+            record(&e);
+            return -1;
+        }
+    };
+    match mode {
+        XattrMode::Create if present => {
+            set_error("the ACL is already set".into(), libc_eexist());
+            return -1;
+        }
+        XattrMode::Replace if !present => {
+            record_xattr(&Error::NotFound);
+            return -1;
+        }
+        _ => {}
+    }
+    match fs.set_acl(ino, kind, &entries) {
+        Ok(_) => 0,
+        Err(e) => {
+            record_xattr(&e);
+            -1
+        }
+    }
 }
 
 unsafe fn xattr_target<'a>(
