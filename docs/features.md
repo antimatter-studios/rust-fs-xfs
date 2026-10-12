@@ -44,8 +44,8 @@ States:
 | Dirty log: replayed into memory, the device untouched | Supported | 0.8.0 (#90) | | `dirty_log_mount.rs`, `log_oracle.rs` |
 | Log head found from cycle numbers, not a whole-ring read | Supported | 0.9.0 (#251) | | `read_path_cost.rs` |
 | `File` handle (`open`, `open_ino`, `root`) | Supported | 0.6.0 | | `file_handle_oracle.rs` |
-| Parent pointers and exchange-range volumes | Supported; parent pointers read-only | 0.8.0 (#99); exchange-range writes Unreleased (#374) | #373 | `parent_exchrange_oracle.rs` |
-| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied | Experimental | Unreleased (#374) | | `exchange_range.rs`, `exchange_range_kernel.rs` |
+| Parent pointers and exchange-range volumes | Supported; parent pointers read-only | 0.8.0 (#99); exchange-range writes Unreleased (#459) | #373 | `parent_exchrange_oracle.rs` |
+| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied | Experimental | Unreleased (#459) | | `exchange_range.rs`, `exchange_range_kernel.rs` |
 | Realtime files, read from the realtime device | Supported | 0.10.0 (#98) | #361 | `realtime_oracle.rs` |
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | Reverse-mapping and reference-count trees | Supported | 0.7.0 | | `rmap_oracle.rs`, `refcount_oracle.rs` |
