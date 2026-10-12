@@ -1750,15 +1750,38 @@ impl Filesystem {
                     dir_inode.ino
                 ))
             })?;
-        // Down the node B-tree to the leaf covering the hash. A node sits
-        // more than MAX_SUPPORTED_NODE_LEVEL above the leaves is refused by
-        // parse_node, so this is bounded.
+        // Down the node B-tree to the leaf covering the hash. EACH STEP
+        // GOES ONE LEVEL DOWN (#443): a node more than
+        // MAX_SUPPORTED_NODE_LEVEL above the leaves is refused by
+        // parse_node, but that bounded nothing on its own, because nothing
+        // made a child sit below its parent, and a node naming itself was
+        // followed forever. Now a child must be a node exactly one level
+        // down, or a leaf under level 1.
+        let corrupt = |what: String| {
+            Error::BadSuperblock(format!("directory inode {}: {what}", dir_inode.ino))
+        };
+        let mut below: Option<u16> = None;
         loop {
             let magic = crate::endian::be16(&block, crate::format::dir::offsets::da_blk::MAGIC);
             if magic != XFS_DA3_NODE_MAGIC && magic != XFS_DA_NODE_MAGIC {
+                if below.is_some_and(|level| level != 0) {
+                    return Err(corrupt(format!(
+                        "a level-{} node names block {at}, which is a leaf",
+                        below.unwrap_or(0) + 1
+                    )));
+                }
                 break;
             }
-            let Some(child) = dir::parse_node(&block, &self.sb)?.child_for_hash(hash) else {
+            let node = dir::parse_node(&block, &self.sb)?;
+            if node.level == 0 || below.is_some_and(|level| level != node.level) {
+                return Err(corrupt(format!(
+                    "the node at block {at} is level {}, where its parent needs {}",
+                    node.level,
+                    below.map_or_else(|| "a level of at least 1".to_string(), |l| l.to_string())
+                )));
+            }
+            below = Some(node.level - 1);
+            let Some(child) = node.child_for_hash(hash) else {
                 return Ok(None);
             };
             at = self.dablk_to_dir_block(child, dir_inode.ino)?;
@@ -1773,8 +1796,11 @@ impl Filesystem {
         }
 
         // Every record with the hash, following the leaf chain while the
-        // run of equal hashes continues into the next leaf.
+        // run of equal hashes continues into the next leaf. A LEAF IS READ
+        // ONCE (#443): a chain whose forward pointer comes back round was
+        // followed forever, gathering the same records each time.
         let mut addresses = Vec::new();
+        let mut visited = std::collections::HashSet::from([at]);
         loop {
             let leaf = dir::parse_leaf(&block, &self.sb)?;
             addresses.extend(
@@ -1790,6 +1816,11 @@ impl Filesystem {
                 break;
             }
             at = self.dablk_to_dir_block(leaf.forw, dir_inode.ino)?;
+            if !visited.insert(at) {
+                return Err(corrupt(format!(
+                    "the leaf chain comes back to block {at}, which it has already read"
+                )));
+            }
             block = match self.read_dir_block(&extents, at, dir_inode.ino)? {
                 Some(b) => b,
                 None => break,
