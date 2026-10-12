@@ -6,6 +6,8 @@ never does.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-10-12
+
 ### Added
 
 - **The C ABI writes through the log (#460).** A caller holding only the C
@@ -1005,6 +1007,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.13.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.10.0...v0.11.0

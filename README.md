@@ -336,6 +336,14 @@ gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
 
 The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.13.0 — 2026-10-12
+
+- The C ABI writes through the log: a writable device mount, create, mkdir, unlink, rmdir, link, rename, a clean unmount, and attribute and extended-attribute changes.
+- A write anywhere in a file, truncate to any length, directories past one block and node-form directories changed in place.
+- Hard links, renames across directories and over an existing name, and empty directories removed.
+- POSIX ACLs and extended attributes written and removed on v5.
+- The checker reads realtime metadata, the reverse-mapping and refcount btrees and quota records, every code graded by `xfs_repair -n`.
+
 ### v0.12.1 — 2026-10-07
 
 - The tools are released again.
@@ -390,11 +398,6 @@ The latest releases; every release, with the reasoning behind each change, is in
 
 - A superblock can be written back, and is proved against `mkfs.xfs`.
 - The block-map tree's block addresses are checked.
-
-### v0.5.1 — 2026-08-29
-
-- Directory writes.
-- The mount's one checkpoint is spent on writes, not on refusals.
 
 ## License
 

@@ -35,7 +35,7 @@ States:
 | Inodes: v1, v2, v3 cores, `bigtime`, 64-bit extent counts | Supported | 0.1.0 | | `oracle_vm_fixtures.rs`, `inode_version_oracle.rs` |
 | An inode version the filesystem does not use | Refused | 0.11.0 (#92) | | `inode_version_oracle.rs` |
 | Directories: short form, block, leaf and node | Supported | 0.1.0 | | `dir_oracle.rs`, `endtoend_oracle.rs` |
-| Lookup through the directory's hash index | Supported | 0.8.0; node form over blocks smaller than a directory block Unreleased (#424) | | `lookup_by_hash_oracle.rs`, `node_directories_oracle.rs` |
+| Lookup through the directory's hash index | Supported | 0.8.0; node form over blocks smaller than a directory block 0.13.0 (#424) | | `lookup_by_hash_oracle.rs`, `node_directories_oracle.rs` |
 | Extent-format data forks | Supported | 0.1.0 | | `endtoend_oracle.rs` |
 | B+tree-format data forks (bmbt), one and two levels | Supported | 0.4.0 | | `bmbt_two_level_oracle.rs`, `endtoend_oracle.rs` |
 | Symlinks, inline and remote (`XSLM`) | Supported | 0.1.0; readlink contract 0.8.0 (#259) | | `capi.rs`, `endtoend_oracle.rs` |
@@ -49,9 +49,9 @@ States:
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | Reverse-mapping and reference-count trees | Supported | 0.7.0 | | `rmap_oracle.rs`, `refcount_oracle.rs` |
 | Filesystems shaped by the stress generators | Supported | 0.8.0 | | `stress_oracle.rs` |
-| `finobt`, `rmapbt`, `reflink`, `inobtcnt`, `ftype`, sparse inodes, metadata UUID | Supported | 0.1.0; pinned matrix with provenance Unreleased (#428) | | `feature_matrix_oracle.rs`, `feature_bit_contract.rs` |
-| Legacy shared superblocks and advertised unknown `features2` bits; any `log_incompat` bit on a writable mount or a log that needs replay | Refused at mount, before the log is read | Unreleased (#428) | | `feature_bit_contract.rs` |
-| An unknown incompatible feature bit, named by its exact error before any device write | Refused | 0.1.0; exact gate errors Unreleased (#428) | | `src/superblock.rs` unit tests, `feature_bit_contract.rs` |
+| `finobt`, `rmapbt`, `reflink`, `inobtcnt`, `ftype`, sparse inodes, metadata UUID | Supported | 0.1.0; pinned matrix with provenance 0.13.0 (#428) | | `feature_matrix_oracle.rs`, `feature_bit_contract.rs` |
+| Legacy shared superblocks and advertised unknown `features2` bits; any `log_incompat` bit on a writable mount or a log that needs replay | Refused at mount, before the log is read | 0.13.0 (#428) | | `feature_bit_contract.rs` |
+| An unknown incompatible feature bit, named by its exact error before any device write | Refused | 0.1.0; exact gate errors 0.13.0 (#428) | | `src/superblock.rs` unit tests, `feature_bit_contract.rs` |
 | Fuzzed parsers: superblock, group headers, inodes, directories, btrees | Supported | 0.8.0 (#96) | | `fuzz_decoders.rs` |
 
 ## Checking
@@ -59,14 +59,14 @@ States:
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
 | `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
-| Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | Unreleased (#403) | | `cli_fsck_oracle.rs` |
-| Every finding code damaged by a case `xfs_repair -n` agrees is damage, or listed with the reason it has none, held by a contract test | Supported | Unreleased (#426) | | `cli_fsck_oracle.rs`, `fsck_coverage_contract.rs` |
-| Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | Unreleased (#402) | #378 | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
-| Realtime metadata checked from the data device: geometry, each realtime file's extents, the bitmap against the extents files map, the summary against the bitmap, and `sb_frextents` (`rt.*`, `counter.sb.frextents`) | Experimental | Unreleased (#381) | | `realtime_check_oracle.rs` |
-| Reverse-mapping btree checked block by block against the owners the walk finds: missing, stale, wrong-owner and duplicate records (`rmap.*`) | Experimental | Unreleased (#380) | | `rmap_check_oracle.rs`, `cli_fsck_oracle.rs` |
-| Refcount btree checked against the file mappings that share each block: a record over unshared blocks (`refcount.stale`) and a wrong count (`refcount.count`) | Experimental | Unreleased (#379) | | `refcount_check_oracle.rs` |
+| Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | 0.13.0 (#403) | | `cli_fsck_oracle.rs` |
+| Every finding code damaged by a case `xfs_repair -n` agrees is damage, or listed with the reason it has none, held by a contract test | Supported | 0.13.0 (#426) | | `cli_fsck_oracle.rs`, `fsck_coverage_contract.rs` |
+| Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | 0.13.0 (#402) | #378 | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
+| Realtime metadata checked from the data device: geometry, each realtime file's extents, the bitmap against the extents files map, the summary against the bitmap, and `sb_frextents` (`rt.*`, `counter.sb.frextents`) | Experimental | 0.13.0 (#381) | | `realtime_check_oracle.rs` |
+| Reverse-mapping btree checked block by block against the owners the walk finds: missing, stale, wrong-owner and duplicate records (`rmap.*`) | Experimental | 0.13.0 (#380) | | `rmap_check_oracle.rs`, `cli_fsck_oracle.rs` |
+| Refcount btree checked against the file mappings that share each block: a record over unshared blocks (`refcount.stale`) and a wrong count (`refcount.count`) | Experimental | 0.13.0 (#379) | | `refcount_check_oracle.rs` |
 | The checker's remaining gaps against `xfs_repair -n` | Upcoming | | #364 | |
-| Repair planning, `fsck.xfs --dry-run` and `fs_xfs::repair`: proposed changes with before and after bytes, writing nothing; refused by `repair.*` finding without exclusive access, under `rmapbt`, realtime, quota or `log_incompat`, on a dirty log, an incomplete scan or ambiguous ownership | Experimental: no repair rule ships yet, so every error is listed as left | Unreleased (#404) | #376, #377 | `repair_plan.rs`, `cli_repair_plan_oracle.rs` |
+| Repair planning, `fsck.xfs --dry-run` and `fs_xfs::repair`: proposed changes with before and after bytes, writing nothing; refused by `repair.*` finding without exclusive access, under `rmapbt`, realtime, quota or `log_incompat`, on a dirty log, an incomplete scan or ambiguous ownership | Experimental: no repair rule ships yet, so every error is listed as left | 0.13.0 (#404) | #376, #377 | `repair_plan.rs`, `cli_repair_plan_oracle.rs` |
 | Repair (`-y`, `-p`) | Refused (exit 16) | 0.11.0 (#339) | #376, #377 | `cli_fsck_oracle.rs` |
 
 ## Writing
@@ -78,44 +78,44 @@ only.
 
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
-| Overwrite existing bytes in place: aligned, unaligned, across blocks, at extent edges and repeated, with the size and extent map unchanged | Supported | 0.5.0; cases Unreleased (#386) | | `write_oracle.rs`, `overwrite_ranges_oracle.rs` |
+| Overwrite existing bytes in place: aligned, unaligned, across blocks, at extent edges and repeated, with the size and extent map unchanged | Supported | 0.5.0; cases 0.13.0 (#386) | | `write_oracle.rs`, `overwrite_ranges_oracle.rs` |
 | Change timestamps, permissions and ownership | Supported | 0.5.0; pre-1970 times 0.8.0 | | `capi.rs`, `write_oracle.rs` |
 | Write into an empty file, allocating | Supported | 0.5.1 (#32) | | `file_write_replay_oracle.rs` |
-| Write anywhere in a file (`Filesystem::write`): holes given blocks, unwritten extents converted where covered, the file grown past its end, zeros wherever the write does not reach | Experimental: extent-format files whose extents fit in the inode; a hole is placed across free runs and across allocation groups (#388) | Unreleased (#387, #388) | | `write_through_holes.rs`, `write_holes_oracle.rs`, `write_across_groups.rs`, `write_across_groups_oracle.rs` |
+| Write anywhere in a file (`Filesystem::write`): holes given blocks, unwritten extents converted where covered, the file grown past its end, zeros wherever the write does not reach | Experimental: extent-format files whose extents fit in the inode; a hole is placed across free runs and across allocation groups (#388) | 0.13.0 (#387, #388) | | `write_through_holes.rs`, `write_holes_oracle.rs`, `write_across_groups.rs`, `write_across_groups_oracle.rs` |
 | Truncate to zero, including a B+tree data fork | Supported | 0.5.1 (#30); bmbt 0.8.0 (#222) | | `truncate_replay_oracle.rs`, `truncate_btree_fork.rs` |
 | Shorten in place, without freeing blocks (`Filesystem::truncate`) | Partial: the blocks stay allocated; the C ABI uses it only where `truncate_to` refuses, before anything is logged | 0.5.0 | #370 | `capi.rs` |
-| Truncate to any length (`Filesystem::truncate_to`), shorter or longer, freeing the blocks past the new end, cutting a straddling extent, zeroing the last block's tail; an extent B+tree left small enough returned to an inline list; shared blocks kept, and a cut inside one refused | Experimental: a B+tree that would still need a tree after freeing is refused | Unreleased (#370) | | `truncate_to.rs`, `truncate_to_oracle.rs` |
+| Truncate to any length (`Filesystem::truncate_to`), shorter or longer, freeing the blocks past the new end, cutting a straddling extent, zeroing the last block's tail; an extent B+tree left small enough returned to an inline list; shared blocks kept, and a cut inside one refused | Experimental: a B+tree that would still need a tree after freeing is refused | 0.13.0 (#370) | | `truncate_to.rs`, `truncate_to_oracle.rs` |
 | Create a file | Supported | 0.5.1 (#36) | | `create_replay_oracle.rs`, `create_free_slot_oracle.rs` |
-| Create in a group whose inode trees outgrow one block: tree blocks from free space, owned by `OWN_INOBT`, with `inobtcount`'s block counts kept | Supported | Unreleased (#425) | | `inode_tree_growth.rs`, `inode_tree_growth_oracle.rs` |
+| Create in a group whose inode trees outgrow one block: tree blocks from free space, owned by `OWN_INOBT`, with `inobtcount`'s block counts kept | Supported | 0.13.0 (#425) | | `inode_tree_growth.rs`, `inode_tree_growth_oracle.rs` |
 | Create in a directory with a default ACL | Refused | 0.10.0 (#284) | #390 | `create_default_acl_oracle.rs` |
-| Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | Unreleased (#PR) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
-| Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | Unreleased (#422) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
+| Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | 0.13.0 (#PR) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
+| Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | 0.13.0 (#422) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
 | Unlink a file | Supported | 0.5.1 (#37) | | `unlink_replay_oracle.rs` |
 | mkdir, and a directory converted to block form | Supported | 0.5.1 (#38) | | `dir_block_oracle.rs` |
 | Entries in a block-form directory | Supported | 0.8.0 (#215) | | `block_form_insert.rs` |
-| Create, unlink, rename and rmdir in block- and leaf-form directories: the directory laid out again in block form while one block holds it and in leaf form beyond, blocks taken and given back as it grows and shrinks | Experimental | Unreleased (#366) | | `leaf_directories.rs`, `leaf_directories_oracle.rs`, `block_form_insert.rs` |
-| Create, unlink, rename and rmdir in node-form directories: edited in place, with leaf and node splits, joins and root collapse, free-index upkeep, transitions to and from leaf form, and a block-map B+tree for a map that outgrows the inode; a link or a move finds its names through the hash index, at a cost that does not grow with the directory | Experimental | Unreleased (#424) | | `node_directories.rs`, `node_directories_oracle.rs` |
+| Create, unlink, rename and rmdir in block- and leaf-form directories: the directory laid out again in block form while one block holds it and in leaf form beyond, blocks taken and given back as it grows and shrinks | Experimental | 0.13.0 (#366) | | `leaf_directories.rs`, `leaf_directories_oracle.rs`, `block_form_insert.rs` |
+| Create, unlink, rename and rmdir in node-form directories: edited in place, with leaf and node splits, joins and root collapse, free-index upkeep, transitions to and from leaf form, and a block-map B+tree for a map that outgrows the inode; a link or a move finds its names through the hash index, at a cost that does not grow with the directory | Experimental | 0.13.0 (#424) | | `node_directories.rs`, `node_directories_oracle.rs` |
 | Rename within a short-form directory | Supported | 0.5.1 (#25) | #368 | `rename_oracle.rs` |
-| Move a name across directories (`Filesystem::rename`), a directory taking its `..` and both parents' link counts with it, in any directory form; a move beneath itself refused | Experimental | Unreleased (#382) | | `cross_directory_rename.rs`, `cross_directory_rename_oracle.rs` |
-| Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | Unreleased (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |
-| Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | Unreleased (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
-| Hard links: `Filesystem::link` in any directory form; unlink of one of several names; the last name freeing the inode with its blocks and quota | Experimental | Unreleased (#384) | | `hardlinks.rs`, `hardlinks_oracle.rs` |
-| Extended attribute writes: set, create-only, replace-only and remove in `user.`, `trusted.` and `security.`, across short-form, leaf, node and remote forks, values to 64 KiB, quota charged for attribute blocks; C ABI `fs_xfs_setxattr`/`getxattr`/`listxattr`/`removexattr` | Experimental: the rebuilt attribute fork needs one free run | Unreleased (#389) | | `xattr_write_oracle.rs`, `xattr_capi.rs`, `oracle_vm_fixtures.rs` |
-| ACL writes: `set_acl`, `remove_acl` and `chmod`, access and default, kept in step with the mode; `set_attributes` refuses a permission change under an access ACL | Experimental | Unreleased (#422) | | `acl_write_oracle.rs`, `acl_write.rs` |
+| Move a name across directories (`Filesystem::rename`), a directory taking its `..` and both parents' link counts with it, in any directory form; a move beneath itself refused | Experimental | 0.13.0 (#382) | | `cross_directory_rename.rs`, `cross_directory_rename_oracle.rs` |
+| Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | 0.13.0 (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |
+| Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | 0.13.0 (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
+| Hard links: `Filesystem::link` in any directory form; unlink of one of several names; the last name freeing the inode with its blocks and quota | Experimental | 0.13.0 (#384) | | `hardlinks.rs`, `hardlinks_oracle.rs` |
+| Extended attribute writes: set, create-only, replace-only and remove in `user.`, `trusted.` and `security.`, across short-form, leaf, node and remote forks, values to 64 KiB, quota charged for attribute blocks; C ABI `fs_xfs_setxattr`/`getxattr`/`listxattr`/`removexattr` | Experimental: the rebuilt attribute fork needs one free run | 0.13.0 (#389) | | `xattr_write_oracle.rs`, `xattr_capi.rs`, `oracle_vm_fixtures.rs` |
+| ACL writes: `set_acl`, `remove_acl` and `chmod`, access and default, kept in step with the mode; `set_attributes` refuses a permission change under an access ACL | Experimental | 0.13.0 (#422) | | `acl_write_oracle.rs`, `acl_write.rs` |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
-| Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points Unreleased (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
-| Log reuse in bounded memory (`sync`); a checkpoint that would leave a gap no pad record fits wraps first | Supported | 0.8.0 (#89); gap fixed Unreleased (#424) | | `log_reuse.rs`, `log_write` unit tests |
+| Many journalled operations in one mount, each built on the ones before, including a crash at any checkpoint or record boundary replaying to a prefix of the sequence | Supported | 0.8.0 (#89); crash points 0.13.0 (#365) | | `many_ops_per_mount.rs`, `random_operations_replay.rs`, `checkpoint_boundary_crash_oracle.rs` |
+| Log reuse in bounded memory (`sync`); a checkpoint that would leave a gap no pad record fits wraps first | Supported | 0.8.0 (#89); gap fixed 0.13.0 (#424) | | `log_reuse.rs`, `log_write` unit tests |
 | A checkpoint split across several log records | Supported | 0.8.0 (#216) | | `split_checkpoint.rs` |
-| Clean unmount (`Filesystem::unmount`): metadata pushed home, the lazy summary counters written to the superblock and an unmount record logged, so `xfs_repair -n` grades the volume and the kernel mounts it with no replay | Supported | Unreleased (#453) | | `clean_unmount.rs`, `clean_unmount_oracle.rs` |
+| Clean unmount (`Filesystem::unmount`): metadata pushed home, the lazy summary counters written to the superblock and an unmount record logged, so `xfs_repair -n` grades the volume and the kernel mounts it with no replay | Supported | 0.13.0 (#453) | | `clean_unmount.rs`, `clean_unmount_oracle.rs` |
 | A checkpoint whose flush fails | Supported: the kernel replays to a consistent volume | 0.8.0 | | `torn_checkpoint_oracle.rs` |
-| Writing after a failed log write or push | Refused (`Error::Io`, EIO): the mount reads and writes nothing more, as the kernel shuts down | Unreleased (#400) | | `log_write_failure.rs`, `torn_checkpoint_oracle.rs` |
+| Writing after a failed log write or push | Refused (`Error::Io`, EIO): the mount reads and writes nothing more, as the kernel shuts down | 0.13.0 (#400) | | `log_write_failure.rs`, `torn_checkpoint_oracle.rs` |
 | In-place writes after a mount has logged a change | Refused | 0.8.0 (#186) | | `in_place_after_checkpoint.rs` |
 | Groups whose B+trees are more than one block deep | Supported | 0.7.0 | | `deeptree_oracle.rs` |
 | Free-list refill | Supported | 0.8.0 (#197) | | `agfl_refill.rs` |
 | Inode chunks on the inode alignment | Supported | 0.8.0 | | `inode_chunk_alignment.rs` |
 | Shared extents: a partial free splits the reference-count record | Supported | 0.7.0 | | `refcount_oracle.rs` |
 | Damaged group, inode-chunk, free-space and reference-count records | Refused before anything is built | 0.11.0 (#92, #314) | | `group_record_oracle.rs`, `free_space_record_oracle.rs`, `inode_chunk_record_oracle.rs`, `refcount_record_oracle.rs`, `extent_bounds_oracle.rs` |
-| User, group and project quota accounting, with hard limits | Experimental | Unreleased (#396, #397) | #378 | `quota_accounting_oracle.rs` |
+| User, group and project quota accounting, with hard limits | Experimental | 0.13.0 (#396, #397) | #378 | `quota_accounting_oracle.rs` |
 | Every write against every legal feature combination | Supported | 0.8.0 | #359 | `feature_matrix_oracle.rs` |
 | Writing a volume with parent pointers or exchange-range | Refused | 0.8.0 (#99) | #373, #374 | `parent_exchrange_oracle.rs` |
 | Writing a v4 volume | Partial: in-place overwrite only; journalled operations refused | 0.5.0 | | `feature_matrix_oracle.rs` |
@@ -136,8 +136,8 @@ only.
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
 | C ABI: mount (path, callbacks, fs_core device, realtime), volume info, stat, directory iterator, read, readlink, write, truncate, set attributes | Supported | 0.3.0; realtime 0.10.0 (#291) | | `capi.rs`, `header_declares_every_entry_point.rs`, `header_sentinels_match_the_abi.rs` |
-| C ABI writes through the log: `fs_xfs_mount_rw_with_fs_core_device`, `fs_xfs_create`, `fs_xfs_mkdir`, `fs_xfs_unlink`, `fs_xfs_rmdir`, `fs_xfs_link`, `fs_xfs_rename`/`rename2` (`FS_XFS_RENAME_REPLACE`), `fs_xfs_flush`, `fs_xfs_set_label` (before anything is logged); `fs_xfs_write_file` allocating and growing, `fs_xfs_truncate` to any length, `fs_xfs_set_attributes` after a logged operation, POSIX ACLs through `fs_xfs_setxattr`/`removexattr`, and a clean unmount from `fs_xfs_umount` | Experimental: each call as experimental as the operation it reaches; v4 keeps in-place overwrite and shrink only | Unreleased (#460) | | `capi_write_ops.rs`, `capi_after_a_logged_change.rs`, `capi_write_ops_oracle.rs` |
-| Attribute changes through the log (`Filesystem::change_attributes`): mode, owner, group and times in one record, a mode change under an access ACL through `chmod` | Experimental | Unreleased (#460) | | `capi_write_ops.rs`, `capi_write_ops_oracle.rs` |
+| C ABI writes through the log: `fs_xfs_mount_rw_with_fs_core_device`, `fs_xfs_create`, `fs_xfs_mkdir`, `fs_xfs_unlink`, `fs_xfs_rmdir`, `fs_xfs_link`, `fs_xfs_rename`/`rename2` (`FS_XFS_RENAME_REPLACE`), `fs_xfs_flush`, `fs_xfs_set_label` (before anything is logged); `fs_xfs_write_file` allocating and growing, `fs_xfs_truncate` to any length, `fs_xfs_set_attributes` after a logged operation, POSIX ACLs through `fs_xfs_setxattr`/`removexattr`, and a clean unmount from `fs_xfs_umount` | Experimental: each call as experimental as the operation it reaches; v4 keeps in-place overwrite and shrink only | 0.13.0 (#460) | | `capi_write_ops.rs`, `capi_after_a_logged_change.rs`, `capi_write_ops_oracle.rs` |
+| Attribute changes through the log (`Filesystem::change_attributes`): mode, owner, group and times in one record, a mode change under an access ACL through `chmod` | Experimental | 0.13.0 (#460) | | `capi_write_ops.rs`, `capi_write_ops_oracle.rs` |
 | Create a symlink | Not supported: no operation makes one | | | |
 | In-image paths as bytes, not UTF-8 | Supported | 0.9.0 (#269) | | `capi.rs` |
 | `fs.xfs` `ls`, `read`, `get`/`info` (`--features cli`) | Supported | 0.9.0 (#271) | | `cli_get_oracle.rs`, `cli_corrupt_oracle.rs`, `tests/cli/` |
