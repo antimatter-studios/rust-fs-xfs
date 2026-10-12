@@ -224,6 +224,12 @@ never does.
   under level 1), the chain reads no leaf twice, and either corruption is
   reported as one. A lookup through such a directory, on a read-only mount,
   used to hang the caller.
+- **A directory data block that does not parse fails the listing (#438).**
+  `read_dir` skipped such a block as free space, so its names vanished from
+  the listing while a lookup could still find them: a damaged block-form
+  directory listed as empty. XFS keeps no free space mapped in a
+  directory's data region, so the block is damage, and the listing now
+  says which.
 
 - **Creates past one block of inode tree (#423).** A create that made an inode
   chunk and grew the group's inode tree in one record logged the group's
