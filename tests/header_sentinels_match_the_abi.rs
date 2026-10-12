@@ -48,6 +48,11 @@ const SENTINELS: &[(&str, i64, &str)] = &[
         fs_xfs::capi::FS_XFS_LEAVE_TIME,
         "((int64_t)INT64_MIN)",
     ),
+    (
+        "FS_XFS_RENAME_REPLACE",
+        fs_xfs::capi::FS_XFS_RENAME_REPLACE as i64,
+        "0x01",
+    ),
 ];
 
 fn header() -> String {

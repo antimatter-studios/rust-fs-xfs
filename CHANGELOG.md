@@ -8,6 +8,25 @@ never does.
 
 ### Added
 
+- **The C ABI writes through the log (#460).** A caller holding only the C
+  ABI can now do what the library could: `fs_xfs_mount_rw_with_fs_core_device`
+  mounts a callback device or partition slice for writing;
+  `fs_xfs_create`, `fs_xfs_mkdir`, `fs_xfs_unlink`, `fs_xfs_rmdir`,
+  `fs_xfs_link`, `fs_xfs_rename` and `fs_xfs_rename2` (with
+  `FS_XFS_RENAME_REPLACE` for `rename(2)`'s replace) change the namespace,
+  each refusal by the errno its POSIX call gives; `fs_xfs_flush` writes
+  what the handle has logged home; and `fs_xfs_set_label` sets the volume
+  label, before the handle has logged anything. `fs_xfs_umount` unmounts a writable
+  handle cleanly, so the volume it leaves needs no replay and a writable
+  mount takes it again; before, it was dropped with its log still dirty.
+  `tests/capi_write_ops_oracle.rs` has `xfs_repair -n`, `xfs_logprint` and
+  the kernel read a volume changed through nothing but these calls.
+
+- **Attribute changes through the log (#460).**
+  `Filesystem::change_attributes` writes mode, owner, group and times as one
+  logged inode core, so it works after a mount has logged anything, where
+  `set_attributes` writes in place and is refused from then on.
+
 - **A clean unmount (#439).** `Filesystem::unmount` pushes every logged
   change home, writes the summary counters (`sb_icount`, `sb_ifree`,
   `sb_fdblocks`) from the group headers into the superblock, and logs an
@@ -181,6 +200,16 @@ never does.
   and `quota.usage`.
 
 ### Changed
+
+- **`fs_xfs_write_file`, `fs_xfs_truncate` and `fs_xfs_set_attributes` go
+  through the log on v5 (#460).** A write fills holes and grows the file, a
+  truncate goes to any length and frees what it cuts, and an attribute change
+  works after a logged operation; each was ENOTSUP before. A mode change keeps
+  an access ACL in step, and the inode-change time is the time now rather than
+  the latest time set. Shapes the logged paths refuse, and v4, keep the
+  in-place behaviour. `fs_xfs_setxattr` and `fs_xfs_removexattr` take
+  `system.posix_acl_access` and `system.posix_acl_default` in the format
+  `fs_xfs_getxattr` returns and set or remove the ACL itself.
 
 - **`main` merges through a merge queue, and a change to documentation alone
   skips the VM.** rust-fs-core is pinned at v0.3.8: `AGENTS.md` carries its

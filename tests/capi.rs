@@ -1045,28 +1045,51 @@ fn a_write_round_trips_through_the_abi() {
     unsafe { fs_xfs_umount(fs) };
 }
 
-/// Writing past the end of a file needs metadata this driver cannot
-/// change, and the ABI must say which kind of refusal that is.
+/// A write past the end of a file grows it, through the log (#460): the
+/// bytes land where they were asked to, and the gap before them reads
+/// as zeros. This was ENOTSUP while the ABI wrote in place only.
 #[test]
-fn writing_past_the_end_is_enotsup() {
+fn writing_past_the_end_grows_the_file() {
     let copy = WritableCopy::new("xfscapi-past-end.img");
     let fs = copy.open_rw();
+    let path = cstr("/small.txt");
+    let mut before = zeroed_attr();
+    assert_eq!(unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut before) }, 0);
     let data = b"beyond";
     let n = unsafe {
         fs_xfs_write_file(
             fs,
-            cstr("/small.txt").as_ptr(),
+            path.as_ptr(),
             data.as_ptr().cast::<c_void>(),
             1 << 20,
             data.len() as u64,
         )
     };
-    assert_eq!(n, -1);
-    assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
+    assert_eq!(n, data.len() as i64, "{}", last_error());
+    let mut st = zeroed_attr();
+    assert_eq!(unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut st) }, 0);
+    assert_eq!(st.size, (1 << 20) + data.len() as u64);
+
+    let gap = (1u64 << 20) - before.size;
+    let mut back = vec![0xEEu8; gap as usize + data.len()];
+    let r = unsafe {
+        fs_xfs_read_file(
+            fs,
+            path.as_ptr(),
+            back.as_mut_ptr().cast::<c_void>(),
+            before.size,
+            back.len() as u64,
+        )
+    };
+    assert_eq!(r, back.len() as i64, "{}", last_error());
+    assert!(
+        back[..gap as usize].iter().all(|&b| b == 0),
+        "the gap is not zeros"
+    );
+    assert_eq!(&back[gap as usize..], data);
     unsafe { fs_xfs_umount(fs) };
 }
 
-/// Truncate through the ABI, and the size visible afterwards.
 #[test]
 fn a_truncate_is_visible_through_the_abi() {
     let copy = WritableCopy::new("xfscapi-trunc.img");
@@ -1087,23 +1110,34 @@ fn a_truncate_is_visible_through_the_abi() {
     unsafe { fs_xfs_umount(fs) };
 }
 
-/// Growing is refused, and named as unsupported rather than as an error
-/// in the arguments.
+/// Truncating to a larger size grows the file, through the log (#460),
+/// and what it adds reads as zeros. This was ENOTSUP while the ABI wrote
+/// in place only.
 #[test]
-fn growing_by_truncate_is_enotsup() {
+fn growing_by_truncate_reads_as_zeros() {
     let copy = WritableCopy::new("xfscapi-grow.img");
     let fs = copy.open_rw();
-    let rc = unsafe {
-        fs_xfs_truncate(
+    let path = cstr("/small.txt");
+    let mut before = zeroed_attr();
+    assert_eq!(unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut before) }, 0);
+    let rc = unsafe { fs_xfs_truncate(fs, path.as_ptr(), 1 << 20, FS_XFS_LEAVE_TIME, 0) };
+    assert_eq!(rc, 0, "{}", last_error());
+    let mut st = zeroed_attr();
+    assert_eq!(unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut st) }, 0);
+    assert_eq!(st.size, 1 << 20);
+
+    let mut added = vec![0xEEu8; ((1u64 << 20) - before.size) as usize];
+    let r = unsafe {
+        fs_xfs_read_file(
             fs,
-            cstr("/small.txt").as_ptr(),
-            1 << 20,
-            FS_XFS_LEAVE_TIME,
-            0,
+            path.as_ptr(),
+            added.as_mut_ptr().cast::<c_void>(),
+            before.size,
+            added.len() as u64,
         )
     };
-    assert_eq!(rc, -1);
-    assert_eq!(fs_xfs_last_errno(), ENOTSUP, "{}", last_error());
+    assert_eq!(r, added.len() as i64, "{}", last_error());
+    assert!(added.iter().all(|&b| b == 0), "the grown part is not zeros");
     unsafe { fs_xfs_umount(fs) };
 }
 

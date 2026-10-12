@@ -83,7 +83,7 @@ only.
 | Write into an empty file, allocating | Supported | 0.5.1 (#32) | | `file_write_replay_oracle.rs` |
 | Write anywhere in a file (`Filesystem::write`): holes given blocks, unwritten extents converted where covered, the file grown past its end, zeros wherever the write does not reach | Experimental: extent-format files whose extents fit in the inode; a hole is placed across free runs and across allocation groups (#388) | Unreleased (#387, #388) | | `write_through_holes.rs`, `write_holes_oracle.rs`, `write_across_groups.rs`, `write_across_groups_oracle.rs` |
 | Truncate to zero, including a B+tree data fork | Supported | 0.5.1 (#30); bmbt 0.8.0 (#222) | | `truncate_replay_oracle.rs`, `truncate_btree_fork.rs` |
-| Shorten in place, without freeing blocks (C ABI `fs_xfs_truncate`) | Partial: the blocks stay allocated | 0.5.0 | #370 | `capi.rs` |
+| Shorten in place, without freeing blocks (`Filesystem::truncate`) | Partial: the blocks stay allocated; the C ABI uses it only where `truncate_to` refuses, before anything is logged | 0.5.0 | #370 | `capi.rs` |
 | Truncate to any length (`Filesystem::truncate_to`), shorter or longer, freeing the blocks past the new end, cutting a straddling extent, zeroing the last block's tail; an extent B+tree left small enough returned to an inline list; shared blocks kept, and a cut inside one refused | Experimental: a B+tree that would still need a tree after freeing is refused | Unreleased (#370) | | `truncate_to.rs`, `truncate_to_oracle.rs` |
 | Create a file | Supported | 0.5.1 (#36) | | `create_replay_oracle.rs`, `create_free_slot_oracle.rs` |
 | Create in a group whose inode trees outgrow one block: tree blocks from free space, owned by `OWN_INOBT`, with `inobtcount`'s block counts kept | Supported | Unreleased (#425) | | `inode_tree_growth.rs`, `inode_tree_growth_oracle.rs` |
@@ -136,6 +136,9 @@ only.
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
 | C ABI: mount (path, callbacks, fs_core device, realtime), volume info, stat, directory iterator, read, readlink, write, truncate, set attributes | Supported | 0.3.0; realtime 0.10.0 (#291) | | `capi.rs`, `header_declares_every_entry_point.rs`, `header_sentinels_match_the_abi.rs` |
+| C ABI writes through the log: `fs_xfs_mount_rw_with_fs_core_device`, `fs_xfs_create`, `fs_xfs_mkdir`, `fs_xfs_unlink`, `fs_xfs_rmdir`, `fs_xfs_link`, `fs_xfs_rename`/`rename2` (`FS_XFS_RENAME_REPLACE`), `fs_xfs_flush`, `fs_xfs_set_label` (before anything is logged); `fs_xfs_write_file` allocating and growing, `fs_xfs_truncate` to any length, `fs_xfs_set_attributes` after a logged operation, POSIX ACLs through `fs_xfs_setxattr`/`removexattr`, and a clean unmount from `fs_xfs_umount` | Experimental: each call as experimental as the operation it reaches; v4 keeps in-place overwrite and shrink only | Unreleased (#460) | | `capi_write_ops.rs`, `capi_after_a_logged_change.rs`, `capi_write_ops_oracle.rs` |
+| Attribute changes through the log (`Filesystem::change_attributes`): mode, owner, group and times in one record, a mode change under an access ACL through `chmod` | Experimental | Unreleased (#460) | | `capi_write_ops.rs`, `capi_write_ops_oracle.rs` |
+| Create a symlink | Not supported: no operation makes one | | | |
 | In-image paths as bytes, not UTF-8 | Supported | 0.9.0 (#269) | | `capi.rs` |
 | `fs.xfs` `ls`, `read`, `get`/`info` (`--features cli`) | Supported | 0.9.0 (#271) | | `cli_get_oracle.rs`, `cli_corrupt_oracle.rs`, `tests/cli/` |
 | `fs.xfs` `write`, `mkdir`, `set label` | Supported, within the write shapes above | 0.9.0 (#271); label 0.11.0 (#341) | | `cli_write_kernel.rs`, `cli_label_kernel.rs` |
