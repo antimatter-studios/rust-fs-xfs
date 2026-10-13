@@ -9,8 +9,10 @@
 //! - Exchange-range adds log items, and a volume with a dirty log is
 //!   refused before anything reads it.
 //!
-//! So a read accepts both bits. A write does not: every create, rename and
-//! unlink must maintain the parent pointers, and nothing here does.
+//! So a read accepts both bits. A write accepts exchange-range (#374),
+//! whose exchanges are graded on the Debian 13 guest by
+//! `tests/exchange_range_kernel.rs`. It refuses parent pointers: every
+//! create, rename and unlink must maintain them, and nothing here does yet.
 //!
 //! The volumes are built without a kernel. A protofile populates them, so
 //! mkfs writes the parent pointers, and `xfs_db -x` adds user attributes
@@ -156,7 +158,15 @@ fn xfs_db_attr_counts(img: &Path, path: &str) -> (usize, usize) {
     (count, parents)
 }
 
-fn check_reads(tag: &str, args: &[&str], bits: u32) {
+/// What a writable mount of the volume should do: be refused, as parent
+/// pointers still are, or be accepted, as exchange-range is (#374).
+#[derive(PartialEq)]
+enum Writes {
+    Refused,
+    Accepted,
+}
+
+fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
     let (dir, big_bytes) = build(tag, args);
     let img = dir.join("fs.img");
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&img).unwrap()))
@@ -234,14 +244,27 @@ fn check_reads(tag: &str, args: &[&str], bits: u32) {
     }
 
     drop(fs);
-    match Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap())) {
-        Err(Error::UnsupportedFeature(why)) => assert!(
-            why.contains("can be read but not written"),
-            "{tag}: the refusal should say the volume stays readable: {why}"
-        ),
-        Err(other) => panic!("{tag}: wrong refusal {other:?}"),
-        Ok(_) => panic!("{tag}: a writable mount must be refused"),
+    if writes == Writes::Refused {
+        match Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap())) {
+            Err(Error::UnsupportedFeature(why)) => assert!(
+                why.contains("can be read but not written"),
+                "{tag}: the refusal should say the volume stays readable: {why}"
+            ),
+            Err(other) => panic!("{tag}: wrong refusal {other:?}"),
+            Ok(_) => panic!("{tag}: a writable mount must be refused"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
     }
+
+    // A writable mount is accepted (#374). What an exchange on this volume
+    // leaves behind is graded where a kernel can replay the log first, on
+    // the Debian 13 guest: tests/exchange_range_kernel.rs. This guest's
+    // 6.1 kernel cannot mount an exchange-range volume at all, and
+    // xfs_repair will not grade a log nothing has replayed.
+    let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap()))
+        .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
+    drop(fs);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -251,10 +274,16 @@ fn a_parent_pointer_volume_reads_and_refuses_writes() {
         "parent",
         &["-n", "parent=1"],
         incompat::PARENT | incompat::EXCHRANGE,
+        Writes::Refused,
     );
 }
 
 #[test]
-fn an_exchange_range_volume_reads_and_refuses_writes() {
-    check_reads("exchange", &["-i", "exchange=1"], incompat::EXCHRANGE);
+fn an_exchange_range_volume_reads_and_accepts_a_writable_mount() {
+    check_reads(
+        "exchange",
+        &["-i", "exchange=1"],
+        incompat::EXCHRANGE,
+        Writes::Accepted,
+    );
 }

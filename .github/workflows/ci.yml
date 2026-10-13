@@ -361,6 +361,70 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # THE DEBIAN 13 GUEST (#374): kernel 6.12 and xfsprogs 6.13, for the
+  # suites Debian 12's 6.1 cannot mount, parent pointers and exchange-range.
+  # Its own machine and its own box cache, keyed on that guest, so it never
+  # restores the Debian 12 box the other jobs boot. No fixtures: its suites
+  # build their own volumes in the guest.
+  test-kernel-new:
+    name: test (x86_64, kernel 6.12 in the Debian 13 VM)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        env:
+          FLTH_VM_GUEST: debian-13
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - name: Make the runner's own xfsprogs unusable
+        run: |
+          set -eu
+          for tool in mkfs.xfs xfs_db xfs_repair xfs_logprint xfs_io xfs_admin xfs_bmap xfs_info; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore test:kernel-new
+        id: tier
+        run: chore test:kernel-new
+      - name: Keep the tier logs
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-kernel-new
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
   test-arm64:
     name: test (aarch64, no KVM on this runner)
     needs: [changes, fixtures]
@@ -666,7 +730,7 @@ jobs:
     # permanently pending, with nothing to point at. It is also the only
     # shape in which a job-level `if:` is safe.
     if: always()
-    needs: [changes, unit, fixtures, test, test-arm64, test-darwin, suite-in-vm, cli, semver]
+    needs: [changes, unit, fixtures, test, test-kernel-new, test-arm64, test-darwin, suite-in-vm, cli, semver]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded

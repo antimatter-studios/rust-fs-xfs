@@ -49,6 +49,7 @@ pub mod dir_write;
 mod directory_repair;
 pub mod endian;
 pub mod error;
+mod exchange;
 pub mod extent;
 pub mod file_write;
 pub mod format;

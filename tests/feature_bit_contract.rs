@@ -198,7 +198,7 @@ fn every_unknown_ro_compat_bit_is_readable_but_refuses_write_before_mutation() {
 
 #[test]
 fn readable_unmaintained_features_refuse_write_before_mutation() {
-    for bit in [incompat::PARENT, incompat::EXCHRANGE, incompat::READ_ONLY] {
+    for bit in [incompat::PARENT, incompat::READ_ONLY] {
         let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, bit);
         Filesystem::mount(device.clone()).unwrap();
         assert!(matches!(
@@ -207,6 +207,15 @@ fn readable_unmaintained_features_refuse_write_before_mutation() {
         ));
         assert_eq!(device.writes.load(Ordering::SeqCst), 0);
     }
+}
+
+/// Exchange-range is written (#374): a volume with it mounts for writing,
+/// and mounting writes nothing.
+#[test]
+fn an_exchange_range_volume_mounts_for_writing_without_mutation() {
+    let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, incompat::EXCHRANGE);
+    read_populated_file(&Filesystem::mount_rw(device.clone()).unwrap());
+    assert_eq!(device.writes.load(Ordering::SeqCst), 0);
 }
 
 /// A clean log holds nothing a log-incompatible bit describes, so it is
@@ -310,19 +319,14 @@ fn gate_errors_are_exact_and_accepted_mounts_read_without_changing_the_fixture()
             }
         }
     }
-    for (bits, named) in [
-        (incompat::PARENT, "parent pointers (parent)"),
-        (incompat::EXCHRANGE, "exchange-range (exchrange)"),
-        (
-            incompat::READ_ONLY,
-            "parent pointers (parent) and exchange-range (exchrange)",
-        ),
-    ] {
-        let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, bits);
-        read_populated_file(&Filesystem::mount(device.clone()).unwrap());
-        unsupported(Filesystem::mount_rw(device.clone()), &format!("this volume uses {named}, which this driver does not maintain, so it can be read but not written"));
-        assert_eq!(device.writes.load(Ordering::SeqCst), 0);
-    }
+    let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, incompat::PARENT);
+    read_populated_file(&Filesystem::mount(device.clone()).unwrap());
+    unsupported(
+        Filesystem::mount_rw(device.clone()),
+        "this volume uses parent pointers (parent), which this driver does not maintain, so \
+         it can be read but not written",
+    );
+    assert_eq!(device.writes.load(Ordering::SeqCst), 0);
     assert_eq!(fixture_digest(), before);
 }
 

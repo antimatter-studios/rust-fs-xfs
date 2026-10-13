@@ -213,7 +213,10 @@ pub mod incompat {
     /// 64-bit per-inode extent counters.
     pub const NREXT64: u32 = 1 << 5;
     /// Atomic file extent exchange (`exchrange`). Adds log items and no
-    /// structure a read walks, so it is read; writing is refused (#99).
+    /// structure a read walks, so it is read (#99). Written too (#374):
+    /// this driver's own exchange is one checkpoint and writes none of
+    /// those items, and while the kernel's are in a log it sets a
+    /// log-incompatible bit, which a write refuses.
     pub const EXCHRANGE: u32 = 1 << 6;
     /// Parent pointers (`parent`): each link has an extended attribute in
     /// its own namespace naming its directory, which the attribute reader
@@ -240,7 +243,7 @@ pub mod incompat {
 
     /// The readable bits a write does not maintain. A read-write mount
     /// refuses them; see `Filesystem::mount_rw`.
-    pub const READ_ONLY: u32 = EXCHRANGE | PARENT;
+    pub const READ_ONLY: u32 = PARENT;
 }
 
 /// `sb_features2` bits. Only meaningful when `MOREBITSBIT` is set in

@@ -44,7 +44,8 @@ States:
 | Dirty log: replayed into memory, the device untouched | Supported | 0.8.0 (#90) | | `dirty_log_mount.rs`, `log_oracle.rs` |
 | Log head found from cycle numbers, not a whole-ring read | Supported | 0.9.0 (#251) | | `read_path_cost.rs` |
 | `File` handle (`open`, `open_ino`, `root`) | Supported | 0.6.0 | | `file_handle_oracle.rs` |
-| Parent pointers and exchange-range volumes | Supported, read-only | 0.8.0 (#99) | #373, #374 | `parent_exchrange_oracle.rs` |
+| Parent pointers and exchange-range volumes | Supported; parent pointers read-only | 0.8.0 (#99); exchange-range writes Unreleased (#459) | #373 | `parent_exchrange_oracle.rs` |
+| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied | Experimental | Unreleased (#459) | | `exchange_range.rs`, `exchange_range_kernel.rs` |
 | Realtime files, read from the realtime device | Supported | 0.10.0 (#98) | #361 | `realtime_oracle.rs` |
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | Reverse-mapping and reference-count trees | Supported | 0.7.0 | | `rmap_oracle.rs`, `refcount_oracle.rs` |
@@ -117,7 +118,7 @@ only.
 | Damaged group, inode-chunk, free-space and reference-count records | Refused before anything is built | 0.11.0 (#92, #314) | | `group_record_oracle.rs`, `free_space_record_oracle.rs`, `inode_chunk_record_oracle.rs`, `refcount_record_oracle.rs`, `extent_bounds_oracle.rs` |
 | User, group and project quota accounting, with hard limits | Experimental | 0.13.0 (#396, #397) | #378 | `quota_accounting_oracle.rs` |
 | Every write against every legal feature combination | Supported | 0.8.0 | #359 | `feature_matrix_oracle.rs` |
-| Writing a volume with parent pointers or exchange-range | Refused | 0.8.0 (#99) | #373, #374 | `parent_exchrange_oracle.rs` |
+| Writing a volume with parent pointers | Refused | 0.8.0 (#99) | #373 | `parent_exchrange_oracle.rs` |
 | Writing a v4 volume | Partial: in-place overwrite only; journalled operations refused | 0.5.0 | | `feature_matrix_oracle.rs` |
 | Writing a volume whose log is dirty | Refused | 0.5.0 | | |
 | Superblock written back | Supported | 0.5.2 | | `super_write_oracle.rs` |
