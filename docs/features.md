@@ -60,7 +60,7 @@ States:
 |---|---|---|---|---|
 | `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
 | Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | 0.13.0 (#403) | | `cli_fsck_oracle.rs` |
-| The checker through the C ABI: `fs_xfs_check` passes each finding (code, severity, group, block, inode, field, words) to a callback and fills a report of totals that tells a complete scan from a partial one | Experimental | Unreleased (#PR) | | `capi_write_ops.rs` |
+| The checker through the C ABI: `fs_xfs_check` passes each finding (code, severity, group, block, inode, field, words) to a callback and fills a report of totals that tells a complete scan from a partial one | Experimental | Unreleased (#469) | | `capi_write_ops.rs` |
 | Every finding code damaged by a case `xfs_repair -n` agrees is damage, or listed with the reason it has none, held by a contract test | Supported | 0.13.0 (#426) | | `cli_fsck_oracle.rs`, `fsck_coverage_contract.rs` |
 | Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | 0.13.0 (#402) | #378 | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
 | Realtime metadata checked from the data device: geometry, each realtime file's extents, the bitmap against the extents files map, the summary against the bitmap, and `sb_frextents` (`rt.*`, `counter.sb.frextents`) | Experimental | 0.13.0 (#381) | | `realtime_check_oracle.rs` |
@@ -89,7 +89,6 @@ only.
 | Create a file | Supported | 0.5.1 (#36) | | `create_replay_oracle.rs`, `create_free_slot_oracle.rs` |
 | Create in a group whose inode trees outgrow one block: tree blocks from free space, owned by `OWN_INOBT`, with `inobtcount`'s block counts kept | Supported | 0.13.0 (#425) | | `inode_tree_growth.rs`, `inode_tree_growth_oracle.rs` |
 | Create in a directory with a default ACL | Refused | 0.10.0 (#284) | #390 | `create_default_acl_oracle.rs` |
-| Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | 0.13.0 (#PR) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
 | Create in a directory with a default ACL: the new inode inherits it, narrowed by the mode asked for | Supported | 0.13.0 (#422) | | `create_default_acl_oracle.rs`, `acl_write.rs` |
 | Unlink a file | Supported | 0.5.1 (#37) | | `unlink_replay_oracle.rs` |
 | mkdir, and a directory converted to block form | Supported | 0.5.1 (#38) | | `dir_block_oracle.rs` |
