@@ -146,6 +146,17 @@ impl BufferItem {
             // A remote symlink target's run, whose one checksum covers every
             // block of it (#462).
             BLFT_SYMLINK => crate::format::symlink::offsets::CRC,
+            // The primary superblock, logged by a label change (#464). Only
+            // a v5 superblock has a checksum; a v4 one has nothing at that
+            // offset, and bytes past its end are expected to stay zero.
+            BLFT_SB
+                if self.data.len() > crate::superblock::offsets::VERSIONNUM + 1
+                    && crate::endian::be16(&self.data, crate::superblock::offsets::VERSIONNUM)
+                        & crate::superblock::XFS_SB_VERSION_NUMBITS
+                        == 5 =>
+            {
+                crate::superblock::SB_CRC_OFFSET
+            }
             _ => return self.data.clone(),
         };
         let mut out = self.data.clone();

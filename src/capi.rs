@@ -1539,12 +1539,13 @@ pub unsafe extern "C" fn fs_xfs_rename2(
 /// Set the volume label: `sb_fname` in every group's superblock
 /// ([`Filesystem::set_label`]).
 ///
-/// The label is written in place, as the reference tool writes it, so it
-/// must come before the handle logs any change: afterwards a replay of
-/// those records would write over it, and the call is refused with
-/// ENOTSUP. ENAMETOOLONG for a label over 12 bytes, EINVAL for one that
-/// is not UTF-8, EROFS for a read-only handle. [`fs_xfs_get_volume_info`]
-/// reports the old label until the volume is mounted again.
+/// Before the handle logs any change the label is written in place, as
+/// the reference tool writes it; after, the primary superblock is logged
+/// with it, since a replay of the earlier records would write over a
+/// label put there in place (#464). ENAMETOOLONG for a label over 12
+/// bytes, EINVAL for one that is not UTF-8, EROFS for a read-only
+/// handle. [`fs_xfs_get_volume_info`] reports the old label until the
+/// volume is mounted again.
 ///
 /// # Safety
 ///
