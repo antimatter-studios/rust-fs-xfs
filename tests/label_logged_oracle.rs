@@ -61,7 +61,10 @@ fn a_label_logged_after_a_create_is_replayed_by_the_kernel() {
         r#"
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
         cp {image} "$img"
-        echo "DISK_LABEL $(xfs_db -r -c label "$img")"
+        # Each copy's own fname: `label` reads the primary and warns about
+        # every secondary that differs, which before the replay is all of
+        # them, since only the primary waits in the log.
+        echo "DISK_LABEL $(xfs_db -r -c 'sb 0' -c 'p fname' "$img" | grep '^fname')"
         m=$(mktemp -d)
         if mount -o loop,nouuid "$img" "$m"; then
             echo "MOUNTED_LABEL $(xfs_io -c label "$m")"
@@ -72,8 +75,8 @@ fn a_label_logged_after_a_create_is_replayed_by_the_kernel() {
             dmesg | tail -12
         fi
         rmdir "$m" 2>/dev/null
-        echo "PRIMARY_LABEL $(xfs_db -r -c label "$img")"
-        echo "SECONDARY_LABEL $(xfs_db -r -c 'sb 1' -c label "$img")"
+        echo "PRIMARY_LABEL $(xfs_db -r -c 'sb 0' -c 'p fname' "$img" | grep '^fname')"
+        echo "SECONDARY_LABEL $(xfs_db -r -c 'sb 1' -c 'p fname' "$img" | grep '^fname')"
         {repair}
         rm -f "$img"
         echo "DONE"
@@ -97,11 +100,17 @@ fn a_label_logged_after_a_create_is_replayed_by_the_kernel() {
             .trim()
             .to_string()
     };
-    assert_eq!(
-        line("DISK_LABEL"),
-        "label = \"BEFORE\"",
+    // xfs_db prints all twelve bytes of `sb_fname`, the padding as `\000`.
+    let holds = |key: &str, label: &str| {
+        let fname = line(key);
+        fname
+            .strip_prefix(&format!("fname = \"{label}"))
+            .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('"'))
+    };
+    assert!(
+        holds("DISK_LABEL", "BEFORE"),
         "before the replay the primary superblock should still hold the old label, so \
-         that only the log can carry the new one"
+         that only the log can carry the new one:\n{out}"
     );
     assert_eq!(
         line("MOUNTED_LABEL"),
@@ -113,7 +122,13 @@ fn a_label_logged_after_a_create_is_replayed_by_the_kernel() {
         "after before",
         "the creates either side of the label were not both replayed"
     );
-    assert_eq!(line("PRIMARY_LABEL"), "label = \"LOGGED\"");
-    assert_eq!(line("SECONDARY_LABEL"), "label = \"LOGGED\"");
+    assert!(
+        holds("PRIMARY_LABEL", "LOGGED"),
+        "the primary superblock after the replay:\n{out}"
+    );
+    assert!(
+        holds("SECONDARY_LABEL", "LOGGED"),
+        "a secondary superblock, written in place:\n{out}"
+    );
     repair::assert_agreed(&out, "a volume whose label was logged after a create");
 }
