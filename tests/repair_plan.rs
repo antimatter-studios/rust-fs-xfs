@@ -206,12 +206,6 @@ fn a_feature_outside_the_planners_set_is_refused_by_field() {
     use fs_xfs::superblock::{incompat, ro_compat};
     let cases: &[(&str, usize, u32, &str)] = &[
         (
-            "rmapbt",
-            SB_FEATURES_RO_COMPAT,
-            ro_compat::RMAPBT,
-            "sb_features_ro_compat",
-        ),
-        (
             "unknown ro_compat",
             SB_FEATURES_RO_COMPAT,
             1 << 20,
@@ -254,6 +248,31 @@ fn a_feature_outside_the_planners_set_is_refused_by_field() {
             "{name}: planning wrote"
         );
     }
+
+    // A reverse-mapping btree is inside the set only for rules that keep
+    // it (#442): one that does not say so, as `Scribble` does not, is
+    // refused on rmapbt by field, before it is asked.
+    let dev = formatted();
+    set_sb_bits(&dev, SB_FEATURES_RO_COMPAT, ro_compat::RMAPBT);
+    let fs = mount(&dev);
+    let plan = repair::plan_with(&fs, &Exclusive::asserted_by_caller(), &[&Scribble]);
+    assert_eq!(plan.status, Status::Refused, "rmapbt: {plan:?}");
+    assert!(
+        plan.refusals
+            .iter()
+            .any(|f| f.code == Code::RepairFeature
+                && f.location.field == Some("sb_features_ro_compat")),
+        "rmapbt: no repair.feature on sb_features_ro_compat: {plan:?}"
+    );
+    assert!(
+        plan.changes.is_empty(),
+        "rmapbt: a refused plan proposed changes"
+    );
+    assert_eq!(
+        dev.writes.load(Ordering::SeqCst),
+        0,
+        "rmapbt: planning wrote"
+    );
 }
 
 #[test]

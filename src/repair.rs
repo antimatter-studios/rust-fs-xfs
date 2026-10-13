@@ -65,11 +65,14 @@ pub const INCOMPAT: u32 = incompat::FTYPE
     | incompat::BIGTIME
     | incompat::NREXT64;
 
-/// Every `sb_features_ro_compat` bit a plan may be made under.
+/// Every `sb_features_ro_compat` bit a plan may be made under, whatever its
+/// rules.
 ///
-/// Not `RMAPBT`: every block a repair moves has a reverse-mapping record
-/// that would have to move with it, and the checker does not read the
-/// reverse-mapping btree.
+/// Not `RMAPBT`: a block a repair takes or gives back has a reverse-mapping
+/// record that has to change with it. A plan is made under `RMAPBT` when
+/// every rule asked keeps the reverse map ([`Rule::keeps_reverse_map`],
+/// #442): `mkfs.xfs` turns it on by default, and the rules that ship move
+/// no block, or move one only through the writer, which keeps it.
 pub const RO_COMPAT: u32 = ro_compat::FINOBT | ro_compat::REFLINK | ro_compat::INOBTCNT;
 
 /// Proof that the caller has the target to itself.
@@ -200,6 +203,15 @@ pub trait Rule {
     fn completes(&self) -> &'static [Code] {
         &[]
     }
+
+    /// Whether every change this rule makes leaves the reverse-mapping
+    /// btree right: it takes and gives back no block, or does so only
+    /// through the writer's allocator, which records each in the reverse
+    /// map. A plan under `rmapbt` is made only when every rule asked says
+    /// so (#442). No by default: a rule has to know.
+    fn keeps_reverse_map(&self) -> bool {
+        false
+    }
 }
 
 /// The changes the rules have proposed so far.
@@ -308,6 +320,11 @@ pub struct SuperblockCopies;
 impl Rule for SuperblockCopies {
     fn name(&self) -> &'static str {
         "superblock-copies"
+    }
+
+    /// A superblock copy is rewritten where it is; no block moves.
+    fn keeps_reverse_map(&self) -> bool {
+        true
     }
 
     fn repairs(&self) -> &'static [Code] {
@@ -520,6 +537,11 @@ impl Rule for Counters {
         "counters"
     }
 
+    /// Counters are fields of headers rewritten in place; no block moves.
+    fn keeps_reverse_map(&self) -> bool {
+        true
+    }
+
     fn repairs(&self) -> &'static [Code] {
         COUNTER_CODES
     }
@@ -701,7 +723,8 @@ pub fn plan_with(fs: &Filesystem, _access: &Exclusive, rules: &[&dyn Rule]) -> P
         .iter()
         .flat_map(|r| r.completes().iter().copied())
         .collect();
-    let mut refusals = preconditions(fs, &report, &completed);
+    let keeps_reverse_map = rules.iter().all(|r| r.keeps_reverse_map());
+    let mut refusals = preconditions(fs, &report, &completed, keeps_reverse_map);
     let mut changes = BTreeMap::new();
     if refusals.is_empty() {
         let mut proposal = Proposal {
@@ -750,7 +773,12 @@ pub fn plan_with(fs: &Filesystem, _access: &Exclusive, rules: &[&dyn Rule]) -> P
 }
 
 /// Everything that stops a plan being made, before any rule is asked.
-fn preconditions(fs: &Filesystem, report: &Report, completed: &[Code]) -> Vec<Finding> {
+fn preconditions(
+    fs: &Filesystem,
+    report: &Report,
+    completed: &[Code],
+    keeps_reverse_map: bool,
+) -> Vec<Finding> {
     let sb = fs.superblock();
     let mut refusals = Vec::new();
     let mut feature = |field: &'static str, what: String| {
@@ -778,8 +806,20 @@ fn preconditions(fs: &Filesystem, report: &Report, completed: &[Code]) -> Vec<Fi
                 format!("incompatible features {extra:#x} are outside what a plan reasons about"),
             );
         }
-        let extra = sb.features_ro_compat & !RO_COMPAT;
-        if extra != 0 {
+        let allowed = if keeps_reverse_map {
+            RO_COMPAT | ro_compat::RMAPBT
+        } else {
+            RO_COMPAT
+        };
+        let extra = sb.features_ro_compat & !allowed;
+        if extra & ro_compat::RMAPBT != 0 {
+            feature(
+                "sb_features_ro_compat",
+                "the volume has a reverse-mapping btree, and a rule this plan asks may take or \
+                 give back blocks without recording them in it"
+                    .into(),
+            );
+        } else if extra != 0 {
             feature(
                 "sb_features_ro_compat",
                 format!(

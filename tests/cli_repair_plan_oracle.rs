@@ -15,9 +15,11 @@
 //!   finds.
 //!
 //! And each refusal is the one the volume calls for: a feature the
-//! planner does not reason about (`rmapbt`, on the reflink fixture the
-//! reference calls clean), a log the kernel left unreplayed, two files
-//! claiming one block, and a target another holder has locked.
+//! planner does not reason about (quota accounting, on the quota fixture
+//! the reference calls clean), a log the kernel left unreplayed, two files
+//! claiming one block, and a target another holder has locked. A volume
+//! with a reverse-mapping btree is planned on (#442), since every rule
+//! keeps the reverse map.
 
 mod cli_support;
 mod common;
@@ -287,18 +289,32 @@ fn two_files_claiming_one_block_are_refused_as_ambiguous() {
 
 #[test]
 fn a_feature_the_planner_does_not_reason_about_is_refused_on_a_clean_volume() {
-    let volume = copy("xfs-reflink.img", "rmapbt");
+    let volume = copy("xfsfeat-quota.img", "quota");
     let (_, said) = reference_clean(volume.path().to_str().unwrap());
-    common::repair::assert_agreed(&said, "the reflink+rmapbt fixture");
-    let (code, plan) = planned_twice(volume.path(), "rmapbt");
+    common::repair::assert_agreed(&said, "the quota fixture");
+    let (code, plan) = planned_twice(volume.path(), "quota");
     assert_eq!(code, Some(0), "a refusal to plan is not damage: {plan}");
     assert!(
         plan.starts_with(r#"{"status":"refused","changes":[]"#),
         "{plan}"
     );
     assert!(
-        plan.contains(r#""code":"repair.feature""#)
-            && plan.contains(r#""field":"sb_features_ro_compat""#),
+        plan.contains(r#""code":"repair.feature""#) && plan.contains(r#""field":"sb_qflags""#),
+        "{plan}"
+    );
+}
+
+/// A clean volume with a reverse-mapping btree, which `mkfs.xfs` makes by
+/// default, is planned on, and the plan is empty (#442).
+#[test]
+fn a_clean_volume_with_a_reverse_mapping_btree_is_planned_and_needs_nothing() {
+    let volume = copy("xfs-reflink.img", "rmapbt");
+    let (_, said) = reference_clean(volume.path().to_str().unwrap());
+    common::repair::assert_agreed(&said, "the reflink+rmapbt fixture");
+    let (code, plan) = planned_twice(volume.path(), "rmapbt");
+    assert_eq!(code, Some(0), "{plan}");
+    assert!(
+        plan.starts_with(r#"{"status":"ready","changes":[]"#),
         "{plan}"
     );
 }

@@ -21,9 +21,13 @@ use common::{fixture, oracle, scratch};
 const SUITE: &str = "cli_superblock_repair_oracle";
 
 fn damaged(name: &str, commands: &[&str]) -> scratch::Volume {
+    damaged_on("xfsdata-default.img", name, commands)
+}
+
+fn damaged_on(source: &str, name: &str, commands: &[&str]) -> scratch::Volume {
     let copy = scratch::Volume::copy_of(
         SUITE,
-        &fixture("xfsdata-default.img"),
+        &fixture(source),
         &format!("{}-{name}.img", std::process::id()),
     );
     let mut db = oracle("xfs_db").arg("-x");
@@ -77,6 +81,27 @@ fn copy_range(image: &str, ag: u64) -> (usize, usize) {
     };
     let at = ag * num("agblocks") * num("blocksize");
     (at as usize, num("sectsize") as usize)
+}
+
+/// A damaged copy on a volume with a reverse-mapping btree is rewritten too
+/// (#442): the copy is rewritten where it is, and no block moves.
+#[test]
+fn a_damaged_copy_under_a_reverse_mapping_btree_is_rewritten() {
+    let volume = damaged_on(
+        "xfsfeat-rmapbt.img",
+        "rmapbt",
+        &["sb 1", "write -d logblocks 1234"],
+    );
+    let image = volume.path().to_str().unwrap();
+    let (code, said) = fsck_y(image);
+    assert_eq!(code, Some(1), "fsck.xfs -y did not repair:\n{said}");
+    let after = oracle("xfs_repair").args(["-n", image]).output();
+    common::repair::assert_agreed(&after.repair_report(), "rmapbt: after fsck.xfs -y");
+    assert_eq!(
+        sb_field(image, 1, "logblocks"),
+        sb_field(image, 0, "logblocks"),
+        "xfs_db reads another logblocks in the copy than in the primary"
+    );
 }
 
 #[test]

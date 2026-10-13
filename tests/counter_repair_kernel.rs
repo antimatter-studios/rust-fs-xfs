@@ -208,6 +208,21 @@ fn each_derivable_counter_is_repaired_independently() {
     }
 }
 
+/// The same repairs on a volume with a reverse-mapping btree (#442), whose
+/// blocks the AGF's btree block count includes.
+#[test]
+fn counters_are_repaired_under_a_reverse_mapping_btree() {
+    let source = fixture("xfsfeat-rmapbt-finobt-inobtcount.img");
+    for (header, field, bad) in [
+        ("agf 0", "freeblks", "1"),
+        ("agf 0", "btreeblks", "99"),
+        ("agi 0", "freecount", "1"),
+        ("sb 0", "fdblocks", "1"),
+    ] {
+        repaired_counter(&source, &format!("rmapbt-{field}"), header, field, bad);
+    }
+}
+
 #[test]
 fn deep_free_space_trees_and_later_groups_are_counted() {
     repaired_counter(
