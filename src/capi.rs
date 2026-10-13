@@ -58,6 +58,9 @@ fn errno_for(e: &Error) -> c_int {
         Error::NotAFile => libc_eisdir(),
         Error::ReadOnly => libc_erofs(),
         Error::UnsupportedFeature(_) => libc_enotsup(),
+        // A full volume, which a caller tells from an unsupported shape
+        // only by this (#463).
+        Error::NoSpace(_) => libc_enospc(),
         // A format the caller asked for that cannot be made.
         Error::InvalidGeometry(_) => libc_einval(),
         // The data is on a device this mount was not given: "no such
@@ -92,6 +95,10 @@ const fn libc_enoent() -> c_int {
 }
 const fn libc_eio() -> c_int {
     5
+}
+/// `ENOSPC` — 28 on both Darwin and Linux.
+const fn libc_enospc() -> c_int {
+    28
 }
 /// `ENXIO` — 6 on both Darwin and Linux.
 const fn libc_enxio() -> c_int {

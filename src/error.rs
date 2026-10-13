@@ -47,6 +47,13 @@ pub enum Error {
     /// we simply cannot honour it safely.
     UnsupportedFeature(String),
 
+    /// The volume has fewer free blocks than the operation needs (#463):
+    /// every group a write could take blocks from is full, or the whole
+    /// volume has less free space than one allocation wants. Distinct
+    /// from [`Error::UnsupportedFeature`], so a caller can tell a full
+    /// volume from a shape this crate does not write.
+    NoSpace(String),
+
     /// The log itself is malformed: a record that ends outside the ring,
     /// or a head that cannot be located. Distinct from [`Error::DirtyLog`],
     /// which describes a perfectly well-formed log that simply has work
@@ -132,6 +139,7 @@ impl fmt::Display for Error {
                 "{what} read from block {expected} claims to be block {found}"
             ),
             Error::UnsupportedFeature(m) => write!(f, "unsupported XFS feature: {m}"),
+            Error::NoSpace(m) => write!(f, "no space left on the XFS volume: {m}"),
             Error::CorruptLog(m) => write!(f, "XFS log is malformed: {m}"),
             Error::DirtyLog => f.write_str("XFS log is dirty and needs replay before mount"),
             Error::NotFound => f.write_str("no such file or directory"),
@@ -261,6 +269,7 @@ mod tests {
                 found: 1,
             },
             Error::UnsupportedFeature("x".into()),
+            Error::NoSpace("x".into()),
             Error::CorruptLog("x".into()),
             Error::DirtyLog,
             Error::NotFound,
