@@ -127,7 +127,9 @@ vars:
   # v0.4.0: concurrent `vm.sh up` calls of one machine wait for the boot
   # under way instead of racing it, a halt that hangs is forced, and the
   # SSH forward port is picked at boot when the configured one is taken.
-  LINUX_HARNESS_REF: v0.4.0
+  # v0.5.0: a consumer chooses its guest, `[vm] guest = "debian-13"`, which
+  # the exchange-range kernel tier needs for kernel 6.12.
+  LINUX_HARNESS_REF: v0.5.0
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
