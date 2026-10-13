@@ -129,7 +129,9 @@ vars:
   # SSH forward port is picked at boot when the configured one is taken.
   # v0.5.0: a consumer chooses its guest, `[vm] guest = "debian-13"`, which
   # the exchange-range kernel tier needs for kernel 6.12.
-  LINUX_HARNESS_REF: v0.5.0
+  # v0.5.1: that guest boots on a Linux x86_64 host, where v0.5.0's reset
+  # in GRUB with no display device (fs-linux-test-harness#70).
+  LINUX_HARNESS_REF: v0.5.1
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
