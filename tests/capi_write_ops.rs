@@ -33,6 +33,7 @@ const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
 const EROFS: i32 = 30;
+const ENOSPC: i32 = 28;
 
 /// A sparse in-memory device, writable or not.
 struct Sparse {
@@ -669,6 +670,33 @@ fn volume_info(fs: *mut fs_xfs_fs) -> fs_xfs_volume_info_t {
     let mut out = std::mem::MaybeUninit::<fs_xfs_volume_info_t>::zeroed();
     assert_eq!(unsafe { fs_xfs_get_volume_info(fs, out.as_mut_ptr()) }, 0);
     unsafe { out.assume_init() }
+}
+
+/// A write that wants more blocks than the volume has free is ENOSPC, and
+/// writes nothing (#463). It was ENOTSUP, which a caller cannot tell from
+/// a shape this crate does not write, so a file manager said the wrong
+/// thing about a full disk. The buffer is never read: the allocation is
+/// refused before a byte is copied.
+#[test]
+fn a_write_larger_than_the_free_space_is_enospc() {
+    let dev = formatted();
+    let fs = mount_rw(&dev);
+    assert_ne!(create(fs, "/big", 0o644), 0, "create /big");
+    let before = volume_info(fs);
+    let free = before.free_blocks * u64::from(before.block_size);
+    let data = vec![0u8; (free + (1 << 20)) as usize];
+    assert_errno(
+        write(fs, "/big", 0, &data),
+        ENOSPC,
+        "a write of more bytes than the volume has free",
+    );
+    assert_eq!(stat(fs, "/big").expect("stat /big").size, 0, "/big grew");
+    assert_eq!(
+        volume_info(fs).free_blocks,
+        before.free_blocks,
+        "blocks were taken"
+    );
+    unsafe { fs_xfs_umount(fs) };
 }
 
 /// The free counts follow what the mount writes. The superblock's are
