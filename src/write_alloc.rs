@@ -279,7 +279,9 @@ impl Filesystem {
             while fb < start + len {
                 let want = (start + len - fb).min(MAX_EXTENT_BLOCKS) as u32;
                 let Some(&agno) = order.get(next) else {
-                    return Err(Error::UnsupportedFeature(format!(
+                    // Every group has been taken from until it had no free
+                    // run left: the volume is full (#463).
+                    return Err(Error::NoSpace(format!(
                         "no allocation group has room for the {} blocks still wanted at \
                          file block {fb} of inode {ino}",
                         start + len - fb

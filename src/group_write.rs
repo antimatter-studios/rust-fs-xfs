@@ -348,6 +348,22 @@ impl crate::ag_btree::BlockSource for InodeTreeBlocks<'_, '_> {
     }
 }
 
+/// The free blocks the whole volume has: every group's `agf_freeblks`, read
+/// as [`GroupAlloc::open`] reads one. What tells a full volume from space
+/// this crate cannot use (#463).
+fn volume_free_blocks(sb: &Superblock, device: &dyn fs_core::BlockRead) -> Result<u64> {
+    let blocksize = u64::from(sb.blocksize);
+    let sector = u64::from(sb.sectsize);
+    let mut free = 0u64;
+    for agno in 0..sb.agcount {
+        let ag_start = u64::from(agno) * u64::from(sb.agblocks) * blocksize;
+        let mut raw = vec![0u8; sb.sectsize as usize];
+        device.read_at(ag_start + sector, &mut raw)?;
+        free += u64::from(crate::ag::Agf::parse(&raw, sb, agno)?.freeblks);
+    }
+    Ok(free)
+}
+
 pub(crate) struct GroupAlloc<'a> {
     sb: &'a Superblock,
     device: &'a dyn fs_core::BlockRead,
@@ -607,22 +623,28 @@ impl<'a> GroupAlloc<'a> {
 
         let agno = self.agno;
         let align = u64::from(align.max(1));
-        let start = self
-            .by_block
-            .iter()
-            .find_map(|run| {
-                let start = u64::from(run.startblock).div_ceil(align) * align;
-                let end = u64::from(run.startblock) + u64::from(run.blockcount);
-                (start + u64::from(want) <= end).then_some(start as u32)
-            })
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "allocation group {agno} has no single free run of {want} blocks \
-                     starting on a multiple of {align} — its longest run is {}, and \
-                     splitting across extents is not implemented",
-                    longest(&self.by_block)
-                ))
-            })?;
+        let Some(start) = self.by_block.iter().find_map(|run| {
+            let start = u64::from(run.startblock).div_ceil(align) * align;
+            let end = u64::from(run.startblock) + u64::from(run.blockcount);
+            (start + u64::from(want) <= end).then_some(start as u32)
+        }) else {
+            // A full volume is ENOSPC; space this crate cannot use (in
+            // another group, or in pieces) is a shape it does not write
+            // (#463).
+            let free = volume_free_blocks(self.sb, self.device)?;
+            if free < u64::from(want) {
+                return Err(Error::NoSpace(format!(
+                    "{want} blocks are wanted in allocation group {agno}, and the whole \
+                     volume has {free} free"
+                )));
+            }
+            return Err(Error::UnsupportedFeature(format!(
+                "allocation group {agno} has no single free run of {want} blocks \
+                 starting on a multiple of {align} — its longest run is {}, and \
+                 splitting across extents is not implemented",
+                longest(&self.by_block)
+            )));
+        };
         let taking = FreeExtent {
             startblock: start,
             blockcount: want,
