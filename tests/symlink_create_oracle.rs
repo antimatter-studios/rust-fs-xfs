@@ -112,8 +112,8 @@ fn symlinks_on(blocksize: u32) {
         let want = guest_quote(&scratch::guest_path(&file));
         checks.push_str(&format!(
             r#"
-            readlink "$m/{path}" | tr -d '\n' > /tmp/got
-            cmp -s /tmp/got {want} && echo "TARGET_OK {path}"
+            readlink "$m/{path}" | tr -d '\n' > "$got"
+            cmp -s "$got" {want} && echo "TARGET_OK {path}"
             echo "STAT {path} $(stat -c '%F %a %h %s' "$m/{path}")"
             "#
         ));
@@ -125,6 +125,10 @@ fn symlinks_on(blocksize: u32) {
         img=$(mktemp -u /tmp/oracle-XXXXXX.img)
         cp {image} "$img"
         m=$(mktemp -d)
+        # Each case its own file for what readlink returned: the cases run
+        # side by side in one guest, and a shared /tmp/got let one case's
+        # target land in the file the other was about to compare.
+        got=$(mktemp)
         if mount -o loop,nouuid "$img" "$m"; then
             {checks}
             if ! umount "$m"; then sleep 2; umount "$m" || echo UMOUNT_FAILED; fi
@@ -134,7 +138,7 @@ fn symlinks_on(blocksize: u32) {
         fi
         rmdir "$m" 2>/dev/null
         {repair}
-        rm -f "$img"
+        rm -f "$img" "$got"
         echo "DONE"
         "#,
         repair = repair::script("\"$img\""),
