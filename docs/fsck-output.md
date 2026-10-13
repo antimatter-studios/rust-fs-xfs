@@ -210,8 +210,8 @@ code has neither a case nor a reason.
 | `ag.agfl.unreadable` | none: `xfs_repair -n` calls a free list with a damaged header clean, so there is no reference verdict to hold this to; this checker reports it. |
 | `ag.length` | `cli_fsck_oracle.rs`: agi1-length |
 | `btree.unreadable` | `cli_fsck_oracle.rs`: cntbt-magic |
-| `inobt.record` | `cli_fsck_oracle.rs`: inobt-freecount |
-| `inobt.chunk-count` | `cli_fsck_oracle.rs`: inobt-count |
+| `inobt.record` | `cli_fsck_oracle.rs`: inobt-count-range |
+| `inobt.chunk-count` | `cli_fsck_oracle.rs`: inobt-count, inobt-freecount |
 | `finobt.mismatch` | `cli_fsck_oracle.rs`: finobt-freecount |
 | `freesp.empty` | `cli_fsck_oracle.rs`: bnobt-empty |
 | `freesp.overlap` | `cli_fsck_oracle.rs`: bnobt-overlap |

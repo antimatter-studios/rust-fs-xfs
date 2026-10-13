@@ -482,8 +482,21 @@ fn one_damage_per_code(base: &str) -> Vec<Case> {
                 "write -d magic 0".into(),
             ],
         ),
+        // A count no chunk can have: the record cannot say which inodes
+        // it covers, so it is not read.
         (
             "inobt.record",
+            "inobt-count-range",
+            vec![
+                "agi 0".into(),
+                "addr root".into(),
+                "write -d recs[1].count 2".into(),
+            ],
+        ),
+        // A free count that disagrees with the free mask is a fault in that
+        // record alone (#393): the masks still say which inodes it covers.
+        (
+            "inobt.chunk-count",
             "inobt-freecount",
             vec![
                 "agi 0".into(),
