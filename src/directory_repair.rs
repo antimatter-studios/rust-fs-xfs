@@ -93,6 +93,12 @@ impl Rule for DirectoryMetadata {
         "directory-metadata"
     }
 
+    /// Entries, tags and hash indexes are rewritten in the blocks that
+    /// hold them; no block moves.
+    fn keeps_reverse_map(&self) -> bool {
+        true
+    }
+
     fn repairs(&self) -> &'static [Code] {
         CODES
     }

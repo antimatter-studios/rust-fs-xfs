@@ -84,6 +84,14 @@ impl Rule for InodeAllocation {
         "inode-allocation"
     }
 
+    /// Records and counters are rewritten in place; a change to which
+    /// chunks the free-inode btree holds goes through the writer's inode
+    /// tree editor, whose allocator records every block it takes or gives
+    /// back in the reverse map.
+    fn keeps_reverse_map(&self) -> bool {
+        true
+    }
+
     fn repairs(&self) -> &'static [Code] {
         CODES
     }
