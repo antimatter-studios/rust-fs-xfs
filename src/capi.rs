@@ -1253,6 +1253,61 @@ pub unsafe extern "C" fn fs_xfs_mkdir(fs: *mut fs_xfs_fs, path: *const c_char, m
     guard(0, || unsafe { make(fs, path, mode, true) })
 }
 
+/// Create a symbolic link at `linkpath` whose target is `target`: POSIX
+/// `symlink(target, linkpath)` ([`Filesystem::create_symlink`], #462).
+///
+/// Returns the new link's inode number, or 0 with the errno set: ENOENT
+/// for an empty target, as `symlink(2)` gives, ENAMETOOLONG for one over
+/// the 1023 bytes XFS stores, and otherwise as [`fs_xfs_create`].
+///
+/// # Safety
+///
+/// `fs` must be NULL or a live handle; `target` and `linkpath` NULL or
+/// NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_symlink(
+    fs: *mut fs_xfs_fs,
+    target: *const c_char,
+    linkpath: *const c_char,
+) -> u64 {
+    guard(0, || {
+        let Some(fs) = (unsafe { writable(fs) }) else {
+            return 0;
+        };
+        let Some(target) = (unsafe { borrow_bytes(target, "target") }) else {
+            return 0;
+        };
+        let Some(path) = (unsafe { borrow_bytes(linkpath, "linkpath") }) else {
+            return 0;
+        };
+        if target.is_empty() {
+            set_error("a symlink's target is empty".into(), libc_enoent());
+            return 0;
+        }
+        let most = crate::format::symlink::XFS_SYMLINK_MAX_TARGET;
+        if target.len() > most {
+            set_error(
+                format!(
+                    "a symlink's target of {} bytes; the longest is {most}",
+                    target.len()
+                ),
+                libc_enametoolong(),
+            );
+            return 0;
+        }
+        let Some((parent, name)) = parent_of(fs, path, Last::New) else {
+            return 0;
+        };
+        match fs.create_symlink(parent, name, target) {
+            Ok((ino, _)) => ino,
+            Err(e) => {
+                record(&e);
+                0
+            }
+        }
+    })
+}
+
 /// The body of [`fs_xfs_create`] and [`fs_xfs_mkdir`].
 unsafe fn make(fs: *mut fs_xfs_fs, path: *const c_char, mode: u16, directory: bool) -> u64 {
     let Some(fs) = (unsafe { writable(fs) }) else {

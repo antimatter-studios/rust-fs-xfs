@@ -361,6 +361,19 @@ uint64_t fs_xfs_create(fs_xfs_fs_t *fs, const char *path, uint16_t mode);
 uint64_t fs_xfs_mkdir(fs_xfs_fs_t *fs, const char *path, uint16_t mode);
 
 /*
+ * Create a symbolic link at `linkpath` whose target is `target`: POSIX
+ * symlink(target, linkpath). The target is kept inline when it fits the
+ * inode and in a block of its own otherwise. Returns the new link's inode
+ * number, or 0 on failure. The link's mode is 0777 and its owner uid 0,
+ * gid 0.
+ *
+ * ENOENT for an empty target, ENAMETOOLONG for one over 1023 bytes;
+ * otherwise as fs_xfs_create.
+ */
+uint64_t fs_xfs_symlink(fs_xfs_fs_t *fs, const char *target,
+                        const char *linkpath);
+
+/*
  * Remove the name `path` of a file or symlink; the inode and its blocks
  * are freed with its last name. Returns 0 or -1. EISDIR for a directory
  * (fs_xfs_rmdir removes one), ENOENT when nothing is there, EINVAL for
