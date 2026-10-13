@@ -116,7 +116,10 @@ vars:
   # the wrapper from core. v0.3.8 carries the agent-core v5 block that
   # AGENTS.md mirrors (sync before every push; main merges through a merge
   # queue) and scripts/code-changed.sh, which the CI changes job reads.
-  FS_CORE_REF: v0.3.8
+  # v0.3.11 carries agent-core v6 (stacked pull requests, changelog.d
+  # fragments, findings filed before a tracking issue closes) and the
+  # changelog-check.sh that `chore lint` runs.
+  FS_CORE_REF: v0.3.11
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
@@ -694,6 +697,7 @@ tasks:
     desc: Formatting and clippy, exactly as CI runs them
     cmds:
       - bash ../rust-fs-core/scripts/agents-core-check.sh
+      - bash ../rust-fs-core/scripts/changelog-check.sh
       - bash ../rust-fs-core/scripts/ci-gate.sh
       # The family scripts are rust-fs-core's alone: fails on a committed copy,
       # or a call to a local copy.
