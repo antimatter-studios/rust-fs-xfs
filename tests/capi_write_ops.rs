@@ -731,10 +731,10 @@ fn set_label(fs: *mut fs_xfs_fs, label: &str) -> i32 {
     unsafe { fs_xfs_set_label(fs, l.as_ptr()) }
 }
 
-/// The label is written in place, so it is set before the handle logs
-/// anything and refused after; the next mount reads it.
+/// The label is set before the handle logs anything, in place, and
+/// after, logged (#464); the next mount reads the last one set.
 #[test]
-fn the_label_is_set_before_anything_is_logged_and_refused_after() {
+fn the_label_is_set_before_and_after_a_logged_change() {
     let dev = formatted();
     let fs = mount_rw(&dev);
     assert_eq!(set_label(fs, "NEWNAME"), 0, "errno {}", fs_xfs_last_errno());
@@ -744,10 +744,11 @@ fn the_label_is_set_before_anything_is_logged_and_refused_after() {
         "a 13-byte label",
     );
     assert_ne!(create(fs, "/f", 0o644), 0);
-    assert_errno(
-        set_label(fs, "LATER").into(),
-        ENOTSUP,
-        "a label after a logged change",
+    assert_eq!(
+        set_label(fs, "LATER"),
+        0,
+        "a label after a logged change: errno {}",
+        fs_xfs_last_errno()
     );
     unsafe { fs_xfs_umount(fs) };
 
@@ -755,7 +756,7 @@ fn the_label_is_set_before_anything_is_logged_and_refused_after() {
     let info = volume_info(again);
     // c_char is i8 on Darwin and u8 on aarch64 Linux; CStr reads either.
     let name = unsafe { std::ffi::CStr::from_ptr(info.volume_name.as_ptr()) };
-    assert_eq!(name.to_bytes(), b"NEWNAME");
+    assert_eq!(name.to_bytes(), b"LATER");
     unsafe { fs_xfs_umount(again) };
 
     let handle = FsCoreDevice::into_handle(read_only_copy(&dev) as Arc<dyn BlockDevice>);

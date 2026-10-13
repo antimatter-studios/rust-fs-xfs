@@ -4,11 +4,12 @@
 //! The guest's own `mkfs.xfs` makes the volume. The driver then mounts it
 //! for writing through `fs_xfs_mount_rw_with_fs_core_device` and changes
 //! it through nothing but the C ABI — every namespace call, allocating
-//! writes, truncate both ways, attributes after a logged operation, an
-//! extended attribute and a POSIX ACL — and releases the handle with
-//! `fs_xfs_umount`. With no replay first, `xfs_repair -n` must find
-//! nothing, `xfs_logprint` must call the log clean, and the kernel must
-//! mount it without recovery and read back what the calls said.
+//! writes, truncate both ways, attributes and the label after a logged
+//! operation, an extended attribute and a POSIX ACL — and releases the
+//! handle with `fs_xfs_umount`. With no replay first, `xfs_repair -n`
+//! must find nothing, `xfs_logprint` must call the log clean, and the
+//! kernel must mount it without recovery and read back what the calls
+//! said.
 //!
 //! `tests/capi_write_ops.rs` pins the ABI's return values and errnos;
 //! this pins what lands on the disk.
@@ -75,12 +76,12 @@ fn a_volume_changed_through_the_c_abi_is_clean_and_reads_back_in_the_kernel() {
         assert!(!fs.is_null(), "mount: errno {}", fs_xfs_last_errno());
 
         unsafe {
-            // In place, so before anything is logged.
+            made(fs_xfs_mkdir(fs, c("/dir").as_ptr(), 0o755), "mkdir /dir");
+            // Logged, since the mkdir was (#464).
             ok(
                 fs_xfs_set_label(fs, c("CAPILABEL").as_ptr()).into(),
-                "set the label",
+                "set the label after a logged change",
             );
-            made(fs_xfs_mkdir(fs, c("/dir").as_ptr(), 0o755), "mkdir /dir");
             made(fs_xfs_create(fs, c("/dir/file").as_ptr(), 0o644), "create");
             let pattern: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
             let file = c("/dir/file");
