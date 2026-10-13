@@ -158,6 +158,44 @@ void fs_xfs_umount(fs_xfs_fs_t *fs);
 /* Fill `out` with volume information. 0 on success, -1 on failure. */
 int fs_xfs_get_volume_info(fs_xfs_fs_t *fs, fs_xfs_volume_info_t *out);
 
+/* ---- checking ---- */
+
+/* One finding of fs_xfs_check. The strings are NUL-terminated, owned by
+ * the library and valid only for the call that receives them. */
+typedef struct {
+    const char *code;     /* as fsck.xfs names it: "checksum", ... */
+    const char *severity; /* "error" (damage) or "warning" (not damage) */
+    int64_t ag;           /* allocation group, or -1 */
+    int64_t agbno;        /* block within that group, or -1 */
+    int64_t ino;          /* inode, or -1 */
+    const char *field;    /* on-disk field or structure, or NULL */
+    const char *what;     /* what is wrong, in words */
+} fs_xfs_check_finding_t;
+
+/* What fs_xfs_check found, in sum. */
+typedef struct {
+    uint64_t findings;    /* listed, each passed to the callback */
+    uint64_t errors;      /* of those, errors rather than warnings */
+    uint64_t suppressed;  /* found and not listed, past the per-kind limit */
+    uint64_t inodes;      /* allocated inodes walked */
+    uint64_t directories; /* directories walked */
+    uint64_t free_blocks; /* free blocks counted across every group */
+    uint8_t  complete;    /* 1 when every structure reached was read */
+    uint8_t  dirty;       /* 1 when the log held records not yet applied */
+    uint8_t  clean;       /* 1 when complete and no error was found */
+} fs_xfs_check_report_t;
+
+/* Called once per finding; return 0 to go on, anything else to stop the
+ * listing (the report is still filled in). */
+typedef int (*fs_xfs_check_finding_fn)(void *context,
+                                       const fs_xfs_check_finding_t *finding);
+
+/* Check the mounted volume as fsck.xfs does, writing nothing. Each finding
+ * goes to `on_finding` (may be NULL); `out` gets the totals. 0 when the
+ * check ran, whatever it found; -1 when it could not run. */
+int fs_xfs_check(fs_xfs_fs_t *fs, fs_xfs_check_finding_fn on_finding,
+                 void *context, fs_xfs_check_report_t *out);
+
 /* ---- lookup and metadata ---- */
 
 /*
