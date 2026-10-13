@@ -1027,15 +1027,28 @@ impl Filesystem {
     }
 
     /// Set the volume label: `sb_fname` in the superblock of every
-    /// allocation group, each with a fresh CRC on a v5 volume, the
-    /// secondaries first and the primary last (#341).
+    /// allocation group, the secondaries first and the primary last
+    /// (#341).
     ///
-    /// The label is the superblock's and nothing else's, so this is the
-    /// whole change, written in place as the reference tool writes it on
-    /// an unmounted volume: no transaction, and nothing else in any copy
-    /// changes. A secondary superblock carries the label too, and a
-    /// repair that rebuilds the primary from one would bring the old name
-    /// back if only the primary were rewritten.
+    /// The label is the superblock's and nothing else's, so nothing else
+    /// in any copy changes. A secondary superblock carries the label too,
+    /// and a repair that rebuilds the primary from one would bring the old
+    /// name back if only the primary were rewritten.
+    ///
+    /// # In place, or logged
+    ///
+    /// Before this mount has logged anything, every copy is written in
+    /// place, each with a fresh CRC on a v5 volume, as the reference tool
+    /// writes it on an unmounted volume: no transaction, and the log stays
+    /// clean.
+    ///
+    /// After, the primary is **logged** like any other buffer (#464): a
+    /// replay of the earlier records would write their image of it over a
+    /// label put there in place. The record carries the chunk of the
+    /// sector that holds the name, and recovery stamps the checksum when
+    /// it writes the sector out. The secondaries are still written in
+    /// place, which is what the kernel does with them too: no record ever
+    /// names one, so no replay can undo the write.
     ///
     /// This mount keeps the superblock it read: [`Filesystem::superblock`]
     /// reports the old label until the volume is mounted again.
@@ -1044,41 +1057,76 @@ impl Filesystem {
     ///
     /// [`Error::ReadOnly`] on a mount that cannot write.
     /// [`Error::UnsupportedFeature`] for a label longer than the field's
-    /// 12 bytes or holding a NUL, and on a mount that has already logged
-    /// a change, whose records a replay would write over the label.
-    /// Whatever reading or writing the device returns.
+    /// 12 bytes or holding a NUL. Whatever reading the device, writing it
+    /// or appending the record returns.
     pub fn set_label(&self, label: &str) -> Result<()> {
+        use crate::format::log_items::buf_log_format::buf_type::BLFT_SB;
+        use crate::log_write::{
+            trans_header, Op, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+        };
         use crate::superblock::offsets::{FNAME, FNAME_LEN};
-        let device = self.writable_device()?;
+        let device = self.writable_device()?.clone();
         if label.len() > FNAME_LEN || label.contains('\0') {
             return Err(Error::UnsupportedFeature(format!(
                 "an XFS label is at most {FNAME_LEN} bytes, with no NUL; this one is {}",
                 label.len()
             )));
         }
-        if self
+        let relabel = |buf: &mut [u8]| {
+            buf[FNAME..FNAME + FNAME_LEN].fill(0);
+            buf[FNAME..FNAME + label.len()].copy_from_slice(label.as_bytes());
+        };
+        let logged = self
             .logged_anything
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(Error::UnsupportedFeature(
-                "set the label before logging any change on this mount: a replay of \
-                 those records would write over it"
-                    .into(),
-            ));
-        }
+            .load(std::sync::atomic::Ordering::SeqCst);
         let sector = usize::from(self.sb.sectsize);
-        for ag in (0..self.sb.agcount).rev() {
+        let in_place_from = if logged { 1 } else { 0 };
+        for ag in (in_place_from..self.sb.agcount).rev() {
             let at = self.ag_offset(ag);
             let mut buf = vec![0u8; sector];
             device.read_at(at, &mut buf)?;
-            buf[FNAME..FNAME + FNAME_LEN].fill(0);
-            buf[FNAME..FNAME + label.len()].copy_from_slice(label.as_bytes());
+            relabel(&mut buf);
             if self.sb.is_v5() {
                 crate::group_write::restamp_crc(&mut buf, crate::superblock::SB_CRC_OFFSET);
             }
-            device.write_at(at, &buf)?;
+            self.or_stop_writing(|| device.write_at(at, &buf).map_err(Error::from))?;
         }
-        device.flush()?;
+        self.or_stop_writing(|| device.flush().map_err(Error::from))?;
+        if !logged {
+            return Ok(());
+        }
+
+        // The primary as this mount reads it, which is what the records
+        // before this one left it: the overlay, not the disk.
+        let mut before = vec![0u8; sector];
+        self.device.read_at(0, &mut before)?;
+        let mut after = before.clone();
+        relabel(&mut after);
+        if after == before {
+            return Ok(());
+        }
+        let item = crate::group_write::changed_chunks(0, &before, after, BLFT_SB);
+        let item_ops = item.op_count() as u32;
+        self.commit_record(|tid| {
+            let mut ops = vec![
+                Op {
+                    flags: XLOG_START_TRANS,
+                    data: Vec::new(),
+                },
+                Op {
+                    flags: 0,
+                    data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops),
+                },
+            ];
+            ops.extend(item.ops());
+            ops.push(Op {
+                flags: XLOG_COMMIT_TRANS,
+                data: Vec::new(),
+            });
+            ops
+        })?;
+        // What the record says is now what this mount reads (#89).
+        self.logged_buffers(std::slice::from_ref(&item));
         Ok(())
     }
 

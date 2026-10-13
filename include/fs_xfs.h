@@ -420,11 +420,11 @@ int fs_xfs_rename2(fs_xfs_fs_t *fs, const char *src, const char *dst,
                    int flags);
 
 /*
- * Set the volume label in every group's superblock. Returns 0 or -1. It
- * is written in place, so it must come before the handle logs any change
- * (ENOTSUP afterwards). ENAMETOOLONG for a label over 12 bytes, EINVAL
- * for one that is not UTF-8. fs_xfs_get_volume_info reports the old
- * label until the volume is mounted again.
+ * Set the volume label in every group's superblock. Returns 0 or -1.
+ * Written in place before the handle logs any change, and logged after.
+ * ENAMETOOLONG for a label over 12 bytes, EINVAL for one that is not
+ * UTF-8. fs_xfs_get_volume_info reports the old label until the volume
+ * is mounted again.
  */
 int fs_xfs_set_label(fs_xfs_fs_t *fs, const char *label);
 

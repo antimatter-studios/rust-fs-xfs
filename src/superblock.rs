@@ -165,7 +165,7 @@ pub mod offsets {
 }
 
 /// Mask selecting the version number from `sb_versionnum`.
-const XFS_SB_VERSION_NUMBITS: u16 = 0x000f;
+pub(crate) const XFS_SB_VERSION_NUMBITS: u16 = 0x000f;
 
 /// Feature bits carried in the top of `sb_versionnum` (v4-era features).
 pub mod version_flags {
