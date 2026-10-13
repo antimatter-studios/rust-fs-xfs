@@ -280,6 +280,109 @@ fn create_and_mkdir_answer_the_new_inode_and_refuse_by_errno() {
     unsafe { fs_xfs_umount(fs) };
 }
 
+fn symlink(fs: *mut fs_xfs_fs, target: &[u8], path: &str) -> u64 {
+    let (t, p) = (CString::new(target).unwrap(), c(path));
+    unsafe { fs_xfs_symlink(fs, t.as_ptr(), p.as_ptr()) }
+}
+
+fn readlink(fs: *mut fs_xfs_fs, path: &str) -> Vec<u8> {
+    let p = c(path);
+    let mut buf = vec![0u8; 1025];
+    let n = unsafe { fs_xfs_readlink(fs, p.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    assert!(n >= 0, "readlink {path}: errno {}", fs_xfs_last_errno());
+    buf.truncate(n as usize);
+    buf
+}
+
+/// A target `len` bytes long, path-shaped and not repetitive enough for
+/// a misplaced chunk to read back the same.
+fn long_target(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            if i % 37 == 36 {
+                b'/'
+            } else {
+                b'a' + (i % 26) as u8
+            }
+        })
+        .collect()
+}
+
+/// A symlink is made inline when its target fits the inode and in a
+/// block of its own when it does not, after other logged changes, and
+/// both read back on this handle and on the next (#462).
+#[test]
+fn a_symlink_is_made_inline_or_in_a_block_and_refused_by_errno() {
+    let dev = formatted();
+    let fs = mount_rw(&dev);
+    assert_ne!(mkdir(fs, "/d", 0o755), 0);
+
+    let long = long_target(1000);
+    let most = long_target(1024);
+    let short = symlink(fs, b"../somewhere/else", "/d/short");
+    assert_ne!(short, 0, "inline symlink: errno {}", fs_xfs_last_errno());
+    let remote = symlink(fs, &long, "/d/long");
+    assert_ne!(remote, 0, "remote symlink: errno {}", fs_xfs_last_errno());
+    assert_ne!(
+        symlink(fs, &most, "/most"),
+        0,
+        "errno {}",
+        fs_xfs_last_errno()
+    );
+
+    for (path, ino, target) in [
+        ("/d/short", short, &b"../somewhere/else"[..]),
+        ("/d/long", remote, &long[..]),
+    ] {
+        let st = stat(fs, path).expect(path);
+        assert_eq!(st.inode, ino, "{path}");
+        assert_eq!(st.mode, 0o120777, "{path}");
+        assert_eq!(st.link_count, 1, "{path}");
+        assert_eq!(st.size, target.len() as u64, "{path}");
+        assert_eq!(
+            readlink(fs, path),
+            target,
+            "{path} on the handle that made it"
+        );
+    }
+    assert_eq!(readlink(fs, "/most"), most);
+    assert_eq!(stat(fs, "/d").expect("/d").link_count, 2);
+
+    assert_errno(
+        symlink(fs, b"x", "/d/short") as i64,
+        EEXIST,
+        "a symlink over a name",
+    );
+    assert_errno(symlink(fs, b"", "/empty") as i64, ENOENT, "an empty target");
+    assert_errno(
+        symlink(fs, &long_target(1025), "/toolong") as i64,
+        ENAMETOOLONG,
+        "a 1025-byte target",
+    );
+    assert_errno(
+        symlink(fs, b"x", "/nope/l") as i64,
+        ENOENT,
+        "a missing parent",
+    );
+    unsafe { fs_xfs_umount(fs) };
+
+    let again = mount_rw(&dev);
+    assert_eq!(readlink(again, "/d/short"), b"../somewhere/else");
+    assert_eq!(readlink(again, "/d/long"), long);
+    assert_eq!(readlink(again, "/most"), most);
+    unsafe { fs_xfs_umount(again) };
+
+    let handle = FsCoreDevice::into_handle(read_only_copy(&dev) as Arc<dyn BlockDevice>);
+    let ro = unsafe { fs_xfs_mount_with_fs_core_device(handle) };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+    assert_errno(
+        symlink(ro, b"x", "/ro") as i64,
+        EROFS,
+        "a symlink on a read-only handle",
+    );
+    unsafe { fs_xfs_umount(ro) };
+}
+
 #[test]
 fn a_write_fills_holes_and_grows_the_file_and_truncate_goes_both_ways() {
     let dev = formatted();

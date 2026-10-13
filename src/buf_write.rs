@@ -143,6 +143,9 @@ impl BufferItem {
             BLFT_DIR_FREE => crate::format::dir::offsets::dir3_blk::CRC,
             // An attribute fork's leaf block, under the same v3 header (#389).
             BLFT_ATTR_LEAF => crate::format::attr::offsets::da_blkinfo::CRC,
+            // A remote symlink target's run, whose one checksum covers every
+            // block of it (#462).
+            BLFT_SYMLINK => crate::format::symlink::offsets::CRC,
             _ => return self.data.clone(),
         };
         let mut out = self.data.clone();

@@ -94,6 +94,11 @@ enum Kind {
     /// An empty directory: a short-form fork holding only its parent,
     /// and **two** links — its own `.` and the entry naming it.
     Directory,
+    /// A symbolic link (#462): its target inline in the fork when it fits
+    /// the inode's literal area, and in a block of its own, behind an
+    /// `XSLM` header, when it does not. One link, and the size is the
+    /// target's length.
+    Symlink,
 }
 
 impl Kind {
@@ -106,6 +111,9 @@ impl Kind {
             // A directory small enough lives inside its inode, and a
             // new one always is.
             Kind::Directory => Format::Local,
+            // Inline. A target too long for the inode is moved to a block
+            // by the create, which says so in the core it writes.
+            Kind::Symlink => Format::Local,
         }
     }
 
@@ -117,7 +125,7 @@ impl Kind {
     /// directory refusing to be removed later.
     fn nlink(self) -> u32 {
         match self {
-            Kind::File => 1,
+            Kind::File | Kind::Symlink => 1,
             Kind::Directory => 2,
         }
     }
@@ -128,7 +136,7 @@ impl Kind {
     /// gains one. A file has no `..` and the parent does not move.
     fn parent_nlink(self, was: u32) -> u32 {
         match self {
-            Kind::File => was,
+            Kind::File | Kind::Symlink => was,
             Kind::Directory => was + 1,
         }
     }
@@ -138,6 +146,7 @@ impl Kind {
         match self {
             Kind::File => S_IFREG,
             Kind::Directory => S_IFDIR,
+            Kind::Symlink => S_IFLNK,
         }
     }
 
@@ -146,6 +155,7 @@ impl Kind {
         dir::ftype_to_raw(Some(match self {
             Kind::File => crate::inode::FileType::Regular,
             Kind::Directory => crate::inode::FileType::Directory,
+            Kind::Symlink => crate::inode::FileType::Symlink,
         }))
     }
 }
@@ -156,6 +166,8 @@ const S_IFMT: u16 = 0o170000;
 const S_IFREG: u16 = 0o100000;
 /// `S_IFDIR`, a directory.
 const S_IFDIR: u16 = 0o040000;
+/// `S_IFLNK`, a symbolic link.
+const S_IFLNK: u16 = 0o120000;
 
 /// The `di_mode` a create of `kind` writes, given the mode it was asked for.
 ///
@@ -178,6 +190,7 @@ fn typed_mode(mode: u16, kind: Kind) -> Result<u16> {
             match kind {
                 Kind::File => "a regular file",
                 Kind::Directory => "a directory",
+                Kind::Symlink => "a symbolic link",
             },
             kind.type_bits()
         ))),
@@ -320,6 +333,37 @@ pub(crate) fn reset_flags(core: &mut [u8]) {
         .copy_from_slice(&(flags2 & (DI_FLAGS2_BIGTIME | DI_FLAGS2_NREXT64)).to_be_bytes());
 }
 
+/// A symlink's target, refused before anything is read if no symlink
+/// can hold it: empty, longer than XFS stores, or holding a NUL, which
+/// would end it early for every reader that takes it as a C string.
+fn check_target(target: &[u8]) -> Result<()> {
+    use crate::format::symlink::XFS_SYMLINK_MAXLEN;
+    if target.is_empty() || target.len() > XFS_SYMLINK_MAXLEN || target.contains(&0) {
+        return Err(Error::UnsupportedFeature(format!(
+            "a symlink's target is 1 to {XFS_SYMLINK_MAXLEN} bytes with no NUL; this one is \
+             {} bytes{}",
+            target.len(),
+            if target.contains(&0) {
+                " and holds a NUL"
+            } else {
+                ""
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// Where a new symlink keeps its target (#462).
+struct SymlinkData {
+    /// The inode's data fork: the target itself when it is inline, or one
+    /// extent record naming the blocks that hold it.
+    fork: Vec<u8>,
+    /// The blocks taken for the target: none when it is inline.
+    blocks: u64,
+    /// The target's blocks, logged whole: empty when it is inline.
+    items: Vec<crate::buf_write::BufferItem>,
+}
+
 /// What converting a directory to block form produced.
 struct Converted {
     /// The parent's new data fork: a single extent record naming the
@@ -366,6 +410,78 @@ fn set_nextents(core: &mut [u8], count: u64) {
 const NEW_CHUNK_GENERATION: u32 = 1;
 
 impl Filesystem {
+    /// Where symlink `ino`'s `target` goes: inline in the inode's literal
+    /// area when it fits there, and otherwise in a run of blocks taken
+    /// from group `agno`, which begins with the v5 header that says whose
+    /// target it is and how much of it the run holds.
+    ///
+    /// # The remote target is metadata
+    ///
+    /// Unlike a file's data, a symlink's blocks are logged: the kernel
+    /// logs the whole buffer, header and target, as a symlink buffer, and
+    /// recovery writes it. So nothing is written here; the blocks go out
+    /// with the record, and a crash before it leaves nothing at all.
+    ///
+    /// One run, so one header, with `sl_bytes` the whole target: see
+    /// [`crate::format::symlink`] on why the unit is the extent and not
+    /// the block. The checksum covers the run, every block of it.
+    fn symlink_data<'a>(
+        &'a self,
+        allocations: &mut crate::group_write::Allocations<'a>,
+        agno: u32,
+        ino: u64,
+        target: &[u8],
+    ) -> Result<SymlinkData> {
+        use crate::format::log_items::buf_log_format::buf_type::BLFT_SYMLINK;
+        use crate::format::symlink::{offsets as at, XFS_SYMLINK_HDR_SIZE, XFS_SYMLINK_MAGIC};
+
+        // A new inode has no attribute fork, so its data fork is the whole
+        // literal area behind the v3 core.
+        let literal = usize::from(self.sb.inodesize) - crate::inode::XFS_DINODE_V3_SIZE;
+        if target.len() <= literal {
+            return Ok(SymlinkData {
+                fork: target.to_vec(),
+                blocks: 0,
+                items: Vec::new(),
+            });
+        }
+
+        let blocksize = self.sb.blocksize as usize;
+        let blocks = (XFS_SYMLINK_HDR_SIZE + target.len()).div_ceil(blocksize);
+        let agblock =
+            allocations
+                .group(&self.sb, self.device(), agno)?
+                .take(blocks as u32, ino as i64, 0)?;
+        let fsblock = (u64::from(agno) << self.sb.agblklog) | u64::from(agblock);
+        let disk = self.block_offset(fsblock);
+        let daddr = disk / crate::log::BBSIZE as u64;
+
+        let mut buf = vec![0u8; blocks * blocksize];
+        buf[at::MAGIC..at::MAGIC + 4].copy_from_slice(&XFS_SYMLINK_MAGIC.to_be_bytes());
+        buf[at::OFFSET..at::OFFSET + 4].copy_from_slice(&0u32.to_be_bytes());
+        buf[at::BYTES..at::BYTES + 4].copy_from_slice(&(target.len() as u32).to_be_bytes());
+        buf[at::UUID..at::UUID + 16].copy_from_slice(&self.sb.meta_uuid);
+        buf[at::OWNER..at::OWNER + 8].copy_from_slice(&ino.to_be_bytes());
+        buf[at::BLKNO..at::BLKNO + 8].copy_from_slice(&daddr.to_be_bytes());
+        buf[XFS_SYMLINK_HDR_SIZE..XFS_SYMLINK_HDR_SIZE + target.len()].copy_from_slice(target);
+        crate::group_write::restamp_crc(&mut buf, at::CRC);
+        let whole = buf.len();
+        let mut item = crate::buf_write::BufferItem::new(daddr, buf, BLFT_SYMLINK, 0);
+        item.mark(0, whole);
+
+        let extent = crate::extent::Extent {
+            startoff: 0,
+            startblock: fsblock,
+            blockcount: blocks as u64,
+            unwritten: false,
+        };
+        Ok(SymlinkData {
+            fork: extent.to_bytes()?.to_vec(),
+            blocks: blocks as u64,
+            items: vec![item],
+        })
+    }
+
     /// An inode as recovery will have written it, before anything is
     /// put in it.
     ///
@@ -546,6 +662,31 @@ impl Filesystem {
         self.create_inheriting(parent, name, mode, Kind::Directory)
     }
 
+    /// Create a symbolic link called `name` in `parent`, pointing at
+    /// `target`, through the log (#462).
+    ///
+    /// A target that fits the inode's literal area is kept there; a longer
+    /// one goes in a run of blocks taken from the parent's group, behind
+    /// the v5 header that names its owner, and the inode's fork holds the
+    /// one extent record that maps them. Either way the transaction is a
+    /// create's, with the target's block logged beside it when there is
+    /// one.
+    ///
+    /// The mode is `0777`, as every symlink's is, and nothing is inherited
+    /// from a default ACL: a symlink's permissions are not consulted.
+    ///
+    /// Returns the new link's inode number and the sequence number the
+    /// record was given.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::create_file`], and
+    /// [`Error::UnsupportedFeature`] for an empty target, one longer than
+    /// the 1024 bytes XFS stores, or one holding a NUL.
+    pub fn create_symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<(u64, u64)> {
+        self.create(parent, name, 0o777, Kind::Symlink, target)
+    }
+
     /// Create an inode, giving it what `parent`'s default ACL passes on
     /// (#390, #284).
     ///
@@ -563,14 +704,21 @@ impl Filesystem {
         let mode = inherited
             .as_ref()
             .map_or(mode, |(bits, _, _)| (mode & !0o7777) | bits);
-        let made = self.create(parent, name, mode, kind)?;
+        let made = self.create(parent, name, mode, kind, &[])?;
         if let Some((_, access, default)) = inherited {
             self.write_inherited_acl(made.0, access, default)?;
         }
         Ok(made)
     }
 
-    fn create(&self, parent: u64, name: &[u8], mode: u16, kind: Kind) -> Result<(u64, u64)> {
+    fn create(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: u16,
+        kind: Kind,
+        target: &[u8],
+    ) -> Result<(u64, u64)> {
         self.writable_device()?;
         if !self.sb.is_v5() {
             return Err(Error::UnsupportedFeature(
@@ -585,6 +733,9 @@ impl Filesystem {
         }
         // Before anything is read: a refused mode must cost nothing.
         let mode = typed_mode(mode, kind)?;
+        if kind == Kind::Symlink {
+            check_target(target)?;
+        }
 
         let (dir_inode, dir_raw) = self.read_inode_raw(parent)?;
         if !dir_inode.is_dir() {
@@ -774,6 +925,13 @@ impl Filesystem {
         // the group's header is logged once (#423).
         let inode_tree_items = trees.into_items_in(&mut allocations)?;
 
+        // A symlink's target, inline or in a block taken through the same
+        // allocator as everything else this operation takes (#462).
+        let symlink = match kind {
+            Kind::Symlink => Some(self.symlink_data(&mut allocations, agno, ino, target)?),
+            _ => None,
+        };
+
         // The parent gains an entry, so its fork and its size change —
         // unless the entry will not fit, in which case the directory
         // leaves its inode entirely and this becomes a conversion.
@@ -904,11 +1062,32 @@ impl Filesystem {
         // entries in this form — the parent lives in the header and the
         // directory's own identity in the inode — so an empty directory
         // really is empty.
-        let new_fork = match kind {
-            Kind::File => Vec::new(),
-            Kind::Directory => empty_short_form_dir(parent),
+        let new_fork = match (kind, &symlink) {
+            (Kind::Symlink, Some(s)) => s.fork.clone(),
+            (Kind::Directory, _) => empty_short_form_dir(parent),
+            _ => Vec::new(),
         };
-        let new_core = created_core(&new_raw, mode, kind, new_fork.len() as u64, when);
+        // A symlink's size is its target's length, whether the fork holds
+        // the target or an extent record naming the block that does.
+        let new_size = match kind {
+            Kind::Symlink => target.len() as u64,
+            _ => new_fork.len() as u64,
+        };
+        let mut new_core = created_core(&new_raw, mode, kind, new_size, when);
+        let new_blocks = symlink.as_ref().map_or(0, |s| s.blocks);
+        if new_blocks > 0 {
+            new_core[core_at::FORMAT] = Format::Extents as u8;
+            new_core[core_at::NBLOCKS..core_at::NBLOCKS + 8]
+                .copy_from_slice(&new_blocks.to_be_bytes());
+            set_nextents(&mut new_core, 1);
+        }
+        // The fork's bytes are its target, or a directory's header, inline;
+        // or one extent record.
+        let new_field = if new_blocks > 0 {
+            XFS_ILOG_DEXT
+        } else {
+            XFS_ILOG_DDATA
+        };
         let quota_block_delta = dir_blocks
             .checked_sub(dir_inode.nblocks)
             .and_then(|blocks| i64::try_from(blocks).ok())
@@ -926,7 +1105,9 @@ impl Filesystem {
                         crate::format::log_items::log_dinode::offsets::GID,
                     ),
                     project_id: crate::quota::project_id(&new_core),
-                    blocks_fs: 0,
+                    blocks_fs: i64::try_from(new_blocks).map_err(|_| {
+                        Error::UnsupportedFeature("quota block delta overflowed".into())
+                    })?,
                     inodes: 1,
                 },
                 crate::quota::QuotaChange {
@@ -975,11 +1156,13 @@ impl Filesystem {
         };
 
         let allocation_items = allocations.into_items()?;
+        let symlink_items = symlink.map_or_else(Vec::new, |s| s.items);
 
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + usize::from(icreate.is_some())
             + inode_tree_items.iter().map(|i| i.op_count()).sum::<usize>()
             + extra.iter().map(|i| i.op_count()).sum::<usize>()
+            + symlink_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + new_ops;
@@ -1023,6 +1206,9 @@ impl Filesystem {
             for item in &extra {
                 ops.extend(item.ops());
             }
+            for item in &symlink_items {
+                ops.extend(item.ops());
+            }
             for item in &quota_items {
                 ops.extend(item.ops());
             }
@@ -1059,7 +1245,7 @@ impl Filesystem {
                     flags: 0,
                     data: inode_log_format_with_fork(
                         ino,
-                        XFS_ILOG_CORE | XFS_ILOG_DDATA,
+                        XFS_ILOG_CORE | new_field,
                         &new_buf,
                         new_dsize as u16,
                     ),
@@ -1086,6 +1272,7 @@ impl Filesystem {
         self.logged_buffers(&allocation_items);
         self.logged_buffers(&inode_tree_items);
         self.logged_buffers(&extra);
+        self.logged_buffers(&symlink_items);
         for item in &quota_items {
             item.apply_overlay(self)?;
         }
