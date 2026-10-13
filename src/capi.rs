@@ -282,6 +282,12 @@ pub struct fs_xfs_attr_t {
     pub crtime: i64,
     pub link_count: u32,
     pub file_type: u32,
+    /// The nanoseconds of each time above, which the inode stores and a
+    /// caller can set through [`fs_xfs_set_attributes`] (#465).
+    pub atime_nsec: u32,
+    pub mtime_nsec: u32,
+    pub ctime_nsec: u32,
+    pub crtime_nsec: u32,
 }
 
 /// One directory entry.
@@ -794,6 +800,10 @@ fn fill_attr(inode: &Inode, out: *mut fs_xfs_attr_t) {
             crtime: inode.crtime.sec,
             link_count: inode.nlink,
             file_type: file_type_code(inode.file_type()),
+            atime_nsec: inode.atime.nsec,
+            mtime_nsec: inode.mtime.nsec,
+            ctime_nsec: inode.ctime.nsec,
+            crtime_nsec: inode.crtime.nsec,
         };
     }
 }

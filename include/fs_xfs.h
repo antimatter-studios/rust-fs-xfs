@@ -63,6 +63,10 @@ typedef struct {
     int64_t  crtime;      /* creation time; 0 on v4 filesystems */
     uint32_t link_count;
     uint32_t file_type;   /* fs_xfs_file_type_t */
+    uint32_t atime_nsec;  /* the nanoseconds of each time above */
+    uint32_t mtime_nsec;
+    uint32_t ctime_nsec;
+    uint32_t crtime_nsec;
 } fs_xfs_attr_t;
 
 /* One directory entry. */

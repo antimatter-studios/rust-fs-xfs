@@ -1170,6 +1170,35 @@ fn attributes_round_trip_through_the_abi() {
     unsafe { fs_xfs_umount(fs) };
 }
 
+/// A time set with nanoseconds reads back with them (#465). The inode
+/// stores them, and the kernel sees them, but `fs_xfs_attr_t` carried
+/// whole seconds, so a caller that set 42 ns read back 0.
+#[test]
+fn a_time_set_with_nanoseconds_reads_back_with_them() {
+    let copy = WritableCopy::new("xfscapi-nsec.img");
+    let fs = copy.open_rw();
+    let path = cstr("/small.txt");
+    let rc = unsafe {
+        fs_xfs_set_attributes(
+            fs,
+            path.as_ptr(),
+            FS_XFS_LEAVE,
+            FS_XFS_LEAVE,
+            FS_XFS_LEAVE,
+            1_400_000_000,
+            123_456_789,
+            1_500_000_000,
+            42,
+        )
+    };
+    assert_eq!(rc, 0, "{}", last_error());
+    let mut st = zeroed_attr();
+    assert_eq!(unsafe { fs_xfs_stat(fs, path.as_ptr(), &mut st) }, 0);
+    assert_eq!((st.atime, st.atime_nsec), (1_400_000_000, 123_456_789));
+    assert_eq!((st.mtime, st.mtime_nsec), (1_500_000_000, 42));
+    unsafe { fs_xfs_umount(fs) };
+}
+
 /// A mode carrying file-type bits must be refused, not masked — this is
 /// the ABI's one chance to stop a caller turning a file into a directory
 /// by arithmetic.
