@@ -50,7 +50,7 @@ fn links() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("d/short", b"../somewhere/else".to_vec()),
         ("d/long", long_target(900)),
-        ("most", long_target(1024)),
+        ("most", long_target(1023)),
     ]
 }
 

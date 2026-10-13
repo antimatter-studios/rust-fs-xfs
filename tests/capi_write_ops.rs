@@ -318,7 +318,7 @@ fn a_symlink_is_made_inline_or_in_a_block_and_refused_by_errno() {
     assert_ne!(mkdir(fs, "/d", 0o755), 0);
 
     let long = long_target(1000);
-    let most = long_target(1024);
+    let most = long_target(1023);
     let short = symlink(fs, b"../somewhere/else", "/d/short");
     assert_ne!(short, 0, "inline symlink: errno {}", fs_xfs_last_errno());
     let remote = symlink(fs, &long, "/d/long");
@@ -355,9 +355,9 @@ fn a_symlink_is_made_inline_or_in_a_block_and_refused_by_errno() {
     );
     assert_errno(symlink(fs, b"", "/empty") as i64, ENOENT, "an empty target");
     assert_errno(
-        symlink(fs, &long_target(1025), "/toolong") as i64,
+        symlink(fs, &long_target(1024), "/toolong") as i64,
         ENAMETOOLONG,
-        "a 1025-byte target",
+        "a 1024-byte target",
     );
     assert_errno(
         symlink(fs, b"x", "/nope/l") as i64,

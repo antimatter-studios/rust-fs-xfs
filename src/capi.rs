@@ -1116,7 +1116,7 @@ pub unsafe extern "C" fn fs_xfs_mkdir(fs: *mut fs_xfs_fs, path: *const c_char, m
 ///
 /// Returns the new link's inode number, or 0 with the errno set: ENOENT
 /// for an empty target, as `symlink(2)` gives, ENAMETOOLONG for one over
-/// the 1024 bytes XFS stores, and otherwise as [`fs_xfs_create`].
+/// the 1023 bytes XFS stores, and otherwise as [`fs_xfs_create`].
 ///
 /// # Safety
 ///
@@ -1142,7 +1142,7 @@ pub unsafe extern "C" fn fs_xfs_symlink(
             set_error("a symlink's target is empty".into(), libc_enoent());
             return 0;
         }
-        let most = crate::format::symlink::XFS_SYMLINK_MAXLEN;
+        let most = crate::format::symlink::XFS_SYMLINK_MAX_TARGET;
         if target.len() > most {
             set_error(
                 format!(

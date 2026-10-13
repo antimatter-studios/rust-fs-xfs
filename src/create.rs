@@ -337,10 +337,10 @@ pub(crate) fn reset_flags(core: &mut [u8]) {
 /// can hold it: empty, longer than XFS stores, or holding a NUL, which
 /// would end it early for every reader that takes it as a C string.
 fn check_target(target: &[u8]) -> Result<()> {
-    use crate::format::symlink::XFS_SYMLINK_MAXLEN;
-    if target.is_empty() || target.len() > XFS_SYMLINK_MAXLEN || target.contains(&0) {
+    use crate::format::symlink::XFS_SYMLINK_MAX_TARGET;
+    if target.is_empty() || target.len() > XFS_SYMLINK_MAX_TARGET || target.contains(&0) {
         return Err(Error::UnsupportedFeature(format!(
-            "a symlink's target is 1 to {XFS_SYMLINK_MAXLEN} bytes with no NUL; this one is \
+            "a symlink's target is 1 to {XFS_SYMLINK_MAX_TARGET} bytes with no NUL; this one is \
              {} bytes{}",
             target.len(),
             if target.contains(&0) {
@@ -682,7 +682,7 @@ impl Filesystem {
     ///
     /// As [`Filesystem::create_file`], and
     /// [`Error::UnsupportedFeature`] for an empty target, one longer than
-    /// the 1024 bytes XFS stores, or one holding a NUL.
+    /// the 1023 bytes XFS stores, or one holding a NUL.
     pub fn create_symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<(u64, u64)> {
         self.create(parent, name, 0o777, Kind::Symlink, target)
     }

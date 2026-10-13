@@ -55,6 +55,16 @@ pub const XFS_SYMLINK_HDR_SIZE: usize = 56;
 /// reason a symlink never needs more than a couple of blocks.
 pub const XFS_SYMLINK_MAXLEN: usize = 1024;
 
+/// The longest target a symlink this driver makes may have: one byte
+/// short of [`XFS_SYMLINK_MAXLEN`].
+///
+/// MEASURED (#462): a 1024-byte target written behind its `XSLM` header
+/// made the kernel's log recovery shut the filesystem down ("Corruption of
+/// in-memory data" writing the symlink buffer) at 4 KiB and 1 KiB blocks,
+/// while 900 bytes recovered. The bound the kernel checks the header's
+/// offset plus bytes against is the maximum itself, not one past it.
+pub const XFS_SYMLINK_MAX_TARGET: usize = XFS_SYMLINK_MAXLEN - 1;
+
 /// Byte offsets within `xfs_dsymlink_hdr`. Big-endian, like every other
 /// on-disk structure.
 pub mod offsets {

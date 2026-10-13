@@ -325,7 +325,7 @@ uint64_t fs_xfs_mkdir(fs_xfs_fs_t *fs, const char *path, uint16_t mode);
  * number, or 0 on failure. The link's mode is 0777 and its owner uid 0,
  * gid 0.
  *
- * ENOENT for an empty target, ENAMETOOLONG for one over 1024 bytes;
+ * ENOENT for an empty target, ENAMETOOLONG for one over 1023 bytes;
  * otherwise as fs_xfs_create.
  */
 uint64_t fs_xfs_symlink(fs_xfs_fs_t *fs, const char *target,
