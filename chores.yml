@@ -427,11 +427,16 @@ tasks:
     # expanded matrix and the quota record oracle together on current main:
     # every test passed and the tier printed 1,234 lines / 79,160 bytes;
     # half as much again is 1,851 lines / 119,000 bytes.
+    # MEASURED in run 38393092090 (job 115295062742, 2026-10-13), with the repair
+    # stack's kernel suites (#431): all 147 tests passed and the tier printed
+    # 1,836 lines / 153,861 bytes, its growth the repairs' `[kernel vm]` and
+    # `[oracle vm]` evidence; half as much again is 2,754 lines / 230,800
+    # bytes.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/build-fixtures.sh --check'
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 1851 119000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      - 'CI_TEST_FLOOR=36 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'

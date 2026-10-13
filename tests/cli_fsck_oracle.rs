@@ -482,8 +482,21 @@ fn one_damage_per_code(base: &str) -> Vec<Case> {
                 "write -d magic 0".into(),
             ],
         ),
+        // A count no chunk can have: the record cannot say which inodes
+        // it covers, so it is not read.
         (
             "inobt.record",
+            "inobt-count-range",
+            vec![
+                "agi 0".into(),
+                "addr root".into(),
+                "write -d recs[1].count 2".into(),
+            ],
+        ),
+        // A free count that disagrees with the free mask is a fault in that
+        // record alone (#393): the masks still say which inodes it covers.
+        (
+            "inobt.chunk-count",
             "inobt-freecount",
             vec![
                 "agi 0".into(),
@@ -814,15 +827,27 @@ fn a_volume_that_is_not_xfs_is_an_operational_error() {
 }
 
 #[test]
-fn a_repair_is_refused_not_pretended() {
+fn a_repair_of_a_clean_volume_writes_nothing_and_asking_for_both_is_refused() {
     let copy = scratch::Volume::copy_of(
         SUITE,
         &fixture("xfs-default.img"),
         &format!("{}-y.img", std::process::id()),
     );
-    let out = tool("fsck.xfs")
-        .args(["-y", copy.path().to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(16), "fsck.xfs -y: {}", stderr(&out));
+    let path = copy.path().to_str().unwrap();
+    let before = std::fs::read(path).unwrap();
+    let out = tool("fsck.xfs").args(["-y", path]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "fsck.xfs -y: {}", stderr(&out));
+    assert!(
+        std::fs::read(path).unwrap() == before,
+        "fsck.xfs -y changed a clean volume"
+    );
+    for both in [["-n", "-y"], ["-y", "--dry-run"]] {
+        let out = tool("fsck.xfs").args(both).arg(path).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(16),
+            "fsck.xfs {both:?}: {}",
+            stderr(&out)
+        );
+    }
 }

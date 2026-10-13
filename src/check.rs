@@ -366,7 +366,6 @@ impl Code {
             self,
             Code::Checksum
                 | Code::Identity
-                | Code::SbCopyUnreadable
                 | Code::AgfUnreadable
                 | Code::AgiUnreadable
                 | Code::AgflUnreadable
@@ -877,12 +876,15 @@ impl Checker<'_> {
                 );
                 continue;
             }
+            // A copy that fails its checksum is this code too, not
+            // `checksum`: nothing is reached through a copy, so it is the
+            // copy alone that went unchecked, and a repair from the primary
+            // owns it (#391).
             let copy = match crate::superblock::Superblock::parse_copy(&raw) {
                 Ok(copy) => copy,
                 Err(e) => {
-                    self.failed(
+                    self.find(
                         Code::SbCopyUnreadable,
-                        &e,
                         Some(ag),
                         None,
                         format!("the superblock copy: {e}"),
@@ -1160,7 +1162,7 @@ impl Checker<'_> {
             agi.root,
             agi.level,
             read,
-            |buf, at| crate::inode_btree::record(buf, at, sparse),
+            |buf, at| crate::inode_btree::record_counted(buf, at, sparse),
         ) {
             Ok((records, blocks)) => {
                 if has_inobt_counts(sb) && blocks.len() as u32 != agi_blocks.0 {
@@ -1181,7 +1183,17 @@ impl Checker<'_> {
                 let mut chunks = Vec::new();
                 for r in records {
                     match r {
-                        Ok(chunk) => chunks.push(chunk),
+                        Ok((chunk, said)) => {
+                            if let Some(said) = said {
+                                self.find(
+                                    Code::InobtChunkCount,
+                                    Some(ag),
+                                    None,
+                                    format!("an inode btree record: {said}"),
+                                );
+                            }
+                            chunks.push(chunk);
+                        }
                         Err(e) => self.failed(
                             Code::InobtRecord,
                             &e,
@@ -1498,8 +1510,28 @@ impl Checker<'_> {
         let mut links: HashMap<u64, u32> = HashMap::new();
         let mut subdirs: HashMap<u64, u32> = HashMap::new();
         let mut reached: HashSet<u64> = HashSet::new();
+        // Whether a directory could not be listed: then what it names is
+        // unknown, and no inode's reach or link count can be judged.
+        let mut unlisted = false;
         let mut stack = vec![sb.rootino];
         reached.insert(sb.rootino);
+        // An inode the inode btree calls free and that is in use is
+        // `inode.free-in-use`, found above. It is readable and in use, so
+        // the walk goes through it rather than leaving everything under
+        // it unchecked and the scan partial (#393): only its allocation
+        // bit is wrong.
+        let free: Vec<u64> = self.free.iter().copied().collect();
+        for ino in free {
+            if usable.contains_key(&ino) {
+                continue;
+            }
+            if let Ok((inode, raw)) = fs.read_inode_raw(ino) {
+                if inode.mode != 0 {
+                    raws.insert(ino, raw);
+                    usable.insert(ino, inode);
+                }
+            }
+        }
         if !usable.contains_key(&sb.rootino) {
             let why = if self.allocated.contains(&sb.rootino) {
                 "could not be read"
@@ -1528,10 +1560,46 @@ impl Checker<'_> {
                 continue;
             }
             self.report.directories += 1;
-            let entries = match fs
-                .read_dir(&inode, &raws[&dir])
-                .and_then(|e| every_data_block_parses(fs, &inode, &raws[&dir]).map(|()| e))
-            {
+            // A short-form directory is read past an undefined file type
+            // byte, which is reported below, so the repair that sets it from
+            // the inode has a complete walk to plan from (#394).
+            let mut tolerated = crate::dir::Tolerated::default();
+            let listed = if inode.format == Format::Local {
+                let (start, end) = inode.data_fork_range(usize::from(sb.inodesize));
+                crate::dir::read_short_form_lenient(&inode, &raws[&dir][start..end], &sb).map(
+                    |(sf, t)| {
+                        tolerated = t;
+                        sf.entries
+                    },
+                )
+            } else {
+                fs.read_dir(&inode, &raws[&dir])
+                    .and_then(|e| every_data_block_parses(fs, &inode, &raws[&dir]).map(|()| e))
+            };
+            // A parent that is no inode number is a directory the kernel
+            // will not read, and the repair that gives it its parent back
+            // owns the code; the entries below it are still walked.
+            if let Some(why) = &tolerated.parent {
+                self.find(
+                    Code::DirUnreadable,
+                    None,
+                    Some(dir),
+                    format!("directory {dir}: {why}"),
+                );
+            }
+            for (name, byte) in &tolerated.types {
+                self.find(
+                    Code::DirEntryFtype,
+                    None,
+                    Some(dir),
+                    format!(
+                        "directory {dir}: entry {:?} has file type {byte}, which is not a \
+                         defined value",
+                        String::from_utf8_lossy(name)
+                    ),
+                );
+            }
+            let entries = match listed {
                 Ok(e) => e,
                 Err(e) => {
                     self.failed(
@@ -1541,6 +1609,7 @@ impl Checker<'_> {
                         Some(dir),
                         format!("directory {dir}: {e}"),
                     );
+                    unlisted = true;
                     continue;
                 }
             };
@@ -1600,6 +1669,14 @@ impl Checker<'_> {
             }
         }
 
+        // NOTHING IS UNREACHED BEHIND A DIRECTORY THAT COULD NOT BE READ
+        // (#394). The names it holds are the ones missing from the count,
+        // so every inode below it read as unreached and every link it held
+        // as absent: findings by the dozen, each wrong, and enough of them
+        // to crowd the report past what a repair plan may account for.
+        if unlisted {
+            return;
+        }
         for (&ino, inode) in &usable {
             if metadata.contains(&ino) {
                 continue;
@@ -2319,11 +2396,11 @@ fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(b[at..at + 4].try_into().expect("4 bytes"))
 }
 
-fn has_inobt_counts(sb: &crate::superblock::Superblock) -> bool {
+pub(crate) fn has_inobt_counts(sb: &crate::superblock::Superblock) -> bool {
     sb.features_ro_compat & crate::superblock::ro_compat::INOBTCNT != 0
 }
 
-fn has_lazy_counters(sb: &crate::superblock::Superblock) -> bool {
+pub(crate) fn has_lazy_counters(sb: &crate::superblock::Superblock) -> bool {
     sb.features2 & crate::superblock::features2_flags::LAZYSBCOUNT != 0
 }
 

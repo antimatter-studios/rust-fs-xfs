@@ -1104,6 +1104,44 @@ fn read_sf_ino(buf: &[u8], off: usize, wide: bool) -> Result<u64> {
 /// carries for exactly this purpose: it fails loudly if the inode
 /// numbers were read at the wrong width or the wrong offset.
 pub fn read_short_form(inode: &Inode, fork: &[u8], sb: &Superblock) -> Result<ShortFormDir> {
+    short_form(inode, fork, sb, None)
+}
+
+/// What [`read_short_form_lenient`] read past.
+#[derive(Debug, Default)]
+pub(crate) struct Tolerated {
+    /// Entries whose file type byte is not a defined value: each name,
+    /// and the byte. They are read with no file type.
+    pub types: Vec<(Vec<u8>, u8)>,
+    /// Why the header's parent is not an inode number, when it is not.
+    pub parent: Option<String>,
+}
+
+/// [`read_short_form`], except that an entry whose file type byte is not
+/// a defined value, and a parent that is not an inode number, are named
+/// in [`Tolerated`] rather than failing the directory.
+///
+/// For the checker: the kernel refuses such a directory, and so does a
+/// read here, but `xfs_repair` sets both from the inodes and the tree, and
+/// a checker that could not read past them could neither say so nor walk
+/// on to count the links below (#394). Every other fault still fails the
+/// read.
+pub(crate) fn read_short_form_lenient(
+    inode: &Inode,
+    fork: &[u8],
+    sb: &Superblock,
+) -> Result<(ShortFormDir, Tolerated)> {
+    let mut tolerated = Tolerated::default();
+    let dir = short_form(inode, fork, sb, Some(&mut tolerated))?;
+    Ok((dir, tolerated))
+}
+
+fn short_form(
+    inode: &Inode,
+    fork: &[u8],
+    sb: &Superblock,
+    mut tolerated: Option<&mut Tolerated>,
+) -> Result<ShortFormDir> {
     if !inode.is_dir() {
         return Err(Error::NotADirectory);
     }
@@ -1151,11 +1189,16 @@ pub fn read_short_form(inode: &Inode, fork: &[u8], sb: &Superblock) -> Result<Sh
     }
 
     let parent_ino = read_sf_ino(sf, offsets::sf_hdr::PARENT, wide)?;
-    check_entry_ino(
+    if let Err(e) = check_entry_ino(
         sb,
         parent_ino,
         &format!("inode {}: short-form parent", inode.ino),
-    )?;
+    ) {
+        match tolerated.as_deref_mut() {
+            Some(t) => t.parent = Some(e.to_string()),
+            None => return Err(e),
+        }
+    }
 
     let ftype = dir_has_ftype(sb);
     let mut entries = Vec::with_capacity(count);
@@ -1191,7 +1234,15 @@ pub fn read_short_form(inode: &Inode, fork: &[u8], sb: &Superblock) -> Result<Sh
         let name_start = cur + offsets::sf_entry::NAME;
         let name_end = name_start + namelen;
         let ft = if ftype {
-            ftype_from_raw(sf[name_end])?
+            match (ftype_from_raw(sf[name_end]), tolerated.as_deref_mut()) {
+                (Ok(ft), _) => ft,
+                (Err(_), Some(t)) => {
+                    t.types
+                        .push((sf[name_start..name_end].to_vec(), sf[name_end]));
+                    None
+                }
+                (Err(e), None) => return Err(e),
+            }
         } else {
             None
         };
