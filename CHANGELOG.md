@@ -9,6 +9,113 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-13
+
+### Added
+
+- **The checker through the C ABI.** `fs_xfs_check` checks a mounted
+  volume as `fsck.xfs` does, writing nothing: each finding goes to a
+  callback with its code, severity, group, block, inode, field and words,
+  and `fs_xfs_check_report_t` holds the totals, whether the scan was
+  complete, whether the log held unapplied records, and whether the volume
+  is clean. A C caller could not reach the checker before.
+
+- **A label set after a logged change is logged (#464).**
+  `Filesystem::set_label` and `fs_xfs_set_label` used to refuse once the
+  mount had logged anything, since a replay of those records would write
+  over a label put on the primary superblock in place. The primary is now
+  logged with the new label, and the secondaries are still written in
+  place, as the kernel writes them. `tests/label_logged_oracle.rs` has the
+  kernel replay the label from the log and `xfs_repair -n` find the volume
+  clean.
+
+- **`fsck.xfs -y` repairs redundant directory metadata (#394).** The
+  `DirectoryMetadata` rule rebuilds entry types, entry tags, dot and dot-dot
+  entries and hash indexes. Their sources are the validated inodes, the directory
+  topology and the entries' own data; names and entry inode numbers are never
+  changed. A duplicate name, a dangling entry, uncertain topology, or a preview
+  that does not check complete and free of directory findings refuses it. A rule
+  may now account for findings that stop the check's walk, and a partial scan
+  whose every such finding a rule accounts for is planned rather than refused.
+
+- **`fsck.xfs -y` repairs inode allocation and link counts (#393).** The
+  `InodeAllocation` rule sets each inode's allocation bit to whether the inode is
+  in use. Both inode trees, the free counts that follow, and every link count are
+  derived from checksum-valid inodes and a complete directory traversal. An
+  orphan, a directory with two parents, an unused slot still claiming blocks, a
+  metadata inode, or any other finding refuses it. The rule checks a view of the
+  volume with its changes applied before proposing them.
+
+- **`fsck.xfs -y` counts group and superblock counters again (#392).** The
+  `Counters` rule derives each AGF, AGI and superblock counter from the trees it
+  summarises, exactly as the checker does, and rewrites only those fields and the
+  header's checksum. The AGF counters are free blocks, longest extent and btree
+  blocks; the AGI counters are inodes, free inodes and inode btree blocks; the
+  superblock's are inodes, free inodes and free blocks. A counter beside any
+  other damage refuses the plan, because a summary of trees the check did not
+  find sound is not a repair.
+
+- **`fsck.xfs -y` and `-p` repair a damaged secondary superblock (#391).** The
+  repair plan of #375 is applied: `fs_xfs::repair::apply` reads every range
+  again and writes only if it still holds the bytes the plan saw. The volume is
+  then checked again. The first rule, `SuperblockCopies`, rewrites one damaged
+  copy from the primary, as `xfs_repair` does. A copy naming another filesystem,
+  or more than one damaged copy, refuses the plan, and nothing is written. Exit
+  status 1 means corrected; it adds to 4 when errors are left.
+
+- **`fs_xfs_attr_t` reports each time's nanoseconds (#465).**
+  `atime_nsec`, `mtime_nsec`, `ctime_nsec` and `crtime_nsec`, appended to
+  the struct, where a time set with nanoseconds through
+  `fs_xfs_set_attributes` read back truncated to the second. The struct
+  grows, so a caller rebuilds against the new header; 0.14.0.
+
+- **A symlink can be created (#462).** `Filesystem::create_symlink` and
+  the C ABI's `fs_xfs_symlink(fs, target, linkpath)` make one through the
+  log, as one create transaction. A target that fits the inode's literal
+  area is kept inline; a longer one, up to the 1023 bytes XFS stores, goes
+  in one run of blocks behind the v5 `XSLM` header, logged with the
+  create. `tests/symlink_create_oracle.rs` has the kernel replay the log
+  and read every target back, on 4 KiB and 1 KiB blocks, and
+  `xfs_repair -n` find the volume clean.
+
+### Changed
+
+- **`fsck.xfs -y` repairs volumes with a reverse-mapping btree (#442).** The
+  planner refused any `rmapbt` volume, which `mkfs.xfs` makes by default,
+  so on new volumes it repaired nothing. A rule now says whether it keeps
+  the reverse map (`Rule::keeps_reverse_map`). Every rule that ships does:
+  superblock copies, counters and directory metadata move no block, and
+  inode allocation moves one only through the writer, which records it. A
+  plan under `rmapbt` is refused only when a rule asked does not.
+
+- **An inode chunk whose free count disagrees with its free mask is
+  `inobt.chunk-count` (#393),** not `inobt.record`. The record's first inode and
+  masks still say which inodes it covers, so the check reads them and the scan
+  stays complete. An inode the inode btree calls free that is in use is walked
+  through, rather than hiding the directory tree beneath it.
+
+- **A secondary superblock that fails its checksum is `sb.copy.unreadable` (#391),**
+  not `checksum`, and no longer makes the scan partial: nothing is reached
+  through a copy, so only the copy went unchecked. `-y` and `-p` are no longer
+  refused with 16; they repair, and only asking for them with `-n` or
+  `--dry-run` is.
+
+### Fixed
+
+- **An inode chunk may start wherever the superblock aligns it.** A write
+  refused a group whose first inode chunk did not start at a multiple of 64
+  inodes, but `mkfs.xfs -i sparse=0` puts it at inode 96, block 12 of a
+  four-block alignment, and the kernel and `xfs_repair` take it. A chunk now
+  has to start on an inode block aligned to `sb_inoalignmt`.
+
+- **A full volume is ENOSPC, not ENOTSUP (#463).** `Error::NoSpace`,
+  mapped to ENOSPC by the C ABI, where an allocation that found no room
+  was `UnsupportedFeature` and so ENOTSUP. A data write is `NoSpace` once
+  every allocation group has been taken from; an aligned allocation is
+  `NoSpace` when the whole volume has fewer free blocks than it wants, and
+  stays `UnsupportedFeature` when the space is there but in another group
+  or in pieces. A new variant of `Error`, so 0.14.0.
+
 ## [0.13.0] — 2026-10-12
 
 ### Added
@@ -1010,6 +1117,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.14.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.11.0...v0.12.0

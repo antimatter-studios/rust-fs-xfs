@@ -342,6 +342,13 @@ gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
 
 The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.14.0 — 2026-10-13
+
+- `fsck.xfs -y` repairs superblock copies, counters, inode allocation and directory metadata, on volumes with a reverse-mapping btree too.
+- The checker is reachable through the C ABI: `fs_xfs_check` reports each finding and whether the scan was complete.
+- A symlink can be created through the log, and a label set after a logged change is logged.
+- `fs_xfs_attr_t` reports each time's nanoseconds, and a full volume is ENOSPC rather than ENOTSUP.
+
 ### v0.13.0 — 2026-10-12
 
 - The C ABI writes through the log: a writable device mount, create, mkdir, unlink, rmdir, link, rename, a clean unmount, and attribute and extended-attribute changes.
@@ -399,11 +406,6 @@ The latest releases; every release, with the reasoning behind each change, is in
 ### v0.6.0 — 2026-09-04
 
 - `File`, and `Filesystem::open` / `open_ino` / `root`.
-
-### v0.5.2 — 2026-09-04
-
-- A superblock can be written back, and is proved against `mkfs.xfs`.
-- The block-map tree's block addresses are checked.
 
 ## License
 
