@@ -746,3 +746,99 @@ fn the_new_entry_points_reject_null_handles() {
         );
     }
 }
+
+/// A read-only C handle over `dev`.
+fn mount_ro(dev: &Arc<Sparse>) -> *mut fs_xfs_fs {
+    let handle = FsCoreDevice::into_handle(dev.clone() as Arc<dyn BlockDevice>);
+    let fs = unsafe { fs_xfs_mount_with_fs_core_device(handle) };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+    assert!(
+        !fs.is_null(),
+        "mount_with_fs_core_device failed: errno {}",
+        fs_xfs_last_errno()
+    );
+    fs
+}
+
+/// Each finding the callback is given: code, severity and group.
+type Found = Vec<(String, String, i64)>;
+
+unsafe extern "C" fn collect(
+    context: *mut std::ffi::c_void,
+    finding: *const fs_xfs_check_finding_t,
+) -> i32 {
+    let found = unsafe { &mut *context.cast::<Found>() };
+    let f = unsafe { &*finding };
+    let text = |p: *const c_char| {
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    found.push((text(f.code), text(f.severity), f.ag));
+    0
+}
+
+fn check(fs: *mut fs_xfs_fs) -> (fs_xfs_check_report_t, Found) {
+    let mut found: Found = Vec::new();
+    let mut report = std::mem::MaybeUninit::<fs_xfs_check_report_t>::zeroed();
+    let rc = unsafe {
+        fs_xfs_check(
+            fs,
+            Some(collect),
+            (&mut found as *mut Found).cast(),
+            report.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, 0, "fs_xfs_check failed: errno {}", fs_xfs_last_errno());
+    (unsafe { report.assume_init() }, found)
+}
+
+/// The checker through the C ABI: a fresh volume is clean and was
+/// checked in full, and the totals are the walk's.
+#[test]
+fn a_fresh_volume_checks_clean_through_the_abi() {
+    let dev = formatted();
+    let fs = mount_ro(&dev);
+    let (report, found) = check(fs);
+    assert!(found.is_empty(), "findings on a fresh volume: {found:?}");
+    assert_eq!(report.findings, 0);
+    assert_eq!(report.errors, 0);
+    assert_eq!((report.complete, report.clean, report.dirty), (1, 1, 0));
+    assert!(report.inodes > 0, "the walk counted no inodes");
+    assert!(report.free_blocks > 0, "the walk counted no free blocks");
+    unsafe { fs_xfs_umount(fs) };
+}
+
+/// A group header that fails its checksum is an error the callback is
+/// given, with its code and its group, and the volume is not clean.
+#[test]
+fn a_damaged_group_header_is_a_finding_through_the_abi() {
+    let dev = formatted();
+    let (ag_start, sector) = {
+        let fs =
+            Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).expect("mount the fresh volume");
+        let sb = fs.superblock();
+        (
+            u64::from(sb.agblocks) * u64::from(sb.blocksize),
+            u64::from(sb.sectsize),
+        )
+    };
+    // Group 1's AGF, one byte inside what its CRC covers, inverted.
+    let at = ag_start + sector + 64;
+    let mut byte = [0u8; 1];
+    dev.read_at(at, &mut byte).unwrap();
+    dev.write_at(at, &[!byte[0]]).unwrap();
+
+    let fs = mount_ro(&dev);
+    let (report, found) = check(fs);
+    assert!(
+        found
+            .iter()
+            .any(|(_, severity, ag)| severity == "error" && *ag == 1),
+        "no error in group 1 among {found:?}"
+    );
+    assert_eq!(report.findings as usize, found.len());
+    assert!(report.errors > 0);
+    assert_eq!(report.clean, 0);
+    unsafe { fs_xfs_umount(fs) };
+}

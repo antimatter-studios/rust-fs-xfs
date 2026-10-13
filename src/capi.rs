@@ -182,6 +182,60 @@ fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// One finding of [`fs_xfs_check`]. The strings are NUL-terminated, owned by
+/// the library and valid only for the call that receives them.
+#[repr(C)]
+pub struct fs_xfs_check_finding_t {
+    /// What kind of thing is wrong, as `fsck.xfs` names it (`checksum`,
+    /// `counter_agf_freeblks`, ...).
+    pub code: *const c_char,
+    /// `error` (the volume is damaged) or `warning` (worth knowing, and
+    /// not damage).
+    pub severity: *const c_char,
+    /// The allocation group, or -1 when it belongs to none.
+    pub ag: i64,
+    /// The block within that group, or -1.
+    pub agbno: i64,
+    /// The inode, or -1.
+    pub ino: i64,
+    /// The on-disk field or structure it names, or NULL.
+    pub field: *const c_char,
+    /// What is wrong, in words.
+    pub what: *const c_char,
+}
+
+/// What [`fs_xfs_check`] found, in sum.
+#[repr(C)]
+pub struct fs_xfs_check_report_t {
+    /// Findings listed, each passed to the callback.
+    pub findings: u64,
+    /// How many of them are errors rather than warnings.
+    pub errors: u64,
+    /// Findings found and not listed, past the checker's limit of one kind
+    /// in one group.
+    pub suppressed: u64,
+    /// Allocated inodes walked.
+    pub inodes: u64,
+    /// Directories walked.
+    pub directories: u64,
+    /// Free blocks counted across every group.
+    pub free_blocks: u64,
+    /// 1 when every structure the walk reached was read; 0 when a finding
+    /// stopped it, so the volume was not checked in full.
+    pub complete: u8,
+    /// 1 when the log held records not yet applied; the volume was checked
+    /// as replaying them leaves it.
+    pub dirty: u8,
+    /// 1 when the check was complete and found no error.
+    pub clean: u8,
+}
+
+/// Called once for each finding of [`fs_xfs_check`], with the context the
+/// caller passed. Return 0 to go on; anything else stops the listing
+/// (the report is still filled in).
+pub type fs_xfs_check_finding_fn =
+    Option<unsafe extern "C" fn(*mut c_void, *const fs_xfs_check_finding_t) -> c_int>;
+
 /// Opaque mounted-filesystem handle.
 pub struct fs_xfs_fs {
     fs: Filesystem,
@@ -603,6 +657,77 @@ pub unsafe extern "C" fn fs_xfs_umount(fs: *mut fs_xfs_fs) {
             }
         }
     });
+}
+
+/// Check the volume the handle mounts, as `fsck.xfs` does: every finding
+/// is passed to `on_finding` (which may be NULL), and `out` is filled in
+/// with the totals. A read-only check: nothing is written. Returns 0 when
+/// the check ran, whatever it found; −1 with the error recorded when it
+/// could not run.
+///
+/// `clean` in the report is 1 only when the scan was complete and found
+/// no error: a check stopped by what it found is not a clean one.
+///
+/// # Safety
+///
+/// `fs` must be a live handle; `out` must be writable; `on_finding`, when
+/// not NULL, must be callable with `context`.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_check(
+    fs: *mut fs_xfs_fs,
+    on_finding: fs_xfs_check_finding_fn,
+    context: *mut c_void,
+    out: *mut fs_xfs_check_report_t,
+) -> c_int {
+    guard(-1, || {
+        if fs.is_null() || out.is_null() {
+            set_error("fs or out is NULL".into(), libc_eio());
+            return -1;
+        }
+        let fs = &unsafe { &*fs }.fs;
+        let report = crate::check::check(fs);
+        let mut errors = 0u64;
+        for finding in &report.findings {
+            if finding.severity() == crate::check::Severity::Error {
+                errors += 1;
+            }
+        }
+        if let Some(callback) = on_finding {
+            let text = |s: &str| CString::new(s.replace('\0', " ")).unwrap_or_default();
+            for finding in &report.findings {
+                let code = text(finding.code.as_str());
+                let severity = text(finding.severity().as_str());
+                let field = finding.location.field.map(text);
+                let what = text(&finding.what);
+                let c_finding = fs_xfs_check_finding_t {
+                    code: code.as_ptr(),
+                    severity: severity.as_ptr(),
+                    ag: finding.location.ag.map_or(-1, i64::from),
+                    agbno: finding.location.agbno.map_or(-1, i64::from),
+                    ino: finding.location.ino.map_or(-1, |i| i as i64),
+                    field: field.as_ref().map_or(std::ptr::null(), |f| f.as_ptr()),
+                    what: what.as_ptr(),
+                };
+                if unsafe { callback(context, &c_finding) } != 0 {
+                    break;
+                }
+            }
+        }
+        unsafe {
+            *out = fs_xfs_check_report_t {
+                findings: report.findings.len() as u64,
+                errors,
+                suppressed: report.suppressed,
+                inodes: report.inodes,
+                directories: report.directories,
+                free_blocks: report.free_blocks,
+                complete: u8::from(report.scan == crate::check::Scan::Complete),
+                dirty: u8::from(report.dirty),
+                clean: u8::from(report.is_clean()),
+            };
+        }
+        0
+    })
 }
 
 /// # Safety
