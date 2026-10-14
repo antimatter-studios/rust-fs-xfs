@@ -516,7 +516,11 @@ mod tests {
             b"security.a"
         );
         assert_eq!(full_name(1, flags::INCOMPLETE, b"a").unwrap(), None);
-        assert_eq!(full_name(1, 0x08, b"a").unwrap(), None, "an undefined bit");
+        assert_eq!(full_name(1, 0x10, b"a").unwrap(), None, "an undefined bit");
+        // The parent bit (#373) is a namespace of its own, kept internal.
+        let mut internal = PARENT_PREFIX.to_vec();
+        internal.push(b'a');
+        assert_eq!(full_name(1, flags::PARENT, b"a").unwrap(), Some(internal));
         assert!(full_name(1, flags::ROOT | flags::SECURE, b"a").is_err());
     }
 
