@@ -404,11 +404,13 @@ tasks:
     # Budget: 312 lines measured with the mkfs and fsck oracle suites in the
     # tier (run 37444985503), so 330. Then 339 lines / 54,505 bytes with a
     # damage case for every checker code (#364, run 37984830147), so 400
-    # lines; the bytes stay where they are.
+    # lines; the bytes stay where they are. Then 417 lines / 61,093 bytes
+    # with the exchange-range and repair suites (run 38488415326, the
+    # tier's own log), so 500 lines / 76,000 bytes, about a fifth over.
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 400 64000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 500 76000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
@@ -454,11 +456,14 @@ tasks:
     #
     # Budget: 53 lines / 1,900 bytes measured with exchange_range_kernel
     # alone (#374), on an aarch64 Linux host; half as much again, rounded up,
-    # so 80 lines / 3,000 bytes. The floor is 1, the one suite it holds.
+    # so 80 lines / 3,000 bytes. On the x86_64 CI runner, cold, the same
+    # suite printed 103 lines / 4,715 bytes (run 38488415326, the tier's own
+    # log): a line per crate compiled. Half as much again of that, so 155
+    # lines / 7,100 bytes. The floor is 1, the one suite it holds.
     cmds:
       - scripts/tools.sh --check
       - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" CI_TEST_FLOOR=1 ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 80 3000 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel-new)'
+      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" CI_TEST_FLOOR=1 ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 155 7100 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel-new)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
