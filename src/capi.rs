@@ -243,6 +243,53 @@ pub struct fs_xfs_check_report_t {
 pub type fs_xfs_check_finding_fn =
     Option<unsafe extern "C" fn(*mut c_void, *const fs_xfs_check_finding_t) -> c_int>;
 
+/// One item of [`fs_xfs_repair_with_fs_core_device`]: a change the repair
+/// proposes, a reason it refuses, or an error finding it leaves. The strings
+/// are NUL-terminated, owned by the library and valid only for the call
+/// that receives them.
+#[repr(C)]
+pub struct fs_xfs_repair_item_t {
+    /// `change`, `refusal` or `unplanned`.
+    pub kind: *const c_char,
+    /// The finding code it concerns, as `fsck.xfs` names it.
+    pub code: *const c_char,
+    /// For a change, the rule that proposed it; NULL otherwise.
+    pub rule: *const c_char,
+    /// For a change, the byte offset on the device it writes; -1 otherwise.
+    pub offset: i64,
+    /// For a change, how many bytes it writes; 0 otherwise.
+    pub length: u64,
+    /// Why, in words.
+    pub what: *const c_char,
+}
+
+/// What [`fs_xfs_repair_with_fs_core_device`] planned and did.
+#[repr(C)]
+pub struct fs_xfs_repair_report_t {
+    /// 1 when a plan was made; 0 when the repair refused, and `refusals`
+    /// says how many reasons it gave.
+    pub ready: u8,
+    /// Changes the plan proposes.
+    pub changes: u64,
+    /// Reasons it refused.
+    pub refusals: u64,
+    /// Error findings the plan leaves, which no rule repairs.
+    pub unplanned: u64,
+    /// Changes written: 0 for a dry run, a refused plan, or a listing the
+    /// caller stopped.
+    pub written: u64,
+    /// 1 when the volume, checked after the repair (or as it is, for a
+    /// dry run), was checked in full and found clean.
+    pub clean: u8,
+}
+
+/// Called once for each item of [`fs_xfs_repair_with_fs_core_device`], with
+/// the context the caller passed. Return 0 to go on; anything else stops
+/// the listing and, when the repair was to be applied, cancels it before
+/// anything is written (the report is still filled in).
+pub type fs_xfs_repair_item_fn =
+    Option<unsafe extern "C" fn(*mut c_void, *const fs_xfs_repair_item_t) -> c_int>;
+
 /// Opaque mounted-filesystem handle.
 pub struct fs_xfs_fs {
     fs: Filesystem,
@@ -737,6 +784,148 @@ pub unsafe extern "C" fn fs_xfs_check(
                 complete: u8::from(report.scan == crate::check::Scan::Complete),
                 dirty: u8::from(report.dirty),
                 clean: u8::from(report.is_clean()),
+            };
+        }
+        0
+    })
+}
+
+/// Repair the volume on an `fs_core` device as `fsck.xfs -y` does, or, with
+/// `apply` 0, plan the repair and write nothing (#477).
+///
+/// The volume is mounted read-only to plan from, with every rule this crate
+/// has ([`crate::repair::plan`]). Each change the plan proposes, each reason
+/// it refuses and each error finding it leaves is passed to `on_item`
+/// (which may be NULL). With `apply` set, a ready plan is written: every
+/// range is read first and must still hold the bytes the plan saw, or
+/// nothing is written. The volume is then checked again, and `out` says
+/// whether it is clean.
+///
+/// THE CALLER ASSERTS THAT NOTHING ELSE USES THE DEVICE while this runs
+/// ([`crate::repair::Exclusive::asserted_by_caller`]): no mount of it, ours
+/// or anyone's, may read or write it, and one that was open must be opened
+/// again afterwards, since what it holds in memory describes the volume as
+/// it was.
+///
+/// Returns 0 when the repair ran to its end, whether it planned, refused or
+/// was cancelled by `on_item`; -1 with the error recorded when it could not
+/// run: EROFS for `apply` on a device that cannot be written, and the
+/// mount's, the device's and a stale plan's errors otherwise.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live `FsCoreDevice` from `fs_core`; `out`
+/// must be writable; `on_item`, when not NULL, must be callable with
+/// `context`.
+#[no_mangle]
+pub unsafe extern "C" fn fs_xfs_repair_with_fs_core_device(
+    handle: *mut fs_core::ffi::FsCoreDevice,
+    apply: c_int,
+    on_item: fs_xfs_repair_item_fn,
+    context: *mut c_void,
+    out: *mut fs_xfs_repair_report_t,
+) -> c_int {
+    guard(-1, || {
+        if handle.is_null() || out.is_null() {
+            set_error("handle or out is NULL".into(), libc_eio());
+            return -1;
+        }
+        let dev: Arc<dyn fs_core::BlockDevice> = unsafe { (*handle).inner().clone() };
+        if apply != 0 && !dev.is_writable() {
+            set_error(
+                "the device cannot be written, so a repair cannot be applied to it".into(),
+                libc_erofs(),
+            );
+            return -1;
+        }
+        let access = crate::repair::Exclusive::asserted_by_caller();
+        let plan = match Filesystem::mount(dev.clone() as Arc<dyn BlockRead>) {
+            Ok(fs) => crate::repair::plan(&fs, &access),
+            Err(e) => {
+                record(&e);
+                return -1;
+            }
+        };
+        let ready = plan.status == crate::repair::Status::Ready;
+
+        // The items, in the plan's order; a callback that says stop cancels.
+        let mut cancelled = false;
+        if let Some(callback) = on_item {
+            let text = |s: &str| CString::new(s.replace('\0', " ")).unwrap_or_default();
+            let mut items: Vec<(&str, &crate::check::Finding)> = Vec::new();
+            for f in &plan.refusals {
+                items.push(("refusal", f));
+            }
+            for f in &plan.unplanned {
+                items.push(("unplanned", f));
+            }
+            'list: {
+                for change in &plan.changes {
+                    let (kind, code, rule, what) = (
+                        text("change"),
+                        text(change.code.as_str()),
+                        text(change.rule),
+                        text(&change.what),
+                    );
+                    let item = fs_xfs_repair_item_t {
+                        kind: kind.as_ptr(),
+                        code: code.as_ptr(),
+                        rule: rule.as_ptr(),
+                        offset: i64::try_from(change.offset).unwrap_or(i64::MAX),
+                        length: change.after.len() as u64,
+                        what: what.as_ptr(),
+                    };
+                    if unsafe { callback(context, &item) } != 0 {
+                        cancelled = true;
+                        break 'list;
+                    }
+                }
+                for (kind, finding) in items {
+                    let (kind, code, what) =
+                        (text(kind), text(finding.code.as_str()), text(&finding.what));
+                    let item = fs_xfs_repair_item_t {
+                        kind: kind.as_ptr(),
+                        code: code.as_ptr(),
+                        rule: std::ptr::null(),
+                        offset: -1,
+                        length: 0,
+                        what: what.as_ptr(),
+                    };
+                    if unsafe { callback(context, &item) } != 0 {
+                        cancelled = true;
+                        break 'list;
+                    }
+                }
+            }
+        }
+
+        let mut written = 0u64;
+        if apply != 0 && ready && !cancelled && !plan.changes.is_empty() {
+            match crate::repair::apply(&plan, dev.as_ref(), 0, &access) {
+                Ok(n) => written = n as u64,
+                Err(e) => {
+                    record(&e);
+                    return -1;
+                }
+            }
+        }
+        // What the volume checks as now: after the repair, or as it was.
+        let clean = if written > 0 {
+            match Filesystem::mount(dev as Arc<dyn BlockRead>) {
+                Ok(fs) => crate::check::check(&fs).is_clean(),
+                Err(_) => false,
+            }
+        } else {
+            plan.check.is_clean()
+        };
+        unsafe {
+            *out = fs_xfs_repair_report_t {
+                ready: u8::from(ready),
+                changes: plan.changes.len() as u64,
+                refusals: plan.refusals.len() as u64,
+                unplanned: plan.unplanned.len() as u64,
+                written,
+                clean: u8::from(clean),
             };
         }
         0
