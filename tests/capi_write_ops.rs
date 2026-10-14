@@ -974,3 +974,169 @@ fn a_damaged_group_header_is_a_finding_through_the_abi() {
     assert_eq!(report.clean, 0);
     unsafe { fs_xfs_umount(fs) };
 }
+
+// ---- repair (#477) ----
+
+/// What the repair callback is given: kind, code, offset and length.
+type Items = Vec<(String, String, i64, u64)>;
+
+/// Collects every item; with `stop` set, asks to stop at the first.
+struct Collected {
+    items: Items,
+    stop: bool,
+}
+
+unsafe extern "C" fn collect_item(
+    context: *mut std::ffi::c_void,
+    item: *const fs_xfs_repair_item_t,
+) -> i32 {
+    let c = unsafe { &mut *context.cast::<Collected>() };
+    let i = unsafe { &*item };
+    let text = |p: *const c_char| {
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    c.items
+        .push((text(i.kind), text(i.code), i.offset, i.length));
+    i32::from(c.stop)
+}
+
+/// Repair `dev` through the ABI: the return code, the report and the items.
+fn repair(dev: &Arc<Sparse>, apply: bool, stop: bool) -> (i32, fs_xfs_repair_report_t, Items) {
+    let mut collected = Collected {
+        items: Vec::new(),
+        stop,
+    };
+    let mut report = std::mem::MaybeUninit::<fs_xfs_repair_report_t>::zeroed();
+    let handle = FsCoreDevice::into_handle(dev.clone() as Arc<dyn BlockDevice>);
+    let rc = unsafe {
+        fs_xfs_repair_with_fs_core_device(
+            handle,
+            i32::from(apply),
+            Some(collect_item),
+            (&mut collected as *mut Collected).cast(),
+            report.as_mut_ptr(),
+        )
+    };
+    unsafe { fs_core::ffi::fs_core_device_close(handle) };
+    (rc, unsafe { report.assume_init() }, collected.items)
+}
+
+/// Where group `ag`'s superblock copy starts, and its sector size.
+fn sb_copy(dev: &Arc<Sparse>, ag: u64) -> (u64, usize) {
+    let fs = Filesystem::mount(dev.clone() as Arc<dyn BlockRead>).expect("mount");
+    let sb = fs.superblock();
+    (
+        ag * u64::from(sb.agblocks) * u64::from(sb.blocksize),
+        usize::from(sb.sectsize),
+    )
+}
+
+/// Put `value` in group `ag`'s copy's `sb_logblocks` and stamp its CRC
+/// again: one field a repair rewrites from the primary (#391).
+fn damage_sb_copy(dev: &Arc<Sparse>, ag: u64, value: u32) {
+    const LOGBLOCKS: usize = 96;
+    const CRC: usize = 224;
+    let (at, len) = sb_copy(dev, ag);
+    let mut sector = vec![0u8; len];
+    dev.read_at(at, &mut sector).unwrap();
+    sector[LOGBLOCKS..LOGBLOCKS + 4].copy_from_slice(&value.to_be_bytes());
+    fs_xfs::group_write::restamp_crc(&mut sector, CRC);
+    dev.write_at(at, &sector).unwrap();
+}
+
+fn bytes_of(dev: &Sparse) -> BTreeMap<u64, Box<[u8; SECTOR]>> {
+    dev.sectors.lock().unwrap().clone()
+}
+
+/// A dry run lists the change and writes nothing; an apply writes it, and
+/// the volume then checks clean through the ABI.
+#[test]
+fn a_damaged_superblock_copy_is_planned_then_repaired_through_the_abi() {
+    let dev = formatted();
+    damage_sb_copy(&dev, 1, 1234);
+    let (copy_at, _) = sb_copy(&dev, 1);
+    let damaged = bytes_of(&dev);
+
+    let (rc, report, items) = repair(&dev, false, false);
+    assert_eq!(rc, 0, "dry run failed: errno {}", fs_xfs_last_errno());
+    assert_eq!(
+        (report.ready, report.changes, report.written, report.clean),
+        (1, 1, 0, 0),
+        "{items:?}"
+    );
+    let changes: Vec<_> = items.iter().filter(|i| i.0 == "change").collect();
+    assert_eq!(changes.len(), 1, "{items:?}");
+    assert_eq!(
+        changes[0].2, copy_at as i64,
+        "the change is not at group 1's copy"
+    );
+    assert!(changes[0].3 > 0);
+    assert!(bytes_of(&dev) == damaged, "a dry run wrote");
+
+    let (rc, report, _) = repair(&dev, true, false);
+    assert_eq!(rc, 0, "apply failed: errno {}", fs_xfs_last_errno());
+    assert_eq!(
+        (report.ready, report.written, report.clean),
+        (1, 1, 1),
+        "the repair did not leave the volume clean"
+    );
+    let fs = mount_ro(&dev);
+    let (checked, found) = check(fs);
+    assert!(found.is_empty(), "findings after the repair: {found:?}");
+    assert_eq!(checked.clean, 1);
+    unsafe { fs_xfs_umount(fs) };
+
+    // Again: nothing to do, nothing written.
+    let repaired = bytes_of(&dev);
+    let (rc, report, items) = repair(&dev, true, false);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        (report.ready, report.changes, report.written),
+        (1, 0, 0),
+        "{items:?}"
+    );
+    assert!(bytes_of(&dev) == repaired);
+}
+
+/// A callback that says stop cancels an apply before anything is written.
+#[test]
+fn a_repair_the_callback_stops_writes_nothing() {
+    let dev = formatted();
+    damage_sb_copy(&dev, 1, 1234);
+    let damaged = bytes_of(&dev);
+    let (rc, report, items) = repair(&dev, true, true);
+    assert_eq!(rc, 0);
+    assert_eq!(items.len(), 1, "the listing went on after stop: {items:?}");
+    assert_eq!((report.ready, report.written), (1, 0));
+    assert!(bytes_of(&dev) == damaged, "a cancelled repair wrote");
+}
+
+/// A plan the repair refuses writes nothing and says why; an apply on a
+/// device that cannot be written is refused with EROFS.
+#[test]
+fn a_refused_repair_and_a_read_only_device_write_nothing() {
+    let dev = formatted();
+    damage_sb_copy(&dev, 1, 1234);
+    // A copy that fails its checksum, beside the damaged field: two damaged
+    // copies are refused, as tests/repair_superblock_copies.rs refuses them
+    // (#391).
+    let (at, len) = sb_copy(&dev, 3);
+    let mut sector = vec![0u8; len];
+    dev.read_at(at, &mut sector).unwrap();
+    sector[99] ^= 0x10;
+    dev.write_at(at, &sector).unwrap();
+    let damaged = bytes_of(&dev);
+    let (rc, report, items) = repair(&dev, true, false);
+    assert_eq!(rc, 0, "errno {}", fs_xfs_last_errno());
+    assert_eq!((report.ready, report.written), (0, 0), "{items:?}");
+    assert!(report.refusals > 0);
+    assert!(items.iter().any(|i| i.0 == "refusal"), "{items:?}");
+    assert!(bytes_of(&dev) == damaged, "a refused repair wrote");
+
+    let ro = read_only_copy(&dev);
+    let (rc, _, _) = repair(&ro, true, false);
+    assert_eq!(rc, -1);
+    assert_eq!(fs_xfs_last_errno(), EROFS);
+}

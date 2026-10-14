@@ -200,6 +200,46 @@ typedef int (*fs_xfs_check_finding_fn)(void *context,
 int fs_xfs_check(fs_xfs_fs_t *fs, fs_xfs_check_finding_fn on_finding,
                  void *context, fs_xfs_check_report_t *out);
 
+/* ---- repairing ---- */
+
+/* One item of fs_xfs_repair_with_fs_core_device: a change the repair
+ * proposes, a reason it refuses, or an error finding it leaves. The strings
+ * are NUL-terminated, owned by the library and valid only for the call that
+ * receives them. */
+typedef struct {
+    const char *kind;   /* "change", "refusal" or "unplanned" */
+    const char *code;   /* the finding code, as fsck.xfs names it */
+    const char *rule;   /* for a change, the rule that proposed it; else NULL */
+    int64_t offset;     /* for a change, the device byte offset; else -1 */
+    uint64_t length;    /* for a change, the bytes it writes; else 0 */
+    const char *what;   /* why, in words */
+} fs_xfs_repair_item_t;
+
+/* What fs_xfs_repair_with_fs_core_device planned and did. */
+typedef struct {
+    uint8_t  ready;     /* 1 when a plan was made; 0 when the repair refused */
+    uint64_t changes;   /* changes the plan proposes */
+    uint64_t refusals;  /* reasons it refused */
+    uint64_t unplanned; /* error findings no rule repairs */
+    uint64_t written;   /* changes written: 0 for a dry run or a cancel */
+    uint8_t  clean;     /* 1 when the volume now checks complete and clean */
+} fs_xfs_repair_report_t;
+
+/* Called once per item; return 0 to go on, anything else to stop the
+ * listing and cancel an apply before anything is written. */
+typedef int (*fs_xfs_repair_item_fn)(void *context,
+                                     const fs_xfs_repair_item_t *item);
+
+/* Repair the volume on an fs_core device as fsck.xfs -y does, or with
+ * `apply` 0 plan it and write nothing. The caller asserts nothing else uses
+ * the device meanwhile, and reopens any mount of it afterwards. 0 when the
+ * repair ran to its end (planned, refused or cancelled); -1 when it could
+ * not run (EROFS for `apply` on a read-only device). */
+int fs_xfs_repair_with_fs_core_device(struct FsCoreDevice *handle, int apply,
+                                      fs_xfs_repair_item_fn on_item,
+                                      void *context,
+                                      fs_xfs_repair_report_t *out);
+
 /* ---- lookup and metadata ---- */
 
 /*
