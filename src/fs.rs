@@ -825,7 +825,8 @@ impl Filesystem {
     /// directory tree, realtime groups, whatever comes next — describes
     /// structures a write here would leave behind. And the incompat bits
     /// in [`incompat::READ_ONLY`](crate::superblock::incompat::READ_ONLY),
-    /// parent pointers, which a read accepts (#99).
+    /// which a read accepts and a write would not keep; none at present,
+    /// since parent pointers are maintained (#373).
     ///
     /// This check used to be `Ok(())`, and was called from `mount` as
     /// well as `mount_rw`, so the rule its own comment stated was
@@ -852,20 +853,14 @@ impl Filesystem {
             )));
         }
         // Readable incompat bits whose structures no write here keeps
-        // (#99). Parent pointers need an attribute added, moved or removed
-        // by every create, rename and unlink. Exchange-range is written
-        // (#374): see `incompat::EXCHRANGE`.
+        // (#99). Exchange-range (#374) and parent pointers (#373) are
+        // written: see `incompat::EXCHRANGE` and `incompat::PARENT`.
         use crate::superblock::incompat;
         let read_only = self.sb.features_incompat & incompat::READ_ONLY;
         if read_only != 0 {
-            let mut named = Vec::new();
-            if read_only & incompat::PARENT != 0 {
-                named.push("parent pointers (parent)");
-            }
             return Err(Error::UnsupportedFeature(format!(
-                "this volume uses {}, which this driver does not maintain, so it can be \
-                 read but not written",
-                named.join(" and ")
+                "this volume uses incompat features {read_only:#x}, which this driver does \
+                 not maintain, so it can be read but not written"
             )));
         }
         let unmaintained = self.sb.features_ro_compat & !crate::superblock::ro_compat::SUPPORTED;

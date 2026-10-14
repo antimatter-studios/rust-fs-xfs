@@ -823,6 +823,194 @@ impl Filesystem {
     }
 }
 
+/// Where a short-form attribute fork of `fork_len` bytes goes in an
+/// inode's literal area of `litino` bytes, beside a data fork that needs
+/// `data_required` bytes: as far right as it fits, never closer than the
+/// 56 bytes a small data-fork B+tree root needs, and leaving the 36 an
+/// attribute B+tree root needs (`xfs_attr_shortform_bytesfit`, the rule
+/// [`Filesystem::set_xattr`] places a fork by). The byte offset into the
+/// literal area, or `None` when the two forks do not fit (#373).
+pub(crate) fn shortform_forkoff(
+    litino: usize,
+    data_required: usize,
+    fork_len: usize,
+) -> Option<usize> {
+    let data_required = data_required.max(8).div_ceil(8) * 8;
+    let min_data = data_required.max(56);
+    let offset = litino.checked_sub(fork_len)? / 8 * 8;
+    let max = litino.checked_sub(36)? / 8 * 8;
+    let forkoff = offset.min(max).max(min_data);
+    (forkoff + fork_len <= litino).then_some(forkoff)
+}
+
+/// The short-form attribute fork of a new inode on a volume with parent
+/// pointers (#373): its one parent pointer, naming `name` in directory
+/// `parent`, whose generation is `generation`.
+pub(crate) fn parent_fork(name: &[u8], parent: u64, generation: u32) -> Result<Vec<u8>> {
+    let mut value = parent.to_be_bytes().to_vec();
+    value.extend_from_slice(&generation.to_be_bytes());
+    let mut internal = crate::attr::PARENT_PREFIX.to_vec();
+    internal.extend_from_slice(name);
+    shortform(
+        &[Xattr {
+            name: internal,
+            value,
+        }],
+        usize::MAX,
+    )?
+    .ok_or_else(|| unsupported("a parent pointer does not fit a short-form attribute fork"))
+}
+
+/// A parent pointer to take out of an inode's attribute fork, or to put in
+/// (#373): the directory entry's name, the directory, and for one put in,
+/// the directory's generation.
+pub(crate) enum ParentChange<'a> {
+    Remove {
+        name: &'a [u8],
+        parent: u64,
+    },
+    Add {
+        name: &'a [u8],
+        parent: u64,
+        generation: u32,
+    },
+}
+
+impl Filesystem {
+    /// Inode `raw` with its parent pointers changed (#373): each of
+    /// `changes` applied in order to its short-form attribute fork, the
+    /// rest of the fork kept, and the fork placed again as an attribute
+    /// write places one. Returns the whole new inode and its attribute
+    /// fork's bytes, for the caller's record to log as `ADATA` beside the
+    /// core. Nothing is written here.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] for a fork past short form, a fork that
+    /// no longer fits short form, a data fork whose root moves with the
+    /// fork offset (a B+tree or a device number) when the offset would
+    /// move, and a parent pointer to remove that the inode does not have.
+    pub(crate) fn with_parent_pointers(
+        &self,
+        ino: u64,
+        raw: &[u8],
+        changes: &[ParentChange],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        // The inode as `raw` has it, data fork included: a caller may have
+        // changed the core already (a moved directory's `..`), and its CRC
+        // is stamped only when the record is written, so a copy is stamped
+        // to be read here.
+        let mut probe = raw.to_vec();
+        let crc = crate::superblock::crc32c_with_zeroed_crc(&probe, crate::inode::offsets::CRC);
+        probe[crate::inode::offsets::CRC..crate::inode::offsets::CRC + 4]
+            .copy_from_slice(&crc.to_le_bytes());
+        let parsed = Inode::parse(&probe, &self.sb, ino)?;
+        let inode = &parsed;
+        if !(inode.aformat == Format::Local
+            || (inode.aformat == Format::Extents && inode.anextents == 0))
+        {
+            return Err(unsupported(&format!(
+                "inode {ino}: its attribute fork is past short form, and a parent pointer \
+                 is not written there yet"
+            )));
+        }
+        let mut attrs = self.stored_xattrs(inode, raw)?;
+        for change in changes {
+            match change {
+                ParentChange::Remove { name, parent } => {
+                    let at = attrs
+                        .iter()
+                        .position(|a| {
+                            a.name.strip_prefix(crate::attr::PARENT_PREFIX) == Some(*name)
+                                && a.value.get(..8) == Some(&parent.to_be_bytes()[..])
+                        })
+                        .ok_or_else(|| {
+                            unsupported(&format!(
+                                "inode {ino} has no parent pointer for {:?} in directory \
+                                 {parent}",
+                                String::from_utf8_lossy(name)
+                            ))
+                        })?;
+                    attrs.remove(at);
+                }
+                ParentChange::Add {
+                    name,
+                    parent,
+                    generation,
+                } => {
+                    let mut internal = crate::attr::PARENT_PREFIX.to_vec();
+                    internal.extend_from_slice(name);
+                    let mut value = parent.to_be_bytes().to_vec();
+                    value.extend_from_slice(&generation.to_be_bytes());
+                    attrs.push(Xattr {
+                        name: internal,
+                        value,
+                    });
+                }
+            }
+        }
+        let fork = shortform(&attrs, usize::MAX)?.ok_or_else(|| {
+            unsupported(&format!(
+                "inode {ino}: its attributes no longer fit a short-form fork beside the \
+                 parent pointer"
+            ))
+        })?;
+        let litino = raw.len() - XFS_DINODE_V3_SIZE;
+        let current = usize::from(inode.forkoff) * 8;
+        let data_required = match inode.format {
+            Format::Local => usize::try_from(inode.size).unwrap_or(usize::MAX),
+            Format::Extents => usize::try_from(inode.nextents)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(16),
+            _ => 0,
+        };
+        let forkoff = if attrs.is_empty() {
+            0
+        } else if matches!(inode.format, Format::Btree | Format::Dev) {
+            // The data fork's root is laid out by the fork's size, so the
+            // offset stays where it is, and the fork must fit behind it.
+            if current == 0 || current + fork.len() > litino {
+                return Err(unsupported(&format!(
+                    "inode {ino}: its parent pointers do not fit behind its data fork's root"
+                )));
+            }
+            current
+        } else {
+            shortform_forkoff(litino, data_required, fork.len()).ok_or_else(|| {
+                unsupported(&format!(
+                    "inode {ino}: no room for its parent pointers beside its data fork"
+                ))
+            })?
+        };
+        let mut new = raw.to_vec();
+        if attrs.is_empty() {
+            new[83] = Format::Extents as u8;
+            new[82] = 0;
+            return Ok((new, Vec::new()));
+        }
+        // Behind what the data fork may use, everything is the attribute
+        // fork's: cleared, then the fork at its offset.
+        let data_end = XFS_DINODE_V3_SIZE + data_required.max(8).div_ceil(8) * 8;
+        let fork_at = XFS_DINODE_V3_SIZE + forkoff;
+        if fork_at < data_end.min(raw.len()) && !matches!(inode.format, Format::Btree | Format::Dev)
+        {
+            return Err(unsupported(&format!(
+                "inode {ino}: no room for its parent pointers beside its data fork"
+            )));
+        }
+        new[fork_at.max(XFS_DINODE_V3_SIZE)..].fill(0);
+        new[fork_at..fork_at + fork.len()].copy_from_slice(&fork);
+        new[82] = (forkoff / 8) as u8;
+        new[83] = Format::Local as u8;
+        if self.sb.features_incompat & crate::superblock::incompat::NREXT64 != 0 {
+            new[76..80].copy_from_slice(&0u32.to_be_bytes());
+        } else {
+            new[80..82].copy_from_slice(&0u16.to_be_bytes());
+        }
+        Ok((new, fork))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

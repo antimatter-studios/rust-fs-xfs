@@ -52,8 +52,8 @@ use crate::format::log_items::inode_log_format::XFS_ILOG_DDATA;
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
-    inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
-    Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer, Op, XFS_ILOG_CORE,
+    XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// An operation's payload is padded to four bytes; a fork's own length
@@ -391,6 +391,9 @@ impl Filesystem {
             dir_core[core_at::NLINK..core_at::NLINK + 4].copy_from_slice(&now.to_be_bytes());
         }
 
+        // A freed inode's attribute fork goes with it; one that keeps
+        // another name loses this name's parent pointer (#373).
+        let mut victim_afork = Vec::new();
         let victim_core = if freed {
             emptied_core(&victim_raw)
         } else {
@@ -401,6 +404,13 @@ impl Filesystem {
             let now = u64::from_be_bytes(core[at..at + 8].try_into().expect("8 bytes"));
             core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
             stamp_change(&mut core, clock_now(), Changed::Status);
+            if self.sb.features_incompat & crate::superblock::incompat::PARENT != 0 {
+                (core, victim_afork) = self.with_parent_pointers(
+                    ino,
+                    &core,
+                    &[crate::attr_write::ParentChange::Remove { name, parent }],
+                )?;
+            }
             core
         };
         let mut quota_changes = Vec::new();
@@ -433,6 +443,8 @@ impl Filesystem {
         let cluster = self.sb.inode_cluster_bytes();
         let dir_buf = InodeBuffer::containing(self.inode_offset(parent)?, cluster);
         let victim_buf = InodeBuffer::containing(self.inode_offset(ino)?, cluster);
+        let victim_ops =
+            crate::log_write::inode_ops_with_attr(ino, &victim_buf, victim_logged, &victim_afork);
 
         let dsize = fork.len();
         let mut fork_op = fork;
@@ -443,7 +455,7 @@ impl Filesystem {
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
-            + 2;
+            + victim_ops.len();
 
         // Every refusal this operation has is behind us and the next
         // statement writes, so the mount's one checkpoint is claimed
@@ -491,14 +503,7 @@ impl Filesystem {
                 flags: 0,
                 data: fork_op,
             });
-            ops.push(Op {
-                flags: 0,
-                data: inode_log_format(ino, XFS_ILOG_CORE, &victim_buf),
-            });
-            ops.push(Op {
-                flags: 0,
-                data: victim_logged,
-            });
+            ops.extend(victim_ops.clone());
             ops.push(Op {
                 flags: XLOG_COMMIT_TRANS,
                 data: Vec::new(),

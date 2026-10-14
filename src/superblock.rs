@@ -220,8 +220,9 @@ pub mod incompat {
     pub const EXCHRANGE: u32 = 1 << 6;
     /// Parent pointers (`parent`): each link has an extended attribute in
     /// its own namespace naming its directory, which the attribute reader
-    /// leaves out. Read; writing is refused, because every create, rename
-    /// and unlink must maintain them (#99).
+    /// leaves out. Read (#99), and written (#373): every create, link,
+    /// rename and unlink adds, moves or removes the pointer its link
+    /// change implies, in the same transaction as the directory entry.
     pub const PARENT: u32 = 1 << 7;
     /// The metadata directory tree (`metadir`): quota and realtime
     /// metadata reached through a hidden directory rather than by
@@ -242,8 +243,10 @@ pub mod incompat {
         FTYPE | SPINODES | META_UUID | BIGTIME | NREXT64 | EXCHRANGE | PARENT;
 
     /// The readable bits a write does not maintain. A read-write mount
-    /// refuses them; see `Filesystem::mount_rw`.
-    pub const READ_ONLY: u32 = PARENT;
+    /// refuses them; see `Filesystem::mount_rw`. Empty since parent
+    /// pointers became written (#373), and kept so the next readable bit
+    /// a write cannot keep has somewhere to go.
+    pub const READ_ONLY: u32 = 0;
 }
 
 /// `sb_features2` bits. Only meaningful when `MOREBITSBIT` is set in

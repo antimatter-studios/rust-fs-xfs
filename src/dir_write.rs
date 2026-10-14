@@ -43,8 +43,8 @@ use crate::format::log_items::inode_log_format::{XFS_ILOG_CORE, XFS_ILOG_DDATA};
 use crate::fs::Filesystem;
 use crate::inode::{stamp_change, Changed, Format};
 use crate::log_write::{
-    inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
-    Op, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer, Op,
+    XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// Log operations round up to this; the data they carry does not.
@@ -213,6 +213,25 @@ impl Filesystem {
         let (_, mut moved_core) = self.read_inode_raw(moved_ino)?;
         bump_changecount(&mut moved_core, self.sb.is_v5());
         stamp_change(&mut moved_core, when, Changed::Status);
+        // The moved inode's parent pointer follows its new name (#373).
+        let mut moved_afork = Vec::new();
+        if self.sb.features_incompat & crate::superblock::incompat::PARENT != 0 {
+            (moved_core, moved_afork) = self.with_parent_pointers(
+                moved_ino,
+                &moved_core,
+                &[
+                    crate::attr_write::ParentChange::Remove {
+                        name: from,
+                        parent: dir_ino,
+                    },
+                    crate::attr_write::ParentChange::Add {
+                        name: to,
+                        parent: dir_ino,
+                        generation: dir.gen,
+                    },
+                ],
+            )?;
+        }
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {dir_ino}: {why}")))?;
@@ -222,6 +241,12 @@ impl Filesystem {
         let cluster = self.sb.inode_cluster_bytes();
         let dir_buf = InodeBuffer::containing(self.inode_offset(dir_ino)?, cluster);
         let moved_buf = InodeBuffer::containing(self.inode_offset(moved_ino)?, cluster);
+        let moved_ops = crate::log_write::inode_ops_with_attr(
+            moved_ino,
+            &moved_buf,
+            moved_logged,
+            &moved_afork,
+        );
 
         // The fork travels big-endian inside a native-endian record, and
         // its operation is padded while `ilf_dsize` is not.
@@ -236,8 +261,10 @@ impl Filesystem {
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             // The directory's format, core and fork, then the moved inode's
-            // format and core.
-            + 5;
+            // format and core, and its attribute fork when its parent pointer
+            // moved with it.
+            + 3
+            + moved_ops.len();
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
@@ -273,19 +300,12 @@ impl Filesystem {
                     flags: 0,
                     data: fork_op,
                 },
-                Op {
-                    flags: 0,
-                    data: inode_log_format(moved_ino, XFS_ILOG_CORE, &moved_buf),
-                },
-                Op {
-                    flags: 0,
-                    data: moved_logged,
-                },
-                Op {
-                    flags: XLOG_COMMIT_TRANS,
-                    data: Vec::new(),
-                },
             ]);
+            ops.extend(moved_ops.clone());
+            ops.push(Op {
+                flags: XLOG_COMMIT_TRANS,
+                data: Vec::new(),
+            });
             ops
         })?;
 
