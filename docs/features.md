@@ -45,6 +45,7 @@ States:
 | Log head found from cycle numbers, not a whole-ring read | Supported | 0.9.0 (#251) | | `read_path_cost.rs` |
 | `File` handle (`open`, `open_ino`, `root`) | Supported | 0.6.0 | | `file_handle_oracle.rs` |
 | Parent pointers and exchange-range volumes | Supported; parent pointers read-only | 0.8.0 (#99); exchange-range writes 0.14.1 (#459) | #373 | `parent_exchrange_oracle.rs` |
+| Parent pointers read (`Filesystem::parent_pointers`): each name an inode has in a directory, with the directory and its generation; kept through a rewrite of a short-form attribute fork, and never listed as an attribute | Supported | Unreleased (#373) | | `parent_exchrange_oracle.rs`, `attr.rs` |
 | Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied | Experimental | 0.14.1 (#459) | | `exchange_range.rs`, `exchange_range_kernel.rs` |
 | Realtime files, read from the realtime device | Supported | 0.10.0 (#98) | #361 | `realtime_oracle.rs` |
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |

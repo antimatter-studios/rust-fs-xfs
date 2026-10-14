@@ -201,6 +201,15 @@ pub mod flags {
     /// it.
     pub const INCOMPLETE: u8 = 0x80;
 
+    /// The entry is a parent pointer (#373): one per name the inode has in
+    /// a directory, on a volume with the parent-pointer feature. Its name is
+    /// that directory entry's name, and its value the directory's inode
+    /// number (big-endian, eight bytes) and generation (four). Not an
+    /// attribute anyone lists: `xfs_db` prints the bit as `parent`, and
+    /// `tests/parent_exchrange_oracle.rs` holds every one this reads to the
+    /// directory entries `mkfs.xfs` made beside it.
+    pub const PARENT: u8 = 0x08;
+
     /// The namespace bits, as stored. Zero means the `user.` namespace,
     /// which has no bit of its own — so testing for `user` means testing
     /// that both of the others are clear, and a byte with *both* set is
