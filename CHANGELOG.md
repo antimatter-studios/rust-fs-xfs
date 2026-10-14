@@ -9,6 +9,32 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-10-14
+
+### Added
+
+- **The repair through the C ABI (#477).** `fs_xfs_repair_with_fs_core_device`
+  plans a repair of the volume on an `fs_core` device, with every rule
+  `fsck.xfs -y` has, and with `apply` set writes it. Each change (its
+  offset, length, finding code and rule), each refusal and each unplanned
+  finding is passed to a callback, which can stop the listing and cancel
+  the repair before anything is written. A report says whether a plan was
+  made, how many changes it proposed and wrote, and whether the volume
+  checks clean afterwards. A host that reaches its device through callbacks
+  or a partition slice can now repair a volume as well as check it.
+- **Parent-pointer reading (#373).** `Filesystem::parent_pointers` returns
+  each reverse directory reference and its generation, preserves the
+  references when rewriting short-form attributes, and keeps them out of
+  the ordinary attribute listing.
+- **Volumes with parent pointers are written (#373).** A read-write mount of a
+  parent-pointer volume is no longer refused. Creating a file, directory or
+  symlink, linking, renaming within or between directories, unlinking and
+  removing a directory each add, move or remove the parent pointer their
+  change implies, logged in the same transaction as the directory entry. An
+  inode whose attribute fork is past short form is refused before anything is
+  written. The pinned `xfs_repair -n` calls the volume clean after each kind
+  of change.
+
 ## [0.14.1] — 2026-10-14
 
 ### Added
