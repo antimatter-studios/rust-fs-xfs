@@ -342,6 +342,10 @@ gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
 
 The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.14.1 — 2026-10-14
+
+- Two files exchange ranges of their data by exchanging blocks (`exchange_range`), on volumes with the exchange-range feature, which are now written.
+
 ### v0.14.0 — 2026-10-13
 
 - `fsck.xfs -y` repairs superblock copies, counters, inode allocation and directory metadata, on volumes with a reverse-mapping btree too.
@@ -402,10 +406,6 @@ The latest releases; every release, with the reasoning behind each change, is in
 - The reverse-mapping tree is read as the interval tree it is.
 - One operation allocates once from a group however many times it takes from it.
 - Freeing part of a shared extent splits the reference-count record rather than refusing, and records that adjoin and say the same thing are merged.
-
-### v0.6.0 — 2026-09-04
-
-- `File`, and `Filesystem::open` / `open_ino` / `root`.
 
 ## License
 
