@@ -46,7 +46,7 @@ States:
 | `File` handle (`open`, `open_ino`, `root`) | Supported | 0.6.0 | | `file_handle_oracle.rs` |
 | Parent pointers and exchange-range volumes | Supported | 0.8.0 (#99); exchange-range writes 0.14.1 (#459); parent-pointer writes Unreleased (#373) | | `parent_exchrange_oracle.rs` |
 | Parent pointers read (`Filesystem::parent_pointers`): each name an inode has in a directory, with the directory and its generation; kept through a rewrite of a short-form attribute fork, and never listed as an attribute | Supported | Unreleased (#373) | | `parent_exchrange_oracle.rs`, `attr.rs` |
-| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied | Experimental | 0.14.1 (#459) | | `exchange_range.rs`, `exchange_range_kernel.rs` |
+| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied; reflinked files keep their reference counts and pass the reflink flag on, and a list is laid out inline or as a block-map B+tree as its length needs | Experimental | 0.14.1 (#459); reflinked and B+tree files Unreleased (#441) | | `exchange_range.rs`, `exchange_range_kernel.rs`, `rmap.rs` |
 | Realtime files, read from the realtime device | Supported | 0.10.0 (#98) | #361 | `realtime_oracle.rs` |
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | Reverse-mapping and reference-count trees | Supported | 0.7.0 | | `rmap_oracle.rs`, `refcount_oracle.rs` |

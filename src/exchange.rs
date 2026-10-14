@@ -9,11 +9,24 @@
 //! What moves with the mappings, all in one checkpoint:
 //!
 //! - **both inodes**: their extent lists, block counts and change times;
-//!   sizes do not change;
+//!   sizes do not change. A list is laid out inline or as a block-map
+//!   B+tree by the kernel's rule, whichever form it had before, so an
+//!   exchange can turn either into the other (#441);
 //! - **the reverse map**, where the volume has one: each moved extent's
-//!   record changes owner and file offset;
+//!   record changes owner and file offset, and a block-map tree rebuilt
+//!   gives back its old blocks and takes new ones;
 //! - **quota**, where the two files have different owners: each is
 //!   charged for the blocks it now holds.
+//!
+//! # Shared blocks
+//!
+//! A reflinked block keeps the same number of mappings through an
+//! exchange: each mapping changes file, none is added or dropped. So the
+//! reference-count tree does not change (#441). The reverse map does, and
+//! there a shared block has one record per mapping, overlapping, which a
+//! moved record may now join. A file that takes a shared block takes the
+//! reflink flag with it: both files carry it after an exchange when
+//! either did, as the kernel leaves them.
 //!
 //! The kernel logs an exchange as intent items (`XMI`/`XMD`), so recovery
 //! can finish one a crash interrupted. This driver writes the whole
@@ -25,15 +38,13 @@
 //! Each is refused by name before anything is written: a volume without
 //! the exchange-range feature (the kernel refuses that too), a range that
 //! is not whole blocks or runs past either file's end, one file with
-//! itself, anything but two regular files, a file whose extents are in a
-//! B+tree or that would end with more than its fork can list, and
-//! reflinked, real-time or inline files.
+//! itself, anything but two regular files, and real-time or inline files.
 
 use crate::error::{Error, Result};
 use crate::extent::Extent;
-use crate::format::log_items::inode_log_format::XFS_ILOG_DEXT;
 use crate::fs::Filesystem;
-use crate::inode::{Format, Inode};
+use crate::group_write::Allocations;
+use crate::inode::{flags2, offsets as at, Format, Inode};
 use crate::log_write::{
     inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
     Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
@@ -44,9 +55,6 @@ use crate::superblock::incompat;
 /// An operation's payload is padded to four bytes; the fork's own length
 /// is not.
 const OP_ALIGN: usize = 4;
-
-/// One extent record in an inode's fork.
-const EXTENT_BYTES: usize = 16;
 
 /// `extents` cut at file blocks `first` and `first + n`: the pieces inside
 /// the range, and every piece outside it.
@@ -209,24 +217,11 @@ impl Filesystem {
         let mut new_b = out_b;
         new_b.extend(shifted(&in_a, fa, fb));
         let new_b = joined(new_b);
-        for (inode, list) in [(&ia, &new_a), (&ib, &new_b)] {
-            let (start, end) = inode.data_fork_range(usize::from(self.sb.inodesize));
-            let room = ((end - start) / EXTENT_BYTES) as u64;
-            if list.len() as u64 > room {
-                return Err(Error::UnsupportedFeature(format!(
-                    "the exchange leaves inode {} with {} extents, more than the {room} its \
-                     fork has room to list; a B+tree would be needed",
-                    inode.ino,
-                    list.len()
-                )));
-            }
-        }
-
         // The reverse map: every moved piece leaves its old owner's record
         // and joins the new owner's, at its new offset. All the records
         // come out before any go in, so a group's tree never holds one
-        // block twice.
-        let mut groups: Vec<(u32, crate::group_write::GroupAlloc)> = Vec::new();
+        // mapping twice.
+        let mut allocations = Allocations::new();
         if self.sb.has_rmapbt() {
             let mut moves = Vec::new();
             for (pieces, from, to, owner, taker) in [(&in_a, fa, fb, a, b), (&in_b, fb, fa, b, a)] {
@@ -239,23 +234,43 @@ impl Filesystem {
                 }
             }
             for ((agno, old), _) in &moves {
-                let at = group_at(self, &mut groups, *agno)?;
-                groups[at].1.forget_rmap(*old)?;
+                allocations
+                    .group(&self.sb, self.device(), *agno)?
+                    .forget_rmap(*old)?;
             }
             for (_, (agno, new)) in &moves {
-                let at = group_at(self, &mut groups, *agno)?;
-                groups[at].1.remember_rmap(*new)?;
+                allocations
+                    .group(&self.sb, self.device(), *agno)?
+                    .remember_moved_rmap(*new)?;
             }
         }
-        let mut group_items = Vec::new();
-        for (_, group) in groups {
-            group_items.extend(group.into_items()?);
-        }
+        // Each list laid out in the form its length needs, the tree each
+        // had given back.
+        let map_a = self.map_data_fork(&mut allocations, a, &ia, &raw_a, &new_a)?;
+        let map_b = self.map_data_fork(&mut allocations, b, &ib, &raw_b, &new_b)?;
+        let group_items = allocations.into_items()?;
 
+        // Each file's blocks: what it mapped, less what it gave, plus what
+        // it took, with its tree's blocks swapped for the new tree's.
         let (moved_a, moved_b) = (blocks_in(&in_a), blocks_in(&in_b));
-        let delta = |gain: u64, loss: u64| -> Result<i64> {
-            i64::try_from(gain)
-                .and_then(|g| i64::try_from(loss).map(|l| g - l))
+        let held = |inode: &Inode, map: &crate::bmbt_write::ForkMap, gave: u64, took: u64| {
+            inode
+                .nblocks
+                .checked_sub(gave + map.old_tree_blocks)
+                .map(|n| n + took + map.tree_blocks)
+                .ok_or_else(|| {
+                    Error::BadSuperblock(format!(
+                        "inode {} counts {} blocks, fewer than the {} it maps in the range and \
+                         the {} of its block map",
+                        inode.ino, inode.nblocks, gave, map.old_tree_blocks
+                    ))
+                })
+        };
+        let blocks_a = held(&ia, &map_a, moved_a, moved_b)?;
+        let blocks_b = held(&ib, &map_b, moved_b, moved_a)?;
+        let delta = |now: u64, before: u64| -> Result<i64> {
+            i64::try_from(now)
+                .and_then(|n| i64::try_from(before).map(|b| n - b))
                 .map_err(|_| Error::UnsupportedFeature("quota block delta overflowed".into()))
         };
         let quota_items = crate::quota::accounting_items(
@@ -265,59 +280,68 @@ impl Filesystem {
                     uid: ia.uid,
                     gid: ia.gid,
                     project_id: crate::quota::project_id(&raw_a),
-                    blocks_fs: delta(moved_b, moved_a)?,
+                    blocks_fs: delta(blocks_a, ia.nblocks)?,
                     inodes: 0,
                 },
                 crate::quota::QuotaChange {
                     uid: ib.uid,
                     gid: ib.gid,
                     project_id: crate::quota::project_id(&raw_b),
-                    blocks_fs: delta(moved_a, moved_b)?,
+                    blocks_fs: delta(blocks_b, ib.nblocks)?,
                     inodes: 0,
                 },
             ],
         )?;
 
-        let core_a = crate::write_alloc::grown_core(
-            &raw_a,
-            ia.size,
-            ia.nblocks - moved_a + moved_b,
-            new_a.len() as u64,
-        )?;
-        let core_b = crate::write_alloc::grown_core(
-            &raw_b,
-            ib.size,
-            ib.nblocks - moved_b + moved_a,
-            new_b.len() as u64,
-        )?;
+        let reflink = ia.has_shared_extents() || ib.has_shared_extents();
+        let core = |raw: &[u8],
+                    inode: &Inode,
+                    blocks: u64,
+                    list: &[Extent],
+                    map: &crate::bmbt_write::ForkMap| {
+            let mut core =
+                crate::write_alloc::grown_core(raw, inode.size, blocks, list.len() as u64)?;
+            core[at::FORMAT] = map.format as u8;
+            if reflink {
+                let flags = u64::from_be_bytes(
+                    core[at::FLAGS2..at::FLAGS2 + 8]
+                        .try_into()
+                        .expect("8 bytes"),
+                ) | flags2::REFLINK;
+                core[at::FLAGS2..at::FLAGS2 + 8].copy_from_slice(&flags.to_be_bytes());
+            }
+            Ok::<_, Error>(core)
+        };
         let logged = [
-            (a, core_a, fork_bytes(&new_a)?),
-            (b, core_b, fork_bytes(&new_b)?),
+            (a, core(&raw_a, &ia, blocks_a, &new_a, &map_a)?, &map_a),
+            (b, core(&raw_b, &ib, blocks_b, &new_b, &map_b)?, &map_b),
         ];
         let mut inode_ops = Vec::new();
-        for (ino, core, fork) in &logged {
+        for (ino, core, map) in &logged {
             let buffer =
                 InodeBuffer::containing(self.inode_offset(*ino)?, self.sb.inode_cluster_bytes());
             let dinode = log_dinode_from_disk(core)
                 .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
-            if fork.is_empty() {
+            if map.logged.is_empty() {
                 inode_ops.push(inode_log_format(*ino, XFS_ILOG_CORE, &buffer));
                 inode_ops.push(dinode);
             } else {
-                let mut op = fork.clone();
-                op.resize(fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+                let mut op = map.logged.clone();
+                op.resize(map.logged.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
                 inode_ops.push(inode_log_format_with_fork(
                     *ino,
-                    XFS_ILOG_CORE | XFS_ILOG_DEXT,
+                    XFS_ILOG_CORE | map.fields,
                     &buffer,
-                    fork.len() as u16,
+                    map.logged.len() as u16,
                 ));
                 inode_ops.push(dinode);
                 inode_ops.push(op);
             }
         }
 
+        let tree_items: Vec<_> = map_a.items.iter().chain(&map_b.items).cloned().collect();
         let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + tree_items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + inode_ops.len();
         let lsn = self.commit_record(|tid| {
@@ -331,7 +355,7 @@ impl Filesystem {
                     data: trans_header(tid, XFS_TRANS_CHECKPOINT, item_ops as u32),
                 },
             ];
-            for item in &group_items {
+            for item in group_items.iter().chain(&tree_items) {
                 ops.extend(item.ops());
             }
             for item in &quota_items {
@@ -352,30 +376,15 @@ impl Filesystem {
 
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&group_items);
+        self.logged_buffers(&tree_items);
         for item in &quota_items {
             item.apply_overlay(self)?;
         }
-        for (ino, core, fork) in &logged {
-            self.logged_inode(*ino, core, fork)?;
+        for (ino, core, map) in &logged {
+            self.logged_inode(*ino, core, &map.fork)?;
         }
         Ok(lsn)
     }
-}
-
-/// Where group `agno` is in `groups`, opening it the first time.
-fn group_at<'a>(
-    fs: &'a Filesystem,
-    groups: &mut Vec<(u32, crate::group_write::GroupAlloc<'a>)>,
-    agno: u32,
-) -> Result<usize> {
-    if let Some(at) = groups.iter().position(|(g, _)| *g == agno) {
-        return Ok(at);
-    }
-    groups.push((
-        agno,
-        crate::group_write::GroupAlloc::open(&fs.sb, fs.device(), agno)?,
-    ));
-    Ok(groups.len() - 1)
 }
 
 /// An inode whose data this exchange does not move, refused by name.
@@ -389,30 +398,12 @@ fn refuse_unexchangeable(inode: &Inode) -> Result<()> {
             "inode {ino} keeps its data on the real-time device"
         )));
     }
-    if inode.has_shared_extents() {
-        return Err(Error::UnsupportedFeature(format!(
-            "inode {ino} has reflinked extents, whose reference counts an exchange here does \
-             not follow"
-        )));
-    }
     match inode.format {
-        Format::Extents => Ok(()),
-        Format::Btree => Err(Error::UnsupportedFeature(format!(
-            "inode {ino} lists its extents in a B+tree, which this exchange does not edit"
-        ))),
+        Format::Extents | Format::Btree => Ok(()),
         _ => Err(Error::UnsupportedFeature(format!(
             "inode {ino} stores its data inside the inode"
         ))),
     }
-}
-
-/// The literal-area bytes of an extent list.
-fn fork_bytes(extents: &[Extent]) -> Result<Vec<u8>> {
-    let mut fork = Vec::with_capacity(extents.len() * EXTENT_BYTES);
-    for e in extents {
-        fork.extend_from_slice(&e.to_bytes()?);
-    }
-    Ok(fork)
 }
 
 #[cfg(test)]

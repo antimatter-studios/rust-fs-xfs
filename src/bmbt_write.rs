@@ -67,6 +67,8 @@ pub(crate) struct ForkMap {
     pub format: Format,
     /// Blocks the tree holds, counted in `di_nblocks`.
     pub tree_blocks: u64,
+    /// Blocks the tree it had held, given back.
+    pub old_tree_blocks: u64,
     /// The new tree's blocks.
     pub items: Vec<BufferItem>,
 }
@@ -90,8 +92,8 @@ pub(crate) fn shares(n: usize, max: usize) -> Vec<usize> {
 }
 
 impl Filesystem {
-    /// Lay `extents` out as the data fork of directory `ino`, giving back
-    /// whatever tree it had.
+    /// Lay `extents` out as the data fork of directory or file `ino`,
+    /// giving back whatever tree it had.
     ///
     /// # Errors
     ///
@@ -111,7 +113,7 @@ impl Filesystem {
         let fork_len = end - start;
 
         // What it had goes back first: the new tree is built from nothing.
-
+        let mut old_tree_blocks = 0;
         if inode.format == Format::Btree {
             let bs = sb.blocksize as usize;
             let (_, blocks) = crate::bmbt::walk_with_blocks(
@@ -126,6 +128,7 @@ impl Filesystem {
                     Ok(buf)
                 },
             )?;
+            old_tree_blocks = blocks.len() as u64;
             for fsblock in blocks {
                 let (ag, agbno) = sb.split_fsblock(fsblock);
                 let group = allocations.group(sb, self.device(), ag)?;
@@ -153,6 +156,7 @@ impl Filesystem {
                 fields: XFS_ILOG_DEXT,
                 format: Format::Extents,
                 tree_blocks: 0,
+                old_tree_blocks,
                 items: Vec::new(),
             });
         }
@@ -296,6 +300,7 @@ impl Filesystem {
             fields: XFS_ILOG_DBROOT,
             format: Format::Btree,
             tree_blocks: built.len() as u64,
+            old_tree_blocks,
             items,
         })
     }

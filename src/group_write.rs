@@ -711,6 +711,22 @@ impl<'a> GroupAlloc<'a> {
         Ok(())
     }
 
+    /// The same for a mapping that moved from one file to another (#441).
+    /// On a filesystem with the reference-count tree the block may be
+    /// shared, so the record may overlap another file's: see
+    /// [`crate::rmap::insert_shared`]. Without it, exactly
+    /// [`GroupAlloc::remember_rmap`].
+    pub(crate) fn remember_moved_rmap(&mut self, record: crate::rmap::Rmap) -> Result<()> {
+        if self.refcount.is_none() {
+            return self.remember_rmap(record);
+        }
+        if let Some((records, _)) = self.rmap.as_mut() {
+            crate::rmap::insert_shared(records, record)?;
+            self.took = true;
+        }
+        Ok(())
+    }
+
     /// Give up one reference to `startblock..+blockcount`, and say which
     /// of those blocks may go back to free space.
     ///

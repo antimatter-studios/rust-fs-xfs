@@ -425,15 +425,25 @@ pub fn insert(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
 pub fn remove(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
     let start = u64::from(rec.startblock);
     let end = start + u64::from(rec.blockcount);
+    let holds = |r: &Rmap| {
+        let r_start = u64::from(r.startblock);
+        r.owner == rec.owner
+            && r.flags() == rec.flags()
+            && r_start <= start
+            && end <= r_start + u64::from(r.blockcount)
+    };
+    // A file can map one shared block at two offsets (#441), and then two
+    // of its records hold the range: the one whose offset lines up is the
+    // mapping being removed.
+    let lines_up = |r: &Rmap| {
+        r.is_reserved_owner()
+            || r.offset & OFF_BMBT_BLOCK != 0
+            || r.file_offset() + (start - u64::from(r.startblock)) == rec.file_offset()
+    };
     let at = records
         .iter()
-        .position(|r| {
-            let r_start = u64::from(r.startblock);
-            r.owner == rec.owner
-                && r.flags() == rec.flags()
-                && r_start <= start
-                && end <= r_start + u64::from(r.blockcount)
-        })
+        .position(|r| holds(r) && lines_up(r))
+        .or_else(|| records.iter().position(holds))
         .ok_or_else(|| {
             Error::UnsupportedFeature(format!(
                 "freeing {} blocks at group block {} owned by {} but no reverse-mapping \
@@ -473,6 +483,83 @@ pub fn remove(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
             },
         );
     }
+    // Where records overlap, the piece after a hole can belong behind
+    // another owner's record. Without overlaps this changes nothing.
+    records.sort_by_key(key_order);
+    Ok(())
+}
+
+/// The order the kernel keeps reverse-mapping records in
+/// (`xfs_rmapbt_cmp_two_keys`): start block, then owner compared unsigned,
+/// then the offset with its fork and map-block flags but not
+/// `OFF_UNWRITTEN`. Records only need more than the start block where
+/// they overlap, which only shared blocks do.
+fn key_order(r: &Rmap) -> (u32, u64, u64) {
+    (r.startblock, r.owner as u64, r.offset & !OFF_UNWRITTEN)
+}
+
+/// Put an ownership record into a tree whose records may overlap, as every
+/// record of a block shared through reflink does (#441).
+///
+/// [`insert`] refuses an overlap, because on a filesystem without shared
+/// blocks one means two owners claim the same space. Here a data block
+/// can have one record per mapping, so an overlap is refused only where
+/// it cannot be a shared mapping: a reserved owner's or a map block's
+/// record on either side, or the same owner mapping the same blocks at the
+/// same file offset twice. A record the new one continues, or that
+/// continues it, is joined to it, as the kernel's `xfs_rmap_map_shared`
+/// does, wherever it sits in the order.
+pub fn insert_shared(records: &mut Vec<Rmap>, rec: Rmap) -> Result<()> {
+    let start = u64::from(rec.startblock);
+    let end = start + u64::from(rec.blockcount);
+    let metadata = |r: &Rmap| r.is_reserved_owner() || r.offset & OFF_BMBT_BLOCK != 0;
+    if let Some(clash) = records.iter().find(|r| {
+        let (r_start, r_end) = (
+            u64::from(r.startblock),
+            u64::from(r.startblock) + u64::from(r.blockcount),
+        );
+        r_start < end
+            && start < r_end
+            && (metadata(r)
+                || metadata(&rec)
+                || (r.owner == rec.owner
+                    && r.flags() == rec.flags()
+                    && i128::from(r.file_offset()) - i128::from(r.startblock)
+                        == i128::from(rec.file_offset()) - i128::from(rec.startblock)))
+    }) {
+        return Err(Error::UnsupportedFeature(format!(
+            "an extent at group block {} overlaps the reverse-mapping record for {}..{}              owned by {}, which no shared mapping can",
+            rec.startblock,
+            clash.startblock,
+            u64::from(clash.startblock) + u64::from(clash.blockcount),
+            clash.owner
+        )));
+    }
+    let overflow = || {
+        Error::UnsupportedFeature(
+            "merging reverse-mapping records would overflow the block count".into(),
+        )
+    };
+    let mut rec = rec;
+    if let Some(i) = records.iter().position(|r| r.continues_into(&rec)) {
+        let before = records.remove(i);
+        rec = Rmap {
+            blockcount: before
+                .blockcount
+                .checked_add(rec.blockcount)
+                .ok_or_else(overflow)?,
+            ..before
+        };
+    }
+    if let Some(i) = records.iter().position(|r| rec.continues_into(r)) {
+        let after = records.remove(i);
+        rec.blockcount = rec
+            .blockcount
+            .checked_add(after.blockcount)
+            .ok_or_else(overflow)?;
+    }
+    let at = records.partition_point(|r| key_order(r) < key_order(&rec));
+    records.insert(at, rec);
     Ok(())
 }
 
@@ -734,6 +821,70 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("overlaps"), "got: {err}");
+    }
+
+    /// Records of a shared block overlap, one per mapping, in the kernel's
+    /// key order, and a mapping continuing one of its owner's records
+    /// joins it even with another owner's record between them (#441).
+    #[test]
+    fn a_shared_block_has_a_record_per_mapping_in_key_order() {
+        let mut records = vec![rec(10, 4, 131, 0), rec(20, 2, 132, 0)];
+        insert_shared(&mut records, rec(10, 4, 140, 8)).unwrap();
+        insert_shared(&mut records, rec(10, 2, 133, 0)).unwrap();
+        assert_eq!(
+            records,
+            vec![
+                rec(10, 4, 131, 0),
+                rec(10, 2, 133, 0),
+                rec(10, 4, 140, 8),
+                rec(20, 2, 132, 0),
+            ]
+        );
+        // 133 continues at block 12, file block 2: one record, placed
+        // where its start sorts, past 131's record that starts there too.
+        insert_shared(&mut records, rec(12, 3, 133, 2)).unwrap();
+        assert_eq!(records[1], rec(10, 5, 133, 0), "{records:?}");
+        assert!(records
+            .windows(2)
+            .all(|w| key_order(&w[0]) <= key_order(&w[1])));
+
+        // Taking out one mapping of a shared block leaves the other.
+        remove(&mut records, rec(10, 4, 140, 8)).unwrap();
+        assert!(records.contains(&rec(10, 4, 131, 0)), "{records:?}");
+        assert!(!records.iter().any(|r| r.owner == 140), "{records:?}");
+    }
+
+    /// A file mapping one shared block at two offsets has two records of
+    /// its own over it, and removing one mapping removes the record whose
+    /// offset is that mapping's (#441).
+    #[test]
+    fn removing_one_of_a_files_two_mappings_of_a_block_takes_the_matching_record() {
+        let mut records = vec![rec(10, 2, 131, 0)];
+        insert_shared(&mut records, rec(10, 2, 131, 50)).unwrap();
+        assert_eq!(records, vec![rec(10, 2, 131, 0), rec(10, 2, 131, 50)]);
+        remove(&mut records, rec(10, 2, 131, 50)).unwrap();
+        assert_eq!(records, vec![rec(10, 2, 131, 0)]);
+    }
+
+    /// What no shared mapping can be is still refused: the same mapping
+    /// twice, or anything over metadata.
+    #[test]
+    fn an_overlap_no_sharing_explains_is_refused() {
+        let mut records = vec![rec(10, 4, 131, 0), rec(30, 1, OWN_INODES, 0)];
+        let whole = records.clone();
+        for clash in [
+            rec(11, 1, 131, 1),
+            rec(30, 1, 140, 0),
+            rec(12, 1, OWN_AG, 0),
+            rec(10, 1, 140, OFF_BMBT_BLOCK),
+        ] {
+            let err = insert_shared(&mut records, clash).unwrap_err();
+            assert!(
+                format!("{err}").contains("no shared mapping can"),
+                "{clash:?}: {err}"
+            );
+            assert_eq!(records, whole);
+        }
     }
 
     /// An allocation that continues its neighbour extends that record
