@@ -9,6 +9,20 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-10-14
+
+### Added
+
+- **Two files exchange ranges of their data (#374).**
+  `Filesystem::exchange_range(a, a_offset, b, b_offset, length)` swaps
+  whole-block ranges of two regular files by exchanging the blocks that map
+  them: extent lists, block counts, reverse-map records and quota move in one
+  checkpoint, and no data is copied. A volume with the exchange-range feature
+  is now written; one with parent pointers is still refused. The kernel test
+  runs on a second guest, Debian 13 (kernel 6.12), through `chore
+  test:kernel-new` and its own CI job, because Debian 12's 6.1 cannot mount
+  such a volume.
+
 ## [0.14.0] — 2026-10-13
 
 ### Added
@@ -1117,6 +1131,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.14.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.0...v0.12.1

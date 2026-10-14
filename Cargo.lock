@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "rust-fs-xfs"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "clap",
  "crc32c",
