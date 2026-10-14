@@ -68,7 +68,7 @@
 use crate::dir;
 use crate::dir_block;
 use crate::error::{Error, Result};
-use crate::format::log_items::inode_log_format::{XFS_ILOG_DDATA, XFS_ILOG_DEXT};
+use crate::format::log_items::inode_log_format::{XFS_ILOG_ADATA, XFS_ILOG_DDATA, XFS_ILOG_DEXT};
 use crate::fs::Filesystem;
 use crate::inode::{offsets as inode_offsets, stamp_change, Changed, Format, Timestamp};
 use crate::inode_btree::{choose_free_inode, InodeChunk, Taken};
@@ -431,14 +431,20 @@ impl Filesystem {
         agno: u32,
         ino: u64,
         target: &[u8],
+        attr_fork: Option<usize>,
     ) -> Result<SymlinkData> {
         use crate::format::log_items::buf_log_format::buf_type::BLFT_SYMLINK;
         use crate::format::symlink::{offsets as at, XFS_SYMLINK_HDR_SIZE, XFS_SYMLINK_MAGIC};
 
-        // A new inode has no attribute fork, so its data fork is the whole
-        // literal area behind the v3 core.
+        // A new inode's data fork is the whole literal area behind the v3
+        // core, or, beside a parent pointer's attribute fork (#373), what
+        // the attribute fork leaves it.
         let literal = usize::from(self.sb.inodesize) - crate::inode::XFS_DINODE_V3_SIZE;
-        if target.len() <= literal {
+        let inline = match attr_fork {
+            None => target.len() <= literal,
+            Some(len) => crate::attr_write::shortform_forkoff(literal, target.len(), len).is_some(),
+        };
+        if inline {
             return Ok(SymlinkData {
                 fork: target.to_vec(),
                 blocks: 0,
@@ -741,6 +747,15 @@ impl Filesystem {
         if !dir_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
+        // THE NEW INODE'S PARENT POINTER (#373). On a volume with parent
+        // pointers every name an inode has is also an attribute of the
+        // inode, naming the directory and its generation, so the new inode
+        // starts with a short-form attribute fork holding that one.
+        let parent_fork = if self.sb.features_incompat & crate::superblock::incompat::PARENT != 0 {
+            Some(crate::attr_write::parent_fork(name, parent, dir_inode.gen)?)
+        } else {
+            None
+        };
         // A directory past its inode is changed by `edit_directory`, in
         // block, leaf or node form (#366, #367), mapped by an extent list
         // or a B+tree.
@@ -928,7 +943,13 @@ impl Filesystem {
         // A symlink's target, inline or in a block taken through the same
         // allocator as everything else this operation takes (#462).
         let symlink = match kind {
-            Kind::Symlink => Some(self.symlink_data(&mut allocations, agno, ino, target)?),
+            Kind::Symlink => Some(self.symlink_data(
+                &mut allocations,
+                agno,
+                ino,
+                target,
+                parent_fork.as_ref().map(Vec::len),
+            )?),
             _ => None,
         };
 
@@ -1081,6 +1102,23 @@ impl Filesystem {
                 .copy_from_slice(&new_blocks.to_be_bytes());
             set_nextents(&mut new_core, 1);
         }
+        // The parent pointer's fork, placed in the literal area beside the
+        // data fork as an attribute write places one (#373). The core then
+        // holds it, which is what the overlay and the record both carry.
+        if let Some(fork) = &parent_fork {
+            let litino = new_core.len() - crate::inode::XFS_DINODE_V3_SIZE;
+            let data_required = if new_blocks > 0 { 16 } else { new_fork.len() };
+            let forkoff = crate::attr_write::shortform_forkoff(litino, data_required, fork.len())
+                .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "inode {ino}: no room for its parent pointer beside its data fork"
+                ))
+            })?;
+            new_core[core_at::FORKOFF] = (forkoff / 8) as u8;
+            new_core[core_at::AFORMAT] = Format::Local as u8;
+            let at = crate::inode::XFS_DINODE_V3_SIZE + forkoff;
+            new_core[at..at + fork.len()].copy_from_slice(fork);
+        }
         // The fork's bytes are its target, or a directory's header, inline;
         // or one extent record.
         let new_field = if new_blocks > 0 {
@@ -1142,7 +1180,10 @@ impl Filesystem {
         // and two or three for the new inode, depending on whether it
         // has a fork. That one operation is the whole difference between
         // a create's fourteen and a mkdir's fifteen.
-        let new_ops = if new_dsize == 0 { 2 } else { 3 };
+        let new_asize = parent_fork.as_ref().map_or(0, Vec::len);
+        let mut new_attr_op = parent_fork.clone().unwrap_or_default();
+        new_attr_op.resize(new_asize.div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+        let new_ops = 2 + usize::from(new_dsize > 0) + usize::from(new_asize > 0);
 
         // The conversion's own item, when there was one: the directory
         // block itself. Empty otherwise, which is why the ordinary
@@ -1231,7 +1272,36 @@ impl Filesystem {
                 flags: 0,
                 data: fork_op,
             });
-            if new_dsize == 0 {
+            if new_asize > 0 {
+                // With its parent pointer's fork (#373): data fork, when
+                // there is one, then the attribute fork.
+                let fields =
+                    XFS_ILOG_CORE | if new_dsize > 0 { new_field } else { 0 } | XFS_ILOG_ADATA;
+                ops.push(Op {
+                    flags: 0,
+                    data: crate::log_write::inode_log_format_with_forks(
+                        ino,
+                        fields,
+                        &new_buf,
+                        new_dsize as u16,
+                        new_asize as u16,
+                    ),
+                });
+                ops.push(Op {
+                    flags: 0,
+                    data: new_logged,
+                });
+                if new_dsize > 0 {
+                    ops.push(Op {
+                        flags: 0,
+                        data: new_fork_op,
+                    });
+                }
+                ops.push(Op {
+                    flags: 0,
+                    data: new_attr_op,
+                });
+            } else if new_dsize == 0 {
                 ops.push(Op {
                     flags: 0,
                     data: inode_log_format(ino, XFS_ILOG_CORE, &new_buf),

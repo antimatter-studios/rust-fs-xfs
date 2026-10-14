@@ -1,5 +1,5 @@
-//! Volumes with parent pointers or exchange-range read correctly, and are
-//! refused for writing (#99).
+//! Volumes with parent pointers or exchange-range read correctly (#99),
+//! and are written (#373, #374).
 //!
 //! `mkfs.xfs -n parent=1` sets both incompat bits: parent pointers (7) and
 //! exchange-range (6), which parent pointers need. `-i exchange=1` sets
@@ -11,8 +11,11 @@
 //!
 //! So a read accepts both bits. A write accepts exchange-range (#374),
 //! whose exchanges are graded on the Debian 13 guest by
-//! `tests/exchange_range_kernel.rs`. It refuses parent pointers: every
-//! create, rename and unlink must maintain them, and nothing here does yet.
+//! `tests/exchange_range_kernel.rs`. It accepts parent pointers too (#373):
+//! every create, link, rename and unlink adds, moves or removes the pointer
+//! its change implies. The driver makes each kind of change here, unmounts,
+//! and the pinned `xfs_repair -n`, which checks every parent pointer
+//! against the directory entries, grades the volume as it lies.
 //!
 //! The volumes are built without a kernel. A protofile populates them, so
 //! mkfs writes the parent pointers, and `xfs_db -x` adds user attributes
@@ -159,11 +162,12 @@ fn xfs_db_attr_counts(img: &Path, path: &str) -> (usize, usize) {
     (count, parents)
 }
 
-/// What a writable mount of the volume should do: be refused, as parent
-/// pointers still are, or be accepted, as exchange-range is (#374).
+/// What a writable mount of the volume is asked to do: keep its parent
+/// pointers through every kind of namespace change (#373), or only mount,
+/// as an exchange-range volume does here (#374).
 #[derive(PartialEq)]
 enum Writes {
-    Refused,
+    KeepParents,
     Accepted,
 }
 
@@ -275,15 +279,8 @@ fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
     }
 
     drop(fs);
-    if writes == Writes::Refused {
-        match Filesystem::mount_rw(Arc::new(FileDevice::open_rw(&img).unwrap())) {
-            Err(Error::UnsupportedFeature(why)) => assert!(
-                why.contains("can be read but not written"),
-                "{tag}: the refusal should say the volume stays readable: {why}"
-            ),
-            Err(other) => panic!("{tag}: wrong refusal {other:?}"),
-            Ok(_) => panic!("{tag}: a writable mount must be refused"),
-        }
+    if writes == Writes::KeepParents {
+        keep_parent_pointers(tag, &img);
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
@@ -299,13 +296,152 @@ fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Each kind of namespace change this driver makes, on the volume `build`
+/// made, after which the pinned `xfs_repair -n` must call it clean and
+/// every name must have exactly the parent pointers its links imply.
+///
+/// - `create_directory`, `create_file` and `create_symlink` give the new
+///   inode its first pointer.
+/// - `link` adds one; `unlink_file` of one of two links removes one.
+/// - `rename` between directories moves a file's and a directory's, and
+///   replacing a name another link keeps alive removes the victim's.
+/// - `rename_in_directory`, and `rename` within one directory, rename one.
+/// - `unlink_file` of a last link and `remove_directory` free the inode.
+///
+/// `/dir/hello.txt` holds 30 user attributes, a leaf-form fork, where a
+/// parent pointer is not written yet: a link to it is refused, and the
+/// volume `xfs_repair` grades afterwards shows the refusal changed nothing.
+fn keep_parent_pointers(tag: &str, img: &Path) {
+    let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(img).unwrap()))
+        .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
+    let root = fs.superblock().rootino;
+    let ino = |path: &str| {
+        fs.lookup_path(path)
+            .unwrap_or_else(|e| panic!("{path}: {e:?}"))
+            .ino
+    };
+
+    let (made, _) = fs.create_directory(root, b"made", 0o040755).expect("mkdir");
+    fs.create_file(made, b"new.txt", 0o100644).expect("create");
+    fs.create_symlink(made, b"sym", b"../top.txt")
+        .expect("symlink");
+    fs.link(ino("/top.txt"), made, b"top-link").expect("link");
+    assert!(
+        matches!(
+            fs.link(ino("/dir/hello.txt"), made, b"hello-link"),
+            Err(Error::UnsupportedFeature(_))
+        ),
+        "{tag}: a link to an inode whose attributes are past short form must be refused"
+    );
+    fs.rename(root, b"top.txt", made, b"top-moved.txt")
+        .expect("move a file with two links");
+    fs.unlink_file(made, b"top-link")
+        .expect("unlink one of two links");
+    let many = ino("/many");
+    fs.rename_in_directory(many, b"entry_000", b"entry_first")
+        .expect("rename in a directory");
+    fs.unlink_file(many, b"entry_001")
+        .expect("unlink a last link");
+    let (victim, _) = fs.create_file(made, b"victim", 0o100644).expect("create");
+    fs.link(victim, root, b"victim-too")
+        .expect("link the victim");
+    fs.rename(many, b"entry_002", made, b"victim")
+        .expect("replace a name another link keeps alive");
+    fs.rename(root, b"dir", made, b"dir-moved")
+        .expect("move a directory");
+    fs.rename(made, b"new.txt", made, b"renamed.txt")
+        .expect("rename within one directory");
+    let (empty, _) = fs
+        .create_directory(made, b"empty", 0o040755)
+        .expect("mkdir");
+    fs.create_file(empty, b"gone", 0o100644).expect("create");
+    fs.unlink_file(empty, b"gone").expect("unlink");
+    fs.remove_directory(made, b"empty").expect("rmdir");
+    let (twice, _) = fs.create_file(made, b"twice", 0o100644).expect("create");
+    fs.link(twice, many, b"twice-in-many").expect("link");
+    fs.unmount().expect("unmount");
+
+    // No mount first: the unmount left a clean log (#439), so the pinned
+    // tool grades the volume as the driver left it.
+    let report = parent_oracle("xfs_repair").arg("-n").arg(img).output();
+    let said = report.repair_report();
+    repair::assert_agreed(&said, &format!("{tag}: the volume after namespace changes"));
+    // `-n` reports what it would change, parent pointers included, and a
+    // clean volume has nothing it would change.
+    assert!(
+        !said.to_ascii_lowercase().contains("would"),
+        "{tag}: xfs_repair would change the volume:\n{said}"
+    );
+
+    let fs = Filesystem::mount(Arc::new(FileDevice::open(img).unwrap())).unwrap();
+    for (path, links) in [
+        ("/made", &[("made", "/")][..]),
+        ("/made/renamed.txt", &[("renamed.txt", "/made")]),
+        ("/made/sym", &[("sym", "/made")]),
+        ("/made/top-moved.txt", &[("top-moved.txt", "/made")]),
+        ("/many/entry_first", &[("entry_first", "/many")]),
+        ("/victim-too", &[("victim-too", "/")]),
+        ("/made/victim", &[("victim", "/made")]),
+        ("/made/dir-moved", &[("dir-moved", "/made")]),
+        (
+            "/made/dir-moved/hello.txt",
+            &[("hello.txt", "/made/dir-moved")],
+        ),
+        ("/made/dir-moved/link", &[("link", "/made/dir-moved")]),
+        (
+            "/made/twice",
+            &[("twice", "/made"), ("twice-in-many", "/many")],
+        ),
+    ] {
+        let file = fs
+            .open(path)
+            .unwrap_or_else(|e| panic!("{tag} {path}: {e:?}"));
+        let mut got = fs.parent_pointers(file.inode(), file.raw()).unwrap();
+        got.sort_by(|a, b| a.name.cmp(&b.name));
+        let want: Vec<ParentPointer> = links
+            .iter()
+            .map(|(name, parent)| {
+                let parent = fs.open(parent).unwrap();
+                ParentPointer {
+                    name: name.as_bytes().to_vec(),
+                    parent: parent.inode().ino,
+                    generation: parent.inode().gen,
+                }
+            })
+            .collect();
+        assert_eq!(
+            got, want,
+            "{tag} {path}: its parent pointers after the writes"
+        );
+    }
+    // The independent count of the same thing: xfs_db, reading the fork.
+    for (path, parents) in [("/made/top-moved.txt", 1), ("/made/twice", 2)] {
+        assert_eq!(
+            xfs_db_attr_counts(img, path).1,
+            parents,
+            "{tag} {path}: xfs_db's count of its parent pointers"
+        );
+    }
+    for gone in [
+        "/many/entry_000",
+        "/many/entry_001",
+        "/many/entry_002",
+        "/made/empty",
+    ] {
+        assert!(
+            fs.lookup_path(gone).is_err(),
+            "{tag}: {gone} is still there"
+        );
+    }
+}
+
 #[test]
-fn a_parent_pointer_volume_reads_and_refuses_writes() {
+fn a_parent_pointer_volume_reads_and_keeps_its_parent_pointers_through_writes() {
     check_reads(
         "parent",
         &["-n", "parent=1"],
         incompat::PARENT | incompat::EXCHRANGE,
-        Writes::Refused,
+        Writes::KeepParents,
     );
 }
 

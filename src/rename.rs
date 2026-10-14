@@ -35,8 +35,8 @@ use crate::fs::Filesystem;
 use crate::group_write::Allocations;
 use crate::inode::{stamp_change, Changed, Format, Inode};
 use crate::log_write::{
-    inode_log_format, inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer,
-    Op, XFS_ILOG_CORE, XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
+    inode_log_format_with_fork, log_dinode_from_disk, trans_header, InodeBuffer, Op, XFS_ILOG_CORE,
+    XFS_TRANS_CHECKPOINT, XLOG_COMMIT_TRANS, XLOG_START_TRANS,
 };
 
 /// An operation's payload is padded to four bytes; the fork's own length
@@ -77,6 +77,9 @@ struct Logged {
     ino: u64,
     core: Vec<u8>,
     fork: Option<(u32, Vec<u8>, Vec<u8>)>,
+    /// The short-form attribute fork, when its parent pointers changed
+    /// (#373); empty when it did not.
+    afork: Vec<u8>,
 }
 
 impl Filesystem {
@@ -306,6 +309,7 @@ impl Filesystem {
                 src_change.fork.clone(),
                 src_change.disk.clone(),
             )),
+            afork: Vec::new(),
         });
         if let Some(d) = &dst_change {
             logged.push(Logged {
@@ -320,6 +324,7 @@ impl Filesystem {
                     Changed::Contents,
                 )?,
                 fork: Some((d.flags, d.fork.clone(), d.disk.clone())),
+                afork: Vec::new(),
             });
         }
         logged.push(match &moved_change {
@@ -327,6 +332,7 @@ impl Filesystem {
                 ino: moved_ino,
                 core: core_after(&moved_raw, change, None, when, Changed::Status)?,
                 fork: Some((change.flags, change.fork.clone(), change.disk.clone())),
+                afork: Vec::new(),
             },
             None => {
                 let mut core = moved_raw.clone();
@@ -336,10 +342,36 @@ impl Filesystem {
                     ino: moved_ino,
                     core,
                     fork: None,
+                    afork: Vec::new(),
                 }
             }
         });
+        // THE PARENT POINTERS (#373): the moved inode trades its old name's
+        // for its new one's, and a replaced inode that lives on loses its
+        // name's. A freed one's attribute fork goes with it.
+        let parents = self.sb.features_incompat & crate::superblock::incompat::PARENT != 0;
+        if parents {
+            let moved = logged.last_mut().expect("the moved inode is logged");
+            let (core, afork) = self.with_parent_pointers(
+                moved_ino,
+                &moved.core,
+                &[
+                    crate::attr_write::ParentChange::Remove {
+                        name: from,
+                        parent: from_dir,
+                    },
+                    crate::attr_write::ParentChange::Add {
+                        name: to,
+                        parent: to_dir,
+                        generation: dst.gen,
+                    },
+                ],
+            )?;
+            moved.core = core;
+            moved.afork = afork;
+        }
         if let Some((v, raw)) = &victim {
+            let mut afork = Vec::new();
             let core = if victim_freed {
                 crate::unlink::emptied_core(raw)
             } else {
@@ -347,12 +379,23 @@ impl Filesystem {
                 core[at::NLINK..at::NLINK + 4].copy_from_slice(&(v.nlink - 1).to_be_bytes());
                 bump(&mut core);
                 stamp_change(&mut core, when, Changed::Status);
+                if parents {
+                    (core, afork) = self.with_parent_pointers(
+                        v.ino,
+                        &core,
+                        &[crate::attr_write::ParentChange::Remove {
+                            name: to,
+                            parent: to_dir,
+                        }],
+                    )?;
+                }
                 core
             };
             logged.push(Logged {
                 ino: v.ino,
                 core,
                 fork: None,
+                afork,
             });
         }
 
@@ -363,6 +406,25 @@ impl Filesystem {
             let core = log_dinode_from_disk(&l.core)
                 .map_err(|why| Error::UnsupportedFeature(format!("inode {}: {why}", l.ino)))?;
             match &l.fork {
+                Some((flags, fork, _)) if !l.afork.is_empty() => {
+                    // Data fork and attribute fork both (#373).
+                    let mut op = fork.clone();
+                    op.resize(fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+                    let mut attr = l.afork.clone();
+                    attr.resize(l.afork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+                    inode_ops.push(crate::log_write::inode_log_format_with_forks(
+                        l.ino,
+                        XFS_ILOG_CORE
+                            | flags
+                            | crate::format::log_items::inode_log_format::XFS_ILOG_ADATA,
+                        &buf,
+                        fork.len() as u16,
+                        l.afork.len() as u16,
+                    ));
+                    inode_ops.push(core);
+                    inode_ops.push(op);
+                    inode_ops.push(attr);
+                }
                 Some((flags, fork, _)) => {
                     let mut op = fork.clone();
                     op.resize(fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
@@ -376,8 +438,11 @@ impl Filesystem {
                     inode_ops.push(op);
                 }
                 None => {
-                    inode_ops.push(inode_log_format(l.ino, XFS_ILOG_CORE, &buf));
-                    inode_ops.push(core);
+                    inode_ops.extend(
+                        crate::log_write::inode_ops_with_attr(l.ino, &buf, core, &l.afork)
+                            .into_iter()
+                            .map(|op| op.data),
+                    );
                 }
             }
         }
@@ -526,6 +591,19 @@ impl Filesystem {
         inode_core[at::NLINK..at::NLINK + 4].copy_from_slice(&(inode.nlink + 1).to_be_bytes());
         bump(&mut inode_core);
         stamp_change(&mut inode_core, when, Changed::Status);
+        // The new name's parent pointer, in the same record (#373).
+        let mut afork = Vec::new();
+        if self.sb.features_incompat & crate::superblock::incompat::PARENT != 0 {
+            (inode_core, afork) = self.with_parent_pointers(
+                ino,
+                &inode_core,
+                &[crate::attr_write::ParentChange::Add {
+                    name,
+                    parent: dir_ino,
+                    generation: dir.gen,
+                }],
+            )?;
+        }
 
         let cluster = self.sb.inode_cluster_bytes();
         let dir_buf = InodeBuffer::containing(self.inode_offset(dir_ino)?, cluster);
@@ -536,11 +614,13 @@ impl Filesystem {
             .map_err(|why| Error::UnsupportedFeature(format!("inode {ino}: {why}")))?;
         let mut fork_op = change.fork.clone();
         fork_op.resize(change.fork.len().div_ceil(OP_ALIGN) * OP_ALIGN, 0);
+        let inode_ops =
+            crate::log_write::inode_ops_with_attr(ino, &inode_buf, inode_logged, &afork);
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + change.items.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
-            + 2;
+            + inode_ops.len();
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
@@ -576,19 +656,12 @@ impl Filesystem {
                     flags: 0,
                     data: fork_op,
                 },
-                Op {
-                    flags: 0,
-                    data: inode_log_format(ino, XFS_ILOG_CORE, &inode_buf),
-                },
-                Op {
-                    flags: 0,
-                    data: inode_logged,
-                },
-                Op {
-                    flags: XLOG_COMMIT_TRANS,
-                    data: Vec::new(),
-                },
             ]);
+            ops.extend(inode_ops.clone());
+            ops.push(Op {
+                flags: XLOG_COMMIT_TRANS,
+                data: Vec::new(),
+            });
             ops
         })?;
 

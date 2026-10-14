@@ -35,7 +35,7 @@ base; they prove gate policy, not pinned formatter provenance (#360).
 | incompat 4 | NEEDSREPAIR | refused at superblock parse | refused | cannot mount | base with CRC-correct flag overlay; bits |
 | incompat 5 | NREXT64 | yes | yes | inode extent counts | nrext64/nrext64-bigtime0; feature_matrix_oracle |
 | incompat 6 | EXCHRANGE | yes | refused at mount_rw | structural checks only; exchange log extension unsupported | base flag overlay; bits; real 6.13 fixture in parent_exchrange_oracle |
-| incompat 7 | PARENT | yes; hidden parent attributes omitted | refused at mount_rw | parent-link semantics not checked | base flag overlay; bits; real 6.13 fixture in parent_exchrange_oracle |
+| incompat 7 | PARENT | yes; hidden parent attributes omitted | maintained by create, link, rename and unlink; a fork past short form refused | parent-link semantics not checked | base flag overlay; bits; real 6.13 fixture in parent_exchrange_oracle |
 | incompat 8 | METADIR | refused at superblock parse | refused | cannot mount | base flag overlay; bits |
 | incompat other | unknown layout | refused at superblock parse | refused | cannot mount | every unset supported bit over base; bits |
 | ro_compat 0 | FINOBT | yes | yes | inode allocation/free trees | finobt; feature_matrix_oracle |

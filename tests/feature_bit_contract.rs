@@ -196,9 +196,18 @@ fn every_unknown_ro_compat_bit_is_readable_but_refuses_write_before_mutation() {
     }
 }
 
+/// Parent pointers are written (#373): a volume with them mounts for
+/// writing, and mounting writes nothing. Every readable bit a write does
+/// not keep is still refused before any mutation.
 #[test]
 fn readable_unmaintained_features_refuse_write_before_mutation() {
-    for bit in [incompat::PARENT, incompat::READ_ONLY] {
+    let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, incompat::PARENT);
+    read_populated_file(&Filesystem::mount_rw(device.clone()).unwrap());
+    assert_eq!(device.writes.load(Ordering::SeqCst), 0);
+    let mut refused = incompat::READ_ONLY;
+    while refused != 0 {
+        let bit = refused & refused.wrapping_neg();
+        refused &= !bit;
         let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, bit);
         Filesystem::mount(device.clone()).unwrap();
         assert!(matches!(
@@ -319,13 +328,11 @@ fn gate_errors_are_exact_and_accepted_mounts_read_without_changing_the_fixture()
             }
         }
     }
+    // Parent pointers are maintained (#373): both mounts are accepted, and
+    // neither writes.
     let device = Probe::with_bit(offsets::FEATURES_INCOMPAT, incompat::PARENT);
     read_populated_file(&Filesystem::mount(device.clone()).unwrap());
-    unsupported(
-        Filesystem::mount_rw(device.clone()),
-        "this volume uses parent pointers (parent), which this driver does not maintain, so \
-         it can be read but not written",
-    );
+    read_populated_file(&Filesystem::mount_rw(device.clone()).unwrap());
     assert_eq!(device.writes.load(Ordering::SeqCst), 0);
     assert_eq!(fixture_digest(), before);
 }

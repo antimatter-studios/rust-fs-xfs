@@ -179,6 +179,73 @@ pub fn inode_log_format_with_fork(
     v
 }
 
+/// [`inode_log_format_with_fork`] for an inode whose short-form attribute
+/// fork is logged as well (#373): after the format and the core, `dsize`
+/// bytes of data fork when it is not zero, then `asize` of attribute fork,
+/// each its own operation.
+pub fn inode_log_format_with_forks(
+    ino: u64,
+    fields: u32,
+    buffer: &InodeBuffer,
+    dsize: u16,
+    asize: u16,
+) -> Vec<u8> {
+    use crate::format::log_items::inode_log_format::offsets as at;
+
+    let mut v = inode_log_format(ino, fields, buffer);
+    let ops = 2 + u16::from(dsize > 0) + u16::from(asize > 0);
+    v[at::SIZE..at::SIZE + 2].copy_from_slice(&ops.to_le_bytes());
+    v[at::DSIZE..at::DSIZE + 2].copy_from_slice(&dsize.to_le_bytes());
+    v[at::ASIZE..at::ASIZE + 2].copy_from_slice(&asize.to_le_bytes());
+    v
+}
+
+/// The operations that log inode `ino`'s core, and after it its short-form
+/// attribute fork when `afork` is not empty (#373): two operations, or
+/// three.
+pub(crate) fn inode_ops_with_attr(
+    ino: u64,
+    buffer: &InodeBuffer,
+    logged_core: Vec<u8>,
+    afork: &[u8],
+) -> Vec<Op> {
+    use crate::format::log_items::inode_log_format::XFS_ILOG_ADATA;
+    if afork.is_empty() {
+        return vec![
+            Op {
+                flags: 0,
+                data: inode_log_format(ino, XFS_ILOG_CORE, buffer),
+            },
+            Op {
+                flags: 0,
+                data: logged_core,
+            },
+        ];
+    }
+    let mut attr = afork.to_vec();
+    attr.resize(afork.len().div_ceil(4) * 4, 0);
+    vec![
+        Op {
+            flags: 0,
+            data: inode_log_format_with_forks(
+                ino,
+                XFS_ILOG_CORE | XFS_ILOG_ADATA,
+                buffer,
+                0,
+                afork.len() as u16,
+            ),
+        },
+        Op {
+            flags: 0,
+            data: logged_core,
+        },
+        Op {
+            flags: 0,
+            data: attr,
+        },
+    ]
+}
+
 /// Assemble a record's payload from its operations.
 ///
 /// Every operation carries the same transaction id; that is what ties
