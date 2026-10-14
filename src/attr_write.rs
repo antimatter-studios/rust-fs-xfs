@@ -39,6 +39,14 @@ fn unsupported(message: &str) -> Error {
 }
 
 fn name_parts(name: &[u8]) -> Result<(u8, &[u8])> {
+    // A parent pointer kept through a rewrite of the fork (#373). Its name
+    // is a directory entry's, which may hold any byte but NUL and `/`.
+    if let Some(short) = name.strip_prefix(crate::attr::PARENT_PREFIX) {
+        if short.is_empty() || short.len() > 255 {
+            return Err(unsupported("a parent pointer's name must be 1..255 bytes"));
+        }
+        return Ok((flags::PARENT, short));
+    }
     let (namespace, short) = if let Some(short) = name.strip_prefix(b"user.") {
         (0, short)
     } else if let Some(short) = name.strip_prefix(b"trusted.") {
@@ -106,6 +114,14 @@ impl<'a> Layout<'a> {
         let mut entries = Vec::with_capacity(attrs.len());
         for attr in attrs {
             let (namespace, name) = name_parts(&attr.name)?;
+            // A parent pointer's hash mixes in its directory, which this
+            // writer does not compute yet: a fork holding one is kept only
+            // while it is short form, which has no hashes (#373).
+            if namespace == flags::PARENT {
+                return Err(unsupported(
+                    "an attribute fork holding parent pointers past short form is not written yet",
+                ));
+            }
             let local_size = align4(3 + name.len() + attr.value.len());
             let local = local_size < bs / 2 - 16;
             entries.push(Entry {
@@ -391,6 +407,12 @@ impl Filesystem {
     ) -> Result<u64> {
         if matches!(name, b"trusted.SGI_ACL_FILE" | b"trusted.SGI_ACL_DEFAULT") {
             return Err(unsupported("ACL attributes require an ACL operation"));
+        }
+        // Parent pointers follow the directory entries; no caller sets one.
+        if name.starts_with(crate::attr::PARENT_PREFIX) {
+            return Err(unsupported(
+                "supported attribute namespaces are user, trusted and security",
+            ));
         }
         self.write_xattr(ino, name, change, None)
     }

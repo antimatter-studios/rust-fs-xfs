@@ -54,13 +54,39 @@ pub struct Xattr {
 /// parent pointers -- is not an attribute to report under `user.`.
 const KNOWN_FLAGS: u8 = flags::LOCAL | flags::ROOT | flags::SECURE | flags::INCOMPLETE;
 
+/// The name a parent pointer is carried under inside this crate (#373): no
+/// attribute name starts with a NUL, so it collides with none, and
+/// `list_xattrs` and `get_xattr` report none.
+pub(crate) const PARENT_PREFIX: &[u8] = b"\0parent.";
+
+/// One parent pointer (#373): a name an inode has in a directory, that
+/// directory, and the directory's generation when the name was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentPointer {
+    /// The directory entry's name.
+    pub name: Vec<u8>,
+    /// The directory's inode number.
+    pub parent: u64,
+    /// The directory's generation.
+    pub generation: u32,
+}
+
 fn corrupt(ino: u64, what: &str) -> Error {
     Error::BadSuperblock(format!("inode {ino}: attribute fork: {what}"))
 }
 
 /// The reported name, or `None` for an entry that is not reported.
 fn full_name(ino: u64, entry_flags: u8, name: &[u8]) -> Result<Option<Vec<u8>>> {
-    if entry_flags & flags::INCOMPLETE != 0 || entry_flags & !KNOWN_FLAGS != 0 {
+    if entry_flags & flags::INCOMPLETE != 0 {
+        return Ok(None);
+    }
+    // A parent pointer, carried under its internal name (#373).
+    if entry_flags & !flags::LOCAL == flags::PARENT {
+        let mut out = PARENT_PREFIX.to_vec();
+        out.extend_from_slice(name);
+        return Ok(Some(out));
+    }
+    if entry_flags & !KNOWN_FLAGS != 0 {
         return Ok(None);
     }
     let prefix = flags::namespace_prefix(entry_flags)
@@ -82,10 +108,48 @@ impl Filesystem {
     /// not fit where they claim to be, or a stored ACL the kernel would
     /// refuse to read, and whatever reading its blocks returns.
     pub fn list_xattrs(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Xattr>> {
-        with_acl_views(inode.ino, self.stored_xattrs(inode, raw)?, self.sb.is_v5())
+        let stored = self
+            .stored_xattrs(inode, raw)?
+            .into_iter()
+            .filter(|a| !a.name.starts_with(PARENT_PREFIX))
+            .collect();
+        with_acl_views(inode.ino, stored, self.sb.is_v5())
+    }
+
+    /// Every parent pointer of an inode, in on-disk order (#373): one for
+    /// each name it has in a directory, on a volume with the parent-pointer
+    /// feature, and none on one without.
+    ///
+    /// # Errors
+    ///
+    /// As [`Filesystem::list_xattrs`], and [`Error::BadSuperblock`] for a
+    /// parent pointer whose value is not twelve bytes.
+    pub fn parent_pointers(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<ParentPointer>> {
+        self.stored_xattrs(inode, raw)?
+            .into_iter()
+            .filter_map(|a| {
+                let name = a.name.strip_prefix(PARENT_PREFIX)?.to_vec();
+                Some((name, a.value))
+            })
+            .map(|(name, value)| {
+                if value.len() != 12 {
+                    return Err(corrupt(
+                        inode.ino,
+                        &format!("a parent pointer whose value is {} bytes", value.len()),
+                    ));
+                }
+                Ok(ParentPointer {
+                    name,
+                    parent: be64(&value, 0),
+                    generation: be32(&value, 8),
+                })
+            })
+            .collect()
     }
 
     /// Stored names only: ACL aliases must never be written as new entries.
+    /// Parent pointers are among them, under [`PARENT_PREFIX`], so a
+    /// rewrite of the fork keeps them (#373).
     pub(crate) fn stored_xattrs(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Xattr>> {
         let isize = usize::from(self.sb.inodesize);
         let Some((start, end)) = inode.attr_fork_range(isize) else {
@@ -529,6 +593,38 @@ mod tests {
                 b"security.SGI_ACL_DEFAULT",
             ]
         );
+    }
+
+    /// A parent pointer (#373) is read under its internal name, beside a
+    /// user attribute, and a parent bit beside another namespace is not one.
+    #[test]
+    fn a_parent_pointer_is_carried_under_its_internal_name() {
+        let mut fork = vec![0u8; 64];
+        let mut value = 128u64.to_be_bytes().to_vec();
+        value.extend_from_slice(&7u32.to_be_bytes());
+        let mut at = 4;
+        for (flags_byte, name, value) in [
+            (0u8, &b"colour"[..], &b"red"[..]),
+            (flags::PARENT, b"top.txt", value.as_slice()),
+        ] {
+            fork[at] = name.len() as u8;
+            fork[at + 1] = value.len() as u8;
+            fork[at + 2] = flags_byte;
+            fork[at + 3..at + 3 + name.len()].copy_from_slice(name);
+            fork[at + 3 + name.len()..at + 3 + name.len() + value.len()].copy_from_slice(value);
+            at += 3 + name.len() + value.len();
+        }
+        fork[0..2].copy_from_slice(&(at as u16).to_be_bytes());
+        fork[2] = 2;
+        let got = shortform(1, &fork).unwrap();
+        assert_eq!(got[0].name, b"user.colour");
+        let mut internal = PARENT_PREFIX.to_vec();
+        internal.extend_from_slice(b"top.txt");
+        assert_eq!(got[1].name, internal);
+        assert_eq!(got[1].value, value);
+        // A parent pointer with any other namespace bit is not one.
+        fork[4 + 3 + 6 + 3 + 2] = flags::PARENT | flags::ROOT;
+        assert_eq!(shortform(1, &fork).unwrap().len(), 1);
     }
 
     /// A short-form fork: header, two entries, and a lie about the size.

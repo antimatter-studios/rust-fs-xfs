@@ -32,6 +32,7 @@ mod common;
 
 use common::{parent_oracle, repair, Oracle};
 use fs_core::FileDevice;
+use fs_xfs::attr::ParentPointer;
 use fs_xfs::superblock::incompat;
 use fs_xfs::{Error, Filesystem};
 use std::path::{Path, PathBuf};
@@ -241,6 +242,36 @@ fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
                 "{tag} {path}: {name}"
             );
         }
+    }
+
+    // Each inode's parent pointers are exactly the directory entries that
+    // name it, each with its directory's generation, and a volume without
+    // the feature has none (#373). The entries are the directory's own,
+    // read by a walk that never looks at an attribute fork, so the two
+    // agree only if the parent pointers are read right.
+    for (path, name, parent_path) in [
+        ("/dir", "dir", "/"),
+        ("/dir/hello.txt", "hello.txt", "/dir"),
+        ("/dir/link", "link", "/dir"),
+        ("/top.txt", "top.txt", "/"),
+        ("/many", "many", "/"),
+        ("/many/entry_137", "entry_137", "/many"),
+    ] {
+        let file = fs.open(path).unwrap();
+        let parent = fs.open(parent_path).unwrap();
+        let got = fs
+            .parent_pointers(file.inode(), file.raw())
+            .unwrap_or_else(|e| panic!("{tag} {path}: {e:?}"));
+        let want = if bits & incompat::PARENT != 0 {
+            vec![ParentPointer {
+                name: name.as_bytes().to_vec(),
+                parent: parent.inode().ino,
+                generation: parent.inode().gen,
+            }]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(got, want, "{tag} {path}: its parent pointers");
     }
 
     drop(fs);
