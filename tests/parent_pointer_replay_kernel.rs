@@ -221,15 +221,22 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
         let mut got: Vec<(String, u64)> = Vec::new();
         let mut parent = None;
         for line in out.lines().filter_map(|l| l.strip_prefix(&prefix)) {
-            if line.contains("p_ino") {
-                parent = line.rsplit(' ').next().and_then(|n| n.trim().parse().ok());
-            } else if line.contains("p_name") {
-                let (start, end) = (line.find('"'), line.rfind('"'));
-                if let (Some(start), Some(end), Some(p)) = (start, end, parent.take()) {
-                    if end > start {
-                        got.push((line[start + 1..end].to_string(), p));
+            let Some((field, value)) = line.split_once('=') else {
+                continue;
+            };
+            match field.trim() {
+                "p_ino" => parent = value.trim().parse().ok(),
+                // p_namelen precedes p_name in xfs_io's output. Match
+                // the field exactly so it cannot consume the inode.
+                "p_name" => {
+                    let (start, end) = (value.find('"'), value.rfind('"'));
+                    if let (Some(start), Some(end), Some(p)) = (start, end, parent.take()) {
+                        if end > start {
+                            got.push((value[start + 1..end].to_string(), p));
+                        }
                     }
                 }
+                _ => {}
             }
         }
         got.sort();
