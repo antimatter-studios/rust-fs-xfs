@@ -459,11 +459,13 @@ tasks:
     # so 80 lines / 3,000 bytes. On the x86_64 CI runner, cold, the same
     # suite printed 103 lines / 4,715 bytes (run 38488415326, the tier's own
     # log): a line per crate compiled. Half as much again of that, so 155
-    # lines / 7,100 bytes. The floor is 1, the one suite it holds.
+    # lines / 7,100 bytes. The floor is 2: both replay tests passed in
+    # run 38579919181, job 115907655076, head d245576 (2026-10-14).
+    # That kernel-new log measured 22 lines / 1,190 bytes; the budget stays.
     cmds:
       - scripts/tools.sh --check
       - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" CI_TEST_FLOOR=1 ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 155 7100 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel-new)'
+      - 'FLTH_CONFIG="$PWD/fs-linux-test-harness.debian-13.toml" CI_TEST_FLOOR=2 ../rust-fs-core/scripts/tier.sh test:kernel-new kernel-new 155 7100 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel-new)'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
