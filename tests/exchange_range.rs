@@ -11,6 +11,7 @@
 //! a volume with a reverse-mapping tree is `tests/exchange_range_oracle.rs`.
 
 use fs_core::{BlockDevice, BlockRead};
+use fs_xfs::inode::Format;
 use fs_xfs::superblock::{incompat, offsets as sbo};
 use fs_xfs::{Error, Filesystem};
 use std::collections::BTreeMap;
@@ -228,4 +229,63 @@ fn an_exchange_refused_writes_nothing() {
         assert!(result.is_err(), "{what} was exchanged: {result:?}");
         assert!(image(&dev) == before, "{what}: a refused exchange wrote");
     }
+}
+
+/// A list that outgrows its inode becomes a block-map B+tree, and one that
+/// fits again goes back inline, the tree's block given back (#441).
+///
+/// `a` is 20 one-block extents with a hole after each. `c` is 20 of the
+/// same and then one 39-block extent: 21, as many as its inode lists.
+/// Exchanging `a` whole with `c`'s last extent hands `c` 40 extents and `a`
+/// one; exchanging the same ranges again puts both back.
+#[test]
+fn an_exchange_moves_a_list_into_a_tree_and_back() {
+    let dev = volume(incompat::EXCHRANGE);
+    let fs = mount_rw(&dev);
+    let root = fs.superblock().rootino;
+    let (a, _) = fs.create_file(root, b"a", 0o100644).expect("create a");
+    let (c, _) = fs.create_file(root, b"c", 0o100644).expect("create c");
+    for i in 0..20u64 {
+        fs.write(a, 2 * i * BS, &blocks(0xa0 + i as u8, 1))
+            .expect("write a");
+        fs.write(c, 2 * i * BS, &blocks(0xc0 + i as u8, 1))
+            .expect("write c");
+    }
+    fs.write(c, 40 * BS, &blocks(0x10, 39))
+        .expect("write c's run");
+    let format = |fs: &Filesystem, ino| fs.read_inode_raw(ino).expect("inode").0.format;
+    assert_eq!(format(&fs, c), Format::Extents);
+    let (old_a, held_a) = contents(&fs, a);
+    let (old_c, held_c) = contents(&fs, c);
+    let bs = BS as usize;
+
+    fs.exchange_range(a, 0, c, 40 * BS, 39 * BS)
+        .expect("into a tree");
+    let mut want_c = old_c[..40 * bs].to_vec();
+    want_c.extend_from_slice(&old_a);
+    let fresh = replayed(&dev);
+    for fs in [&fs, &fresh] {
+        assert_eq!(format(fs, c), Format::Btree, "c lists 40 extents inline");
+        assert_eq!(format(fs, a), Format::Extents);
+        let (got_a, now_a) = contents(fs, a);
+        let (got_c, now_c) = contents(fs, c);
+        assert!(got_a == old_c[40 * bs..], "a reads other than c's run");
+        assert!(got_c == want_c, "c reads other than its fragments and a's");
+        // a took 39 blocks for 20; c gave 39, took 20 and a tree block.
+        assert_eq!((now_a, now_c), (held_a + 19, held_c - 19 + 1));
+    }
+    let report = fs_xfs::check::check(&fresh);
+    assert!(report.is_clean(), "{:#?}", report.findings);
+    drop(fresh);
+
+    fs.exchange_range(a, 0, c, 40 * BS, 39 * BS)
+        .expect("back inline");
+    let fresh = replayed(&dev);
+    for fs in [&fs, &fresh] {
+        assert_eq!(format(fs, c), Format::Extents, "c's tree outlived its need");
+        assert!(contents(fs, a) == (old_a.clone(), held_a));
+        assert!(contents(fs, c) == (old_c.clone(), held_c));
+    }
+    let report = fs_xfs::check::check(&fresh);
+    assert!(report.is_clean(), "{:#?}", report.findings);
 }
