@@ -93,7 +93,7 @@ STRESS_SUITES="stress_oracle"
 # (parent pointers, exchange-range). They are kernel-new's and nobody
 # else's, because every other tier and the whole-suite run boot Debian 12,
 # where they fail at the mount.
-NEW_KERNEL_SUITES="exchange_range_kernel"
+NEW_KERNEL_SUITES="exchange_range_kernel parent_pointer_replay_kernel"
 
 tier="${1:-}"
 args=()
