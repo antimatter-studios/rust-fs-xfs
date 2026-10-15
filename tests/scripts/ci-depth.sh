@@ -17,10 +17,19 @@ events = doc.get("on", doc.get(True))
 assert {"pull_request", "merge_group", "workflow_dispatch"} <= set(events)
 assert not (events.get("pull_request") or {}).get("branches"), "all stack bases need PR checks"
 jobs = doc["jobs"]
-planner = next(s for s in jobs["changes"]["steps"] if s.get("id") == "c")["run"]
+planner_step = next(s for s in jobs["changes"]["steps"] if s.get("id") == "c")
+planner = planner_step["run"]
+# GitHub sets every declared step variable, empty when its expression is, so
+# the planner runs here with exactly the declared names and nothing inherited.
+planner_env = {k: "" for k in planner_step.get("env", {})}
+assert {"EVENT", "REF"} <= set(planner_env), planner_env
 aggregate = next(s for s in jobs["ci-ok"]["steps"] if "NEEDS" in s.get("env", {}))
 full = set(json.loads(aggregate["env"]["FULL_JOBS"]))
 assert full <= set(jobs), "the aggregate must not exempt nonexistent jobs"
+# The merge queue's full validation: fixtures, the x86_64 suite, the newer
+# kernel, the reference-oracle VM tier, arm64, macOS and the CLI.
+assert {"fixtures", "test", "test-kernel-new", "suite-in-vm",
+        "test-arm64", "test-darwin", "cli"} <= full, full
 assert set(jobs["ci-ok"]["needs"]) == set(jobs) - {"ci-ok"}
 
 # Derive every intentionally skipped job from the dependency graph. A new
@@ -50,7 +59,8 @@ for event, ref, decision in [
 ]:
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "output"
-        env = dict(os.environ, EVENT=event, REF=ref, GITHUB_OUTPUT=str(output))
+        env = {k: v for k, v in os.environ.items() if k not in planner_env}
+        env.update(planner_env, EVENT=event, REF=ref, GITHUB_OUTPUT=str(output))
         result = subprocess.run(["bash", "-c", planner], env=env, capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
         assert output.read_text().splitlines() == ["code=" + decision], (event, result.stdout)
