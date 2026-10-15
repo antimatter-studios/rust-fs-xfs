@@ -209,6 +209,18 @@ jobs:
       # guards run here too.
       - name: chore lint
         run: chore lint
+      - name: ripgrep (the script tests search the tree with it)
+        # The script guards fail when rg is absent rather than report PASS
+        # having searched nothing, so it is installed here, not skipped.
+        # `chore tools` would also demand the VM's host tools, which this
+        # runner has none of; the same package from scripts/tools.sh is
+        # installed directly, then its `--check` (which leaves the VM out)
+        # verifies it.
+        run: |
+          set -euo pipefail
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ripgrep >/dev/null ||
+            { sudo apt-get update -qq && sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ripgrep >/dev/null; }
+          scripts/tools.sh --check
       - name: chore test:scripts
         run: chore test:scripts
       - name: Keep the tier logs
