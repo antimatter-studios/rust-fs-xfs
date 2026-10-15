@@ -91,6 +91,9 @@ on:
   # land. The queue reads ci-ok only from a workflow that triggers here, so
   # without this nothing queued would ever merge.
   merge_group:
+  # Explicit full-suite evidence for an oracle regression before it is
+  # queued: a manual run on a branch is planned like the queue's.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -131,18 +134,20 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
           MQ_BASE: ${{ github.event.merge_group.base_sha }}
           MQ_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
+          # Pull requests, every stack layer included, run the quick jobs
+          # only; the merge queue runs the full pipeline on the tree it is
+          # about to land. Any other or unknown event runs everything.
           range=
+          code=
           case "$EVENT" in
-            pull_request) range="$PR_BASE...$PR_HEAD" ;;
-            merge_group) range="$MQ_BASE...$MQ_HEAD" ;;
+            pull_request) code=false ;;
+            merge_group) [ -z "$MQ_BASE" ] || [ -z "$MQ_HEAD" ] || range="$MQ_BASE...$MQ_HEAD" ;;
             push)
               case "$REF" in
                 refs/heads/*)
@@ -152,7 +157,9 @@ jobs:
                   fi ;;
               esac ;;
           esac
-          if [ -n "$range" ]; then
+          if [ -n "$code" ]; then
+            :
+          elif [ -n "$range" ]; then
             git diff --name-only "$range" | tee changed.txt
             code="$(bash ../rust-fs-core/scripts/code-changed.sh < changed.txt)"
           else
@@ -198,6 +205,24 @@ jobs:
       - name: chore test:unit
         id: tier
         run: chore test:unit
+      # The quick pull-request run has no `test` job, so lint and the shell
+      # guards run here too.
+      - name: chore lint
+        run: chore lint
+      - name: ripgrep (the script tests search the tree with it)
+        # The script guards fail when rg is absent rather than report PASS
+        # having searched nothing, so it is installed here, not skipped.
+        # `chore tools` would also demand the VM's host tools, which this
+        # runner has none of; the same package from scripts/tools.sh is
+        # installed directly, then its `--check` (which leaves the VM out)
+        # verifies it.
+        run: |
+          set -euo pipefail
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ripgrep >/dev/null ||
+            { sudo apt-get update -qq && sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ripgrep >/dev/null; }
+          scripts/tools.sh --check
+      - name: chore test:scripts
+        run: chore test:scripts
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
@@ -739,11 +764,15 @@ jobs:
           # false only for a change to documentation alone: then, and only
           # then, a skipped job is not a failed one.
           CODE: ${{ needs.changes.outputs.code }}
+          # The only jobs a quick run may skip. Every other job must succeed
+          # on every event.
+          FULL_JOBS: '["fixtures", "test", "test-kernel-new", "test-arm64", "test-darwin", "suite-in-vm", "cli"]'
         run: |
           set -euo pipefail
+          case "$CODE" in true|false) ;; *) echo "::error::missing full-pipeline decision"; exit 1 ;; esac
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          echo "code changed: $CODE"
-          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" '[to_entries[] | select(.value.result != "success" and ($code != "false" or .value.result != "skipped")) | .key] | join(", ")')"
+          echo "full pipeline: $CODE"
+          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" --argjson full "$FULL_JOBS" '[to_entries[] | select(.value.result != "success" and (($code == "false" and .value.result == "skipped" and (.key as $job | $full | index($job) != null)) | not)) | .key] | join(", ")')"
           if [ -n "$bad" ]; then
             echo "::error::not green: $bad (failed, cancelled or skipped)"
             exit 1
