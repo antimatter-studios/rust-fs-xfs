@@ -118,8 +118,9 @@ vars:
   # queue) and scripts/code-changed.sh, which the CI changes job reads.
   # v0.3.11 carries agent-core v6 (stacked pull requests, changelog.d
   # fragments, findings filed before a tracking issue closes) and the
-  # changelog-check.sh that `chore lint` runs.
-  FS_CORE_REF: v0.3.11
+  # changelog-check.sh that `chore lint` runs. v0.3.12 carries agent-core
+  # v7 (one stack per repository) and the stack-base.sh that names its top.
+  FS_CORE_REF: v0.3.12
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back
