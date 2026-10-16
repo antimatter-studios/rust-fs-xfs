@@ -564,10 +564,10 @@ struct Checker<'a> {
     rmaps: Vec<Option<Vec<crate::rmap::Rmap>>>,
     /// Per group, the refcount btree's records, when it was read.
     refcounts: Vec<Option<Vec<crate::refcount::Refcount>>>,
-    /// Every group whose AGF or AGI could not be read (#489). Nothing in
-    /// one is claimed but its headers, and it adds nothing to the totals
-    /// the superblock's counters are compared with: its blocks are
-    /// unchecked, not lost, and those counters cannot be compared.
+    /// Every group in which something that owns blocks could not be
+    /// read: its AGF or AGI (#489), its free list, or one of its btrees
+    /// (#496). What that structure owned was never claimed, so the
+    /// group's unclaimed blocks are unchecked, not lost.
     unread: HashSet<u32>,
 }
 
@@ -744,6 +744,14 @@ struct Totals {
     icount: u64,
     ifree: u64,
     fdblocks: u64,
+    /// Some group's free space was not counted, because its AGF, its AGI
+    /// or its free-space-by-block btree could not be read: `fdblocks` is
+    /// short by an amount nothing read can say (#489, #496).
+    free_short: bool,
+    /// Some group's inode chunks were not all counted, because its AGF,
+    /// its AGI, its inode btree or one of that btree's records could not
+    /// be read: `icount` and `ifree` are short.
+    inodes_short: bool,
 }
 
 impl Checker<'_> {
@@ -982,6 +990,8 @@ impl Checker<'_> {
                     format!("the AGF: {e}"),
                 );
                 self.unread.insert(ag);
+                totals.free_short = true;
+                totals.inodes_short = true;
                 return;
             }
         };
@@ -996,6 +1006,8 @@ impl Checker<'_> {
                     format!("the AGI: {e}"),
                 );
                 self.unread.insert(ag);
+                totals.free_short = true;
+                totals.inodes_short = true;
                 return;
             }
         };
@@ -1036,13 +1048,16 @@ impl Checker<'_> {
                     self.claim(ag, b, 1, Owner::FreeList);
                 }
             }
-            Err(e) => self.failed(
-                Code::AgflUnreadable,
-                &e,
-                Some(ag),
-                None,
-                format!("the free list: {e}"),
-            ),
+            Err(e) => {
+                self.failed(
+                    Code::AgflUnreadable,
+                    &e,
+                    Some(ag),
+                    None,
+                    format!("the free list: {e}"),
+                );
+                self.unread.insert(ag);
+            }
         }
 
         // The refcount btree first: which blocks may be claimed twice.
@@ -1071,18 +1086,24 @@ impl Checker<'_> {
                     }
                     self.refcounts[ag as usize] = Some(records);
                 }
-                Err(e) => self.failed(
-                    Code::BtreeUnreadable,
-                    &e,
-                    Some(ag),
-                    None,
-                    format!("the refcount btree: {e}"),
-                ),
+                Err(e) => {
+                    self.failed(
+                        Code::BtreeUnreadable,
+                        &e,
+                        Some(ag),
+                        None,
+                        format!("the refcount btree: {e}"),
+                    );
+                    self.unread.insert(ag);
+                }
             }
         }
         let _ = refcount_blocks;
 
-        // The free-space btrees.
+        // The free-space btrees, and which of the three trees the AGF
+        // counts the blocks of were walked: one that was not is no
+        // evidence about anything it holds (#496).
+        let mut walked = [true; 3];
         let mut btree_blocks = 0u32;
         let mut by_block: Vec<FreeExtent> = Vec::new();
         let mut by_count: Vec<FreeExtent> = Vec::new();
@@ -1110,13 +1131,17 @@ impl Checker<'_> {
                     }
                     *out = records;
                 }
-                Err(e) => self.failed(
-                    Code::BtreeUnreadable,
-                    &e,
-                    Some(ag),
-                    None,
-                    format!("the {name} btree: {e}"),
-                ),
+                Err(e) => {
+                    self.failed(
+                        Code::BtreeUnreadable,
+                        &e,
+                        Some(ag),
+                        None,
+                        format!("the {name} btree: {e}"),
+                    );
+                    self.unread.insert(ag);
+                    walked[which] = false;
+                }
             }
         }
         if sb.has_rmapbt() && agf.levels[crate::ag::agf_btree::RMAP] > 0 {
@@ -1137,18 +1162,30 @@ impl Checker<'_> {
                     }
                     self.rmaps[ag as usize] = Some(records);
                 }
-                Err(e) => self.failed(
-                    Code::BtreeUnreadable,
-                    &e,
-                    Some(ag),
-                    None,
-                    format!("the reverse-mapping btree: {e}"),
-                ),
+                Err(e) => {
+                    self.failed(
+                        Code::BtreeUnreadable,
+                        &e,
+                        Some(ag),
+                        None,
+                        format!("the reverse-mapping btree: {e}"),
+                    );
+                    self.unread.insert(ag);
+                    walked[which] = false;
+                }
             }
         }
-        self.free_space(ag, &agf, &by_block, &by_count, btree_blocks);
+        use crate::ag::agf_btree::{BNO, CNT};
+        self.free_space(
+            ag,
+            &agf,
+            walked[BNO].then_some(&by_block[..]),
+            walked[CNT].then_some(&by_count[..]),
+            walked.iter().all(|&w| w).then_some(btree_blocks),
+        );
         let free: u32 = by_block.iter().map(|e| e.blockcount).sum();
         totals.fdblocks += u64::from(free) + u64::from(agf.flcount) + u64::from(agf.btreeblks);
+        totals.free_short |= !walked[BNO];
         self.report.free_blocks += u64::from(free);
 
         // The inode btrees, and the AGI's count of their blocks.
@@ -1163,6 +1200,9 @@ impl Checker<'_> {
             }
         };
         let sparse = sb.has_sparse_inodes();
+        // Whether the inode btree listed every chunk: a chunk it could not
+        // describe is neither claimed nor counted (#496).
+        let mut listed = true;
         let chunks = match ag_btree::walk_blocks(
             sb,
             crate::inode_btree::shape(Which::All, sb.is_v5()),
@@ -1202,13 +1242,16 @@ impl Checker<'_> {
                             }
                             chunks.push(chunk);
                         }
-                        Err(e) => self.failed(
-                            Code::InobtRecord,
-                            &e,
-                            Some(ag),
-                            None,
-                            format!("an inode btree record: {e}"),
-                        ),
+                        Err(e) => {
+                            self.failed(
+                                Code::InobtRecord,
+                                &e,
+                                Some(ag),
+                                None,
+                                format!("an inode btree record: {e}"),
+                            );
+                            listed = false;
+                        }
                     }
                 }
                 chunks
@@ -1221,9 +1264,13 @@ impl Checker<'_> {
                     None,
                     format!("the inode btree: {e}"),
                 );
+                listed = false;
                 Vec::new()
             }
         };
+        if !listed {
+            self.unread.insert(ag);
+        }
         if sb.has_finobt() && agi.free_level > 0 {
             match ag_btree::walk_blocks(
                 sb,
@@ -1253,7 +1300,7 @@ impl Checker<'_> {
                     let got: Vec<InodeChunk> = records.into_iter().filter_map(|r| r.ok()).collect();
                     let want: Vec<InodeChunk> =
                         chunks.iter().copied().filter(|c| c.freecount > 0).collect();
-                    if got != want {
+                    if listed && got != want {
                         self.find(
                             Code::FinobtMismatch,
                             Some(ag),
@@ -1267,27 +1314,38 @@ impl Checker<'_> {
                         );
                     }
                 }
-                Err(e) => self.failed(
-                    Code::BtreeUnreadable,
-                    &e,
-                    Some(ag),
-                    None,
-                    format!("the free inode btree: {e}"),
-                ),
+                Err(e) => {
+                    self.failed(
+                        Code::BtreeUnreadable,
+                        &e,
+                        Some(ag),
+                        None,
+                        format!("the free inode btree: {e}"),
+                    );
+                    self.unread.insert(ag);
+                }
             }
         }
-        self.chunks(ag, &agi, &chunks, totals);
+        self.chunks(ag, &agi, &chunks, listed, totals);
     }
 
     /// The free-space btrees against each other and the AGF.
+    ///
+    /// A tree that could not be walked is `None`, and so is the count of
+    /// btree blocks when a tree it counts was not walked: nothing is
+    /// compared with records that were never read (#496).
     fn free_space(
         &mut self,
         ag: u32,
         agf: &crate::ag::Agf,
-        by_block: &[FreeExtent],
-        by_count: &[FreeExtent],
-        btree_blocks: u32,
+        by_block: Option<&[FreeExtent]>,
+        by_count: Option<&[FreeExtent]>,
+        btree_blocks: Option<u32>,
     ) {
+        let by_block_walked = by_block.is_some();
+        let both_walked = by_block_walked && by_count.is_some();
+        let by_block = by_block.unwrap_or_default();
+        let by_count = by_count.unwrap_or_default();
         let mut end = 0u64;
         for (i, e) in by_block.iter().enumerate() {
             if e.blockcount == 0 {
@@ -1336,7 +1394,7 @@ impl Checker<'_> {
             .collect();
         a.sort_unstable();
         b.sort_unstable();
-        if a != b {
+        if both_walked && a != b {
             self.find(
                 Code::FreespDisagree,
                 Some(ag),
@@ -1349,7 +1407,7 @@ impl Checker<'_> {
             );
         }
         let free: u64 = by_block.iter().map(|e| u64::from(e.blockcount)).sum();
-        if free != u64::from(agf.freeblks) {
+        if by_block_walked && free != u64::from(agf.freeblks) {
             self.find(
                 Code::CounterAgfFreeblks,
                 Some(ag),
@@ -1361,7 +1419,7 @@ impl Checker<'_> {
             );
         }
         let longest = by_block.iter().map(|e| e.blockcount).max().unwrap_or(0);
-        if longest != agf.longest {
+        if by_block_walked && longest != agf.longest {
             self.find(
                 Code::CounterAgfLongest,
                 Some(ag),
@@ -1373,6 +1431,9 @@ impl Checker<'_> {
             );
         }
         let sb = self.fs.superblock();
+        let Some(btree_blocks) = btree_blocks else {
+            return;
+        };
         if has_lazy_counters(sb) && agf.btreeblks != btree_blocks {
             self.find(
                 Code::CounterAgfBtreeblks,
@@ -1387,12 +1448,16 @@ impl Checker<'_> {
     }
 
     /// The chunks against themselves and the AGI, and the inodes they
-    /// hold against what the chunks say about them.
+    /// hold against what the chunks say about them. When the inode btree
+    /// did not list every chunk, `listed` is false, and the chunks it did
+    /// list are not compared with the AGI's counts or added up as the
+    /// group's whole (#496).
     fn chunks(
         &mut self,
         ag: u32,
         agi: &crate::ag::Agi,
         chunks: &[InodeChunk],
+        listed: bool,
         totals: &mut Totals,
     ) {
         let sb = self.fs.superblock().clone();
@@ -1434,7 +1499,7 @@ impl Checker<'_> {
                 }
             }
         }
-        if count != u64::from(agi.count) || freecount != u64::from(agi.freecount) {
+        if listed && (count != u64::from(agi.count) || freecount != u64::from(agi.freecount)) {
             self.find(
                 Code::CounterAgiInodes,
                 Some(ag),
@@ -1447,6 +1512,7 @@ impl Checker<'_> {
         }
         totals.icount += count;
         totals.ifree += freecount;
+        totals.inodes_short |= !listed;
     }
 
     /// Every inode: allocated ones are in use and checksum, free ones are
@@ -2373,26 +2439,35 @@ impl Checker<'_> {
             );
             return;
         }
-        // A group whose AGF or AGI could not be read stopped before its
-        // free space and its inode btree were counted, so every total
-        // below is short by an amount nothing read can say (#489). An
-        // exact comparison is all these findings make, and it cannot be
-        // made: the counters go unchecked, as the partial scan says.
-        if !self.unread.is_empty() {
-            return;
-        }
         let sb = self.fs.superblock().clone();
-        for (code, name, said, counted) in [
-            (Code::CounterSbIcount, "icount", sb.icount, totals.icount),
-            (Code::CounterSbIfree, "ifree", sb.ifree, totals.ifree),
+        for (code, name, said, counted, short) in [
+            (
+                Code::CounterSbIcount,
+                "icount",
+                sb.icount,
+                totals.icount,
+                totals.inodes_short,
+            ),
+            (
+                Code::CounterSbIfree,
+                "ifree",
+                sb.ifree,
+                totals.ifree,
+                totals.inodes_short,
+            ),
             (
                 Code::CounterSbFdblocks,
                 "fdblocks",
                 sb.fdblocks,
                 totals.fdblocks,
+                totals.free_short,
             ),
         ] {
-            if said != counted {
+            // A total some group could not add to is short by an amount
+            // nothing read can say (#489, #496). An exact comparison is
+            // all this finding makes, and it cannot be made: the counter
+            // goes unchecked, as the partial scan says.
+            if !short && said != counted {
                 self.find(
                     code,
                     None,
