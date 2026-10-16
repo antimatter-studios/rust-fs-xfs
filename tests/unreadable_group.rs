@@ -14,6 +14,11 @@
 //! have listed, are never claimed, and the group's counters cannot be
 //! compared with records that were never read.
 //!
+//! An inode in a group whose inode btree was not read is not known to be
+//! free or allocated (#497). An entry naming it is not an entry into
+//! nothing; read on its own and found in use, it is walked like any
+//! other, and the blocks it owns elsewhere are claimed.
+//!
 //! Each case damages one structure on a volume this crate's `mkfs` made
 //! in memory, so it needs no tool and no fixture. What `xfs_repair -n`
 //! makes of a damaged AGF and a damaged free-space btree is
@@ -24,7 +29,7 @@
 use fs_core::{BlockDevice, BlockRead};
 use fs_xfs::check::{Code, Report, Scan};
 use fs_xfs::Filesystem;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 const BYTES: u64 = 400 * 1024 * 1024;
@@ -292,5 +297,98 @@ fn an_inode_btree_that_cannot_be_walked_is_unchecked_not_lost() {
         0,
         &[Code::Lost, Code::CounterAgiInodes, Code::FinobtMismatch],
         "inode",
+    );
+}
+
+/// A volume whose root holds a directory `d` with a file `f` in it, and a
+/// file `big` written a mebibyte past what group 0 has free, so that its
+/// inode is in group 0, as every inode here is, and some of its blocks
+/// are not. `big` is linked into `d` as well. Unmounted, so its log is
+/// clean.
+fn populated() -> Arc<Sparse> {
+    use fs_xfs::alloc_btree::{walk_from_agf, Order};
+    let dev = volume();
+    let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).expect("mount_rw");
+    let sb = fs.superblock().clone();
+    let root = sb.rootino;
+    let (d, _) = fs.create_directory(root, b"d", 0o040755).expect("mkdir");
+    let (f, _) = fs.create_file(d, b"f", 0o100644).expect("create");
+    fs.write(f, 0, &[1u8; 5000]).expect("write");
+    let (big, _) = fs.create_file(root, b"big", 0o100644).expect("create");
+    let bs = u64::from(sb.blocksize);
+    let agf = fs.read_agf(0).expect("the AGF");
+    let read = |b: u32| -> fs_xfs::Result<Vec<u8>> {
+        let mut raw = vec![0u8; bs as usize];
+        dev.read_at(u64::from(b) * bs, &mut raw)?;
+        Ok(raw)
+    };
+    let free: u64 = walk_from_agf(&sb, &agf, Order::ByBlock, read)
+        .expect("free space")
+        .iter()
+        .map(|e| u64::from(e.blockcount))
+        .sum();
+    fs.write(big, 0, &vec![2u8; (free * bs + 1024 * 1024) as usize])
+        .expect("a write larger than group 0");
+    fs.link(big, d, b"again").expect("link");
+    fs.unmount().expect("unmount");
+
+    let fs = mount(&dev);
+    let (inode, raw) = fs.read_inode_raw(big).expect("big");
+    let groups: BTreeSet<u32> = fs
+        .data_extents(&inode, &raw)
+        .expect("big's extents")
+        .iter()
+        .map(|e| sb.split_fsblock(e.startblock).0)
+        .collect();
+    assert!(
+        groups.iter().any(|&g| g != 0),
+        "big was meant to have blocks outside group 0, and is in groups {groups:?}"
+    );
+    let report = fs_xfs::check::check(&fs);
+    assert!(
+        report.is_clean(),
+        "the populated volume has findings:\n{}",
+        listed(&report)
+    );
+    dev
+}
+
+/// Group 0's inode btree cannot be walked, so no inode is known to be
+/// allocated. The root, `d`, `f` and `big` are each read on their own
+/// and walked: the tree is reached, every link counted, and `big`'s
+/// blocks outside group 0 are claimed.
+#[test]
+fn an_entry_into_a_group_whose_inode_btree_was_not_read_is_walked() {
+    let dev = populated();
+    let root = mount(&dev).read_agi(0).expect("the AGI").root;
+    damage_block(&dev, 0, root);
+    let report = fs_xfs::check::check(&mount(&dev));
+    assert_unwalked(&report, 0, "inode");
+    let wrong: Vec<String> = report
+        .findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.code,
+                Code::DirRoot
+                    | Code::DirEntryTarget
+                    | Code::DirUnreached
+                    | Code::InodeNlink
+                    | Code::Lost
+            )
+        })
+        .map(|f| format!("{} ag {:?}", f.code.as_str(), f.location.ag))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "inodes in a group whose inode btree was not read are judged as if none were \
+         allocated: {wrong:?}\n{}",
+        listed(&report)
+    );
+    assert_eq!(
+        report.directories,
+        2,
+        "the walk did not go through the root and d:\n{}",
+        listed(&report)
     );
 }

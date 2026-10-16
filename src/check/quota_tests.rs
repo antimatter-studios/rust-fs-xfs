@@ -135,6 +135,7 @@ fn run(
         rmaps: Vec::new(),
         refcounts: Vec::new(),
         unread: HashSet::new(),
+        inodes_unlisted: HashSet::new(),
     };
     c.quotas(inodes, raws);
     c.report

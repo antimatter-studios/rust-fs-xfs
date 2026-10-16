@@ -163,7 +163,7 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `dir.root` | error | yes | The root directory is missing or unreadable. |
 | `dir.not-a-directory` | error | yes | An inode reached as a directory is not one. |
 | `dir.unreadable` | error | yes | A directory's entries could not be read. |
-| `dir.entry-target` | error | no | A directory entry points at an inode that is not in use. |
+| `dir.entry-target` | error | no | A directory entry points at an inode that is not in use. An inode in a group whose inode btree was not read is not known to be allocated or free: it is read on its own and walked when it is in use, and otherwise left unchecked rather than reported. |
 | `dir.entry-ftype` | error | no | A directory entry's recorded type is not its inode's. |
 | `dir.reached-twice` | error | no | A directory is reached from more than one place. |
 | `dir.unreached` | error | no | An allocated inode is reached by no directory. |
