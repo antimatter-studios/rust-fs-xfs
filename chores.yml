@@ -729,7 +729,7 @@ tasks:
       - 'cp "../rust-fs-core/include/fs_core.h" "{{.OUT}}/include/fs_core.h"'
 
   lint:
-    desc: Formatting and clippy, exactly as CI runs them
+    desc: Formatting, clippy and current lockfiles, exactly as CI runs them
     cmds:
       - bash ../rust-fs-core/scripts/agents-core-check.sh
       - bash ../rust-fs-core/scripts/changelog-check.sh
@@ -741,6 +741,13 @@ tasks:
       # `--features cli`: the command-line tools' target requires it, and
       # clippy silently leaves out a target whose features are off.
       - cargo clippy --locked --all-targets --features cli -- -D warnings
+      # The fuzz targets are a workspace of their own (`exclude = ["fuzz"]`)
+      # with a lockfile of their own, and nothing a pull request ran resolved
+      # it: --locked above holds only the root one. A release bumped the
+      # crate's version, fuzz/Cargo.lock kept the old one, and only the
+      # nightly fuzz run found out, after the merge (#491). Resolving builds
+      # nothing, so it needs no nightly and no cargo-fuzz.
+      - cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
 
   build:
     desc: Debug build
