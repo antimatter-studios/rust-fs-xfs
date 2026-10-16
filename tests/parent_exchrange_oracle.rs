@@ -333,6 +333,15 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         ),
         "{tag}: a link to an inode whose attributes are past short form must be refused"
     );
+    // A rename trades the moved inode's pointer for its new name's, so the
+    // same fork refuses it, and neither name changes.
+    assert!(
+        matches!(
+            fs.rename(ino("/dir"), b"hello.txt", made, b"hello-moved"),
+            Err(Error::UnsupportedFeature(_))
+        ),
+        "{tag}: a rename of an inode whose attributes are past short form must be refused"
+    );
     fs.rename(root, b"top.txt", made, b"top-moved.txt")
         .expect("move a file with two links");
     fs.unlink_file(made, b"top-link")
@@ -427,6 +436,8 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         "/many/entry_001",
         "/many/entry_002",
         "/made/empty",
+        "/made/hello-link",
+        "/made/hello-moved",
     ] {
         assert!(
             fs.lookup_path(gone).is_err(),
