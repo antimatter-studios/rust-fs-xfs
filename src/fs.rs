@@ -493,6 +493,18 @@ impl Filesystem {
         }
     }
 
+    /// Let go of every block a record cancelled, as the kernel's
+    /// `xfs_trans_binval` marks a freed buffer stale (#495). The block is
+    /// free: an image an earlier record left in the overlay must neither be
+    /// read in place of what is written there next nor pushed over it.
+    pub(crate) fn cancelled_buffers(&self, cancels: &[crate::buf_write::BufferItem]) {
+        if let Some(overlay) = &self.overlay {
+            for item in cancels {
+                overlay.forget(item.blkno() * 512, item.image().len());
+            }
+        }
+    }
+
     /// Put a buffer this mount has just logged into the overlay, so the
     /// next operation reads it rather than the disk (#89).
     pub(crate) fn logged_buffer(&self, offset: u64, bytes: &[u8]) {

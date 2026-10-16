@@ -15,7 +15,9 @@
 //!
 //! What is kept is what recovery would write: whole buffers at their device
 //! offsets. It is not a cache with a policy; nothing is ever evicted,
-//! because dropping an entry would mean reading a stale disk again.
+//! because dropping an entry would mean reading a stale disk again. The
+//! one exception is a block a record cancels (#495): recovery will not
+//! write the earlier image either, so neither does this.
 
 use fs_core::{BlockRead, Result};
 use std::collections::BTreeMap;
@@ -63,6 +65,20 @@ impl Overlay {
                 block
             });
             entry[..chunk.len()].copy_from_slice(chunk);
+        }
+    }
+
+    /// Let go of whatever is held for `offset..offset + len`, without
+    /// writing it: a record cancelled those blocks, so the image an earlier
+    /// record put here describes a block that is free now (#495).
+    pub(crate) fn forget(&self, offset: u64, len: usize) {
+        let mut logged = self.logged.lock().expect("overlay poisoned");
+        let held: Vec<u64> = logged
+            .range(offset..offset + len as u64)
+            .map(|(&at, _)| at)
+            .collect();
+        for at in held {
+            logged.remove(&at);
         }
     }
 
@@ -247,6 +263,22 @@ mod tests {
         let written = device.bytes.lock().unwrap();
         assert!(written[512..1536].iter().all(|&b| b == 9), "on the device");
         assert!(written[..512].iter().all(|&b| b == 7), "and only there");
+    }
+
+    /// A cancelled block is let go of, unwritten, and reads the disk
+    /// again; the blocks around it are kept (#495).
+    #[test]
+    fn a_forgotten_block_reads_the_disk_again() {
+        let overlay = Overlay::new(device(vec![7u8; 4096]));
+        overlay.wrote(0, &[9u8; 2048]);
+        overlay.forget(512, 1024);
+
+        let mut buf = vec![0u8; 2048];
+        overlay.read_at(0, &mut buf).expect("read");
+        assert!(buf[..512].iter().all(|&b| b == 9), "before it, still held");
+        assert!(buf[512..1536].iter().all(|&b| b == 7), "the disk again");
+        assert!(buf[1536..].iter().all(|&b| b == 9), "after it, still held");
+        assert_eq!(overlay.bytes(), 1024, "two basic blocks let go of");
     }
 
     /// A later record over the same block wins, and a partial write keeps

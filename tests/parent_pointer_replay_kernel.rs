@@ -31,6 +31,12 @@
 //! one link moves a fork from short form to a leaf with its new pointer.
 //! The kernel has to replay those blocks, list every pointer, and still
 //! report every user attribute.
+//!
+//! And the last name of an inode whose attribute fork has blocks of its
+//! own frees all of them (#495): a leaf and remote values mapped by a
+//! B+tree, each unlinked, and a node, replaced by a rename. The guest's
+//! `xfs_repair -n` checks that every one of those blocks is free again
+//! after the replay, and owned by nothing.
 
 mod common;
 
@@ -81,6 +87,8 @@ fn survivors() -> Vec<(String, Vec<(String, String)>)> {
             &[("leaf-link", "/made"), ("node-link", "/made")],
         ),
         ("/made/node-moved", &[("node-moved", "/made")]),
+        // #495: the file a rename put in place of a freed one.
+        ("/node-last", &[("node-last", "/")]),
     ];
     let mut all: Vec<(String, Vec<(String, String)>)> = fixed
         .iter()
@@ -110,6 +118,9 @@ const GONE: &[&str] = &[
     "/made/leaf-moved",
     "/node.txt",
     "/node-too",
+    "/leaf-last",
+    "/tree-last",
+    "/made/over-node",
 ];
 
 /// The inodes whose forks were rebuilt past short form, and how many user
@@ -146,16 +157,30 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
         echo node > "$m/node.txt"
         for i in $(seq -w 0 299); do setfattr -n "user.name_$i" -v "value_$i" "$m/node.txt"; done
         ln "$m/node.txt" "$m/node-too"
+        # One name each, so removing it frees the inode with its attribute
+        # blocks (#495). Sixty remote values with every other one removed
+        # leave thirty extents with holes between them, more than the
+        # inode holds, so their map is a B+tree.
+        echo leaf > "$m/leaf-last"
+        for i in $(seq -w 0 29); do setfattr -n "user.name_$i" -v "value_$i" "$m/leaf-last"; done
+        echo node > "$m/node-last"
+        for i in $(seq -w 0 299); do setfattr -n "user.name_$i" -v "value_$i" "$m/node-last"; done
+        echo tree > "$m/tree-last"
+        big=$(head -c 3000 /dev/zero | tr '\0' v)
+        for i in $(seq -w 0 59); do setfattr -n "user.big_$i" -v "$big" "$m/tree-last"; done
+        for i in $(seq -w 1 2 59); do setfattr -x "user.big_$i" "$m/tree-last"; done
         umount "$m" || {{ echo UMOUNT_FAILED; exit 1; }}
         rmdir "$m"
         # The form each fork is in, as xfs_db reads attribute block 0.
-        for f in leaf.txt node.txt; do
+        for f in leaf.txt node.txt leaf-last node-last; do
             out=$({PARENT_XFSPROGS_BIN}/xfs_db -r -c "path /$f" -c "ablock 0" -c print {image} 2>&1 || true)
             if echo "$out" | grep -q '^hdr.level = '; then form=node
             elif echo "$out" | grep -q '^hdr.count = '; then form=leaf
             else form=neither; fi
             echo "FORM /$f $form"
         done
+        out=$({PARENT_XFSPROGS_BIN}/xfs_db -r -c "path /tree-last" -c "print core.aformat" {image} 2>&1 || true)
+        echo "AFORMAT /tree-last $out"
         echo DONE
         "#
     ));
@@ -164,12 +189,21 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
         built.contains("DONE"),
         "the guest did not build the volume:\n{built}"
     );
-    for (file, form) in [("/leaf.txt", "leaf"), ("/node.txt", "node")] {
+    for (file, form) in [
+        ("/leaf.txt", "leaf"),
+        ("/node.txt", "node"),
+        ("/leaf-last", "leaf"),
+        ("/node-last", "node"),
+    ] {
         assert!(
             built.contains(&format!("FORM {file} {form}")),
             "{file}: the kernel did not build a {form}-form attribute fork:\n{built}"
         );
     }
+    assert!(
+        built.contains("AFORMAT /tree-last core.aformat = 3 (btree)"),
+        "/tree-last: the kernel did not map its attribute fork with a B+tree:\n{built}"
+    );
 
     {
         let dev = FileDevice::open_rw(volume.path()).expect("open");
@@ -221,6 +255,18 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
             .expect("create");
         fs.link(long, made, b.as_bytes())
             .expect("a link whose parent pointer moves the attribute fork past short form");
+        // THE LAST NAME (#495): the inode freed with every block of its
+        // attribute fork, by an unlink and by a rename that replaces it.
+        fs.unlink_file(root, b"leaf-last")
+            .expect("unlink the last name of an inode whose attribute fork is a leaf");
+        fs.unlink_file(root, b"tree-last").expect(
+            "unlink the last name of an inode whose attribute fork maps remote values with a \
+             B+tree",
+        );
+        fs.create_file(made, b"over-node", 0o100644)
+            .expect("create");
+        fs.rename(made, b"over-node", root, b"node-last")
+            .expect("replace the last name of an inode whose attribute fork is a node");
         // DROPPED, NOT UNMOUNTED. An unmount checkpoints and leaves a
         // clean log (#439); without one, the records are all there is.
     }

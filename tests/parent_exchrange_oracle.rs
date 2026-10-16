@@ -517,9 +517,15 @@ fn xfs_db_attr_form(img: &Path, path: &str) -> &'static str {
 /// come through every rebuild, and xfs_db's own listing of each one's
 /// parent pointers has to match its names.
 ///
+/// The last name of an inode whose attribute fork has blocks of its own
+/// frees every one of them (#495): `/multi`, a leaf, once its other name is
+/// gone; `/treed`, whose remote values xfs_db mapped with holes between
+/// them until the map became a B+tree; and `/noded`, a node, replaced by a
+/// rename. The pinned `xfs_repair -n` checks that each block is free again
+/// and owned by nothing.
+///
 /// Still refused before anything is written, with the image byte-for-byte
 /// what it was and the volume `xfs_repair` grades afterwards agreeing:
-/// removing the last name of an inode with attribute blocks (#495), and
 /// linking `/remote`, whose fork past short form holds a 3000-byte value
 /// in blocks of its own (#501).
 fn keep_parent_pointers(tag: &str, img: &Path) {
@@ -541,9 +547,14 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
                 .expect("create");
             fs.link(made, root, second.as_bytes()).expect("link");
         }
+        // One name each, so removing it frees the inode (#495).
+        for only in ["noded", "treed"] {
+            fs.create_file(root, only.as_bytes(), 0o100644)
+                .expect("create");
+        }
         fs.unmount().expect("unmount");
     }
-    for (path, count) in [("/multi", 30), ("/bulky", 300)] {
+    for (path, count) in [("/multi", 30), ("/bulky", 300), ("/noded", 300)] {
         let mut db = parent_oracle("xfs_db")
             .args(["-x", "-c"])
             .arg(format!("path {path}"));
@@ -558,11 +569,23 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
     run(parent_oracle("xfs_db")
         .args(["-x", "-c", "path /remote", "-c", "attr_set -u -v 3000 big"])
         .arg(img));
+    // Sixty remote values, then every other one removed: each leaves a hole
+    // in the fork's map, the thirty extents left do not fit the inode, and
+    // the map becomes a B+tree (#495).
+    let mut db = parent_oracle("xfs_db").args(["-x", "-c", "path /treed"]);
+    for i in 0..60 {
+        db = db.arg("-c").arg(format!("attr_set -u -v 3000 big_{i:02}"));
+    }
+    for i in (1..60).step_by(2) {
+        db = db.arg("-c").arg(format!("attr_remove -u big_{i:02}"));
+    }
+    run(db.arg(img));
     for (path, form) in [
         ("/dir/hello.txt", "leaf"),
         ("/multi", "leaf"),
         ("/bulky", "node"),
         ("/remote", "leaf"),
+        ("/noded", "node"),
     ] {
         assert_eq!(
             xfs_db_attr_form(img, path),
@@ -570,6 +593,13 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
             "{tag} {path}: the attribute fork xfs_db built"
         );
     }
+    let treed = run(parent_oracle("xfs_db")
+        .args(["-r", "-c", "path /treed", "-c", "print core.aformat"])
+        .arg(img));
+    assert!(
+        treed.contains("core.aformat = 3 (btree)"),
+        "{tag} /treed: xfs_db did not map its attribute fork with a B+tree:\n{treed}"
+    );
     for path in ["/multi", "/bulky", "/remote"] {
         assert_eq!(
             xfs_db_parents(img, path).len(),
@@ -635,25 +665,18 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
     fs.unlink_file(made, long[2].as_bytes())
         .expect("unlink one of two names of an inode whose fork crossed to a leaf");
 
-    // Still refused (#495): the last name of an inode with attribute
-    // blocks. A refusal is decided before anything is written: every byte
-    // of the image, read back from the file, is what it was before the call.
-    let before = image_digest(img);
-    assert!(
-        matches!(
-            fs.unlink_file(root, b"multi"),
-            Err(Error::UnsupportedFeature(_))
-        ),
-        "{tag}: unlinking the last name of an inode with attribute blocks must be refused"
+    // THE LAST NAME (#495): the inode is freed with every block its
+    // attribute fork holds -- a leaf, remote values and the B+tree mapping
+    // them, a node -- by an unlink and by a rename that replaces it.
+    fs.unlink_file(root, b"multi")
+        .expect("unlink the last name of an inode whose attribute fork is a leaf");
+    fs.unlink_file(root, b"treed").expect(
+        "unlink the last name of an inode whose attribute fork maps remote values with a B+tree",
     );
-    assert!(
-        image_digest(img) == before,
-        "{tag}: a refused unlink changed the image"
-    );
-    assert!(
-        fs.lookup_path("/multi").is_ok(),
-        "{tag}: a refused unlink removed /multi"
-    );
+    fs.create_file(made, b"over-noded", 0o100644)
+        .expect("create");
+    fs.rename(made, b"over-noded", root, b"noded")
+        .expect("replace the last name of an inode whose attribute fork is a node");
     // Still refused (#501): a remote value beside the parent pointers.
     let before = image_digest(img);
     assert!(
@@ -734,7 +757,8 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         ("/made/bulky-link".into(), &[("bulky-link", "/made")]),
         ("/made/bulky-moved".into(), &[("bulky-moved", "/made")]),
         ("/made/hello-link".into(), &[("hello-link", "/made")]),
-        ("/multi".into(), &[("multi", "/")]),
+        // #495: the file the rename put in place of a freed one.
+        ("/noded".into(), &[("noded", "/")]),
         ("/remote".into(), &[("remote", "/"), ("remote-too", "/")]),
         (path(&long[0]), &crossing_links),
         (path(&long[1]), &crossing_links),
@@ -778,7 +802,6 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
     // the forks are still in the forms these cases are about.
     for (path, count, last, form) in [
         ("/made/bulky-link".to_string(), 30, "user.name_29", "leaf"),
-        ("/multi".into(), 30, "user.name_029", "leaf"),
         ("/made/bulky-moved".into(), 300, "user.name_299", "node"),
         (path(&long[0]), 0, "", "leaf"),
     ] {
@@ -816,6 +839,9 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         "/made/replacer".into(),
         "/made/remote-link".into(),
         "/multi-too".into(),
+        "/multi".into(),
+        "/treed".into(),
+        "/made/over-noded".into(),
         "/bulky".into(),
         "/bulky-too".into(),
         path(&long[2]),
