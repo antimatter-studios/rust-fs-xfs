@@ -1,15 +1,17 @@
 # Features
 
 What this driver does today, what it refuses, and what is coming. **Every
-pull request that adds, fixes, refuses or removes behaviour updates its row
-here, in the same pull request** (AGENTS.md). The reasoning behind each change
+pull request that adds, fixes, refuses or removes behaviour adds its row to
+[`features.d/`](../features.d/), in the same pull request**, never to this
+page (AGENTS.md); a release applies those rows here. The reasoning behind each change
 is in [CHANGELOG.md](../CHANGELOG.md); the measured transaction shapes are in
 [transaction-shapes.md](transaction-shapes.md).
 
 **Since** is the release a row's current state shipped in, with the issue or
 pull request the changelog cites for it. Work merged after the last release
-is **Unreleased (#N)** until the next one. **Tracking** names the issue for
-anything not finished.
+is a row in `features.d/` saying **Unreleased (#N)** until the next release
+writes it here with the version. **Tracking** names the issue for anything
+not finished.
 
 States:
 
@@ -44,9 +46,8 @@ States:
 | Dirty log: replayed into memory, the device untouched | Supported | 0.8.0 (#90) | | `dirty_log_mount.rs`, `log_oracle.rs` |
 | Log head found from cycle numbers, not a whole-ring read | Supported | 0.9.0 (#251) | | `read_path_cost.rs` |
 | `File` handle (`open`, `open_ino`, `root`) | Supported | 0.6.0 | | `file_handle_oracle.rs` |
-| Parent pointers and exchange-range volumes | Supported | 0.8.0 (#99); exchange-range writes 0.14.1 (#459); parent-pointer writes Unreleased (#373) | | `parent_exchrange_oracle.rs` |
-| Parent pointers read (`Filesystem::parent_pointers`): each name an inode has in a directory, with the directory and its generation, from a short-form, leaf or node attribute fork; kept through every rewrite of the fork, and never listed as an attribute | Supported | Unreleased (#373); leaf and node forks Unreleased (#500) | | `parent_exchrange_oracle.rs`, `parent_pointer_replay_kernel.rs`, `attr.rs` |
-| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied; reflinked files keep their reference counts and pass the reflink flag on, and a list is laid out inline or as a block-map B+tree as its length needs | Experimental | 0.14.1 (#459); reflinked and B+tree files Unreleased (#441) | | `exchange_range.rs`, `exchange_range_kernel.rs`, `rmap.rs` |
+| Parent pointers and exchange-range volumes | Supported; parent pointers read-only | 0.8.0 (#99); exchange-range writes 0.14.1 (#459) | #373 | `parent_exchrange_oracle.rs` |
+| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied | Experimental | 0.14.1 (#459) | | `exchange_range.rs`, `exchange_range_kernel.rs` |
 | Realtime files, read from the realtime device | Supported | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | A realtime file with no realtime device given | Refused (`RealtimeDeviceAbsent`, ENXIO) | 0.10.0 (#98) | | `realtime_oracle.rs` |
 | Reverse-mapping and reference-count trees | Supported | 0.7.0 | | `rmap_oracle.rs`, `refcount_oracle.rs` |
@@ -60,11 +61,9 @@ States:
 
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
-| `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339); a group whose AGF or AGI cannot be read left unchecked rather than lost, Unreleased (#494); likewise a group with a btree that cannot be walked, Unreleased (#502) | | `cli_fsck_oracle.rs`, `unreadable_group.rs` |
+| `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
 | Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | 0.13.0 (#403) | | `cli_fsck_oracle.rs` |
 | The checker through the C ABI: `fs_xfs_check` passes each finding (code, severity, group, block, inode, field, words) to a callback and fills a report of totals that tells a complete scan from a partial one | Experimental | 0.14.0 (#469) | | `capi_write_ops.rs` |
-| `fsck.xfs` on a target it cannot open, in every mode (`-n`, `--dry-run`, `-y`, `-p`): exit 8 and an error naming the target on stderr, with no report | Supported | Unreleased (#493) | | `cli_dispatch.rs` |
-| The repair through the C ABI: `fs_xfs_repair_with_fs_core_device` plans a repair over an `fs_core` device and, when asked, applies it, passing each change, refusal and unplanned finding to a callback that can cancel, and checks the volume again; the caller asserts nothing else uses the device | Experimental | Unreleased (#477) | | `capi_write_ops.rs` |
 | Every finding code damaged by a case `xfs_repair -n` agrees is damage, or listed with the reason it has none, held by a contract test | Supported | 0.13.0 (#426) | | `cli_fsck_oracle.rs`, `fsck_coverage_contract.rs` |
 | Quota records: quota inode references, record identities, v5 checksums and UUIDs, limits and grace timers, and accounting against allocated inode usage | Experimental | 0.13.0 (#402) | | `quota_records_oracle.rs`, `oracle_vm_fixtures.rs` |
 | Realtime metadata checked from the data device: geometry, each realtime file's extents, the bitmap against the extents files map, the summary against the bitmap, and `sb_frextents` (`rt.*`, `counter.sb.frextents`) | Experimental | 0.13.0 (#381) | | `realtime_check_oracle.rs` |
@@ -102,7 +101,7 @@ only.
 | Rename over an existing target: a file over a file, a directory over an empty directory, the replaced inode freed with its blocks when no link is left; a file over a directory (EISDIR), a directory over a file (ENOTDIR) and over a non-empty directory (ENOTEMPTY) refused | Experimental | 0.13.0 (#383) | | `rename_over_target.rs`, `rename_over_target_oracle.rs` |
 | Remove an empty directory (`remove_directory`), with the parent's link count; a non-empty one refused (`DirectoryNotEmpty`, ENOTEMPTY) and a non-directory (`NotADirectory`) before anything is written | Experimental | 0.13.0 (#385) | | `remove_directory.rs`, `rmdir_replay_oracle.rs` |
 | Hard links: `Filesystem::link` in any directory form; unlink of one of several names; the last name freeing the inode with its blocks and quota | Experimental | 0.13.0 (#384) | | `hardlinks.rs`, `hardlinks_oracle.rs` |
-| Freeing an inode whose attribute fork has blocks of its own (leaf, node, remote values or a B+tree map), when `unlink_file` removes its last name or `rename` replaces it: every block back to free space with its reverse-mapping record, its buffer cancelled and its quota credited, in the record that frees the inode | Experimental | Unreleased (#495) | | `final_unlink.rs`, `parent_exchrange_oracle.rs`, `parent_pointer_replay_kernel.rs` |
+| Freeing an inode whose attribute fork has blocks of its own (leaf, node, remote values or a B+tree map), when `unlink_file` removes its last name or `rename` replaces it: refused before anything is written | Refused | 0.13.0 (#384) | #495 | `parent_exchrange_oracle.rs` |
 | Extended attribute writes: set, create-only, replace-only and remove in `user.`, `trusted.` and `security.`, across short-form, leaf, node and remote forks, values to 64 KiB, quota charged for attribute blocks; C ABI `fs_xfs_setxattr`/`getxattr`/`listxattr`/`removexattr` | Experimental: the rebuilt attribute fork needs one free run | 0.13.0 (#389) | | `xattr_write_oracle.rs`, `xattr_capi.rs`, `oracle_vm_fixtures.rs` |
 | ACL writes: `set_acl`, `remove_acl` and `chmod`, access and default, kept in step with the mode; `set_attributes` refuses a permission change under an access ACL | Experimental | 0.13.0 (#422) | | `acl_write_oracle.rs`, `acl_write.rs` |
 | Names no directory entry can hold | Refused | 0.8.0 (#192) | | `entry_names.rs` |
@@ -120,7 +119,7 @@ only.
 | Damaged group, inode-chunk, free-space and reference-count records | Refused before anything is built | 0.11.0 (#92, #314) | | `group_record_oracle.rs`, `free_space_record_oracle.rs`, `inode_chunk_record_oracle.rs`, `refcount_record_oracle.rs`, `extent_bounds_oracle.rs` |
 | User, group and project quota accounting, with hard limits | Experimental | 0.13.0 (#396, #397) | | `quota_accounting_oracle.rs` |
 | Every write against every legal feature combination | Supported | 0.8.0 | | `feature_matrix_oracle.rs` |
-| Writing a volume with parent pointers: `create_file`, `create_directory`, `create_symlink`, `link`, `rename`, `rename_in_directory`, `unlink_file` and `remove_directory` add, move or remove each pointer in the same transaction as the directory entry. An attribute fork past short form, or pushed past it by the new pointer, is rebuilt as a leaf or a node in one free run, every pointer under the kernel's parent-pointer hash. A value such a fork stores in blocks of its own is rebuilt with it, written before the transaction into a run that was free before the transaction began, never into blocks the same change gives back (#501). The last name of an inode with attribute blocks frees them all (#495) | Experimental: the rebuilt attribute fork needs one free run | Unreleased (#373); leaf and node forks Unreleased (#500); last names Unreleased (#495); remote values Unreleased (#501) | | `parent_exchrange_oracle.rs`, `parent_pointer_replay_kernel.rs`, `feature_bit_contract.rs` |
+| Writing a volume with parent pointers | Refused | 0.8.0 (#99) | #373 | `parent_exchrange_oracle.rs` |
 | Writing a v4 volume | Partial: in-place overwrite only; journalled operations refused | 0.5.0 | | `feature_matrix_oracle.rs` |
 | Writing a volume whose log is dirty | Refused | 0.5.0 | | |
 | Superblock written back | Supported | 0.5.2 | | `super_write_oracle.rs` |

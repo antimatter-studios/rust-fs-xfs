@@ -1,0 +1,19 @@
+## Reading
+
+| Parent pointers and exchange-range volumes | Supported | 0.8.0 (#99); exchange-range writes 0.14.1 (#459); parent-pointer writes Unreleased (#373) | | `parent_exchrange_oracle.rs` |
+| Parent pointers read (`Filesystem::parent_pointers`): each name an inode has in a directory, with the directory and its generation, from a short-form, leaf or node attribute fork; kept through every rewrite of the fork, and never listed as an attribute | Supported | Unreleased (#373); leaf and node forks Unreleased (#500) | | `parent_exchrange_oracle.rs`, `parent_pointer_replay_kernel.rs`, `attr.rs` |
+rename: Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied
+| Exchange a range of two files' data (`Filesystem::exchange_range`): extents, block counts, reverse-map records and quota swap in one checkpoint, no data copied; reflinked files keep their reference counts and pass the reflink flag on, and a list is laid out inline or as a block-map B+tree as its length needs | Experimental | 0.14.1 (#459); reflinked and B+tree files Unreleased (#441) | | `exchange_range.rs`, `exchange_range_kernel.rs`, `rmap.rs` |
+
+## Checking
+
+| `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339); a group whose AGF or AGI cannot be read left unchecked rather than lost, Unreleased (#494); likewise a group with a btree that cannot be walked, Unreleased (#502) | | `cli_fsck_oracle.rs`, `unreadable_group.rs` |
+| `fsck.xfs` on a target it cannot open, in every mode (`-n`, `--dry-run`, `-y`, `-p`): exit 8 and an error naming the target on stderr, with no report | Supported | Unreleased (#493) | | `cli_dispatch.rs` |
+| The repair through the C ABI: `fs_xfs_repair_with_fs_core_device` plans a repair over an `fs_core` device and, when asked, applies it, passing each change, refusal and unplanned finding to a callback that can cancel, and checks the volume again; the caller asserts nothing else uses the device | Experimental | Unreleased (#477) | | `capi_write_ops.rs` |
+
+## Writing
+
+rename: Freeing an inode whose attribute fork has blocks of its own (leaf, node, remote values or a B+tree map), when `unlink_file` removes its last name or `rename` replaces it: refused before anything is written
+| Freeing an inode whose attribute fork has blocks of its own (leaf, node, remote values or a B+tree map), when `unlink_file` removes its last name or `rename` replaces it: every block back to free space with its reverse-mapping record, its buffer cancelled and its quota credited, in the record that frees the inode | Experimental | Unreleased (#495) | | `final_unlink.rs`, `parent_exchrange_oracle.rs`, `parent_pointer_replay_kernel.rs` |
+rename: Writing a volume with parent pointers
+| Writing a volume with parent pointers: `create_file`, `create_directory`, `create_symlink`, `link`, `rename`, `rename_in_directory`, `unlink_file` and `remove_directory` add, move or remove each pointer in the same transaction as the directory entry. An attribute fork past short form, or pushed past it by the new pointer, is rebuilt as a leaf or a node in one free run, every pointer under the kernel's parent-pointer hash. A value such a fork stores in blocks of its own is rebuilt with it, written before the transaction into a run that was free before the transaction began, never into blocks the same change gives back (#501). The last name of an inode with attribute blocks frees them all (#495) | Experimental: the rebuilt attribute fork needs one free run | Unreleased (#373); leaf and node forks Unreleased (#500); last names Unreleased (#495); remote values Unreleased (#501) | | `parent_exchrange_oracle.rs`, `parent_pointer_replay_kernel.rs`, `feature_bit_contract.rs` |
