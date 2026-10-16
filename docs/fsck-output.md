@@ -132,10 +132,10 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `sb.copy.uuid` | error | no | A secondary superblock carries another filesystem's UUID. |
 | `ag.agf.unreadable` | error | yes | A group's AGF could not be read. Nothing else in the group is checked: its blocks are not reported `lost`, and the superblock's `counter.sb.*` counts are not compared. |
 | `ag.agi.unreadable` | error | yes | A group's AGI could not be read. Nothing else in the group is checked: its blocks are not reported `lost`, and the superblock's `counter.sb.*` counts are not compared. |
-| `ag.agfl.unreadable` | error | yes | A group's free list could not be read. |
+| `ag.agfl.unreadable` | error | yes | A group's free list could not be read. The group's blocks are not reported `lost`. |
 | `ag.length` | error | no | The AGF, the AGI and the geometry disagree on a group's length. |
-| `btree.unreadable` | error | yes | A btree could not be walked. |
-| `inobt.record` | error | yes | An inode btree record could not be decoded. |
+| `btree.unreadable` | error | yes | A btree could not be walked. What it holds is unchecked: its group's blocks are not reported `lost`, nothing it would have listed is compared with the other free-space btree, the AGF or the AGI, and a superblock count it would have added to (`counter.sb.fdblocks` for the free-space-by-block btree, `counter.sb.icount` and `counter.sb.ifree` for the inode btree) is not compared. |
+| `inobt.record` | error | yes | An inode btree record could not be decoded. As for an inode btree that cannot be walked, the group's blocks are not reported `lost` and its inode counts are not compared. |
 | `inobt.chunk-count` | error | no | An inode chunk's counts disagree with its masks. |
 | `finobt.mismatch` | error | no | The free inode btree is not the inode btree's chunks with a free inode. |
 | `freesp.empty` | error | no | A free-space record is empty. |
@@ -154,7 +154,7 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `range.block` | error | no | Blocks are claimed outside the group, or outside any group. |
 | `range.extent` | error | no | An inode maps an extent outside one allocation group. |
 | `cross-link` | error | no | A block is claimed by two owners. |
-| `lost` | error | no | Blocks are claimed by nothing, in a group whose AGF and AGI were read. |
+| `lost` | error | no | Blocks are claimed by nothing, in a group whose AGF, AGI, free list and btrees were all read. |
 | `extent.unreadable` | error | yes | An inode's extent list or extent tree could not be read. |
 | `inode.unreadable` | error | yes | An inode could not be read. |
 | `inode.free-in-use` | error | no | An inode the inode btree calls free is in use. |

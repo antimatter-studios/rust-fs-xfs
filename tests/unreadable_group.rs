@@ -9,10 +9,16 @@
 //! scan, not lost; and the superblock's counters cannot be compared with
 //! totals the group never added to.
 //!
-//! Each case damages the last group's header on a volume this crate's
-//! `mkfs` made in memory, so it needs no tool and no fixture. What
-//! `xfs_repair -n` makes of a damaged AGF is
-//! `a_group_that_cannot_be_read_is_a_partial_scan` in
+//! A btree that cannot be walked is the same thing on a smaller scale
+//! (#496): its own blocks, and the free extents or inode chunks it would
+//! have listed, are never claimed, and the group's counters cannot be
+//! compared with records that were never read.
+//!
+//! Each case damages one structure on a volume this crate's `mkfs` made
+//! in memory, so it needs no tool and no fixture. What `xfs_repair -n`
+//! makes of a damaged AGF and a damaged free-space btree is
+//! `a_group_that_cannot_be_read_is_a_partial_scan` and
+//! `a_free_space_btree_that_cannot_be_walked_is_a_partial_scan` in
 //! `tests/cli_fsck_oracle.rs`.
 
 use fs_core::{BlockDevice, BlockRead};
@@ -186,4 +192,105 @@ fn a_group_whose_agi_cannot_be_read_is_unchecked_not_lost() {
     damage_magic(&dev, 2);
     let report = fs_xfs::check::check(&fs);
     assert_unchecked_not_lost(&report, Code::AgiUnreadable, "AGI");
+}
+
+/// Zero the magic of block `agbno` of group `ag`, so the btree it
+/// belongs to cannot be walked.
+fn damage_block(dev: &Arc<Sparse>, ag: u32, agbno: u32) {
+    let sb = mount(dev).superblock().clone();
+    let at = (u64::from(ag) * u64::from(sb.agblocks) + u64::from(agbno)) * u64::from(sb.blocksize);
+    dev.write_at(at, &[0; 4]).unwrap();
+}
+
+/// The scan is partial, and `btree.unreadable` names group `ag`.
+fn assert_unwalked(report: &Report, ag: u32, tree: &str) {
+    let all = listed(report);
+    assert_eq!(
+        report.scan,
+        Scan::Partial,
+        "a {tree} btree that cannot be walked is not a complete scan:\n{all}"
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.code == Code::BtreeUnreadable && f.location.ag == Some(ag)),
+        "no btree.unreadable for group {ag}'s {tree} btree:\n{all}"
+    );
+}
+
+/// None of `in_group` is reported for group `ag`, and no superblock
+/// counter at all: each would be a claim about records nobody read.
+fn assert_none_derived(report: &Report, ag: u32, in_group: &[Code], tree: &str) {
+    let sb_counters = [
+        Code::CounterSbIcount,
+        Code::CounterSbIfree,
+        Code::CounterSbFdblocks,
+    ];
+    let derived: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| {
+            (in_group.contains(&f.code) && f.location.ag == Some(ag))
+                || sb_counters.contains(&f.code)
+        })
+        .map(|f| f.code.as_str())
+        .collect();
+    assert!(
+        derived.is_empty(),
+        "group {ag}'s {tree} btree cannot be walked, and the check still reports {derived:?} \
+         from what it did not read:\n{}",
+        listed(report)
+    );
+}
+
+/// What a free-space btree that cannot be walked would otherwise be
+/// blamed for: its group's free extents and its own blocks as lost, the
+/// two trees as disagreeing, and the AGF's counts as wrong.
+const FREE_SPACE_DERIVED: [Code; 5] = [
+    Code::Lost,
+    Code::FreespDisagree,
+    Code::CounterAgfFreeblks,
+    Code::CounterAgfLongest,
+    Code::CounterAgfBtreeblks,
+];
+
+#[test]
+fn a_free_space_by_block_btree_that_cannot_be_walked_is_unchecked_not_lost() {
+    use fs_xfs::ag::agf_btree::BNO;
+    let dev = volume();
+    let root = mount(&dev).read_agf(GROUP).expect("the AGF").roots[BNO];
+    damage_block(&dev, GROUP, root);
+    let report = fs_xfs::check::check(&mount(&dev));
+    assert_unwalked(&report, GROUP, "free-space-by-block");
+    assert_none_derived(&report, GROUP, &FREE_SPACE_DERIVED, "free-space-by-block");
+}
+
+#[test]
+fn a_free_space_by_count_btree_that_cannot_be_walked_is_unchecked_not_lost() {
+    use fs_xfs::ag::agf_btree::CNT;
+    let dev = volume();
+    let root = mount(&dev).read_agf(GROUP).expect("the AGF").roots[CNT];
+    damage_block(&dev, GROUP, root);
+    let report = fs_xfs::check::check(&mount(&dev));
+    assert_unwalked(&report, GROUP, "free-space-by-count");
+    assert_none_derived(&report, GROUP, &FREE_SPACE_DERIVED, "free-space-by-count");
+}
+
+/// Group 0, because it holds the root directory's chunk, the one chunk a
+/// fresh volume has: an inode btree that cannot be walked there leaves
+/// that chunk unlisted, unclaimed and uncounted.
+#[test]
+fn an_inode_btree_that_cannot_be_walked_is_unchecked_not_lost() {
+    let dev = volume();
+    let root = mount(&dev).read_agi(0).expect("the AGI").root;
+    damage_block(&dev, 0, root);
+    let report = fs_xfs::check::check(&mount(&dev));
+    assert_unwalked(&report, 0, "inode");
+    assert_none_derived(
+        &report,
+        0,
+        &[Code::Lost, Code::CounterAgiInodes, Code::FinobtMismatch],
+        "inode",
+    );
 }

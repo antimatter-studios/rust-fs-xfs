@@ -812,6 +812,63 @@ fn a_group_that_cannot_be_read_is_a_partial_scan() {
 }
 
 #[test]
+fn a_free_space_btree_that_cannot_be_walked_is_a_partial_scan() {
+    let source = fixture("xfsdata-default.img");
+    let last = db_value(source.to_str().unwrap(), &["sb 0", "p agcount"]) - 1;
+    let commands = vec![
+        format!("agf {last}"),
+        "addr bnoroot".into(),
+        "write -d magic 0".into(),
+    ];
+    let image = damaged(&source, "bnobt-magic", &commands);
+    let image = image.path().to_str().unwrap();
+    let (clean, said) = repair(image);
+    assert!(
+        !clean,
+        "xfs_repair -n finds nothing wrong with {commands:?}:\n{said}"
+    );
+    let got = report_of(image);
+    assert_eq!(
+        (got.scan.as_str(), got.clean, got.exit),
+        ("partial", false, Some(4)),
+        "a free-space btree that cannot be walked is not a complete scan:\n{}",
+        got.json
+    );
+    assert!(
+        got.findings
+            .contains(&row("btree.unreadable", Some(last), None, None)),
+        "no btree.unreadable for group {last}:\n{}",
+        got.json
+    );
+    // Its free extents and its own blocks were never claimed, and the
+    // AGF's and the superblock's counts were never added up (#496).
+    let derived: Vec<&Row> = got
+        .findings
+        .iter()
+        .filter(|f| {
+            (f.ag == Some(last)
+                && matches!(
+                    f.code.as_str(),
+                    "lost"
+                        | "freesp.disagree"
+                        | "counter.agf.freeblks"
+                        | "counter.agf.longest"
+                        | "counter.agf.btreeblks"
+                ))
+                || matches!(
+                    f.code.as_str(),
+                    "counter.sb.icount" | "counter.sb.ifree" | "counter.sb.fdblocks"
+                )
+        })
+        .collect();
+    assert!(
+        derived.is_empty(),
+        "findings made from the btree that was not read: {derived:?}\n{}",
+        got.json
+    );
+}
+
+#[test]
 fn a_volume_that_cannot_be_mounted_reports_no_scan() {
     let source = fixture("xfsdata-default.img");
     let commands = vec!["sb 0".into(), "write -d blocklog 10".into()];
