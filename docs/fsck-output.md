@@ -58,7 +58,10 @@ it applies nothing: the plan is what a repair would do. It first takes the
 target for itself: an exclusive lock on the file and, on Linux, no mount or
 loop device using it. If that fails, the report has scan `none`, a `plan`
 with status `refused` and a `repair.not-exclusive` refusal, and exit `8`.
-Otherwise the exit status is the check's.
+Otherwise the exit status is the check's. A target that cannot be opened at
+all, such as a path that does not exist, has no report in any mode,
+`--dry-run`, `-y` and `-p` included: an error naming it on stderr, and
+exit `8`.
 
 | Key | Type | Meaning |
 |---|---|---|
