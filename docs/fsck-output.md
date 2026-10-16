@@ -130,8 +130,8 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `sb.copy.unreadable` | error | no | A secondary superblock could not be read or parsed, or failed its checksum. Nothing is reached through a copy, so the scan is not made partial. |
 | `sb.copy.field` | error | no | A secondary superblock disagrees with the primary on a field. |
 | `sb.copy.uuid` | error | no | A secondary superblock carries another filesystem's UUID. |
-| `ag.agf.unreadable` | error | yes | A group's AGF could not be read. |
-| `ag.agi.unreadable` | error | yes | A group's AGI could not be read. |
+| `ag.agf.unreadable` | error | yes | A group's AGF could not be read. Nothing else in the group is checked: its blocks are not reported `lost`, and the superblock's `counter.sb.*` counts are not compared. |
+| `ag.agi.unreadable` | error | yes | A group's AGI could not be read. Nothing else in the group is checked: its blocks are not reported `lost`, and the superblock's `counter.sb.*` counts are not compared. |
 | `ag.agfl.unreadable` | error | yes | A group's free list could not be read. |
 | `ag.length` | error | no | The AGF, the AGI and the geometry disagree on a group's length. |
 | `btree.unreadable` | error | yes | A btree could not be walked. |
@@ -154,7 +154,7 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `range.block` | error | no | Blocks are claimed outside the group, or outside any group. |
 | `range.extent` | error | no | An inode maps an extent outside one allocation group. |
 | `cross-link` | error | no | A block is claimed by two owners. |
-| `lost` | error | no | Blocks are claimed by nothing. |
+| `lost` | error | no | Blocks are claimed by nothing, in a group whose AGF and AGI were read. |
 | `extent.unreadable` | error | yes | An inode's extent list or extent tree could not be read. |
 | `inode.unreadable` | error | yes | An inode could not be read. |
 | `inode.free-in-use` | error | no | An inode the inode btree calls free is in use. |

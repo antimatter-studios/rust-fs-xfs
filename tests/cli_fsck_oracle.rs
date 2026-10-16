@@ -792,6 +792,23 @@ fn a_group_that_cannot_be_read_is_a_partial_scan() {
         "no ag.agf.unreadable for group {last}:\n{}",
         got.json
     );
+    // The group's blocks were never claimed: unchecked, not lost (#489).
+    assert!(
+        !got.findings
+            .iter()
+            .any(|f| f.code == "lost" && f.ag == Some(last)),
+        "the blocks of group {last}, whose AGF cannot be read, are reported lost:\n{}",
+        got.json
+    );
+    // Nor are the superblock's counters held to totals it never added to.
+    assert!(
+        !got.findings.iter().any(|f| matches!(
+            f.code.as_str(),
+            "counter.sb.icount" | "counter.sb.ifree" | "counter.sb.fdblocks"
+        )),
+        "the superblock's counters are compared without group {last}:\n{}",
+        got.json
+    );
 }
 
 #[test]
