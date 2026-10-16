@@ -1586,6 +1586,14 @@ impl Checker<'_> {
             }
         }
 
+        // A quota inode in a group whose inode btree did not list every
+        // chunk is not known to be allocated, and no directory reaches it
+        // to have the walk below read it on its own (#507).
+        for ino in [sb.uquotino, sb.gquotino, sb.pquotino] {
+            if ino != 0 && ino != u64::MAX {
+                self.adopt(ino, &mut usable, &mut raws);
+            }
+        }
         self.quotas(&usable, &raws);
 
         // The tree, from the root.

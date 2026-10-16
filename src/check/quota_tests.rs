@@ -192,6 +192,29 @@ fn accounting_requires_a_complete_checked_walk_and_excludes_quota_storage() {
     assert!(run(&fs, &inodes, &raws, &[999, 1000]).is_clean());
 }
 
+/// The user quota inode, 999, is in group 0, whose inode btree did not
+/// list every chunk, and was not in use when read on its own, so the
+/// walk has no inode for it (#507). Nothing read says it is not
+/// allocated, so it is unchecked. With every group listed, the same walk
+/// says it is not allocated.
+#[test]
+fn a_quota_inode_in_a_group_that_did_not_list_its_inodes_is_unchecked() {
+    let (fs, mut inodes, raws) = model();
+    inodes.remove(&999);
+    let found = run_unlisted(&fs, &inodes, &raws, &[1000], &[0]);
+    assert!(
+        found.is_clean(),
+        "a quota inode in an unlisted group was reported: {:?}",
+        found.findings
+    );
+    let found = run(&fs, &inodes, &raws, &[1000]);
+    assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+    assert_eq!(found.findings[0].code, Code::QuotaInode);
+    assert!(found.findings[0]
+        .what
+        .contains("is not a readable allocated inode"));
+}
+
 #[test]
 fn missing_duplicate_and_invalid_quota_inode_references_are_findings() {
     let (mut fs, mut inodes, raws) = model();
