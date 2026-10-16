@@ -121,6 +121,16 @@ fn build(tag: &str, args: &[&str]) -> (PathBuf, Vec<u8>) {
     (dir, big_bytes)
 }
 
+/// The SHA-256 of every byte of `img`, streamed from the file, so a
+/// refusal can be shown to have written nothing without a second copy.
+fn image_digest(img: &Path) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(img).unwrap();
+    std::io::copy(&mut file, &mut hasher).unwrap();
+    hasher.finalize().to_vec()
+}
+
 /// How many attribute entries xfs_db sees on `path`, and how many of them
 /// are parent pointers.
 fn xfs_db_attr_counts(img: &Path, path: &str) -> (usize, usize) {
@@ -309,9 +319,36 @@ fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
 /// - `unlink_file` of a last link and `remove_directory` free the inode.
 ///
 /// `/dir/hello.txt` holds 30 user attributes, a leaf-form fork, where a
-/// parent pointer is not written yet: a link to it is refused, and the
-/// volume `xfs_repair` grades afterwards shows the refusal changed nothing.
+/// parent pointer is not written yet: a link to it and a rename of it are
+/// refused, as is unlinking one name of `/multi`, a two-link inode with the
+/// same kind of fork. Each refusal leaves the image byte-for-byte as it
+/// was, and the volume `xfs_repair` grades afterwards agrees.
 fn keep_parent_pointers(tag: &str, img: &Path) {
+    // `/multi` and `/multi-too` are two links to one inode. The driver
+    // makes both while its fork is short form, then xfs_db gives it 30
+    // user attributes, which puts the fork past short form, so unlinking
+    // one of the two names must be refused like the link and the rename.
+    {
+        let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(img).unwrap()))
+            .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
+        let root = fs.superblock().rootino;
+        let (multi, _) = fs.create_file(root, b"multi", 0o100644).expect("create");
+        fs.link(multi, root, b"multi-too").expect("link");
+        fs.unmount().expect("unmount");
+    }
+    let mut db = parent_oracle("xfs_db").args(["-x", "-c", "path /multi"]);
+    for i in 0..30 {
+        db = db
+            .arg("-c")
+            .arg(format!("attr_set -u name_{i:02} value_{i:02}"));
+    }
+    run(db.arg(img));
+    assert_eq!(
+        xfs_db_attr_counts(img, "/multi").1,
+        2,
+        "{tag} /multi: xfs_db's count of its parent pointers before the refusal"
+    );
+
     let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(img).unwrap()))
         .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
     let root = fs.superblock().rootino;
@@ -326,12 +363,53 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
     fs.create_symlink(made, b"sym", b"../top.txt")
         .expect("symlink");
     fs.link(ino("/top.txt"), made, b"top-link").expect("link");
+    // A refusal is decided before anything is written: every byte of the
+    // image, read back from the file, is what it was before the call.
+    let before = image_digest(img);
     assert!(
         matches!(
             fs.link(ino("/dir/hello.txt"), made, b"hello-link"),
             Err(Error::UnsupportedFeature(_))
         ),
         "{tag}: a link to an inode whose attributes are past short form must be refused"
+    );
+    assert!(
+        image_digest(img) == before,
+        "{tag}: a refused link changed the image"
+    );
+    // A rename trades the moved inode's pointer for its new name's, so the
+    // same fork refuses it, and neither name changes.
+    let before = image_digest(img);
+    assert!(
+        matches!(
+            fs.rename(ino("/dir"), b"hello.txt", made, b"hello-moved"),
+            Err(Error::UnsupportedFeature(_))
+        ),
+        "{tag}: a rename of an inode whose attributes are past short form must be refused"
+    );
+    assert!(
+        image_digest(img) == before,
+        "{tag}: a refused rename changed the image"
+    );
+    // Unlinking one of two links removes that name's pointer from the same
+    // fork, so it is refused, and both names and the link count stay.
+    let before = image_digest(img);
+    assert!(
+        matches!(
+            fs.unlink_file(root, b"multi-too"),
+            Err(Error::UnsupportedFeature(_))
+        ),
+        "{tag}: an unlink of one of two links to an inode whose attributes are \
+         past short form must be refused"
+    );
+    assert!(
+        image_digest(img) == before,
+        "{tag}: a refused unlink changed the image"
+    );
+    assert_eq!(
+        ino("/multi"),
+        ino("/multi-too"),
+        "{tag}: /multi lost a name"
     );
     fs.rename(root, b"top.txt", made, b"top-moved.txt")
         .expect("move a file with two links");
@@ -415,7 +493,11 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         );
     }
     // The independent count of the same thing: xfs_db, reading the fork.
-    for (path, parents) in [("/made/top-moved.txt", 1), ("/made/twice", 2)] {
+    for (path, parents) in [
+        ("/made/top-moved.txt", 1),
+        ("/made/twice", 2),
+        ("/multi", 2),
+    ] {
         assert_eq!(
             xfs_db_attr_counts(img, path).1,
             parents,
@@ -427,6 +509,8 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         "/many/entry_001",
         "/many/entry_002",
         "/made/empty",
+        "/made/hello-link",
+        "/made/hello-moved",
     ] {
         assert!(
             fs.lookup_path(gone).is_err(),
