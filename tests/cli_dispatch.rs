@@ -179,6 +179,55 @@ fn a_failed_run_is_a_structured_error_on_stderr_with_status_1() {
 }
 
 #[test]
+fn fsck_on_a_path_that_does_not_exist_is_an_error_naming_it_with_status_8() {
+    // fsck(8)'s 8 is "the target could not be checked" (#490). A caller
+    // that runs a repair tells "could not run" from "repaired" (1) and
+    // "damage left" (4) by the status alone, and a person reads why on
+    // stderr. Every mode is asked: check only, plan, repair and preen
+    // each reach the target their own way before it is opened.
+    let scratch = scratch_dir("fsck-missing");
+    let missing = scratch.path().join("never-created.img");
+    let missing = missing.to_str().unwrap();
+    for mode in ["-n", "--dry-run", "-y", "-p"] {
+        let out = tool("fsck.xfs").args([mode, missing]).output().unwrap();
+        let err = stderr(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(8),
+            "fsck.xfs {mode} on a missing path\nstdout:\n{}\nstderr:\n{err}",
+            stdout(&out)
+        );
+        assert!(
+            err.starts_with("{\"error\": \"")
+                && err.contains(missing)
+                && err.trim_end().ends_with("\"code\": 8}"),
+            "fsck.xfs {mode}: no structured error naming {missing} on stderr\n\
+             stdout:\n{}\nstderr:\n{err}",
+            stdout(&out)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "fsck.xfs {mode}: a target that could not be opened has no report\n\
+             stdout:\n{}",
+            stdout(&out)
+        );
+
+        let out = tool("fsck.xfs")
+            .args(["--text", mode, missing])
+            .output()
+            .unwrap();
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(8), "fsck.xfs --text {mode}: {err}");
+        assert!(
+            err.starts_with("fsck.xfs: ") && err.contains(missing),
+            "fsck.xfs --text {mode}: no error naming {missing} on stderr\n\
+             stdout:\n{}\nstderr:\n{err}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn what_the_library_cannot_do_answers_not_implemented_with_status_3() {
     // The verb does not open the image: the answer does not depend on it.
     let out = tool("fs.xfs")

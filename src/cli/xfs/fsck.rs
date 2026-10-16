@@ -150,6 +150,15 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
     let offset = *matches.get_one::<u64>("offset").expect("defaulted");
     let dry_run = matches.get_flag("dry-run");
 
+    // A target that cannot be opened is an operational error in every
+    // mode, as it is for a check (#490): an error naming it on stderr, not
+    // a plan refused for want of exclusive access, which says another
+    // holder has a target that is there.
+    if dry_run || repairing {
+        std::fs::File::open(target)
+            .map_err(|e| CliError::failed(format!("open {name}: {e}")).with_code(OPERATIONAL))?;
+    }
+
     // Taken before anything is read, and held until the plan is made.
     let access = if dry_run || repairing {
         match fs_xfs::repair::Exclusive::claim(std::path::Path::new(target)) {
