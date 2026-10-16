@@ -293,7 +293,7 @@ chore test:kernel-new # the same on the Debian 13 guest (kernel 6.12), for what 
 chore test:vm         # the whole suite compiled and run inside the guest
 chore test:scripts    # the shell tests, tests/scripts/*.sh, by glob
 chore test            # all of it but test:kernel-new, exactly as CI's x86_64 job runs it
-chore lint            # cargo fmt --check and clippy -D warnings, as CI runs them
+chore lint            # cargo fmt --check, clippy -D warnings and fuzz/Cargo.lock current, as CI runs them
 ```
 
 A tier prints a verdict and writes everything it saw to `tmp/logs/<tier>.log`; add
