@@ -889,6 +889,12 @@ const fn rol32(x: u32, n: u32) -> u32 {
 /// the entries a lookup must examine are a *range* of the sorted index,
 /// not a single slot.
 ///
+/// A parent pointer ([`flags::PARENT`]) is the one entry not filed under
+/// this hash of its name. The kernel's `xfs_parent_hashval` takes the hash
+/// the name has as a directory entry, case-folded on a case-insensitive
+/// volume, and XORs in both 32-bit halves of the directory's inode number,
+/// which is the first eight bytes of the entry's value (#488).
+///
 /// # Shape
 ///
 /// Four bytes are consumed per round, each contributing seven bits of

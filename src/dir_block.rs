@@ -86,7 +86,13 @@ use crate::superblock::Superblock;
 /// `Mixed` to 0xdd3e32e0; on a case-insensitive one, 0xdd3e32e2 — and
 /// `hashname` of the lowercased name is exactly that.
 pub(crate) fn hash_for(sb: &Superblock, name: &[u8]) -> u32 {
-    if sb.has_case_insensitive_dirs() {
+    hash_folded(sb.has_case_insensitive_dirs(), name)
+}
+
+/// [`hash_for`], told whether the volume folds the case of names. A
+/// parent pointer's hash starts from this one (#488).
+pub(crate) fn hash_folded(case_insensitive: bool, name: &[u8]) -> u32 {
+    if case_insensitive {
         let folded: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
         hashname(&folded)
     } else {

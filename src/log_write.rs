@@ -200,16 +200,17 @@ pub fn inode_log_format_with_forks(
     v
 }
 
-/// The operations that log inode `ino`'s core, and after it its short-form
-/// attribute fork when `afork` is not empty (#373): two operations, or
-/// three.
+/// The operations that log inode `ino`'s core, and after it its attribute
+/// fork when `afork` is not empty (#373): two operations, or three.
+/// `afields` says what the fork is, `XFS_ILOG_ADATA` for a short-form fork
+/// and `XFS_ILOG_AEXT` for the extent record of one in blocks (#488).
 pub(crate) fn inode_ops_with_attr(
     ino: u64,
     buffer: &InodeBuffer,
     logged_core: Vec<u8>,
     afork: &[u8],
+    afields: u32,
 ) -> Vec<Op> {
-    use crate::format::log_items::inode_log_format::XFS_ILOG_ADATA;
     if afork.is_empty() {
         return vec![
             Op {
@@ -229,7 +230,7 @@ pub(crate) fn inode_ops_with_attr(
             flags: 0,
             data: inode_log_format_with_forks(
                 ino,
-                XFS_ILOG_CORE | XFS_ILOG_ADATA,
+                XFS_ILOG_CORE | afields,
                 buffer,
                 0,
                 afork.len() as u16,

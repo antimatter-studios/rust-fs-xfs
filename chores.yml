@@ -408,10 +408,19 @@ tasks:
     # lines; the bytes stay where they are. Then 417 lines / 61,093 bytes
     # with the exchange-range and repair suites (run 38488415326, the
     # tier's own log), so 500 lines / 76,000 bytes, about a fifth over.
+    # MEASURED in the merge queue's runs for stack #504 on 2026-10-17 (the
+    # tier's own log), every test passing: 428 lines / 81,990 bytes on the
+    # #500 layer (run 38993549281) and, the largest, 430 lines / 95,092
+    # bytes on the #509 layer (run 38993554195), the growth the
+    # parent-pointer and attribute-block cases' `[oracle vm]` lines, each
+    # an xfs_db call setting dozens of attributes. The layers above #509
+    # add remote-value cases and were never measured, so the budget is
+    # raised here, where the tier first exceeds it, from the largest: half
+    # as much again, rounded up, is 645 lines / 143,000 bytes (#514).
     cmds:
       - scripts/tools.sh --check
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 500 76000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
+      - 'CI_TEST_FLOOR=16 ../rust-fs-core/scripts/tier.sh test:oracle oracle 645 143000 -- scripts/ci-test.sh $(scripts/test-targets.sh oracle)'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images mounted and our log records replayed by Linux in the guest'
@@ -527,8 +536,16 @@ tasks:
         # the expanded feature matrix in the guest suite: every test passed
         # and it printed 3,134 lines / 218,235 bytes; half as much again is
         # 4,701 lines / 328,000 bytes.
+        # MEASURED in the merge queue's runs for stack #504 on 2026-10-17,
+        # every test passing in the guest: 4,196 lines / 326,919 bytes on
+        # the #500 layer (run 38993549281), inside the budget, and 4,209
+        # lines / 340,840 bytes on the #509 layer (run 38993554195), over
+        # it. The layers above #509 were never measured. The budget is
+        # raised in the #500 layer rather than #509's, beside the oracle
+        # tier's, so that one change carries both: half as much again as
+        # the largest, rounded up, is 6,314 lines / 512,000 bytes (#514).
         # shellcheck disable=SC2086  # the words are the point
-        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 4701 328000 -- \
+        CI_TEST_FLOOR=525 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:

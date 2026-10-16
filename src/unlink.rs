@@ -367,7 +367,6 @@ impl Filesystem {
             let extents = self.data_extents(&victim, &victim_raw)?;
             self.free_file_extents(&mut allocations, ino, &extents)?;
         }
-        let allocation_items = allocations.into_items()?;
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
         dir_core[core_at::FORMAT] = dir_format as u8;
@@ -392,8 +391,9 @@ impl Filesystem {
         }
 
         // A freed inode's attribute fork goes with it; one that keeps
-        // another name loses this name's parent pointer (#373).
-        let mut victim_afork = Vec::new();
+        // another name loses this name's parent pointer (#373), in whatever
+        // form its attribute fork is in (#488).
+        let mut parents = None;
         let victim_core = if freed {
             emptied_core(&victim_raw)
         } else {
@@ -405,15 +405,21 @@ impl Filesystem {
             core[at..at + 8].copy_from_slice(&now.wrapping_add(1).to_be_bytes());
             stamp_change(&mut core, clock_now(), Changed::Status);
             if self.sb.features_incompat & crate::superblock::incompat::PARENT != 0 {
-                (core, victim_afork) = self.with_parent_pointers(
+                let mut fork = self.with_parent_pointers(
+                    &mut allocations,
                     ino,
                     &core,
                     &[crate::attr_write::ParentChange::Remove { name, parent }],
                 )?;
+                fork.release(self, &mut allocations)?;
+                core = std::mem::take(&mut fork.core);
+                parents = Some(fork);
             }
             core
         };
-        let mut quota_changes = Vec::new();
+        let allocation_items = allocations.into_items()?;
+        let mut quota_changes: Vec<crate::quota::QuotaChange> =
+            parents.as_ref().and_then(|p| p.quota).into_iter().collect();
         if freed {
             quota_changes.push(crate::quota::QuotaChange {
                 uid: victim.uid,
@@ -443,8 +449,16 @@ impl Filesystem {
         let cluster = self.sb.inode_cluster_bytes();
         let dir_buf = InodeBuffer::containing(self.inode_offset(parent)?, cluster);
         let victim_buf = InodeBuffer::containing(self.inode_offset(ino)?, cluster);
-        let victim_ops =
-            crate::log_write::inode_ops_with_attr(ino, &victim_buf, victim_logged, &victim_afork);
+        let (victim_afork, victim_afields) = parents
+            .as_ref()
+            .map_or((&[][..], 0), |p| (p.fork.as_slice(), p.fields));
+        let victim_ops = crate::log_write::inode_ops_with_attr(
+            ino,
+            &victim_buf,
+            victim_logged,
+            victim_afork,
+            victim_afields,
+        );
 
         let dsize = fork.len();
         let mut fork_op = fork;
@@ -453,6 +467,7 @@ impl Filesystem {
         let item_ops = group_items.iter().map(|i| i.op_count()).sum::<usize>()
             + allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + parents.as_ref().map_or(0, |p| p.buffer_op_count())
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + victim_ops.len();
@@ -482,6 +497,9 @@ impl Filesystem {
             }
             for item in &dir_items {
                 ops.extend(item.ops());
+            }
+            if let Some(p) = &parents {
+                ops.extend(p.buffer_ops());
             }
             for item in &quota_items {
                 ops.extend(item.ops());
@@ -515,6 +533,9 @@ impl Filesystem {
         self.logged_buffers(&group_items);
         self.logged_buffers(&allocation_items);
         self.logged_buffers(&dir_items);
+        if let Some(p) = &parents {
+            self.logged_buffers(p.buffers());
+        }
         for item in &quota_items {
             item.apply_overlay(self)?;
         }
