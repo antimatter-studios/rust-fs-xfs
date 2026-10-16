@@ -122,6 +122,18 @@ fn run(
     raws: &HashMap<u64, Vec<u8>>,
     allocated: &[u64],
 ) -> Report {
+    run_unlisted(fs, inodes, raws, allocated, &[])
+}
+
+/// As `run`, with `unlisted` the groups whose inode btree did not list
+/// every chunk.
+fn run_unlisted(
+    fs: &Filesystem,
+    inodes: &BTreeMap<u64, Inode>,
+    raws: &HashMap<u64, Vec<u8>>,
+    allocated: &[u64],
+    unlisted: &[u32],
+) -> Report {
     let mut c = Checker {
         fs,
         report: Report::default(),
@@ -135,10 +147,34 @@ fn run(
         rmaps: Vec::new(),
         refcounts: Vec::new(),
         unread: HashSet::new(),
-        inodes_unlisted: HashSet::new(),
+        inodes_unlisted: unlisted.iter().copied().collect(),
     };
     c.quotas(inodes, raws);
     c.report
+}
+
+/// User 17's file, charged 4 blocks and one inode, is in group 1, whose
+/// inode btree could not be walked, so the walk never listed it and
+/// every inode it did list was read (#503). Its usage is short by
+/// whatever group 1 holds, so record 17 is not compared with it. With
+/// every group listed, the same walk is complete and the file is
+/// missing.
+#[test]
+fn accounting_is_not_compared_when_a_group_did_not_list_its_inodes() {
+    let (fs, mut inodes, raws) = model();
+    inodes.remove(&1000);
+    let found = run_unlisted(&fs, &inodes, &raws, &[999], &[1]);
+    assert!(
+        found.is_clean(),
+        "quota usage was compared with a group's inodes unlisted: {:?}",
+        found.findings
+    );
+    let found = run(&fs, &inodes, &raws, &[999]);
+    assert_eq!(found.findings.len(), 2, "{:?}", found.findings);
+    assert!(found
+        .findings
+        .iter()
+        .all(|f| f.code == Code::QuotaUsage && f.what.contains("record 17 counts")));
 }
 
 #[test]
