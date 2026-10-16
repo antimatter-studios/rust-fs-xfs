@@ -60,7 +60,7 @@ States:
 
 | Feature | State | Since | Tracking | Checked by |
 |---|---|---|---|---|
-| `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339) | #356 | `cli_fsck_oracle.rs` |
+| `fsck.xfs`, check-only: secondary superblocks, group headers against their btrees, block ownership, inodes, directory tree, link counts, counters | Supported | 0.11.0 (#339); a group whose AGF or AGI cannot be read left unchecked rather than lost, Unreleased (#494) | #356 | `cli_fsck_oracle.rs`, `unreadable_group.rs` |
 | Findings with stable codes, severity and location, in a JSON report with `schema_version` 1 that tells a complete scan from a partial one or none | Experimental | 0.13.0 (#403) | | `cli_fsck_oracle.rs` |
 | The checker through the C ABI: `fs_xfs_check` passes each finding (code, severity, group, block, inode, field, words) to a callback and fills a report of totals that tells a complete scan from a partial one | Experimental | 0.14.0 (#469) | | `capi_write_ops.rs` |
 | `fsck.xfs` on a target it cannot open, in every mode (`-n`, `--dry-run`, `-y`, `-p`): exit 8 and an error naming the target on stderr, with no report | Supported | Unreleased (#493) | | `cli_dispatch.rs` |

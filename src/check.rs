@@ -564,6 +564,11 @@ struct Checker<'a> {
     rmaps: Vec<Option<Vec<crate::rmap::Rmap>>>,
     /// Per group, the refcount btree's records, when it was read.
     refcounts: Vec<Option<Vec<crate::refcount::Refcount>>>,
+    /// Every group whose AGF or AGI could not be read (#489). Nothing in
+    /// one is claimed but its headers, and it adds nothing to the totals
+    /// the superblock's counters are compared with: its blocks are
+    /// unchecked, not lost, and those counters cannot be compared.
+    unread: HashSet<u32>,
 }
 
 /// Check `fs`. Never writes.
@@ -587,6 +592,7 @@ pub fn check(fs: &Filesystem) -> Report {
         claimed: vec![Vec::new(); sb.agcount as usize],
         rmaps: vec![None; sb.agcount as usize],
         refcounts: vec![None; sb.agcount as usize],
+        unread: HashSet::new(),
     };
     c.secondaries();
     let mut totals = Totals::default();
@@ -975,6 +981,7 @@ impl Checker<'_> {
                     None,
                     format!("the AGF: {e}"),
                 );
+                self.unread.insert(ag);
                 return;
             }
         };
@@ -988,6 +995,7 @@ impl Checker<'_> {
                     None,
                     format!("the AGI: {e}"),
                 );
+                self.unread.insert(ag);
                 return;
             }
         };
@@ -2123,7 +2131,6 @@ impl Checker<'_> {
         }
     }
 
-    /// A block nothing claimed is lost.
     /// Every group's reverse-mapping records against the owners the walk
     /// found (#380).
     ///
@@ -2318,8 +2325,15 @@ impl Checker<'_> {
         }
     }
 
+    /// A block nothing claimed is lost, in a group whose headers were
+    /// read. In one whose AGF or AGI could not be, only the headers were
+    /// claimed: the rest went unchecked, which the partial scan already
+    /// says, and is not known to belong to nothing (#489).
     fn unclaimed(&mut self) {
         for ag in 0..self.owners.len() {
+            if self.unread.contains(&(ag as u32)) {
+                continue;
+            }
             let lost: Vec<u32> = self.owners[ag]
                 .iter()
                 .enumerate()
@@ -2357,6 +2371,14 @@ impl Checker<'_> {
                  counters, which the kernel recomputes at mount, were not compared"
                     .into(),
             );
+            return;
+        }
+        // A group whose AGF or AGI could not be read stopped before its
+        // free space and its inode btree were counted, so every total
+        // below is short by an amount nothing read can say (#489). An
+        // exact comparison is all these findings make, and it cannot be
+        // made: the counters go unchecked, as the partial scan says.
+        if !self.unread.is_empty() {
             return;
         }
         let sb = self.fs.superblock().clone();
