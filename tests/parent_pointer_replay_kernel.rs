@@ -37,6 +37,13 @@
 //! B+tree, each unlinked, and a node, replaced by a rename. The guest's
 //! `xfs_repair -n` checks that every one of those blocks is free again
 //! after the replay, and owned by nothing.
+//!
+//! One inode's fork also holds a value stored in blocks of its own (#501),
+//! which is not logged: the driver writes it before the record that maps
+//! it, into blocks that were free before that record began. One of its
+//! changes is a rename that replaces a file with data, whose blocks the
+//! same record gives back. After the replay `getfattr` has to read the
+//! value back unchanged.
 
 mod common;
 
@@ -89,6 +96,16 @@ fn survivors() -> Vec<(String, Vec<(String, String)>)> {
         ("/made/node-moved", &[("node-moved", "/made")]),
         // #495: the file a rename put in place of a freed one.
         ("/node-last", &[("node-last", "/")]),
+        // #501: the inode with a remote value, named twice since its second
+        // name replaced a file with data.
+        (
+            "/remote.txt",
+            &[("remote.txt", "/"), ("remote-victim", "/made")],
+        ),
+        (
+            "/made/remote-victim",
+            &[("remote.txt", "/"), ("remote-victim", "/made")],
+        ),
     ];
     let mut all: Vec<(String, Vec<(String, String)>)> = fixed
         .iter()
@@ -121,11 +138,22 @@ const GONE: &[&str] = &[
     "/leaf-last",
     "/tree-last",
     "/made/over-node",
+    "/remote-too",
+    "/made/remote-link",
 ];
 
 /// The inodes whose forks were rebuilt past short form, and how many user
 /// attributes each must still have after the replay (#488).
-const KEPT_ATTRIBUTES: &[(&str, usize)] = &[("/made/leaf-link", 30), ("/made/node-moved", 300)];
+const KEPT_ATTRIBUTES: &[(&str, usize)] = &[
+    ("/made/leaf-link", 30),
+    ("/made/node-moved", 300),
+    ("/remote.txt", 1),
+];
+
+/// The value of `/remote.txt`'s one user attribute, `user.big`: 3000 bytes,
+/// past what a leaf keeps beside its name, so stored in blocks of its own
+/// (#501). It is that many `r`s.
+const REMOTE_VALUE_LEN: usize = 3000;
 
 #[test]
 fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
@@ -169,10 +197,14 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
         big=$(head -c 3000 /dev/zero | tr '\0' v)
         for i in $(seq -w 0 59); do setfattr -n "user.big_$i" -v "$big" "$m/tree-last"; done
         for i in $(seq -w 1 2 59); do setfattr -x "user.big_$i" "$m/tree-last"; done
+        # A remote value (#501): 3000 bytes do not fit a leaf beside a name.
+        echo remote > "$m/remote.txt"
+        setfattr -n user.big -v "$(head -c {REMOTE_VALUE_LEN} /dev/zero | tr '\0' r)" "$m/remote.txt"
+        ln "$m/remote.txt" "$m/remote-too"
         umount "$m" || {{ echo UMOUNT_FAILED; exit 1; }}
         rmdir "$m"
         # The form each fork is in, as xfs_db reads attribute block 0.
-        for f in leaf.txt node.txt leaf-last node-last; do
+        for f in leaf.txt node.txt leaf-last node-last remote.txt; do
             out=$({PARENT_XFSPROGS_BIN}/xfs_db -r -c "path /$f" -c "ablock 0" -c print {image} 2>&1 || true)
             if echo "$out" | grep -q '^hdr.level = '; then form=node
             elif echo "$out" | grep -q '^hdr.count = '; then form=leaf
@@ -194,6 +226,7 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
         ("/node.txt", "node"),
         ("/leaf-last", "leaf"),
         ("/node-last", "node"),
+        ("/remote.txt", "leaf"),
     ] {
         assert!(
             built.contains(&format!("FORM {file} {form}")),
@@ -267,6 +300,18 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
             .expect("create");
         fs.rename(made, b"over-node", root, b"node-last")
             .expect("replace the last name of an inode whose attribute fork is a node");
+        // A REMOTE VALUE (#501): linked, then a name of it replaces a file
+        // whose data the same record gives back, then unlinked from one.
+        fs.link(ino("/remote.txt"), made, b"remote-link")
+            .expect("link an inode with a remote attribute value");
+        let (victim, _) = fs
+            .create_file(made, b"remote-victim", 0o100644)
+            .expect("create");
+        fs.write(victim, 0, &[0x33; 64 * 1024]).expect("write");
+        fs.rename(root, b"remote-too", made, b"remote-victim")
+            .expect("a name of an inode with a remote attribute value replaces a file with data");
+        fs.unlink_file(made, b"remote-link")
+            .expect("unlink a name of an inode with a remote attribute value");
         // DROPPED, NOT UNMOUNTED. An unmount checkpoints and leaves a
         // clean log (#439); without one, the records are all there is.
     }
@@ -314,6 +359,12 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
             # The user attributes beside the rebuilt parent pointers.
             for p in{kept}; do
                 echo "XATTRS ${{p#.}} $(getfattr -d "$p" 2>/dev/null | grep -c '^user\.' || true)"
+            done
+            # The remote value (#501): its length, and how many of its
+            # bytes are not the `r` it was made of.
+            for p in ./remote.txt ./made/remote-victim; do
+                v=$(getfattr --only-values -n user.big "$p" 2>/dev/null | od -An -v -tx1 | tr -s ' \n' ' ')
+                echo "BIG ${{p#.}} $(echo $v | wc -w) $(echo $v | tr ' ' '\n' | grep -cv '^72$' || true)"
             done
             cd /
             umount "$m" || echo UMOUNT_FAILED
@@ -412,6 +463,14 @@ fn parent_pointers_the_driver_journals_are_replayed_by_the_kernel() {
         );
     }
 
+    for path in ["/remote.txt", "/made/remote-victim"] {
+        assert!(
+            out.lines()
+                .any(|l| l == format!("BIG {path} {REMOTE_VALUE_LEN} 0")),
+            "{path}: getfattr does not read its {REMOTE_VALUE_LEN}-byte remote value back \
+             unchanged after the replay:\n{out}"
+        );
+    }
     for (path, count) in KEPT_ATTRIBUTES {
         assert!(
             out.lines().any(|l| l == format!("XATTRS {path} {count}")),

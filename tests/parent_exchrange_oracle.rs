@@ -39,7 +39,7 @@ use common::{parent_oracle, repair, Oracle};
 use fs_core::FileDevice;
 use fs_xfs::attr::ParentPointer;
 use fs_xfs::superblock::incompat;
-use fs_xfs::{Error, Filesystem};
+use fs_xfs::Filesystem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -121,16 +121,6 @@ fn build(tag: &str, args: &[&str]) -> (PathBuf, Vec<u8>) {
         "the fixture this oracle grades against",
     );
     (dir, big_bytes)
-}
-
-/// The SHA-256 of every byte of `img`, streamed from the file, so a
-/// refusal can be shown to have written nothing without a second copy.
-fn image_digest(img: &Path) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(img).unwrap();
-    std::io::copy(&mut file, &mut hasher).unwrap();
-    hasher.finalize().to_vec()
 }
 
 /// How many attribute entries xfs_db sees on `path`, and how many of them
@@ -524,10 +514,11 @@ fn xfs_db_attr_form(img: &Path, path: &str) -> &'static str {
 /// rename. The pinned `xfs_repair -n` checks that each block is free again
 /// and owned by nothing.
 ///
-/// Still refused before anything is written, with the image byte-for-byte
-/// what it was and the volume `xfs_repair` grades afterwards agreeing:
-/// linking `/remote`, whose fork past short form holds a 3000-byte value
-/// in blocks of its own (#501).
+/// `/remote`'s fork holds a 3000-byte value in blocks of its own (#501),
+/// which is not logged and goes to the device before the record that maps
+/// it. The inode is linked, a name of it replaces a file with data whose
+/// blocks the same record gives back, and one name is unlinked; the value
+/// has to come through every rebuild unchanged.
 fn keep_parent_pointers(tag: &str, img: &Path) {
     // `/multi` and `/multi-too` are two links to one inode, and `/bulky`
     // and `/bulky-too` two to another. The driver makes them while their
@@ -617,6 +608,15 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
             .ino
     };
 
+    // The remote value as xfs_db wrote it, for the rebuilds to keep.
+    let big = {
+        let file = fs.open("/remote").unwrap();
+        fs.get_xattr(file.inode(), file.raw(), b"user.big")
+            .unwrap()
+            .expect("xfs_db gave /remote user.big")
+    };
+    assert_eq!(big.len(), 3000, "{tag}: /remote's value as xfs_db wrote it");
+
     let (made, _) = fs.create_directory(root, b"made", 0o040755).expect("mkdir");
     fs.create_file(made, b"new.txt", 0o100644).expect("create");
     fs.create_symlink(made, b"sym", b"../top.txt")
@@ -677,19 +677,19 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         .expect("create");
     fs.rename(made, b"over-noded", root, b"noded")
         .expect("replace the last name of an inode whose attribute fork is a node");
-    // Still refused (#501): a remote value beside the parent pointers.
-    let before = image_digest(img);
-    assert!(
-        matches!(
-            fs.link(ino("/remote"), made, b"remote-link"),
-            Err(Error::UnsupportedFeature(_))
-        ),
-        "{tag}: a link to an inode whose attribute fork holds a remote value must be refused"
-    );
-    assert!(
-        image_digest(img) == before,
-        "{tag}: a refused link changed the image"
-    );
+    // A REMOTE VALUE BESIDE THE PARENT POINTERS (#501): linked, a name of
+    // it replacing a file whose data the same record gives back, and one
+    // of its three names unlinked.
+    fs.link(ino("/remote"), made, b"remote-link")
+        .expect("link an inode whose attribute fork holds a remote value");
+    let (victim, _) = fs
+        .create_file(made, b"remote-victim", 0o100644)
+        .expect("create");
+    fs.write(victim, 0, &[0x33; 64 * 1024]).expect("write");
+    fs.rename(root, b"remote-too", made, b"remote-victim")
+        .expect("a name of an inode with a remote value replaces a file with data");
+    fs.unlink_file(made, b"remote-link")
+        .expect("unlink one of three names of an inode with a remote value");
 
     fs.rename(root, b"top.txt", made, b"top-moved.txt")
         .expect("move a file with two links");
@@ -759,7 +759,14 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         ("/made/hello-link".into(), &[("hello-link", "/made")]),
         // #495: the file the rename put in place of a freed one.
         ("/noded".into(), &[("noded", "/")]),
-        ("/remote".into(), &[("remote", "/"), ("remote-too", "/")]),
+        (
+            "/remote".into(),
+            &[("remote", "/"), ("remote-victim", "/made")],
+        ),
+        (
+            "/made/remote-victim".into(),
+            &[("remote", "/"), ("remote-victim", "/made")],
+        ),
         (path(&long[0]), &crossing_links),
         (path(&long[1]), &crossing_links),
         (path(&long[3]), &back_links),
@@ -828,6 +835,23 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
             "{tag} {path}: the form of its attribute fork after the writes"
         );
     }
+    // The remote value came through each rebuild unchanged, and the fork
+    // is still a leaf beside it.
+    for path in ["/remote", "/made/remote-victim"] {
+        let file = fs.open(path).unwrap();
+        assert!(
+            fs.get_xattr(file.inode(), file.raw(), b"user.big")
+                .unwrap()
+                .as_deref()
+                == Some(&big[..]),
+            "{tag} {path}: user.big after the writes"
+        );
+        assert_eq!(
+            xfs_db_attr_form(img, path),
+            "leaf",
+            "{tag} {path}: the form of its attribute fork after the writes"
+        );
+    }
     for gone in [
         "/many/entry_000".to_string(),
         "/many/entry_001".into(),
@@ -838,6 +862,7 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         "/made/hello-moved".into(),
         "/made/replacer".into(),
         "/made/remote-link".into(),
+        "/remote-too".into(),
         "/multi-too".into(),
         "/multi".into(),
         "/treed".into(),

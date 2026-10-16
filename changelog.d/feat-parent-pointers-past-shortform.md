@@ -8,10 +8,7 @@
   pointer filed under the kernel's parent-pointer hash. The new blocks, the
   old blocks' release and the directory entry go in one transaction. The
   pinned `xfs_repair -n` and xfs_db's parent listing agree with every name,
-  and the Debian 13 kernel replays the changes from the log. Still refused
-  before anything is written: such a fork holding a value stored in blocks of
-  its own (#501), and removing the last name of an inode with attribute blocks
-  (#495).
+  and the Debian 13 kernel replays the changes from the log.
 
 ### Fixed
 

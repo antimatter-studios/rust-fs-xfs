@@ -277,6 +277,11 @@ impl Filesystem {
             // moved with it.
             + 3
             + moved_ops.len();
+        // A remote value in a rebuilt attribute fork is on the device
+        // before the record that maps it (#501).
+        if let Some(p) = &parents {
+            p.write_remote(self)?;
+        }
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
