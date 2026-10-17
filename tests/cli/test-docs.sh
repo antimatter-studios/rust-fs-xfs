@@ -38,7 +38,7 @@ done
 
 # The subcommand pages the tool's page points at.
 share="$(cd "$(dirname "$(command -v fs.xfs)")/.." && pwd)/share"
-for verb in ls read write mkdir rm rmdir get info set resize; do
+for verb in ls read write mkdir rm rmdir ln get info set resize; do
     check "fs.xfs-$verb has a page of its own" test -s "$share/man/man1/fs.xfs-$verb.1"
 done
 check "mkfs.xfs has its section-8 page" test -s "$share/man/man8/mkfs.xfs.8"
