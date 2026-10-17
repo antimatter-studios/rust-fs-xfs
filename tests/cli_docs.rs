@@ -67,6 +67,13 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
     for option in ["recursive", "max-depth", "limit"] {
         assert!(ls.contains(option), "ls man page omits {option}");
     }
+    let mkdir = std::fs::read_to_string(share.join("man/man1/fs.xfs-mkdir.1")).unwrap();
+    assert!(mkdir.contains("parents"), "mkdir man page omits --parents");
+    let help = stdout(&ok(tool("fs.xfs").args(["disk.img", "mkdir", "--help"])));
+    assert!(
+        help.contains("mkdir -p /"),
+        "mkdir help omits its parents example"
+    );
 }
 
 #[test]
@@ -155,7 +162,7 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
         assert!(fish.contains(&format!("complete -c {name}")), "fish {name}");
         if name == "fs.xfs" {
             for completion in [&zsh, &bash, &fish] {
-                for option in ["recursive", "max-depth", "limit"] {
+                for option in ["recursive", "max-depth", "limit", "parents"] {
                     assert!(completion.contains(option), "completion omits {option}");
                 }
             }

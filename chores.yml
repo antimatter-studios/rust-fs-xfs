@@ -466,7 +466,8 @@ tasks:
       # cli_rm_kernel two more (#519).
       # cli_ln_kernel adds two link and format-limit cases (#521), and
       # cli_mv_kernel two more (#520).
-      - 'CI_TEST_FLOOR=48 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      # mkdir --parents adds one Linux-twin case (#522).
+      - 'CI_TEST_FLOOR=49 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:kernel-new:
     desc: 'The kernel tier on the Debian 13 guest: kernel 6.12 reads back what 6.1 cannot mount (parent pointers, exchange-range)'
@@ -565,7 +566,8 @@ tasks:
         # and cli_rm_kernel two more (#519).
         # The fsck help regression adds two more (#526), the ln kernel cases
         # two more (#521), and cli_mv_kernel two more (#520).
-        CI_TEST_FLOOR=537 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
+        # mkdir --parents adds one Linux-twin case (#522).
+        CI_TEST_FLOOR=538 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -728,7 +730,8 @@ tasks:
       # add 108 in test-write.sh and 4 in test-docs.sh (#519).
       # ln adds 104 assertions and two generated-document checks (#521).
       # mv adds 150 in test-mv.sh and 2 in test-docs.sh (#520).
-      - 'scripts/ci-test.sh --gate 1172 tmp/logs/cli.log "the cli tier"'
+      # test-mkdir.sh adds 50 assertions (#522), counted from its checks.
+      - 'scripts/ci-test.sh --gate 1222 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
