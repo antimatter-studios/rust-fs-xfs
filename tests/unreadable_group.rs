@@ -17,7 +17,9 @@
 //! An inode in a group whose inode btree was not read is not known to be
 //! free or allocated (#497). An entry naming it is not an entry into
 //! nothing; read on its own and found in use, it is walked like any
-//! other, and the blocks it owns elsewhere are claimed.
+//! other, and the blocks it owns elsewhere are claimed. A quota inode
+//! there, which no directory reaches, is read on its own the same way
+//! before the quota check runs (#507).
 //!
 //! Each case damages one structure on a volume this crate's `mkfs` made
 //! in memory, so it needs no tool and no fixture. What `xfs_repair -n`
@@ -389,6 +391,87 @@ fn an_entry_into_a_group_whose_inode_btree_was_not_read_is_walked() {
         report.directories,
         2,
         "the walk did not go through the root and d:\n{}",
+        listed(&report)
+    );
+}
+
+/// A fresh volume whose user quota inode is `q` in the root, a regular
+/// file or, when `directory`, a directory: user accounting on and nothing
+/// marked checked, so no usage is compared, and `q` has no blocks, so no
+/// quota record is read. Its inode is in group 0, beside the root, as a
+/// quota inode `mkfs.xfs` makes is. Unmounted, so its log is clean.
+fn quota_volume(directory: bool) -> Arc<Sparse> {
+    let dev = volume();
+    let fs = Filesystem::mount_rw(dev.clone() as Arc<dyn BlockDevice>).expect("mount_rw");
+    let root = fs.superblock().rootino;
+    let (q, _) = if directory {
+        fs.create_directory(root, b"q", 0o040700).expect("mkdir")
+    } else {
+        fs.create_file(root, b"q", 0o100600).expect("create")
+    };
+    fs.unmount().expect("unmount");
+    let mut sb = mount(&dev).superblock().clone();
+    sb.uquotino = q;
+    sb.qflags = 0x1;
+    let mut sector = vec![0u8; usize::from(sb.sectsize)];
+    dev.read_at(0, &mut sector).expect("the superblock");
+    fs_xfs::super_write::apply(&mut sector, &sb).expect("the quota fields");
+    dev.write_at(0, &sector).expect("the superblock");
+    if !directory {
+        let report = fs_xfs::check::check(&mount(&dev));
+        assert!(
+            report.is_clean(),
+            "the volume with a quota inode has findings:\n{}",
+            listed(&report)
+        );
+    }
+    dev
+}
+
+/// What `report` says under `quota.inode`.
+fn quota_inode_findings(report: &Report) -> Vec<&str> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.code == Code::QuotaInode)
+        .map(|f| f.what.as_str())
+        .collect()
+}
+
+/// Group 0's inode btree cannot be walked, so nothing says the user
+/// quota inode is allocated, and the quota check runs before the walk
+/// that would read it on its own (#507). It is read on its own there
+/// instead, and is not reported missing.
+#[test]
+fn a_quota_inode_in_a_group_whose_inode_btree_was_not_read_is_not_missing() {
+    let dev = quota_volume(false);
+    let root = mount(&dev).read_agi(0).expect("the AGI").root;
+    damage_block(&dev, 0, root);
+    let report = fs_xfs::check::check(&mount(&dev));
+    assert_unwalked(&report, 0, "inode");
+    let quota = quota_inode_findings(&report);
+    assert!(
+        quota.is_empty(),
+        "a quota inode in a group whose inode btree was not read is reported: {quota:?}\n{}",
+        listed(&report)
+    );
+}
+
+/// The same, with a directory as the quota inode: read on its own, it is
+/// checked like one the inode btree listed, and is reported as no quota
+/// file rather than as missing.
+#[test]
+fn a_quota_inode_in_a_group_whose_inode_btree_was_not_read_is_checked() {
+    let dev = quota_volume(true);
+    let root = mount(&dev).read_agi(0).expect("the AGI").root;
+    damage_block(&dev, 0, root);
+    let report = fs_xfs::check::check(&mount(&dev));
+    assert_unwalked(&report, 0, "inode");
+    let quota = quota_inode_findings(&report);
+    assert!(
+        quota.len() == 1 && quota[0].contains("has an invalid type"),
+        "a directory as the quota inode, in a group whose inode btree was not read, is not \
+         reported as an invalid quota file: {quota:?}\n{}",
         listed(&report)
     );
 }

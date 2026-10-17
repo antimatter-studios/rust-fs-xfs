@@ -75,12 +75,18 @@ impl Checker<'_> {
                 continue;
             }
             let Some(inode) = inodes.get(&ino) else {
-                self.quota_find(
-                    Code::QuotaInode,
-                    kind,
-                    ino,
-                    "is not a readable allocated inode".into(),
-                );
+                // One in a group whose inode btree did not list every
+                // chunk, and not in use when read on its own, is not known
+                // to be unallocated: the btree that would say was not
+                // read, so it is unchecked (#507).
+                if !self.unknown(ino) {
+                    self.quota_find(
+                        Code::QuotaInode,
+                        kind,
+                        ino,
+                        "is not a readable allocated inode".into(),
+                    );
+                }
                 continue;
             };
             if !inode.is_regular_file()
