@@ -81,14 +81,37 @@ A plan is refused, before any rule is asked, for:
 - `repair.not-exclusive`: another holder has the target, or it is mounted.
 - `repair.feature`: a v4 volume, an incompatible or read-only-compatible
   feature outside `ftype`, `sparse`, `meta_uuid`, `bigtime`, `nrext64`,
-  `finobt`, `reflink` and `inobtcount` (so `rmapbt` is refused), any
-  log-incompatible feature, a realtime section, or quota flags. `field` names
-  the superblock field.
+  `finobt`, `reflink` and `inobtcount`, any log-incompatible feature, a
+  realtime section, or quota flags. `rmapbt` is allowed only when every rule
+  the plan asks keeps the reverse map (#442); the rules `fsck.xfs` ships all
+  do. `field` names the superblock field.
 - `repair.log-dirty`: the log needed replay.
 - `repair.incomplete`: the scan was partial, findings were suppressed, or a
   rule could not finish its plan.
 - `repair.ambiguous`: a `cross-link` or `dir.reached-twice` finding; its
   location is carried over.
+
+## Applying a repair
+
+`-y` and `-p` make the same plan as `--dry-run` and apply it (#391). Every
+range is read again first and must still hold the bytes the plan saw, or
+nothing is written; the volume is then checked again from a fresh mount, and
+that check is the report, with `applied` saying how many changes were
+written. A refused plan writes nothing. A plan lists every error no rule
+repairs under `unplanned`, so a partial repair never reads as a complete one.
+
+The rules that ship, each owning the finding codes it repairs:
+
+- **Superblock copies** (#391): a single damaged secondary superblock is
+  rewritten from the primary. A copy naming another filesystem, or more than
+  one damaged copy, refuses the plan.
+- **Counters** (#392): the AGF, AGI and superblock counters, counted again
+  from trees the check found sound; damage beside them other than a
+  superblock copy refuses the plan.
+- **Inode allocation** (#393): inode allocation bits, their free counts and
+  link counts, from the inodes and a complete directory traversal.
+- **Directory metadata** (#394): entry types, tags, dot entries and hash
+  indexes, rebuilt from entries whose names and inodes are kept.
 
 ## Findings
 

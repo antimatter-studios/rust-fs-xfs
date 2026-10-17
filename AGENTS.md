@@ -6,7 +6,11 @@ all of them inside one Debian guest. This file is the fast path for an agent
 picking up work here, so the workflow does not have to be re-derived each time.
 It points at the existing docs rather than duplicating them:
 
-- **README** → `## Byte order`, `## Status`, `## Test contract`, `## Building`.
+- **README** → `## What it can do`, `## Building`, `## Using it`.
+- **`docs/features.md`** → every feature and its state.
+- **`docs/on-disk-format.md`** → byte order, the checksum exception, self-describing
+  metadata.
+- **`docs/testing.md`** → the test contract, the tiers and how fixtures are made.
 - **`chores.yml`** → every task named below, and what each one actually runs.
 - **`.github-guard`** → what must pass before `main` takes a merge.
 
@@ -290,7 +294,7 @@ considered done.
 
 XFS is **big-endian on disk** — the only big-endian format in this crate family. Use
 `from_be_bytes`, never `from_le_bytes`, never a raw struct cast. The sole exception is
-checksum fields, which are little-endian; `superblock::le32` exists for those and
+checksum fields, which are little-endian; `endian::le32` exists for those and
 should not be used for anything else.
 
 
