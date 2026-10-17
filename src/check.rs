@@ -569,6 +569,10 @@ struct Checker<'a> {
     /// (#496). What that structure owned was never claimed, so the
     /// group's unclaimed blocks are unchecked, not lost.
     unread: HashSet<u32>,
+    /// Every group whose inode btree did not list every chunk: its AGF or
+    /// AGI could not be read, or its inode btree or one of that btree's
+    /// records (#497). Which of its inodes are allocated is not known.
+    inodes_unlisted: HashSet<u32>,
 }
 
 /// Check `fs`. Never writes.
@@ -593,6 +597,7 @@ pub fn check(fs: &Filesystem) -> Report {
         rmaps: vec![None; sb.agcount as usize],
         refcounts: vec![None; sb.agcount as usize],
         unread: HashSet::new(),
+        inodes_unlisted: HashSet::new(),
     };
     c.secondaries();
     let mut totals = Totals::default();
@@ -990,6 +995,7 @@ impl Checker<'_> {
                     format!("the AGF: {e}"),
                 );
                 self.unread.insert(ag);
+                self.inodes_unlisted.insert(ag);
                 totals.free_short = true;
                 totals.inodes_short = true;
                 return;
@@ -1006,6 +1012,7 @@ impl Checker<'_> {
                     format!("the AGI: {e}"),
                 );
                 self.unread.insert(ag);
+                self.inodes_unlisted.insert(ag);
                 totals.free_short = true;
                 totals.inodes_short = true;
                 return;
@@ -1270,6 +1277,7 @@ impl Checker<'_> {
         };
         if !listed {
             self.unread.insert(ag);
+            self.inodes_unlisted.insert(ag);
         }
         if sb.has_finobt() && agi.free_level > 0 {
             match ag_btree::walk_blocks(
@@ -1606,9 +1614,14 @@ impl Checker<'_> {
                 }
             }
         }
-        if !usable.contains_key(&sb.rootino) {
+        if !usable.contains_key(&sb.rootino) && !self.adopt(sb.rootino, &mut usable, &mut raws) {
             let why = if self.allocated.contains(&sb.rootino) {
                 "could not be read"
+            } else if self.unknown(sb.rootino) {
+                // Read on its own, it is not an inode in use, and what it
+                // would have named is unknown (#497).
+                unlisted = true;
+                "is not an inode in use"
             } else {
                 "is not an allocated inode"
             };
@@ -1689,6 +1702,16 @@ impl Checker<'_> {
             };
             for entry in entries {
                 let name = String::from_utf8_lossy(&entry.name).into_owned();
+                // An inode in a group whose inode btree was not read is
+                // not known to be free or allocated, so an entry naming
+                // one that is not in use is not reported: it is unchecked
+                // (#497). Were it a directory, what it names is unknown.
+                if self.unknown(entry.ino) && !self.adopt(entry.ino, &mut usable, &mut raws) {
+                    if matches!(entry.ftype, None | Some(FileType::Directory)) {
+                        unlisted = true;
+                    }
+                    continue;
+                }
                 let Some(target) = usable.get(&entry.ino) else {
                     let why = if self.free.contains(&entry.ino) {
                         "a free inode"
@@ -1781,6 +1804,45 @@ impl Checker<'_> {
                     ),
                 );
             }
+        }
+    }
+
+    /// Whether nothing says if `ino` is allocated: it is in a group whose
+    /// inode btree did not list every chunk, and in no chunk it did list
+    /// (#497).
+    fn unknown(&self, ino: u64) -> bool {
+        let (ag, _, _) = self.fs.superblock().split_ino(ino);
+        self.inodes_unlisted.contains(&ag)
+            && !self.allocated.contains(&ino)
+            && !self.free.contains(&ino)
+    }
+
+    /// Read on its own an inode the walk reaches that nothing says is
+    /// allocated (#497). One in use is walked like any other and its
+    /// blocks are claimed; anything else is left unchecked, because the
+    /// btree that would say what it is was not read. True when the inode
+    /// is one the walk can go through.
+    fn adopt(
+        &mut self,
+        ino: u64,
+        usable: &mut BTreeMap<u64, crate::inode::Inode>,
+        raws: &mut HashMap<u64, Vec<u8>>,
+    ) -> bool {
+        if usable.contains_key(&ino) {
+            return true;
+        }
+        if !self.unknown(ino) {
+            return false;
+        }
+        match self.fs.read_inode_raw(ino) {
+            Ok((inode, raw)) if inode.mode != 0 => {
+                self.report.inodes += 1;
+                self.blocks_of(&inode, &raw);
+                raws.insert(ino, raw);
+                usable.insert(ino, inode);
+                true
+            }
+            _ => false,
         }
     }
 
