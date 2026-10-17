@@ -36,7 +36,7 @@ for size in 4096 0; do
     check "shrink to $size releases clean" test "$(fs.xfs "$img" get dirty --text)" = false
 done
 fs.xfs "$img" stat /medium.bin >"$SANDBOX/stat"
-jq_check "zero shrink frees every data block" '.size == 0 and .blocks == 0' "$SANDBOX/stat"
+jq_check "zero shrink frees every data block" '.size == 0 and .allocated_bytes == 0' "$SANDBOX/stat"
 fs.xfs "$img" truncate --text /medium.bin 8197 >"$SANDBOX/text" 2>"$SANDBOX/e"
 check "growth from zero succeeds ($(cat "$SANDBOX/e"))" test $? -eq 0
 check "text reports the length" test "$(cat "$SANDBOX/text")" = '/medium.bin is 8197 bytes'
