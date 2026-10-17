@@ -8,6 +8,11 @@
 # is clean, so the next journalled write on the same copy is refused until
 # Linux has mounted it once. That refusal is checked here; the chain of
 # writes with the kernel replaying between them is tests/cli_write_kernel.rs.
+#
+# rm AND rmdir RELEASE THE VOLUME CLEAN: each ends the log with an unmount
+# record, so removals chain on one copy where the writes above cannot, and
+# a volume a write left dirty is refused. What xfs_repair and the kernel
+# make of a removal is tests/cli_rm_kernel.rs.
 source "$(dirname "$0")/lib.sh"
 
 need_fixture xfscli-v5.img xfscli-v4.img
@@ -174,6 +179,98 @@ check "write through --offset exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
 check "read through --offset returns it" \
     test "$(fs.xfs --offset 1048576 "$disk" read /p.txt)" = "in a partition"
 check "the first MiB, outside the partition, is still zeros" \
+    test "$(head -c 1048576 "$disk" | tr -d '\0' | wc -c | tr -d ' ')" -eq 0
+
+# rm and rmdir, chained on one copy: names the kernel made go, and each
+# removal leaves the log clean for the next.
+img="$(fresh "$v5")"
+
+# removed VERB PATH DIR: VERB PATH exits 0, reports {"path", "removed":
+# true}, DIR's listing no longer has the name, and the log is clean.
+removed() {
+    local verb="$1" path="$2" dir="$3" name="${2##*/}"
+    fs.xfs "$img" "$verb" "$path" >"$SANDBOX/rm.json" 2>"$SANDBOX/rm.err"
+    local rc=$?
+    check "$verb $path exits 0 ($(cat "$SANDBOX/rm.err"))" test "$rc" -eq 0
+    jq_check "$verb $path reports the path removed" \
+        ".path == \"$path\" and .removed == true and (keys | length) == 2" "$SANDBOX/rm.json"
+    fs.xfs "$img" ls "$dir" >"$SANDBOX/ls.json" 2>/dev/null
+    jq_check "ls $dir no longer has $name after $verb" "all(.[]; .name != \"$name\")" "$SANDBOX/ls.json"
+    check "$verb $path leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
+}
+
+free_before="$(fs.xfs "$img" get free_bytes --text)"
+removed rm /large.bin /
+free_after="$(fs.xfs "$img" get free_bytes --text)"
+check "removing the 8 MiB /large.bin gave its blocks back ($free_before, then $free_after)" \
+    test $((free_after - free_before)) -ge 8388608
+removed rm /link-short /
+check "removing the symlink left the file it named" test "$(fs.xfs "$img" read /small.txt)" = "hello world"
+removed rm /sub/link-remote /sub
+removed rm /manyfiles/entry-100.txt /manyfiles
+removed rm /sub/nested/file.txt /sub/nested
+removed rmdir /sub/nested /sub
+fs.xfs "$img" rmdir --text /sub >"$SANDBOX/text.out" 2>/dev/null
+check "rmdir --text says what it removed" test "$(cat "$SANDBOX/text.out")" = "removed /sub"
+fs.xfs "$img" ls / >"$SANDBOX/ls.json" 2>/dev/null
+jq_check "the names beside the removed ones are still there" \
+    '([.[].name] | sort) == (["empty", "fragmented.bin", "manyfiles", "medium.bin", "modes", "small.txt", "sparse.bin"] | sort)' \
+    "$SANDBOX/ls.json"
+fs.xfs "$img" ls /manyfiles >"$SANDBOX/ls.json" 2>/dev/null
+jq_check "the other 199 entries of /manyfiles are still there" 'length == 199' "$SANDBOX/ls.json"
+check "a file beside the removed ones still reads its bytes" test "$(fs.xfs "$img" read /modes/m0600)" = 0600
+
+# Removals refused before the image is opened for writing: exit 1 for a
+# mistake, with the reason Linux gives; exit 3 for a v4 volume and for a
+# shape the driver does not free.
+refused 1 "no such file" "$v5" /missing rm
+refused 1 "no such file" "$v5" /missing rmdir
+refused 1 "no such file" "$v5" /missing/f rm
+refused 1 "is a directory" "$v5" /sub rm
+refused 1 "is a directory" "$v5" / rm
+refused 1 "is a directory" "$v5" /sub/. rm
+refused 1 "not a directory" "$v5" /small.txt rmdir
+refused 1 "not a directory" "$v5" /link-short rmdir
+refused 1 "not a directory" "$v5" /small.txt/ rm
+refused 1 "not a directory" "$v5" /small.txt/x rm
+refused 1 "not empty" "$v5" /sub rmdir
+refused 1 "not empty" "$v5" /sub/.. rmdir
+refused 1 "invalid argument" "$v5" /sub/. rmdir
+refused 1 "root directory" "$v5" / rmdir
+refused 3 "v4 filesystem is not supported" "$v4" /small.txt rm
+refused 3 "v4 filesystem is not supported" "$v4" /sub/nested rmdir
+refused 3 "B.tree" "$v5" /fragmented.bin rm
+
+# A log a write left holding its record is refused too, as every write
+# verb refuses it.
+img="$(fresh "$v5")"
+printf x | fs.xfs "$img" write /new >/dev/null 2>&1
+copy_image "$img" "$SANDBOX/before.img"
+fs.xfs "$img" rm /small.txt >"$SANDBOX/x.out" 2>"$SANDBOX/x.err"
+check "rm on a volume whose log holds records exits 1" test $? -eq 1
+check "rm on a dirty log prints nothing on stdout" test ! -s "$SANDBOX/x.out"
+jq_check "rm on a dirty log says the log holds records" \
+    '.code == 1 and (.error | test("log holds records"))' "$SANDBOX/x.err"
+unchanged "rm on a dirty log" "$img" "$SANDBOX/before.img"
+rm -f "$SANDBOX/before.img"
+
+img="$(fresh "$v5")"
+fs.xfs "$img" rm >"$SANDBOX/u.out" 2>"$SANDBOX/u.err"
+check "rm without a path is a usage error (exit 2)" test $? -eq 2
+check "rm without a path prints nothing on stdout" test ! -s "$SANDBOX/u.out"
+
+# --offset reaches a partition for removing too, and nothing before it.
+disk="$SANDBOX/rm-disk.img"
+dd if=/dev/zero of="$disk" bs=1048576 count=1 status=none
+dd if="$v5" of="$disk" bs=1048576 seek=1 conv=sparse,notrunc status=none
+fs.xfs --offset 1048576 "$disk" rm /small.txt >/dev/null 2>"$SANDBOX/e"
+rc=$?
+check "rm through --offset exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
+fs.xfs --offset 1048576 "$disk" ls / >"$SANDBOX/ls.json" 2>/dev/null
+jq_check "rm through --offset removed the name" 'all(.[]; .name != "small.txt")' "$SANDBOX/ls.json"
+check "rm through --offset leaves the log clean" \
+    test "$(fs.xfs --offset 1048576 "$disk" get dirty --text)" = false
+check "the first MiB, outside the partition, is still zeros after rm" \
     test "$(head -c 1048576 "$disk" | tr -d '\0' | wc -c | tr -d ' ')" -eq 0
 
 finish
