@@ -1,19 +1,21 @@
-//! What `fs.xfs write` and `mkdir` leave is a filesystem Linux replays and
-//! `xfs_repair` accepts, holding exactly the bytes that went in on stdin.
+//! What `fs.xfs write` and `mkdir` leave is a filesystem `xfs_repair`
+//! accepts as it is and Linux mounts, holding exactly the bytes that went
+//! in on stdin.
 //!
-//! The writes are log records: "nothing on disk is touched: the record is
-//! the change". So the check is two-stage, in the harness guest, as the
-//! driver's own write oracles are: the KERNEL mounts the image, which
-//! replays the records, and reads every written file back with
-//! `sha256sum`; then, on the unmounted image, `xfs_repair -n` must find
-//! nothing. `xfs_repair` runs only after the replay, because it declines
-//! to grade an image whose log holds records (`repair::assert_agreed`
-//! refuses that report rather than reading it as a pass).
+//! The writes are log records, and each verb then releases the volume
+//! clean: it writes the change home, puts the summary counters right and
+//! ends the log with an unmount record. So `xfs_repair -n` grades the
+//! volume after EVERY write, before any kernel has mounted it -- it
+//! declines to grade an image whose log holds records
+//! (`repair::assert_agreed` refuses that report rather than reading it as
+//! a pass), which is how a write that left its log dirty fails here. At
+//! the end the KERNEL mounts the image, reads every written file back with
+//! `sha256sum`, and unmounts it, and `xfs_repair -n` grades it once more.
 //!
-//! THE REPLAY IS WHAT LETS THE NEXT WRITE HAPPEN. The driver writes only
-//! to a volume whose log is clean, so a chain of writes -- mkdir /d, then
-//! mkdir /d/e, then a file inside it -- is one write, one kernel mount,
-//! and the next write, on the volume the kernel left.
+//! THE WRITES CHAIN WITH NO KERNEL BETWEEN THEM. The driver writes only to
+//! a volume whose log is clean, and each write leaves it clean, so mkdir
+//! /d, then mkdir /d/e, then a file inside it run one after another on the
+//! volume the last write left.
 //!
 //! EVERY GUEST STEP WORKS ON A COPY ON THE GUEST'S OWN DISK and copies it
 //! back: a loop mount of a file on the shared folder mixes the guest's
@@ -30,10 +32,10 @@ use common::{fixture, guest_quote, kernel_run, repair, scratch};
 
 const SUITE: &str = "cli_write_kernel";
 
-/// Mount `image` with the kernel -- replaying its log -- and unmount it,
-/// then run `then` against the mounted tree first, in the guest, on a copy
-/// on the guest's own disk that is copied back. `then` runs with `$m` the
-/// mount point, from inside it.
+/// Mount `image` with the kernel and unmount it, running `then` against
+/// the mounted tree first, in the guest, on a copy on the guest's own disk
+/// that is copied back. `then` runs with `$m` the mount point, from inside
+/// it.
 fn with_kernel(image: &str, then: &str) -> String {
     kernel_run(&format!(
         r#"
@@ -60,16 +62,33 @@ fn with_kernel(image: &str, then: &str) -> String {
     ))
 }
 
-/// Replay `image`'s log with the kernel and require the result clean.
+/// `xfs_repair -n` on `image` as the write left it -- no kernel has
+/// mounted it, so nothing has replayed anything -- must find nothing
+/// wrong, and the tool must call the log clean.
 #[track_caller]
-fn replay(image: &str, after: &str) -> String {
-    let out = with_kernel(image, "true");
-    assert!(
-        out.contains("MOUNT_OK"),
-        "the kernel would not mount the volume after {after}:\n{out}"
+fn graded(image: &str, after: &str) {
+    let out = kernel_run(&format!(
+        r#"
+        sync; echo 3 > /proc/sys/vm/drop_caches
+        img=$(mktemp -u /tmp/cli-write-XXXXXX.img)
+        cp --sparse=always {image} "$img"
+        {repair}
+        rm -f "$img"
+        echo DONE
+        "#,
+        image = guest_quote(image),
+        repair = repair::script("\"$img\""),
+    ));
+    repair::assert_agreed(
+        &out,
+        &format!("the volume after {after}, before any replay"),
     );
-    repair::assert_agreed(&out, &format!("the volume after {after}, replayed"));
-    out
+    let dirty = stdout(&ok(tool("fs.xfs").args([image, "get", "dirty", "--text"])));
+    assert_eq!(
+        dirty.trim(),
+        "false",
+        "{after} left the log holding records"
+    );
 }
 
 #[track_caller]
@@ -98,8 +117,8 @@ fn the_kernel_replays_what_the_write_verbs_logged_and_xfs_repair_accepts_it() {
     let image = copy.path().to_str().unwrap().to_string();
     let image = image.as_str();
 
-    // One journalled write, one replay, and on to the next: each write
-    // needs a clean log, and each replay is also a check.
+    // One journalled write after another on the volume the last one left,
+    // each graded by xfs_repair before any kernel has seen it.
     let files: Vec<(&str, Vec<u8>)> = vec![
         ("/f1", pattern(1, 1)),
         ("/f4096", pattern(4096, 2)),
@@ -108,26 +127,28 @@ fn the_kernel_replays_what_the_write_verbs_logged_and_xfs_repair_accepts_it() {
     ];
     for (path, bytes) in &files {
         wrote(image, path, bytes);
-        replay(image, &format!("write {path}"));
+        graded(image, &format!("write {path}"));
     }
     made_dir(image, "/d");
-    replay(image, "mkdir /d");
+    graded(image, "mkdir /d");
     made_dir(image, "/d/e");
-    replay(image, "mkdir /d/e");
+    graded(image, "mkdir /d/e");
     let deep = pattern(5000, 5);
     wrote(image, "/d/e/deep", &deep);
-    replay(image, "write /d/e/deep");
+    graded(image, "write /d/e/deep");
     let filled = pattern(3000, 6);
     wrote(image, "/empty", &filled);
-    replay(image, "write /empty (an empty file given contents)");
+    graded(image, "write /empty (an empty file given contents)");
     let same = pattern(262_144, 7);
     wrote(image, "/medium.bin", &same);
+    graded(image, "write /medium.bin (a same-length overwrite)");
 
     // A write too large for any free run is refused, and the file it had
-    // created is unlinked again: two records the kernel has to replay into
-    // a volume with no /huge in it.
+    // created is unlinked again: two records, written home, leaving a
+    // volume with no /huge in it.
     let huge = fs_write(image, "/huge", &vec![0u8; 100_000_000]);
     assert_eq!(huge.status.code(), Some(3), "{}", stderr(&huge));
+    graded(image, "the refused write /huge");
 
     // Now the kernel reads it all.
     let mut expect: Vec<(String, String)> = files
@@ -170,14 +191,14 @@ fn the_kernel_replays_what_the_write_verbs_logged_and_xfs_repair_accepts_it() {
     );
     let in_de: Vec<&str> = out.lines().filter(|l| l.starts_with("IN_DE ")).collect();
     assert_eq!(in_de, vec!["IN_DE deep"], "{out}");
-    repair::assert_agreed(&out, "the volume after every write verb, replayed");
+    repair::assert_agreed(&out, "the volume after every write verb and a kernel mount");
 
-    // And after the kernel's unmount the tool calls the log clean again.
+    // And after the kernel's unmount the tool calls the log clean still.
     let get = stdout(&ok(tool("fs.xfs").args([image, "get", "dirty", "--text"])));
     assert_eq!(
         get.trim(),
         "false",
-        "the replayed volume still reads as dirty"
+        "the volume reads as dirty after the kernel's unmount"
     );
 }
 
