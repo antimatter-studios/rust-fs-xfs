@@ -55,7 +55,7 @@ fn command() -> Cmd {
              1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is partial, and every other shape is refused by name rather than \
              attempted: a new file (v5, one extent), an empty file given contents, a \
-             same-length overwrite in place, mkdir, rm, rmdir and ln (v5). A journalled \
+             same-length overwrite in place, mkdir, rm, rmdir, ln and mv (v5). A journalled \
              change is written home and the log closed with an unmount record before \
              the tool exits, so the volume is clean and the next write can follow at \
              once.",
@@ -272,6 +272,35 @@ fn command() -> Cmd {
                      are checked read-only, and the journalled edit is released clean.",
                 ),
         )
+        .subcommand(
+            Cmd::new("mv")
+                .about("Give a name a new one, in the same directory or another")
+                .arg(
+                    Arg::new("source")
+                        .value_name("SOURCE")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img mv /notes.txt /archive/notes.txt\n  \
+                     fs.xfs disk.img mv --text /draft /final\n\n\
+                     PATH is the new name itself, not a directory to move into. A name \
+                     already at PATH is replaced, as rename(2) replaces it: a file by a \
+                     file, an empty directory by a directory. A symlink is moved, never \
+                     followed, and no symlink on the way to either path is followed. A \
+                     missing SOURCE or parent, a directory moved beneath itself, the root, \
+                     `.`, `..`, a v4 volume and a log holding records are refused before \
+                     the image is opened for writing; a replacement the driver does not \
+                     make is refused with its reason (exit 3) before anything is written. \
+                     The volume is released clean.",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -370,6 +399,15 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             ),
             path_arg(sub),
             sub.get_flag("symbolic"),
+        ),
+        "mv" => mv(
+            target,
+            offset,
+            os_bytes(
+                sub.get_one::<OsString>("source")
+                    .expect("clap requires the source"),
+            ),
+            path_arg(sub),
         ),
         "get" | "info" => get(
             &super::device::mount(target, offset)?,
@@ -1209,6 +1247,13 @@ fn remove(
     }
     .map_err(|e| write_error(path, e))?;
     release_clean(fs, path)?;
+    let mut fields = named(path);
+    fields.push(("removed", Json::from(true)));
+    Ok(Outcome::report(Json::object(fields)).with_text(format!("removed {}", show(path))))
+}
+/// A report's `path`, with its exact bytes in `path_hex` when it is not
+/// UTF-8.
+fn named(path: &[u8]) -> Vec<(&'static str, Json)> {
     let mut fields = vec![("path", Json::from(show(path)))];
     if std::str::from_utf8(path).is_err() {
         fields.push((
@@ -1216,8 +1261,30 @@ fn remove(
             Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
         ));
     }
-    fields.push(("removed", Json::from(true)));
-    Ok(Outcome::report(Json::object(fields)).with_text(format!("removed {}", show(path))))
+    fields
+}
+
+/// `path` as the directory part, its last name, and whether a `/`
+/// followed that name. The root's last name is empty.
+fn last_name(path: &[u8]) -> (&[u8], &[u8], bool) {
+    let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    let trimmed = &path[..end];
+    let start = trimmed
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |i| i + 1);
+    let (dir, name) = trimmed.split_at(start);
+    (dir, name, end < path.len())
+}
+
+/// The directory `dir` names, which holds `path`'s last name; its errors
+/// name `path`.
+fn parent_dir<'f>(fs: &'f Filesystem, path: &[u8], dir: &[u8]) -> Result<File<'f>, CliError> {
+    let parent = fs.open_bytes(dir).map_err(|e| write_error(path, e))?;
+    if !parent.is_dir() {
+        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+    }
+    Ok(parent)
 }
 
 /// The inode of the directory holding `path`'s last name, and that name,
@@ -1250,24 +1317,14 @@ fn removable<'p>(
     if path.is_empty() {
         return Err(xfs_error(path, fs_xfs::Error::NotFound));
     }
-    let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
-    let trailing_slash = end < path.len();
-    let trimmed = &path[..end];
-    let start = trimmed
-        .iter()
-        .rposition(|&b| b == b'/')
-        .map_or(0, |i| i + 1);
-    let (dir, name) = trimmed.split_at(start);
+    let (dir, name, trailing_slash) = last_name(path);
     if name.is_empty() {
         return Err(match removal {
             Removal::Name => failed("is a directory"),
             Removal::Directory => failed("the root directory cannot be removed"),
         });
     }
-    let parent = fs.open_bytes(dir).map_err(|e| write_error(path, e))?;
-    if !parent.is_dir() {
-        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
-    }
+    let parent = parent_dir(fs, path, dir)?;
     match (removal, name) {
         (Removal::Name, b"." | b"..") => return Err(failed("is a directory")),
         (Removal::Directory, b".") => {
@@ -1295,6 +1352,156 @@ fn removable<'p>(
         }
     }
     Ok((parent.inode().ino, name))
+}
+
+/// The longest name a directory entry holds, in bytes.
+const NAME_MAX: usize = 255;
+
+/// What a move hands the library's `rename`: the directory inode and name
+/// SOURCE is at, and the directory inode and name PATH gives it.
+struct Move<'a> {
+    from_dir: u64,
+    from: &'a [u8],
+    to_dir: u64,
+    to: &'a [u8],
+}
+
+/// Give SOURCE the name PATH, and release the volume clean.
+///
+/// As for a removal, everything the move could be refused for that a read
+/// can decide is decided first, on a read-only mount, so such a refusal
+/// never opens the image for writing and leaves it byte-identical. The
+/// move itself is the library's journalled `rename`, which replaces what
+/// is at PATH as `rename(2)` does and refuses the shapes it does not
+/// change (a replaced file whose extents are in a B+tree, for one) before
+/// it writes anything. `unmount` then writes the change home and ends the
+/// log with an unmount record, so `get dirty` is false afterwards.
+fn mv(target: &OsString, offset: u64, source: &[u8], path: &[u8]) -> Result<Outcome, CliError> {
+    let names = movable(&super::device::mount(target, offset)?, target, source, path)?;
+    let fs = super::device::mount_rw(target, offset)?;
+    fs.rename(names.from_dir, names.from, names.to_dir, names.to)
+        .map_err(|e| write_error(source, e))?;
+    release_clean(fs, path)?;
+    let mut fields = named(path);
+    fields.push(("moved", Json::from(true)));
+    Ok(Outcome::report(Json::object(fields)).with_text(format!(
+        "moved {} to {}",
+        show(source),
+        show(path)
+    )))
+}
+
+/// The [`Move`] SOURCE to PATH is, once each refusal a read can decide
+/// has been ruled out: a v4 volume, a log holding records, and then what
+/// the kernel gives `rename(2)`, for the same reason and in the order it
+/// finds them (`tests/cli_mv_kernel.rs` holds the two to the same
+/// answers): a parent that does not resolve, the root, `.` or `..` at
+/// either end, a SOURCE that is not there, a new name too long for an
+/// entry, a name ending in `/` on something that is not a directory, a
+/// directory moved beneath itself, a file over a directory, a directory
+/// over anything else, and a directory over one with entries.
+///
+/// No path component is followed as a symlink, so a symlink is what moves
+/// and what is replaced. SOURCE and PATH naming the same inode is left to
+/// the library, which changes nothing, as `rename(2)` does.
+fn movable<'a>(
+    fs: &Filesystem,
+    target: &OsString,
+    source: &'a [u8],
+    path: &'a [u8],
+) -> Result<Move<'a>, CliError> {
+    if !fs.superblock().is_v5() {
+        return Err(CliError::refused(format!(
+            "{}: renaming writes v5 metadata; a v4 filesystem is not supported",
+            show(source)
+        )));
+    }
+    if fs.was_replayed() {
+        return Err(super::device::dirty_log(&target.to_string_lossy()));
+    }
+    for given in [source, path] {
+        if given.is_empty() {
+            return Err(xfs_error(given, fs_xfs::Error::NotFound));
+        }
+    }
+    let (from_dir, from, from_slash) = last_name(source);
+    let (to_dir, to, to_slash) = last_name(path);
+    let from_parent = parent_dir(fs, source, from_dir)?;
+    let to_parent = parent_dir(fs, path, to_dir)?;
+    for (given, name) in [(source, from), (path, to)] {
+        if matches!(name, b"" | b"." | b"..") {
+            return Err(CliError::failed(format!(
+                "{}: the root, `.` and `..` cannot be moved or replaced",
+                show(given)
+            )));
+        }
+    }
+    let moved = from_parent
+        .open_child(from)
+        .map_err(|e| xfs_error(source, e))?;
+    if to.len() > NAME_MAX {
+        return Err(CliError::failed(format!(
+            "{}: file name too long: a name is at most {NAME_MAX} bytes",
+            show(path)
+        )));
+    }
+    if !moved.is_dir() && (from_slash || to_slash) {
+        let given = if from_slash { source } else { path };
+        return Err(xfs_error(given, fs_xfs::Error::NotADirectory));
+    }
+    if moved.is_dir()
+        && on_the_way(fs, to_dir, moved.inode().ino).map_err(|e| xfs_error(path, e))?
+    {
+        return Err(CliError::failed(format!(
+            "{}: invalid argument: a directory cannot be moved beneath itself, to {}",
+            show(source),
+            show(path)
+        )));
+    }
+    match to_parent.open_child(to) {
+        Ok(existing) if existing.inode().ino == moved.inode().ino => {}
+        Ok(existing) => match (moved.is_dir(), existing.is_dir()) {
+            (false, true) => {
+                return Err(CliError::failed(format!("{}: is a directory", show(path))))
+            }
+            (true, false) => return Err(xfs_error(path, fs_xfs::Error::NotADirectory)),
+            (true, true) => {
+                if !existing
+                    .entries()
+                    .map_err(|e| xfs_error(path, e))?
+                    .is_empty()
+                {
+                    return Err(xfs_error(path, fs_xfs::Error::DirectoryNotEmpty));
+                }
+            }
+            (false, false) => {}
+        },
+        Err(fs_xfs::Error::NotFound) => {}
+        Err(e) => return Err(xfs_error(path, e)),
+    }
+    Ok(Move {
+        from_dir: from_parent.inode().ino,
+        from,
+        to_dir: to_parent.inode().ino,
+        to,
+    })
+}
+
+/// Whether inode `ino` is the directory `dir` names or one on the way to
+/// it from the root. `dir` has resolved already, through no symlink and no
+/// `..`, so its components are exactly that way.
+fn on_the_way(fs: &Filesystem, dir: &[u8], ino: u64) -> Result<bool, fs_xfs::Error> {
+    let mut at = fs.root()?.inode().ino;
+    for component in dir
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+    {
+        if at == ino {
+            return Ok(true);
+        }
+        at = fs.open_ino(at)?.open_child(component)?.inode().ino;
+    }
+    Ok(at == ino)
 }
 
 /// The UUID in its standard 8-4-4-4-12 form.
