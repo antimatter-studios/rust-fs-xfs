@@ -51,8 +51,8 @@ fn command() -> Cmd {
              An escape hatch for an errand (get a file out, read the label, check whether \
              the log needs replaying), not a place to do real filesystem work: for that, \
              mount it.\n\n\
-             Metadata is JSON on stdout (--text for people); `read` writes the file's raw \
-             bytes and `write` reads them from stdin. A failure is \
+             Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
+             write raw bytes and `write` reads them from stdin. A failure is \
              {\"error\": \"...\", \"code\": N} on stderr, N being the exit status: \
              1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is partial, and every other shape is refused by name rather than \
@@ -143,6 +143,44 @@ fn command() -> Cmd {
                      fs.xfs disk.img stat --text /bin/sh\n\n\
                      A symlink is reported, not followed. Times are signed seconds since \
                      the epoch plus nanoseconds; creation time is null on v4 inodes.",
+                ),
+        )
+        .subcommand(
+            Cmd::new("xattr")
+                .about("List extended attribute names and sizes, or read one value's raw bytes")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("name")
+                        .value_name("NAME")
+                        .value_parser(value_parser!(OsString))
+                        .help("The full attribute name, including its namespace prefix"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .requires("name")
+                        .value_parser(value_parser!(OsString))
+                        .help("Write the named value here instead of stdout"),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img xattr /etc/hostname\n  \
+                     fs.xfs disk.img xattr --text /etc/hostname\n  \
+                     fs.xfs disk.img xattr /etc/hostname user.comment\n  \
+                     fs.xfs disk.img xattr /bin/tool security.capability -o capability.bin\n\n\
+                     Without NAME, list {name, size} objects as JSON, or tab-separated \
+                     name and byte size with --text. A non-UTF-8 name is shown lossily \
+                     with its exact bytes in name_hex. With NAME, write only the value's \
+                     raw bytes, including an empty value, regardless of output format. \
+                     A missing name exits 1 before opening FILE. Like read, -o writes \
+                     FILE.partial and renames it on success. Inspection is read-only; \
+                     no symlink is followed and no attribute is set or removed.",
                 ),
         )
         .subcommand(
@@ -424,6 +462,12 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         }
         "ls" => ls(&super::device::mount(target, offset)?, path_arg(sub)),
         "stat" => stat(&super::device::mount(target, offset)?, path_arg(sub)),
+        "xattr" => xattr(
+            &super::device::mount(target, offset)?,
+            path_arg(sub),
+            sub.get_one::<OsString>("name").map(os_bytes),
+            sub.get_one("output"),
+        ),
         "read" => read(
             &super::device::mount(target, offset)?,
             path_arg(sub),
@@ -883,6 +927,78 @@ fn ls_recursive(
             Err(error)
         }
     }
+}
+
+/// Inspect attributes on a read-only mount. Read the whole value before
+/// opening an output, so a missing attribute or a damaged fork emits no
+/// content and leaves an existing destination alone.
+fn xattr(
+    fs: &Filesystem,
+    path: &[u8],
+    name: Option<&[u8]>,
+    output: Option<&OsString>,
+) -> Result<Outcome, CliError> {
+    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    if let Some(name) = name {
+        let value = fs
+            .get_xattr(file.inode(), file.raw(), name)
+            .map_err(|e| xfs_error(path, e))?
+            .ok_or_else(|| {
+                CliError::failed(format!("{}: no such attribute: {}", show(path), show(name)))
+            })?;
+        if let Some(dest) = output {
+            let dest = std::path::Path::new(dest);
+            let mut partial = dest.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = std::path::PathBuf::from(partial);
+            let written = (|| {
+                std::fs::write(&partial, &value)
+                    .map_err(|e| CliError::failed(format!("write {}: {e}", partial.display())))?;
+                std::fs::rename(&partial, dest)
+                    .map_err(|e| CliError::failed(format!("rename to {}: {e}", dest.display())))
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&partial);
+            }
+            written?;
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&value)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+        }
+        return Ok(Outcome::done());
+    }
+    let mut attrs = fs
+        .list_xattrs(file.inode(), file.raw())
+        .map_err(|e| xfs_error(path, e))?;
+    attrs.sort_by(|a, b| a.name.cmp(&b.name));
+    let text = attrs
+        .iter()
+        .map(|a| format!("{}\t{}", show(&a.name), a.value.len()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rows = attrs
+        .into_iter()
+        .map(|a| {
+            let mut fields = vec![("name", Json::from(show(&a.name)))];
+            if std::str::from_utf8(&a.name).is_err() {
+                fields.push((
+                    "name_hex",
+                    Json::from(
+                        a.name
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    ),
+                ));
+            }
+            fields.push(("size", Json::from(a.value.len() as u64)));
+            Json::object(fields)
+        })
+        .collect();
+    Ok(Outcome::report(Json::Arr(rows)).with_text(text))
 }
 
 /// Stream a regular file's bytes. Everything that can be refused up front
