@@ -9,10 +9,12 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
 use fs_core::cli::{CliError, Format as CliFormat, Json, Outcome, Tool};
+use fs_core::{BlockDevice, BlockRead};
 use fs_xfs::endian::{be16, be32};
 use fs_xfs::format::log_items::log_dinode::offsets;
 use fs_xfs::fs::File;
@@ -55,7 +57,7 @@ fn command() -> Cmd {
              1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is partial, and every other shape is refused by name rather than \
              attempted: a new file (v5, one extent), an empty file given contents, a \
-             same-length overwrite in place, mkdir, rm, rmdir, ln and mv (v5). A journalled \
+             same-length overwrite in place, mkdir, rm, rmdir, ln, mv and truncate (v5). A journalled \
              change is written home and the log closed with an unmount record before \
              the tool exits, so the volume is clean and the next write can follow at \
              once.",
@@ -316,6 +318,32 @@ fn command() -> Cmd {
                      The volume is released clean.",
                 ),
         )
+        .subcommand(
+            Cmd::new("truncate")
+                .about("Set a regular file's length, freeing blocks past a shorter end (v5)")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("size")
+                        .value_name("SIZE")
+                        .required(true)
+                        .value_parser(value_parser!(u64)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img truncate /log.txt 0\n  \
+                     fs.xfs disk.img truncate /sparse.img 1073741824\n\n\
+                     SIZE is a byte count. Shrinking frees blocks past the new end; \
+                     growing reads back as zeros without allocating blocks. Symlinks \
+                     are never followed. A v4 volume, a shared partial last block, \
+                     and a cut whose remaining extents still need a B+tree are refused \
+                     (exit 3). Every driver refusal is checked in memory before TARGET \
+                     is opened for writing. The journalled edit is released clean.",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -404,6 +432,12 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         "write" => write(target, offset, path_arg(sub)),
         "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, path_arg(sub)),
         "mkdir" => mkdir(target, offset, path_arg(sub)),
+        "truncate" => truncate(
+            target,
+            offset,
+            path_arg(sub),
+            *sub.get_one::<u64>("size").expect("clap requires the size"),
+        ),
         "rm" => remove(target, offset, path_arg(sub), Removal::Name),
         "rmdir" => remove(target, offset, path_arg(sub), Removal::Directory),
         "ln" => ln(
@@ -1323,6 +1357,93 @@ fn mkdir_parents(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome,
         ),
     ]);
     Ok(Outcome::report(report).with_text(text))
+}
+
+/// A private, writable view of a read-only mount. Running the library's
+/// truncate and clean release here checks its allocation, quota and log
+/// limits too, without copying the image or opening it for writing.
+struct TruncatePreview {
+    source: Filesystem,
+    writes: Mutex<Vec<(u64, Vec<u8>)>>,
+}
+
+impl BlockRead for TruncatePreview {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        self.source.device().read_at(offset, buf)?;
+        for (at, bytes) in self.writes.lock().expect("preview poisoned").iter() {
+            let start = offset.max(*at);
+            let end = (offset + buf.len() as u64).min(*at + bytes.len() as u64);
+            if start < end {
+                buf[(start - offset) as usize..(end - offset) as usize]
+                    .copy_from_slice(&bytes[(start - at) as usize..(end - at) as usize]);
+            }
+        }
+        Ok(())
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.source.device().size_bytes()
+    }
+}
+
+impl BlockDevice for TruncatePreview {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        let size = self.size_bytes();
+        if offset > size || buf.len() as u64 > size - offset {
+            return Err(fs_core::Error::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                size,
+            });
+        }
+        self.writes
+            .lock()
+            .expect("preview poisoned")
+            .push((offset, buf.to_vec()));
+        Ok(())
+    }
+
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+/// Set the length through truncate_to: unlike the older truncate, it
+/// frees blocks and supports sparse growth. Refusals precede writable open.
+fn truncate(target: &OsString, offset: u64, path: &[u8], size: u64) -> Result<Outcome, CliError> {
+    if size > i64::MAX as u64 {
+        return Err(CliError::refused(
+            "truncate: size exceeds the signed file-length limit",
+        ));
+    }
+    let fs = super::device::mount(target, offset)?;
+    if fs.was_replayed() {
+        return Err(super::device::dirty_log(&target.to_string_lossy()));
+    }
+    let file = fs.open_bytes(path).map_err(|e| write_error(path, e))?;
+    if path.ends_with(b"/") && !file.is_dir() {
+        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+    }
+    let ino = file.inode().ino;
+    let preview = Filesystem::mount_rw(Arc::new(TruncatePreview {
+        source: fs,
+        writes: Mutex::new(Vec::new()),
+    }))
+    .map_err(|e| write_error(path, e))?;
+    preview
+        .truncate_to(ino, size)
+        .map_err(|e| write_error(path, e))?;
+    release_clean(preview, path)?;
+
+    let fs = super::device::mount_rw(target, offset)?;
+    fs.truncate_to(ino, size)
+        .map_err(|e| write_error(path, e))?;
+    release_clean(fs, path)?;
+    Ok(Outcome::report(Json::object([
+        ("path", Json::from(show(path))),
+        ("size", Json::from(size)),
+    ]))
+    .with_text(format!("{} is {size} bytes", show(path))))
 }
 
 /// What a removal takes away: `rm` a name that is not a directory,

@@ -257,6 +257,7 @@ fs.xfs disk.img ls -R --max-depth 8 --limit 1000 /etc
 fs.xfs disk.img read /etc/fstab > fstab
 fs.xfs disk.img write /notes.txt < notes.txt
 fs.xfs disk.img mkdir -p /backup/2026/october
+fs.xfs disk.img truncate /notes.txt 0
 fs.xfs disk.img rm /notes.txt
 fs.xfs disk.img rmdir /backup
 fs.xfs disk.img mv /draft.txt /archive/final.txt
@@ -277,6 +278,7 @@ fs.xfs --offset 1048576 whole-disk.img info
 | `rmdir <path>` | removes an empty directory (v5), with the same report |
 | `ln [-s] <target> <path>` | adds a hard link to the target inode, or stores the target text literally in a symbolic link with `-s` (v5). Reports `{"path": ..., "linked": true, "inode": N}` and leaves the volume clean |
 | `mv <source> <path>` | gives SOURCE the name PATH, in its directory or another (v5). PATH is the new name itself, not a directory to move into; a name already there is replaced as `rename(2)` replaces it, a file by a file and an empty directory by a directory. Reports `{"path": ..., "moved": true}` |
+| `truncate <path> <size>` | sets a regular file's length in bytes (v5), freeing blocks past a shorter end and reading zeros after growth. Reports `{"path": ..., "size": N}` and releases the volume clean |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log holds records nothing has applied yet), and `xfs` or `xfs.<field>` |
 | `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; a volume whose log is not clean is refused |
 | `resize <size>` | answers `not implemented` (exit 3): the library has no resize |
@@ -287,12 +289,21 @@ image. Metadata is JSON on stdout by default, `--text` for people. A failure is
 command line was wrong, 3 not implemented or refused.
 
 A journalled change -- a new file, a filled empty file, a directory, a removal, a link,
-a move -- is a record in the log, and the tool then releases the volume clean: the change is written
+a move, a truncate -- is a record in the log, and the tool then releases the volume
+clean: the change is written
 home and the log ends with an unmount record, so `get dirty` is `false` afterwards and
 the next write follows on the same image at once. The driver writes only to a volume
 whose log is clean, so one Linux left holding records is refused until Linux has
 mounted it again; reading needs no such wait, since `ls` and `read` replay the log in
 memory.
+
+`truncate` never follows symlinks. A directory, a symlink or a missing path fails
+(exit 1); a v4 volume, a shared partial last block, or a cut that would leave too
+many extents for the inode refuses with the driver's reason (exit 3). The complete
+operation is checked in memory with the image read-only before it is opened for
+writing, so a refusal leaves it byte-identical. A malformed size is exit 2 before
+the target is opened. `--offset` selects the filesystem inside the target, never
+a byte within the file.
 
 For `rm` and `rmdir`, a missing path, a directory given to `rm`, anything but a
 directory given to `rmdir`, a directory with entries, `.`, `..`,
