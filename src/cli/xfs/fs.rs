@@ -55,9 +55,10 @@ fn command() -> Cmd {
              1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is partial, and every other shape is refused by name rather than \
              attempted: a new file (v5, one extent), an empty file given contents, a \
-             same-length overwrite in place, and mkdir (v5). A journalled write leaves \
-             its change in the log, and the next write waits until Linux has mounted \
-             the volume once to replay it. rm and rmdir (v5) release the volume clean.",
+             same-length overwrite in place, mkdir, rm and rmdir (v5). A journalled \
+             change is written home and the log closed with an unmount record before \
+             the tool exits, so the volume is clean and the next write can follow at \
+             once.",
         )
         .arg(
             Arg::new("target")
@@ -196,9 +197,10 @@ fn command() -> Cmd {
                         .value_parser(value_parser!(OsString)),
                 )
                 .after_help(
-                    "Examples:\n  fs.xfs disk.img mkdir /backup\n\n\
-                     The change is a log record: mount the volume with Linux once \
-                     before the next write (`mkdir /backup/2026` is refused until then).",
+                    "Examples:\n  fs.xfs disk.img mkdir /backup\n  \
+                     fs.xfs disk.img mkdir /backup/2026\n\n\
+                     The change is journalled, then written home with the log closed \
+                     behind it, so the volume is left clean for the next write.",
                 ),
         )
         .subcommand(
@@ -855,6 +857,19 @@ fn write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     }
 }
 
+/// Release a volume a journalled verb has changed, clean: `unmount` writes
+/// the change home, puts the summary counters right and ends the log with
+/// an unmount record (#439), so `get dirty` is false afterwards and the
+/// next write need not wait for Linux to replay it.
+fn release_clean(fs: Filesystem, what: &[u8]) -> Result<(), CliError> {
+    fs.unmount().map_err(|e| {
+        CliError::failed(format!(
+            "{}: changed in the log, but the volume could not be released clean: {e}",
+            show(what)
+        ))
+    })
+}
+
 /// `path` split into its parent directory and its last component, which
 /// must be a name: not empty, `.` or `..`.
 fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), CliError> {
@@ -889,7 +904,7 @@ fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), CliError> {
 ///   journalled, v5 only). If the second is refused -- no single free run
 ///   long enough, a file too large for one extent -- the new file is
 ///   unlinked again in the same mount, so a refused write leaves no file
-///   behind.
+///   behind, and the volume is released clean as after a write.
 /// - **An existing empty file**: `write_into_empty_file`.
 /// - **An existing file of the same length**: `write_at` in place, which
 ///   changes no metadata and needs no journal.
@@ -897,6 +912,9 @@ fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), CliError> {
 ///   its reason is the error.
 /// - **Shorter**: refused here. Replacing means truncating and
 ///   reallocating, which the driver does not do as one operation.
+///
+/// A journalled write then releases the volume clean, so the next one
+/// follows on the volume this one left.
 fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
     let (parent_path, name) = split_path(path)?;
     let mut data = Vec::new();
@@ -925,11 +943,17 @@ fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
             if !data.is_empty() {
                 if let Err(e) = fs.write_into_empty_file(ino, &data) {
                     let refused = write_error(path, e);
-                    return Err(match fs.unlink_file(parent_ino, name) {
-                        Ok(_) => refused,
-                        Err(undo) => CliError::failed(format!(
+                    if let Err(undo) = fs.unlink_file(parent_ino, name) {
+                        return Err(CliError::failed(format!(
                             "{} (and removing the file it had created failed too: {undo})",
                             refused.message
+                        )));
+                    }
+                    return Err(match release_clean(fs, path) {
+                        Ok(()) => refused,
+                        Err(release) => CliError::failed(format!(
+                            "{} (and then {})",
+                            refused.message, release.message
                         )),
                     });
                 }
@@ -976,19 +1000,23 @@ fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
             }
         }
     };
+    let journalled = how != "overwritten";
+    if journalled {
+        release_clean(fs, path)?;
+    }
     let report = Json::object([
         ("path", Json::from(show(path))),
         ("bytes", Json::from(bytes as u64)),
         ("result", Json::from(how)),
         ("created", Json::from(how == "created")),
-        ("journalled", Json::from(how != "overwritten")),
+        ("journalled", Json::from(journalled)),
     ]);
     let text = format!("{how} {} ({bytes} bytes)", show(path));
     Ok(Outcome::report(report).with_text(text))
 }
 
 /// Create one directory, mode 0755. Its parent must exist, and nothing
-/// may be at the path yet.
+/// may be at the path yet. The volume is then released clean.
 fn mkdir(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
     let (parent_path, name) = split_path(path)?;
     let fs = super::device::mount_rw(target, offset)?;
@@ -1001,6 +1029,7 @@ fn mkdir(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
     let (ino, _) = fs
         .create_directory(parent.inode().ino, name, DIR_MODE)
         .map_err(|e| write_error(path, e))?;
+    release_clean(fs, path)?;
     let report = Json::object([("path", Json::from(show(path))), ("inode", Json::from(ino))]);
     Ok(Outcome::report(report).with_text(format!("created {}", show(path))))
 }
