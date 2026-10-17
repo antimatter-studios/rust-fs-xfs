@@ -20,7 +20,8 @@
 //! a directory replaces an empty directory. The replaced inode loses the
 //! link the name was, and an inode left with none is freed in the same
 //! record: its slot goes back to its chunk, its extents to free space,
-//! its quota with them. What POSIX forbids is refused before anything is
+//! its attribute fork's blocks with them (#495), and its quota with all
+//! of it. What POSIX forbids is refused before anything is
 //! written: a file over a directory ([`Error::NotAFile`], EISDIR), a
 //! directory over anything else ([`Error::NotADirectory`], ENOTDIR), a
 //! directory over one that is not empty ([`Error::DirectoryNotEmpty`]).
@@ -158,21 +159,15 @@ impl Filesystem {
         let victim_freed = victim
             .as_ref()
             .is_some_and(|(v, _)| v.is_dir() || v.nlink <= 1);
-        if let Some((v, _)) = victim.as_ref().filter(|_| victim_freed) {
-            if v.format == Format::Btree {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {} keeps its extents in a B+tree, which freeing it with a rename \
-                     does not undo",
-                    v.ino
-                )));
-            }
-            if v.anextents > 0 && v.aformat != Format::Local {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {} has attribute blocks, which freeing it with a rename does not \
-                     give back",
-                    v.ino
-                )));
-            }
+        if let Some((v, _)) = victim
+            .as_ref()
+            .filter(|(v, _)| victim_freed && v.format == Format::Btree)
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {} keeps its extents in a B+tree, which freeing it with a rename does \
+                 not undo",
+                v.ino
+            )));
         }
 
         if is_dir && !same_dir {
@@ -415,6 +410,14 @@ impl Filesystem {
         for fork in &mut forks {
             fork.release(self, &mut allocations)?;
         }
+        // A FREED VICTIM'S ATTRIBUTE BLOCKS (#495): its leaf, node and
+        // remote-value blocks and the B+tree mapping them, given back after
+        // every fork has taken its new blocks, so none is handed out again
+        // in this record. Its quota credit, above, already counts them.
+        let attr_cancels = match victim.as_ref().filter(|_| victim_freed) {
+            Some((v, raw)) => self.release_freed_attribute_fork(&mut allocations, v, raw)?,
+            None => Vec::new(),
+        };
         quota_changes.extend(forks.iter().filter_map(|f| f.quota));
         let allocation_items = allocations.into_items()?;
         let quota_items = if quota_changes.is_empty() {
@@ -480,6 +483,7 @@ impl Filesystem {
             + freed_items.iter().map(|i| i.op_count()).sum::<usize>()
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + forks.iter().map(|f| f.buffer_op_count()).sum::<usize>()
+            + attr_cancels.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + inode_ops.len();
 
@@ -503,6 +507,9 @@ impl Filesystem {
             for fork in &forks {
                 ops.extend(fork.buffer_ops());
             }
+            for item in &attr_cancels {
+                ops.extend(item.ops());
+            }
             for item in &quota_items {
                 ops.extend(item.ops());
             }
@@ -514,7 +521,10 @@ impl Filesystem {
             ops
         })?;
 
-        // What the record says is now what this mount reads (#89).
+        // What the record says is now what this mount reads (#89). The
+        // freed attribute blocks first, so nothing this record logs is let
+        // go of with them.
+        self.cancelled_buffers(&attr_cancels);
         self.logged_buffers(&allocation_items);
         self.logged_buffers(&freed_items);
         for item in dir_items {

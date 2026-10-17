@@ -97,3 +97,108 @@ fn final_unlink_frees_a_populated_inode_and_its_blocks() {
         assert_eq!(freed.gen, before.gen.wrapping_add(1));
     }
 }
+
+/// A file whose attribute fork has blocks of its own: `names` small user
+/// attributes, past what the inode holds, and one value of 3,000 bytes,
+/// past what a leaf keeps beside its name, so stored in blocks of its own.
+fn file_with_attribute_blocks(fs: &Filesystem, name: &[u8], names: usize) -> u64 {
+    use fs_xfs::attr_write::XattrMode;
+    let root = fs.superblock().rootino;
+    let ino = fs.create_file(root, name, 0o600).unwrap().0;
+    for i in 0..names {
+        fs.set_xattr(
+            ino,
+            format!("user.name_{i:03}").as_bytes(),
+            format!("value_{i:03}").as_bytes(),
+            XattrMode::Create,
+        )
+        .unwrap();
+    }
+    fs.set_xattr(ino, b"user.remote", &[0x5a; 3000], XattrMode::Create)
+        .unwrap();
+    let inode = fs.read_inode(ino).unwrap();
+    assert!(
+        inode.aformat != fs_xfs::inode::Format::Local && inode.anextents > 0 && inode.nblocks > 0,
+        "the attribute fork this case is about has blocks of its own: {:?} with {} extents \
+         and {} blocks",
+        inode.aformat,
+        inode.anextents,
+        inode.nblocks
+    );
+    ino
+}
+
+/// The inode `ino` was freed with everything it held: no mode, no links,
+/// no blocks and no attribute fork, and its generation moved on.
+fn assert_freed(fs: &Filesystem, ino: u64, gen_before: u32) {
+    let freed = fs.read_inode(ino).unwrap();
+    assert_eq!(
+        (freed.mode, freed.nlink, freed.nblocks, freed.forkoff),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(freed.gen, gen_before.wrapping_add(1));
+}
+
+/// The volume on `device`, mounted afresh so the log is replayed, has no
+/// block that is both free and owned, and none owned by nobody.
+fn assert_clean_after_replay(device: &Arc<SparseDevice>, what: &str) {
+    let fresh = Filesystem::mount(device.clone()).expect("remount");
+    let report = fs_xfs::check::check(&fresh);
+    assert!(report.is_clean(), "{what}: {:#?}", report.findings);
+}
+
+/// The last name of a file whose attribute fork has blocks of its own --
+/// a leaf or a node, and a remote value -- frees them with the inode
+/// (#495): each goes back to free space, and the volume replayed from the
+/// log is consistent. It was refused before anything was written.
+#[test]
+fn final_unlink_gives_back_the_attribute_blocks() {
+    for (blocksize, names) in [(1024, 60), (4096, 40)] {
+        let (fs, device) = filesystem(blocksize);
+        let root = fs.superblock().rootino;
+        let ino = file_with_attribute_blocks(&fs, b"victim", names);
+        let before = fs.read_inode(ino).unwrap();
+        let free_blocks_before = free_blocks(&fs);
+        fs.unlink_file(root, b"victim").unwrap_or_else(|e| {
+            panic!("{blocksize}: the last name of a file with attribute blocks: {e:?}")
+        });
+        assert_eq!(fs.lookup_path("/victim"), Err(fs_xfs::Error::NotFound));
+        assert_eq!(
+            free_blocks(&fs),
+            free_blocks_before + before.nblocks,
+            "{blocksize}: every attribute block goes back to free space"
+        );
+        assert_freed(&fs, ino, before.gen);
+        drop(fs);
+        assert_clean_after_replay(&device, &format!("{blocksize}: after the unlink"));
+    }
+}
+
+/// The same for a rename that replaces the last name of such a file
+/// (#495).
+#[test]
+fn a_rename_over_a_last_name_gives_back_the_attribute_blocks() {
+    for (blocksize, names) in [(1024, 60), (4096, 40)] {
+        let (fs, device) = filesystem(blocksize);
+        let root = fs.superblock().rootino;
+        let ino = file_with_attribute_blocks(&fs, b"victim", names);
+        fs.create_file(root, b"replacer", 0o600).unwrap();
+        let before = fs.read_inode(ino).unwrap();
+        let free_blocks_before = free_blocks(&fs);
+        fs.rename(root, b"replacer", root, b"victim")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{blocksize}: replacing the last name of a file with attribute blocks: {e:?}"
+                )
+            });
+        assert_ne!(fs.lookup_path("/victim").unwrap().ino, ino);
+        assert_eq!(
+            free_blocks(&fs),
+            free_blocks_before + before.nblocks,
+            "{blocksize}: every attribute block goes back to free space"
+        );
+        assert_freed(&fs, ino, before.gen);
+        drop(fs);
+        assert_clean_after_replay(&device, &format!("{blocksize}: after the rename"));
+    }
+}

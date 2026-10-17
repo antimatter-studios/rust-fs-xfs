@@ -782,6 +782,31 @@ impl Filesystem {
         Ok(cancels)
     }
 
+    /// Give back every block the attribute fork of `inode`, which is being
+    /// freed, holds (#495): its leaf, node and remote-value blocks, and the
+    /// blocks of the B+tree that maps them when the fork is one. Each goes
+    /// back to free space and out of the reverse map, and a cancellation
+    /// for each is returned, as `xfs_attr_inactive` invalidates them.
+    ///
+    /// A fork with no blocks of its own, short form or none, gives back
+    /// nothing. The fork's entries are not read: an inode being freed keeps
+    /// none of them. Its owners' quota and its block count are the caller's,
+    /// which credit everything the inode held at once.
+    ///
+    /// Call this only once every block the record takes has been taken. A
+    /// block freed here and handed out again in the same record would be
+    /// cancelled in that record, and recovery would not replay what it
+    /// newly holds.
+    pub(crate) fn release_freed_attribute_fork<'a>(
+        &'a self,
+        allocations: &mut Allocations<'a>,
+        inode: &Inode,
+        raw: &[u8],
+    ) -> Result<Vec<BufferItem>> {
+        let map = self.attribute_map(inode, raw)?;
+        self.release_attribute_blocks(allocations, inode.ino, &map)
+    }
+
     fn attribute_map(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
         let Some((start, end)) = inode.attr_fork_range(raw.len()) else {
             return Ok(Vec::new());

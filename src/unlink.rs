@@ -3,7 +3,10 @@
 //! Create in reverse, and the same five items: the group's inode header,
 //! both inode trees, the parent directory and the inode itself. The name
 //! goes out of the directory, the inode goes back into the group's
-//! accounting, and the inode is emptied.
+//! accounting, and the inode is emptied. Whatever it held goes back to
+//! free space in the same record: its data extents, and its attribute
+//! fork's leaf, node and remote-value blocks with the B+tree mapping them
+//! (#495).
 //!
 //! # The case that is easy to get wrong
 //!
@@ -304,19 +307,11 @@ impl Filesystem {
         // A file with another name keeps living, a link fewer (#384); its
         // last name, or a directory, frees it with everything it owns.
         let freed = target == Target::Directory || victim.nlink <= 1;
-        if freed {
-            if victim.format == Format::Btree {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino} keeps its extents in a B+tree, which freeing it here does \
-                     not undo"
-                )));
-            }
-            if victim.anextents > 0 && victim.aformat != Format::Local {
-                return Err(Error::UnsupportedFeature(format!(
-                    "inode {ino} has attribute blocks, which freeing it here does not give \
-                     back"
-                )));
-            }
+        if freed && victim.format == Format::Btree {
+            return Err(Error::UnsupportedFeature(format!(
+                "inode {ino} keeps its extents in a B+tree, which freeing it here does not \
+                 undo"
+            )));
         }
 
         let group_items = if freed {
@@ -367,6 +362,18 @@ impl Filesystem {
             let extents = self.data_extents(&victim, &victim_raw)?;
             self.free_file_extents(&mut allocations, ino, &extents)?;
         }
+        // AND ITS ATTRIBUTE FORK'S BLOCKS (#495): a leaf, a node, remote
+        // values, and the B+tree mapping them, each back to free space with
+        // its reverse mapping and its buffer cancelled. Last, once the
+        // directory has every block it takes, so none of them is handed out
+        // again in this record. A short-form fork holds none, and goes with
+        // the emptied core. The quota credit below is every block the inode
+        // held, these included.
+        let attr_cancels = if freed {
+            self.release_freed_attribute_fork(&mut allocations, &victim, &victim_raw)?
+        } else {
+            Vec::new()
+        };
         let mut dir_core = dir_raw.clone();
         dir_core[core_at::SIZE..core_at::SIZE + 8].copy_from_slice(&dir_size.to_be_bytes());
         dir_core[core_at::FORMAT] = dir_format as u8;
@@ -468,6 +475,7 @@ impl Filesystem {
             + allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
             + parents.as_ref().map_or(0, |p| p.buffer_op_count())
+            + attr_cancels.iter().map(|i| i.op_count()).sum::<usize>()
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + victim_ops.len();
@@ -501,6 +509,9 @@ impl Filesystem {
             if let Some(p) = &parents {
                 ops.extend(p.buffer_ops());
             }
+            for item in &attr_cancels {
+                ops.extend(item.ops());
+            }
             for item in &quota_items {
                 ops.extend(item.ops());
             }
@@ -529,7 +540,10 @@ impl Filesystem {
             ops
         })?;
 
-        // What the record says is now what this mount reads (#89).
+        // What the record says is now what this mount reads (#89). The
+        // freed attribute blocks first, so nothing this record logs is let
+        // go of with them.
+        self.cancelled_buffers(&attr_cancels);
         self.logged_buffers(&group_items);
         self.logged_buffers(&allocation_items);
         self.logged_buffers(&dir_items);
