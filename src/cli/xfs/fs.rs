@@ -12,7 +12,9 @@ use std::io::Write;
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
 use fs_core::cli::{CliError, Json, Outcome, Tool};
-use fs_xfs::inode::{FileType, Inode};
+use fs_xfs::endian::{be16, be32};
+use fs_xfs::format::log_items::log_dinode::offsets;
+use fs_xfs::inode::{FileType, Format, Inode};
 use fs_xfs::Filesystem;
 
 pub const TOOL: Tool = Tool {
@@ -87,6 +89,23 @@ fn command() -> Cmd {
                     "Examples:\n  fs.xfs disk.img ls /etc\n  \
                      fs.xfs disk.img ls / | jq -r '.[].name'\n  \
                      fs.xfs disk.img ls --text /",
+                ),
+        )
+        .subcommand(
+            Cmd::new("stat")
+                .about("Report one path: identity, type, mode, owner, links, sizes and every time")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img stat /etc/hostname\n  \
+                     fs.xfs disk.img stat /var/log | jq .nlink\n  \
+                     fs.xfs disk.img stat --text /bin/sh\n\n\
+                     A symlink is reported, not followed. Times are signed seconds since \
+                     the epoch plus nanoseconds; creation time is null on v4 inodes.",
                 ),
         )
         .subcommand(
@@ -218,6 +237,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .unwrap_or(0);
     match verb {
         "ls" => ls(&super::device::mount(target, offset)?, path_arg(sub)),
+        "stat" => stat(&super::device::mount(target, offset)?, path_arg(sub)),
         "read" => read(
             &super::device::mount(target, offset)?,
             path_arg(sub),
@@ -378,6 +398,145 @@ fn ls(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Outcome::report(Json::Arr(entries)).with_text(text))
+}
+
+/// Names in bit order, with any unrecognised bits retained as hex.
+fn inode_flag_names(mut bits: u64, names: &[&str]) -> Json {
+    let mut flags = Vec::new();
+    for (bit, name) in names.iter().enumerate() {
+        let mask = 1 << bit;
+        if bits & mask != 0 {
+            flags.push(Json::from(*name));
+            bits &= !mask;
+        }
+    }
+    if bits != 0 {
+        flags.push(Json::from(format!("0x{bits:x}")));
+    }
+    Json::Arr(flags)
+}
+
+/// The shared `stat` keys and ordering match the other filesystem tools.
+/// XFS's inode layout is documented in XFS Filesystem Structure, "On-disk
+/// Inode"; cli_stat_kernel holds the decoded values to Linux and xfsprogs.
+fn stat(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
+    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    let inode = file.inode();
+    let raw = file.raw();
+    let v3 = inode.version == 3;
+    let wide_project =
+        fs.superblock().features2 & fs_xfs::superblock::features2_flags::PROJID32BIT != 0;
+    let projid = u32::from(be16(raw, offsets::PROJID_LO))
+        | if wide_project {
+            u32::from(be16(raw, offsets::PROJID_HI)) << 16
+        } else {
+            0
+        };
+    let allocated = inode
+        .nblocks
+        .checked_mul(u64::from(fs.superblock().blocksize))
+        .ok_or_else(|| CliError::failed("allocated byte count overflows"))?;
+    let mut fields = vec![("path", Json::from(show(path)))];
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex",
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.extend([
+        ("inode", Json::from(inode.ino)),
+        ("type", Json::from(type_name(inode.file_type()))),
+        ("mode", Json::from(format!("{:04o}", inode.mode & 0o7777))),
+        ("uid", Json::from(inode.uid)),
+        ("gid", Json::from(inode.gid)),
+        ("nlink", Json::from(inode.nlink)),
+        ("size", Json::from(inode.size)),
+        ("allocated_bytes", Json::from(allocated)),
+        ("atime", Json::from(inode.atime.sec)),
+        ("atime_nsec", Json::from(inode.atime.nsec)),
+        ("mtime", Json::from(inode.mtime.sec)),
+        ("mtime_nsec", Json::from(inode.mtime.nsec)),
+        ("ctime", Json::from(inode.ctime.sec)),
+        ("ctime_nsec", Json::from(inode.ctime.nsec)),
+        ("btime", Json::from(v3.then_some(inode.crtime.sec))),
+        ("btime_nsec", Json::from(v3.then_some(inode.crtime.nsec))),
+    ]);
+    match inode.file_type() {
+        Some(FileType::Symlink) => fields.push((
+            "target",
+            Json::from(show(&file.link_target().map_err(|e| xfs_error(path, e))?)),
+        )),
+        Some(FileType::CharDevice | FileType::BlockDevice) => {
+            // XFS's on-disk SysV device number: 14 major bits, 18 minor
+            // bits. The wide node in cli_stat_kernel distinguishes this
+            // from Linux's in-memory dev_t and its other disk encodings.
+            let dev = be32(raw, inode.data_fork_offset());
+            fields.push(("major", Json::from(dev >> 18)));
+            fields.push(("minor", Json::from(dev & 0x3_ffff)));
+        }
+        _ => {}
+    }
+    fields.push((
+        "xfs",
+        Json::object([
+            ("version", Json::from(u32::from(inode.version))),
+            (
+                "flags",
+                inode_flag_names(
+                    u64::from(inode.flags),
+                    &[
+                        "REALTIME",
+                        "PREALLOC",
+                        "NEWRTBM",
+                        "IMMUTABLE",
+                        "APPEND",
+                        "SYNC",
+                        "NOATIME",
+                        "NODUMP",
+                        "RTINHERIT",
+                        "PROJINHERIT",
+                        "NOSYMLINKS",
+                        "EXTSIZE",
+                        "EXTSZINHERIT",
+                        "NODEFRAG",
+                        "FILESTREAM",
+                    ],
+                ),
+            ),
+            (
+                "flags2",
+                Json::from(v3.then(|| {
+                    inode_flag_names(
+                        inode.flags2,
+                        &["DAX", "REFLINK", "COWEXTSIZE", "BIGTIME", "NREXT64"],
+                    )
+                })),
+            ),
+            ("generation", Json::from(inode.gen)),
+            ("projid", Json::from((inode.version >= 2).then_some(projid))),
+            ("extsize", Json::from(be32(raw, offsets::EXTSIZE))),
+            ("nextents", Json::from(inode.nextents)),
+            ("anextents", Json::from(inode.anextents)),
+            ("crtime", Json::from(v3.then_some(inode.crtime.sec))),
+            ("crtime_nsec", Json::from(v3.then_some(inode.crtime.nsec))),
+            (
+                "bigtime",
+                Json::from(v3.then_some(inode.flags2 & fs_xfs::inode::flags2::BIGTIME != 0)),
+            ),
+            (
+                "format",
+                Json::from(match inode.format {
+                    Format::Dev => "dev",
+                    Format::Local => "local",
+                    Format::Extents => "extents",
+                    Format::Btree => "btree",
+                    Format::Uuid => "uuid",
+                    Format::Rmap => "rmap",
+                }),
+            ),
+        ]),
+    ));
+    Ok(Outcome::report(Json::object(fields)))
 }
 
 /// Stream a regular file's bytes. Everything that can be refused up front
@@ -749,6 +908,15 @@ fn set(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcome, CliE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_inode_flag_bits_are_kept_as_hex() {
+        assert_eq!(inode_flag_names(0, &["KNOWN"]), Json::Arr(vec![]));
+        assert_eq!(
+            inode_flag_names(0x8000_0000_0000_0001, &["KNOWN"]),
+            Json::Arr(vec![Json::from("KNOWN"), Json::from("0x8000000000000000")])
+        );
+    }
 
     #[test]
     fn a_path_splits_into_its_parent_and_its_name() {
