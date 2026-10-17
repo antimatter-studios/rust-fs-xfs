@@ -57,7 +57,7 @@ fn command() -> Cmd {
              attempted: a new file (v5, one extent), an empty file given contents, a \
              same-length overwrite in place, and mkdir (v5). A journalled write leaves \
              its change in the log, and the next write waits until Linux has mounted \
-             the volume once to replay it.",
+             the volume once to replay it. rm and rmdir (v5) release the volume clean.",
         )
         .arg(
             Arg::new("target")
@@ -201,6 +201,43 @@ fn command() -> Cmd {
                      before the next write (`mkdir /backup/2026` is refused until then).",
                 ),
         )
+        .subcommand(
+            Cmd::new("rm")
+                .about("Remove a name that is not a directory; the file goes with its last name")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img rm /notes.txt\n  \
+                     fs.xfs disk.img rm --text /backup/old.tar\n\n\
+                     A symlink is removed, never followed, and no symlink on the way to \
+                     PATH is followed either. A file with other names keeps its content \
+                     under them. A missing path, a directory, a v4 volume and a log \
+                     holding records are refused before the image is opened for writing. \
+                     The volume is released clean, so the next write need not wait for \
+                     Linux. Nothing is removed recursively.",
+                ),
+        )
+        .subcommand(
+            Cmd::new("rmdir")
+                .about("Remove an empty directory")
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img rmdir /backup\n  \
+                     fs.xfs disk.img rmdir --text /backup/2026\n\n\
+                     A missing path, anything that is not a directory, a directory with \
+                     entries, the root, a v4 volume and a log holding records are refused \
+                     before the image is opened for writing. The volume is released clean.",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -288,6 +325,8 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         ),
         "write" => write(target, offset, path_arg(sub)),
         "mkdir" => mkdir(target, offset, path_arg(sub)),
+        "rm" => remove(target, offset, path_arg(sub), Removal::Name),
+        "rmdir" => remove(target, offset, path_arg(sub), Removal::Directory),
         "get" | "info" => get(
             &super::device::mount(target, offset)?,
             sub.get_one::<String>("key").map(String::as_str),
@@ -964,6 +1003,136 @@ fn mkdir(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
         .map_err(|e| write_error(path, e))?;
     let report = Json::object([("path", Json::from(show(path))), ("inode", Json::from(ino))]);
     Ok(Outcome::report(report).with_text(format!("created {}", show(path))))
+}
+
+/// What a removal takes away: `rm` a name that is not a directory,
+/// `rmdir` an empty directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    Name,
+    Directory,
+}
+
+/// Remove one name, and release the volume clean.
+///
+/// Everything the removal could be refused for that a read can decide is
+/// decided first, on a read-only mount, so such a refusal never opens the
+/// image for writing and leaves it byte-identical. The removal itself is
+/// the library's `unlink_file` or `remove_directory`, journalled, which
+/// checks again and refuses the shapes it does not free (a B+tree fork,
+/// for one) before it writes anything. `unmount` then writes the change
+/// home and ends the log with an unmount record, so `get dirty` is false
+/// and the next write need not wait for Linux to replay it.
+fn remove(
+    target: &OsString,
+    offset: u64,
+    path: &[u8],
+    removal: Removal,
+) -> Result<Outcome, CliError> {
+    let (parent, name) = removable(
+        &super::device::mount(target, offset)?,
+        target,
+        path,
+        removal,
+    )?;
+    let fs = super::device::mount_rw(target, offset)?;
+    match removal {
+        Removal::Name => fs.unlink_file(parent, name),
+        Removal::Directory => fs.remove_directory(parent, name),
+    }
+    .map_err(|e| write_error(path, e))?;
+    fs.unmount().map_err(|e| {
+        CliError::failed(format!(
+            "{}: removed in the log, but the volume could not be released clean: {e}",
+            show(path)
+        ))
+    })?;
+    let mut fields = vec![("path", Json::from(show(path)))];
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex",
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.push(("removed", Json::from(true)));
+    Ok(Outcome::report(Json::object(fields)).with_text(format!("removed {}", show(path))))
+}
+
+/// The inode of the directory holding `path`'s last name, and that name,
+/// once each refusal a read can decide has been ruled out: a v4 volume, a
+/// log holding records, and then what the kernel gives `unlink(2)` and
+/// `rmdir(2)`, for the same reason (`tests/cli_rm_kernel.rs` holds the
+/// two to the same answers): a path that does not resolve, a directory
+/// given to `rm` or a name ending in `/` that is not one, anything but a
+/// directory given to `rmdir`, a directory with entries, `.`, `..` and the
+/// root.
+///
+/// No path component is followed as a symlink, so a symlink is what `rm`
+/// removes and what `rmdir` refuses as not a directory.
+fn removable<'p>(
+    fs: &Filesystem,
+    target: &OsString,
+    path: &'p [u8],
+    removal: Removal,
+) -> Result<(u64, &'p [u8]), CliError> {
+    if !fs.superblock().is_v5() {
+        return Err(CliError::refused(format!(
+            "{}: removing writes v5 metadata; a v4 filesystem is not supported",
+            show(path)
+        )));
+    }
+    if fs.was_replayed() {
+        return Err(super::device::dirty_log(&target.to_string_lossy()));
+    }
+    let failed = |why: &str| CliError::failed(format!("{}: {why}", show(path)));
+    if path.is_empty() {
+        return Err(xfs_error(path, fs_xfs::Error::NotFound));
+    }
+    let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    let trailing_slash = end < path.len();
+    let trimmed = &path[..end];
+    let start = trimmed
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |i| i + 1);
+    let (dir, name) = trimmed.split_at(start);
+    if name.is_empty() {
+        return Err(match removal {
+            Removal::Name => failed("is a directory"),
+            Removal::Directory => failed("the root directory cannot be removed"),
+        });
+    }
+    let parent = fs.open_bytes(dir).map_err(|e| write_error(path, e))?;
+    if !parent.is_dir() {
+        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+    }
+    match (removal, name) {
+        (Removal::Name, b"." | b"..") => return Err(failed("is a directory")),
+        (Removal::Directory, b".") => {
+            return Err(failed("invalid argument: rmdir cannot remove `.`"))
+        }
+        (Removal::Directory, b"..") => {
+            return Err(xfs_error(path, fs_xfs::Error::DirectoryNotEmpty))
+        }
+        _ => {}
+    }
+    let child = parent.open_child(name).map_err(|e| xfs_error(path, e))?;
+    match removal {
+        Removal::Name if child.is_dir() => return Err(failed("is a directory")),
+        Removal::Name if trailing_slash => {
+            return Err(xfs_error(path, fs_xfs::Error::NotADirectory))
+        }
+        Removal::Name => {}
+        Removal::Directory if !child.is_dir() => {
+            return Err(xfs_error(path, fs_xfs::Error::NotADirectory))
+        }
+        Removal::Directory => {
+            if !child.entries().map_err(|e| xfs_error(path, e))?.is_empty() {
+                return Err(xfs_error(path, fs_xfs::Error::DirectoryNotEmpty));
+            }
+        }
+    }
+    Ok((parent.inode().ino, name))
 }
 
 /// The UUID in its standard 8-4-4-4-12 form.
