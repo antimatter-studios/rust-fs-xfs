@@ -464,8 +464,9 @@ tasks:
       # cli_stat_kernel adds three cases to the existing floor (#517).
       # Recursive listing adds two kernel-find cases to that floor, and
       # cli_rm_kernel two more (#519).
-      # cli_ln_kernel adds two link and format-limit cases (#521).
-      - 'CI_TEST_FLOOR=46 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      # cli_ln_kernel adds two link and format-limit cases (#521), and
+      # cli_mv_kernel two more (#520).
+      - 'CI_TEST_FLOOR=48 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:kernel-new:
     desc: 'The kernel tier on the Debian 13 guest: kernel 6.12 reads back what 6.1 cannot mount (parent pointers, exchange-range)'
@@ -506,7 +507,7 @@ tasks:
     # The extent-size regressions (#533) add one unit and one kernel case,
     # both included in this guest selection, to the previous floor of 527: 529.
     # Two rm/rmdir cases (#519) and two fsck help cases (#526) make it 533.
-    # The two ln kernel cases (#521) make it 535.
+    # The two ln kernel cases (#521) make it 535, and two mv cases (#520) 537.
     timeout: 150m
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
@@ -562,8 +563,9 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         # Recursive listing adds two kernel-find cases to the previous floor,
         # and cli_rm_kernel two more (#519).
-        # The fsck help regression adds two more (#526).
-        CI_TEST_FLOOR=535 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
+        # The fsck help regression adds two more (#526), the ln kernel cases
+        # two more (#521), and cli_mv_kernel two more (#520).
+        CI_TEST_FLOOR=537 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -718,14 +720,20 @@ tasks:
     # merge-queue run 39085982433, over the old budget of 30; the bytes
     # stayed under 1,200, since that run named only the lines as over.
     # About 30% over that is 42 lines and 1,550 bytes.
+    #
+    # 26 lines / 1,001 bytes on main in run 39016952853, with five files.
+    # test-stat.sh (#517), test-ls-recursive.sh, test-ln.sh (#521) and
+    # test-mv.sh (#520) add three lines each, at most 95 bytes a file:
+    # 38 lines / 1,326 bytes. Half as much again is 57 lines / 2,000 bytes.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 42 1550 -- scripts/test-cli.sh'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 57 2000 -- scripts/test-cli.sh'
       # test-stat.sh adds 28 checks to the existing floor (#517).
       # Recursive listing adds 89 assertions to that floor; rm and rmdir
       # add 108 in test-write.sh and 4 in test-docs.sh (#519).
       # ln adds 104 assertions and two generated-document checks (#521).
-      - 'scripts/ci-test.sh --gate 1020 tmp/logs/cli.log "the cli tier"'
+      # mv adds 150 in test-mv.sh and 2 in test-docs.sh (#520).
+      - 'scripts/ci-test.sh --gate 1172 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
