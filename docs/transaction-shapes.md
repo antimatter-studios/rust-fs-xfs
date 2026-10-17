@@ -34,32 +34,44 @@ so a filesystem that changed is one the kernel replayed. `xfs_repair -n` afterwa
 what catches free-space trees that are plausible on their own and inconsistent with each
 other.
 
-### What the implementations refuse
+### What the implementations refused, and what lifted it
 
-Named here so the gap between what is measured and what is written stays visible:
-extents spanning more than one allocation group; a data fork in B+tree format; a
-free-space or inode tree more than one level deep, or a root with no room for another
-record; a file too large for a single extent; a group with no free inode, which needs a
-whole new chunk and so needs to allocate blocks; a directory that was
-*already* past its inode before the operation began — converting one is implemented,
-adding to one that is already converted is not; a file that still holds blocks, or has
-more than one link, or is a directory, when removing it; real-time files; and v4
-filesystems.
+When these shapes were first written, in 0.5.1, each writer refused whatever its
+measurement did not cover, and this section named every refusal so the gap between what
+was measured and what was written stayed visible. Each of them has since been lifted, as
+[features.md](features.md) records:
 
-### One checkpoint per mount
+| refused in 0.5.1 | written since |
+|---|---|
+| an allocation in more than one allocation group, or across several free runs | 0.13.0 (#388) |
+| truncating a file whose extents are listed in a B+tree | 0.8.0 (#222) |
+| a free-space or inode B+tree more than one block deep, or one that has to grow a level | 0.7.0 (#84); inode trees outgrowing one block 0.13.0 (#425) |
+| a create in a group whose inode chunks are all full, which needs a new chunk | 0.7.0 (#74) |
+| adding to a directory already in block form, and to one in leaf or node form | 0.8.0 (#215); leaf and node 0.13.0 (#366, #424) |
+| removing a file that holds blocks or has several names, and removing a directory | 0.13.0 (#384, #385) |
+
+Still refused, with the rest in [features.md](features.md): a write into a file whose
+extents are listed in a B+tree or would no longer fit in the inode, a truncate that would
+leave a B+tree still needing a tree, real-time files, and journalled writes to a v4
+filesystem.
+
+### One checkpoint per mount, until 0.8.0
 
 A journalled operation writes a record and touches nothing on disk. That is what makes
 each one checkable — a filesystem that came out different is one something replayed —
-but it means a second operation would read the same disk the first one read, as though
-the first had never happened. Two creates in a row hand out the same inode.
+but it means a second operation that reads only the disk reads what the first one read,
+as though the first had never happened. Two creates in a row hand out the same inode.
 
-It is not only the reads. `h_tail_lsn` is written as the record's own sequence number,
+It is not only the reads. `h_tail_lsn` written as the record's own sequence number is
 true precisely while there is one outstanding checkpoint and false the moment there are
 two.
 
-So a mount writes at most one, and the second attempt is refused. Supporting more means
-keeping the changed metadata in memory and building each transaction on the last — a
-dirty-block overlay, which this does not have.
+So until 0.8.0 a mount wrote one checkpoint and refused a second. Since 0.8.0 (#89) a
+mount writes as many as it likes. Every buffer a record carries goes into a dirty-block
+overlay that a writable mount reads through, so each operation is built on what the ones
+before it logged, which is what a replay arrives at; and `h_tail_lsn` names the mount's
+first outstanding record rather than the record itself. In-place writes are still
+refused once a mount has logged a change (#186).
 
 ## The framing fact that changes everything
 
