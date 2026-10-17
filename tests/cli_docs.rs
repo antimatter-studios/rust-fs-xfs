@@ -56,7 +56,7 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
     }
     // fs.xfs's subcommands have pages of their own, which its list names.
     for verb in [
-        "ls", "stat", "read", "write", "mkdir", "rm", "rmdir", "get", "info", "set", "resize",
+        "ls", "stat", "read", "write", "mkdir", "rm", "rmdir", "mv", "get", "info", "set", "resize",
     ] {
         assert!(
             share.join(format!("man/man1/fs.xfs-{verb}.1")).is_file(),
