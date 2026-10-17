@@ -107,6 +107,12 @@ owner, links, sizes and all four times as seconds plus nanoseconds. Symlinks are
 reported without following them; v4 creation times are null. Output is JSON,
 with XFS metadata under `xfs`, or `--text` for `key: value` lines.
 
+`fs.xfs disk.img xattr /etc/hosts` lists extended attribute names and byte sizes
+as JSON, or tab-separated rows with `--text`. Add a full name, such as
+`user.comment`, to read its raw value; `-o FILE` saves it through a `.partial`
+file and rename. Non-UTF-8 names include their exact bytes in `name_hex`.
+Inspection is read-only, includes namespace prefixes, and never follows symlinks.
+
 - `fs.xfs` lists, reads, writes and inspects a volume; `mkfs.xfs` formats one;
   `fsck.xfs` checks one and repairs what it can; `rust-fs-xfs doctor` says whether the
   tools on `PATH` are this program. Each has a man page and shell completions.
