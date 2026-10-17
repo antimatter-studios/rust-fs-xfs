@@ -62,16 +62,22 @@ pub fn mount_rw(target: &OsString, offset: u64) -> Result<Filesystem, CliError> 
         Arc::new(OwnedRwSlice::new(dev, offset, length))
     };
     Filesystem::mount_rw(dev).map_err(|e| match e {
-        fs_xfs::Error::DirtyLog => CliError::failed(format!(
-            "{name}: the log holds records nothing has applied, and this driver writes \
-             only to a volume whose log is clean. Mount it with Linux once (which replays \
-             the log) and try again; reading it works as it is"
-        )),
+        fs_xfs::Error::DirtyLog => dirty_log(&name),
         fs_xfs::Error::UnsupportedFeature(_) | fs_xfs::Error::ReadOnly => {
             CliError::refused(format!("{name}: {e}"))
         }
         other => not_readable(&name, other),
     })
+}
+
+/// Why a volume whose log holds records is not written to, for a verb
+/// that finds it so on a read-only mount as well as for `mount_rw`.
+pub fn dirty_log(name: &str) -> CliError {
+    CliError::failed(format!(
+        "{name}: the log holds records nothing has applied, and this driver writes \
+         only to a volume whose log is clean. Mount it with Linux once (which replays \
+         the log) and try again; reading it works as it is"
+    ))
 }
 
 fn not_readable(name: &str, e: fs_xfs::Error) -> CliError {

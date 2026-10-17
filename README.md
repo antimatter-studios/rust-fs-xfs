@@ -256,6 +256,8 @@ fs.xfs disk.img ls /etc              # a directory, as JSON
 fs.xfs disk.img ls -R --max-depth 8 --limit 1000 /etc
 fs.xfs disk.img read /etc/fstab > fstab
 fs.xfs disk.img write /notes.txt < notes.txt
+fs.xfs disk.img rm /notes.txt
+fs.xfs disk.img rmdir /backup
 fs.xfs disk.img get                  # the properties, as JSON
 fs.xfs disk.img get label --text     # one of them, for a person
 fs.xfs --offset 1048576 whole-disk.img info
@@ -268,6 +270,8 @@ fs.xfs --offset 1048576 whole-disk.img info
 | `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
 | `write <path>` | the bytes on stdin. A new path becomes a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Anything else -- appending, shortening, a v4 create, a file too large for one free run -- is refused with the reason (exit 3), and the volume is left as it was |
 | `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5) |
+| `rm <path>` | removes a name that is not a directory: a symlink rather than what it points at, and the file with its last name, its blocks freed (v5). Reports `{"path": ..., "removed": true}` |
+| `rmdir <path>` | removes an empty directory (v5), with the same report |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log holds records nothing has applied yet), and `xfs` or `xfs.<field>` |
 | `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; a volume whose log is not clean is refused |
 | `resize <size>` | answers `not implemented` (exit 3): the library has no resize |
@@ -282,6 +286,15 @@ in the log: the kernel applies it the next time Linux mounts the volume, and `ge
 says `true` until then. The driver writes only to a volume whose log is clean, so the
 next journalled write on the same image is refused until it has been mounted once.
 Reading needs no such wait: `ls` and `read` replay the log in memory.
+
+`rm` and `rmdir` are journalled too, but release the volume clean: the change is
+written home and the log ends with an unmount record, so `get dirty` is `false`
+afterwards and the next write need not wait. A missing path, a directory given to
+`rm`, anything but a directory given to `rmdir`, a directory with entries, `.`, `..`,
+the root, a v4 volume and a log holding records are refused before the image is opened
+for writing, so a refused command leaves it byte-identical; a mistake is refused for
+the reason Linux gives. No symlink on the way to the path is followed, and nothing is
+removed recursively. A file whose extents are in a B+tree is refused (exit 3).
 
 `ls --recursive` lists direct children at depth 1, omitting the starting
 directory; a starting file or symlink is one entry at depth 0. Symlinks are
