@@ -189,7 +189,14 @@ fn command() -> Cmd {
         )
         .subcommand(
             Cmd::new("mkdir")
-                .about("Create a directory (its parent must exist; v5 only)")
+                .about("Create a directory (v5); --parents creates its missing parents too")
+                .arg(
+                    Arg::new("parents")
+                        .long("parents")
+                        .short('p')
+                        .action(ArgAction::SetTrue)
+                        .help("Create missing directories; an existing directory is success"),
+                )
                 .arg(
                     Arg::new("path")
                         .value_name("PATH")
@@ -198,7 +205,15 @@ fn command() -> Cmd {
                 )
                 .after_help(
                     "Examples:\n  fs.xfs disk.img mkdir /backup\n  \
-                     fs.xfs disk.img mkdir /backup/2026\n\n\
+                     fs.xfs disk.img mkdir /backup/2026\n  \
+                     fs.xfs disk.img mkdir -p /backup/2026/october\n\n\
+                     Without --parents, the parent must exist and PATH must be new. \
+                     With --parents, the report lists only directories created, as \
+                     {\"path\": PATH, \"created\": [PATH, ...]}; an existing chain creates \
+                     nothing and needs no writable open. Created paths are absolute. \
+                     A file or symlink anywhere on the way, or an invalid name, is \
+                     refused before anything is created; symlinks are never followed. \
+                     Every missing directory is made on one writable mount. \
                      The change is journalled, then written home with the log closed \
                      behind it, so the volume is left clean for the next write.",
                 ),
@@ -387,6 +402,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             sub.get_one("output"),
         ),
         "write" => write(target, offset, path_arg(sub)),
+        "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, path_arg(sub)),
         "mkdir" => mkdir(target, offset, path_arg(sub)),
         "rm" => remove(target, offset, path_arg(sub), Removal::Name),
         "rmdir" => remove(target, offset, path_arg(sub), Removal::Directory),
@@ -1208,6 +1224,105 @@ fn ln(
         ("inode", Json::from(ino)),
     ]))
     .with_text(format!("linked {}", show(path))))
+}
+
+/// Plan the entire walk read-only, including components after `..` that
+/// return from a missing branch to an existing one. Planned directories
+/// exist virtually during this walk, so no path refusal leaves a partial chain.
+/// The actual creates share one writable mount and one clean release.
+fn mkdir_parents(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliError> {
+    if path.is_empty() {
+        return Err(CliError::usage("mkdir --parents: PATH must not be empty"));
+    }
+    let fs = super::device::mount(target, offset)?;
+    let mut planned = HashSet::new();
+    let mut missing = Vec::new();
+    let mut current = b"/".to_vec();
+    for name in path.split(|&b| b == b'/') {
+        match name {
+            b"" | b"." => continue,
+            b".." => {
+                let slash = current.iter().rposition(|&b| b == b'/').unwrap_or(0);
+                current.truncate(slash.max(1));
+                continue;
+            }
+            _ => {}
+        }
+        if name.len() > usize::from(u8::MAX) || name.contains(&0) {
+            return Err(CliError::refused(format!(
+                "{}: not a name a directory entry can hold",
+                show(name)
+            )));
+        }
+        if current.len() > 1 {
+            current.push(b'/');
+        }
+        current.extend_from_slice(name);
+        if planned.contains(&current) {
+            continue;
+        }
+        match fs.open_bytes(&current) {
+            Ok(file) if file.is_dir() => {}
+            Ok(_) => return Err(xfs_error(&current, fs_xfs::Error::NotADirectory)),
+            Err(fs_xfs::Error::NotFound) => {
+                planned.insert(current.clone());
+                missing.push(current.clone());
+            }
+            Err(e) => return Err(write_error(&current, e)),
+        }
+    }
+    if !missing.is_empty() {
+        if !fs.superblock().is_v5() {
+            return Err(CliError::refused(format!(
+                "{}: creating writes v5 metadata; a v4 filesystem is not supported",
+                show(path)
+            )));
+        }
+        if fs.was_replayed() {
+            return Err(super::device::dirty_log(&target.to_string_lossy()));
+        }
+        drop(fs);
+        let fs = super::device::mount_rw(target, offset)?;
+        let created = (|| {
+            for directory in &missing {
+                let (parent_path, name) = split_path(directory)?;
+                let parent = fs
+                    .open_bytes(parent_path)
+                    .map_err(|e| write_error(parent_path, e))?;
+                fs.create_directory(parent.inode().ino, name, DIR_MODE)
+                    .map_err(|e| write_error(directory, e))?;
+            }
+            Ok::<_, CliError>(())
+        })();
+        // Even a later allocation or I/O failure must release any earlier
+        // creates clean, with both errors reported if release also fails.
+        if let Err(error) = created {
+            return Err(match release_clean(fs, path) {
+                Ok(()) => error,
+                Err(release) => {
+                    CliError::failed(format!("{} (and then {})", error.message, release.message))
+                }
+            });
+        }
+        release_clean(fs, path)?;
+    }
+    let text = if missing.is_empty() {
+        format!("already exists {}", show(path))
+    } else {
+        missing
+            .iter()
+            .map(|p| format!("created {}", show(p)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let report = Json::object([
+        ("path", Json::from(show(path))),
+        (
+            "created",
+            Json::Arr(missing.iter().map(|p| Json::from(show(p))).collect()),
+        ),
+    ]);
+    Ok(Outcome::report(report).with_text(text))
 }
 
 /// What a removal takes away: `rm` a name that is not a directory,
