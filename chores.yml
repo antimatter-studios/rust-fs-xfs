@@ -335,6 +335,7 @@ tasks:
     # (job 105877256028), less the usual margin. Raise it deliberately.
     # The public extent-size flag regression (#533) adds one unit case to
     # #517's floor of 381: 382.
+    # The fsck help regression (#526) adds two more unit cases: 384.
     #
     # Budget: 828 lines / 50,167 bytes measured on rust-fs-core v0.3.8 (run
     # 38030776962), every test passing; half as much again, so 1250 lines /
@@ -342,7 +343,8 @@ tasks:
     cmds:
       - 'EXPECT_OVERFLOW_CHECKS=1 ../rust-fs-core/scripts/tier.sh test:unit unit 1250 76000 -- scripts/with-test-temp.sh cargo test --locked --features cli $(scripts/test-targets.sh unit) -- --nocapture'
       # Unknown inode flag preservation adds one case (#517).
-      - 'scripts/ci-test.sh --gate 382 tmp/logs/unit.log "the debug unit tier"'
+      # The fsck help regression adds two more (#526).
+      - 'scripts/ci-test.sh --gate 384 tmp/logs/unit.log "the debug unit tier"'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -502,6 +504,7 @@ tasks:
     # The floor was 525: 586 executed, less the usual margin.
     # The extent-size regressions (#533) add one unit and one kernel case,
     # both included in this guest selection, to the previous floor of 527: 529.
+    # Two rm/rmdir cases (#519) and two fsck help cases (#526) make it 533.
     timeout: 150m
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
@@ -557,7 +560,8 @@ tasks:
         # shellcheck disable=SC2086  # the words are the point
         # Recursive listing adds two kernel-find cases to the previous floor,
         # and cli_rm_kernel two more (#519).
-        CI_TEST_FLOOR=531 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
+        # The fsck help regression adds two more (#526).
+        CI_TEST_FLOOR=533 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -633,6 +637,7 @@ tasks:
     # much again. The floor was 525: 586 executed, less the usual margin.
     # The public extent-size flag regression (#533) adds one unit case to
     # this remaining selection: 526; its kernel oracle runs in test:kernel.
+    # The fsck help regression (#526) adds two more unit cases: 528.
     # MEASURED again on 2026-10-09, as the checker, repair and write suites
     # under review added their oracles: every test passed in each run, and
     # the release pass printed 180,953 bytes (run 37933633035), 181,575
@@ -660,7 +665,7 @@ tasks:
       - task: test:oracle
       - task: test:kernel
       - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh up'
-      - 'CI_TEST_FLOOR=526 ../rust-fs-core/scripts/tier.sh "test:native (the rest, release)" suite 2310 147000 -- scripts/ci-test.sh $(scripts/test-targets.sh rest)'
+      - 'CI_TEST_FLOOR=528 ../rust-fs-core/scripts/tier.sh "test:native (the rest, release)" suite 2310 147000 -- scripts/ci-test.sh $(scripts/test-targets.sh rest)'
       - task: test:scripts
       # The command-line tools, built and staged the way an install lays
       # them out, then tested as installed: found on PATH, doctor first.
