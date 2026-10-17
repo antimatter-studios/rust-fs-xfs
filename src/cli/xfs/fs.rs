@@ -1070,12 +1070,7 @@ fn remove(
         Removal::Directory => fs.remove_directory(parent, name),
     }
     .map_err(|e| write_error(path, e))?;
-    fs.unmount().map_err(|e| {
-        CliError::failed(format!(
-            "{}: removed in the log, but the volume could not be released clean: {e}",
-            show(path)
-        ))
-    })?;
+    release_clean(fs, path)?;
     let mut fields = vec![("path", Json::from(show(path)))];
     if std::str::from_utf8(path).is_err() {
         fields.push((
