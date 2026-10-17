@@ -1,183 +1,136 @@
 # rust-fs-xfs
 
-Pure-Rust [XFS](https://docs.kernel.org/filesystems/xfs/index.html) driver over the
-shared [`rust-fs-core`](https://github.com/antimatter-studios/rust-fs-core) block-device
-trait, exposing a stable C ABI (`fs_xfs_*`) for FFI from Swift, C, or Go.
+A pure-Rust driver for the [XFS](https://docs.kernel.org/filesystems/xfs/index.html)
+filesystem. It reads v5 and v4 volumes, writes v5 volumes through the log in records
+the Linux kernel replays, checks and repairs them, and formats new ones. It works on
+an image file or a device directly, with no kernel driver and no mount.
 
-## Byte order
+It is a Rust library (`fs_xfs`), a static library with a stable C ABI (`fs_xfs_*`,
+declared in [`include/fs_xfs.h`](include/fs_xfs.h)) for C, C++, Swift or Go, and a set
+of command-line tools: `fs.xfs`, `mkfs.xfs` and `fsck.xfs`. Block devices come from the
+shared [`rust-fs-core`](https://github.com/antimatter-studios/rust-fs-core) trait, so
+the same device, partition slice or disk-image reader serves every driver in that
+family.
 
-**XFS stores every multi-byte on-disk field in big-endian order, on every host.** It is
-the only big-endian format in this family — ext4, Btrfs and NTFS are all
-little-endian — and it is the first thing to keep in mind when reading this code
-alongside its siblings.
+It is validated against the reference tools (`xfs_db`, `xfs_repair`, `xfs_logprint`)
+and the Linux kernel, not only against its own tests.
 
-With one exception, which has already caused a bug here: **checksum fields are stored
-little-endian**. The kernel's `xfs_end_cksum()` returns `~cpu_to_le32(crc)`, so a CRC
-read big-endian like the rest of the structure makes every real filesystem look
-corrupt.
+## What it can do
 
-## Status
+**[docs/features.md](docs/features.md) is the full list**: every feature, its state
+(supported, experimental, partial, refused, not supported or upcoming), the release it
+shipped in, its tracking issue and the test that checks it. Every pull request that
+changes behaviour updates it. In summary:
 
-Reading is supported for v5 and v4 volumes, clean or with a dirty log (replayed
-in memory, the device untouched), including extended attributes, POSIX ACLs and
-realtime files. `fsck.xfs` checks, and repairs a damaged secondary superblock, and `mkfs.xfs` formats v5.
-An overwrite of existing bytes is written in place, on v5 and v4; on v5,
-create, unlink, mkdir, rename within a short-form directory, allocating writes
-and truncate to zero are journalled records the Linux kernel replays.
-**[docs/features.md](docs/features.md) is the full list**: every feature, its
-state (supported, experimental, partial, refused, not supported or upcoming),
-the release it shipped in, its tracking issue and the test that checks it.
-Every pull request that changes behaviour updates it.
+### Reading
 
-### Self-describing metadata
+- v5 and v4 volumes, clean or with a dirty log, which is replayed in memory with the
+  device untouched.
+- Directories in every form (short form, block, leaf and node), looked up through
+  their hash index; extent and B+tree data forks; inline and remote symlinks.
+- Extended attributes in every form, remote values included, and POSIX ACLs in the
+  format the Linux VFS presents; parent pointers; realtime files, given the realtime
+  device; reverse-mapping and reference-count btrees.
+- Every v5 metadata header is checked for its CRC32C and for its identity (UUID,
+  allocation group, block number). An incompatible feature the driver does not know is
+  refused by name at mount rather than misread.
+- Names and paths are bytes, never assumed to be UTF-8.
 
-On v5, every metadata block carries a CRC32C plus the filesystem UUID, the allocation
-group it belongs to, and a log sequence number. The checksum detects corrupted bits;
-the identity fields detect a block that is internally *perfect* but landed in the wrong
-place — a misdirected write, or a stale block left behind by an earlier filesystem on
-the same device. This driver checks both on every header it parses, because a checksum
-alone cannot catch the second case.
+### Checking and repair
 
-Note that the checksum covers the **whole sector**, not the structure — XFS hands the
-full buffer length to its verifier, trailing zero padding included.
+- `fs_xfs::check`, and `fsck.xfs` over it, check a volume without writing: the
+  secondary superblocks; each allocation group's headers against its free-space,
+  inode, reverse-mapping and refcount btrees; one owner for every block (a block
+  claimed twice is a cross-link unless reflink shares it, a block claimed by nothing is
+  lost); every allocated inode; the directory tree and link counts; the superblock's
+  counters; realtime metadata; and quota records and accounting. It is a subset of what
+  `xfs_repair -n` checks, and its finding codes are graded against it.
+- Findings carry stable codes, a severity and a location, and the report says whether
+  the scan was complete, partial or impossible. A partial scan is never clean.
+- `fs_xfs::repair` plans a repair as byte ranges with their bytes before and after, and
+  applies it: superblock copies, group and superblock counters, inode allocation and
+  link counts, and directory metadata. A volume it cannot reason about (no exclusive
+  access, a v4 volume, a feature the checker does not cover such as a realtime section
+  or quotas, a dirty log, an incomplete scan, ambiguous ownership) is refused, and
+  nothing is written.
 
-## Test contract
+### Writing and journalling
 
-Two layers, and the second is the one that matters.
+- An overwrite of bytes that already exist changes no metadata and is written in
+  place, on v5 and v4.
+- Everything else is v5 only, and is written as records in the volume's log, which the
+  Linux kernel replays: creating files, directories and symlinks; writing anywhere in a
+  file (holes filled, unwritten extents converted, the file grown); truncating to any
+  length; unlinking, removing directories and hard links; renaming within a directory,
+  across directories and over an existing name; times, permissions and ownership;
+  extended attributes and POSIX ACLs; exchanging ranges of two files' data; keeping
+  parent pointers on every namespace change; and user, group and project quota
+  accounting with hard limits.
+- The label is written into the superblock of every allocation group, and logged when
+  the mount has already logged a change.
+- These work in every directory form and in groups whose btrees are more than one
+  block deep, and are tested against every legal combination of features, reflink and
+  reverse mapping included.
+- Many operations can be logged in one mount, the log being reused in bounded memory,
+  and a crash at any checkpoint replays to a prefix of them. `Filesystem::unmount`
+  writes the metadata home and ends the log with an unmount record, so the kernel
+  mounts the volume with no replay.
+- A volume whose log still needs replaying is refused for writing.
+- Many of the write operations are marked **Experimental** on the features page: they
+  pass every test against the kernel and `xfs_repair`, but are new, and some rows name
+  a limit.
 
-**1. Unit tests** (`src/`) parse structures built in-process. These prove the parser is
-*self-consistent*. They cannot prove it is *correct*, because a misreading of the
-format is baked into both the fixture and the parser, and they agree with each other
-while disagreeing with the rest of the world.
+### Formatting
 
-**2. Cross-validation against real XFS tooling** (`tests/oracle_vm_fixtures.rs`).
-Filesystems are built by the canonical `mkfs.xfs` and dumped with `xfs_db`; this driver
-parses the same images and every field it reports must match the value `xfs_db` reports
-for that field. Currently 11 geometries, listed once in `scripts/fixture-geometries.sh`
-— 1k/2k/4k blocks, 512b/1k inodes, explicit allocation-group counts, `reflink+rmapbt`,
-`bigtime`, a v4 filesystem with no CRC at all, and a v5 one with sparse inodes off.
+- `fs_xfs::mkfs`, and `mkfs.xfs` over it, make a v5 filesystem with the standard
+  formatter's default features (checksums, the free inode btree, sparse inode chunks,
+  reflink, large timestamps, directory entry file types), with 1, 2 or 4 KiB blocks, on
+  a device or image of at least 300 MiB. On the same device with the same UUID, every
+  allocation group header and btree root is byte-identical to the standard formatter's.
 
-The second layer is not optional decoration. Three bugs were live in this crate with
-the entire unit suite passing:
+### C ABI
 
-- the superblock magic had two bytes transposed,
-- checksum fields were read big-endian in an otherwise big-endian format that stores
-  *checksums* little-endian,
-- the checksum was computed over the 264-byte structure instead of the whole sector.
+- Mounting by path, over caller-supplied read callbacks, or over an `fs_core` device
+  (which is how a partition inside a whole disk is mounted), with or without a realtime
+  device; volume information, `stat`, directory iteration, reading files and
+  `readlink`.
+- Writable mounts and the journalled operations above: create, mkdir, symlink, unlink,
+  rmdir, link, rename, writing and truncating files, attributes, extended attributes,
+  the label and a flush; `fs_xfs_umount` ends a writable mount cleanly.
+- The checker (`fs_xfs_check`) and the repair (`fs_xfs_repair_with_fs_core_device`),
+  each passing findings or planned changes to a callback.
 
-Every one of them is invisible to a round-trip test and fatal against a real
-filesystem. All three died on the first run against `xfs_db`.
+### Tools
 
-```sh
-chore test:unit    # no tool, no fixture, no VM; green after `chore siblings`
-chore test:images  # adds the tests that read a fixture, still without a VM
-chore test         # everything, exactly as CI runs it
-./scripts/test.sh --test oracle_vm_fixtures -- --nocapture   # one suite, by hand
-```
+- `fs.xfs` lists, reads, writes and inspects a volume; `mkfs.xfs` formats one;
+  `fsck.xfs` checks one and repairs what it can; `rust-fs-xfs doctor` says whether the
+  tools on `PATH` are this program. Each has a man page and shell completions.
 
-There is no `--ignored` tier and no host-side oracle. Every test that runs a tool runs
-it in the guest, and a test that cannot reach one **fails** rather than reporting `ok`
-— see `## Generating fixtures` below.
-
-`scripts/test.sh` and every tier go through `scripts/with-test-temp.sh`, which exports
-an isolated `TMPDIR` and cleans the child it owns. That wrapper is not only tidiness:
-the guest sees this repository and nothing else of the host, so a scratch directory
-under `/tmp` is a path the tool asked to read an image cannot open. An exact
-`FS_XFS_TEST_TMPDIR` is caller-managed; `FS_XFS_TEST_TMP_BASE` receives a unique
-child; GitHub Actions uses `RUNNER_TEMP`; and Raspberry Pi uses this checkout's
-`./tmp` so fixture churn follows the checkout onto NVMe rather than the system
-SD card. Other hosts use `TMPDIR` or their platform temporary mechanism.
-
-### Generating fixtures
-
-**Every fixture is made by one kernel and one `mkfs.xfs` — the guest's — on a
-developer's machine and on a CI runner alike.** A fixture is only evidence if the
-thing that built it is the same everywhere: `mkfs.xfs` on a workstation is whatever
-that machine happens to have (nothing at all on a Mac, 6.1 on Debian 12, 6.6 on
-Ubuntu 24.04), and the kernel is worse, because a runner gets whichever one the cloud
-booted that week. CI used to install xfsprogs on the runner, build the images there and
-loop-mount them with `sudo`, while a developer got a Debian VM with a different
-`mkfs.xfs` and a different kernel — so the two halves of the same gate were graded by
-two different oracles. That is exactly what #211 and #212 are. There is one guest now,
-supplied by
-[fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
-and configured by `fs-linux-test-harness.toml`; there is no host-side build and no
-`sudo` anywhere.
-
-```sh
-chore siblings          # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
-chore tools             # what the HOST needs: ripgrep and the VM. NOT xfsprogs
-chore fixtures          # every set but stress, built in the guest, into .vm-share/
-chore fixtures -- log truncate   # just those sets
-chore fixtures -- stress         # asked for by name; see below
-./scripts/test.sh --test oracle_vm_fixtures -- --nocapture
-```
-
-The sets build different things, and the difference is the reason each exists.
-`geometry` formats a filesystem per entry in `scripts/fixture-geometries.sh` and
-**never mounts it**, which is what the superblock and inode parsers need: nothing has
-touched those images since `mkfs.xfs` wrote them. `log` mounts, writes and unmounts, so
-the log keeps the records written along the way — a log with nothing in it cannot
-disagree with us about how an item is written — and it varies the inode size, because a
-logged inode addresses the *cluster* holding it by a rule that is not in the record.
-`data` writes a tree somebody sat down and thought of — a small file, a big file, a
-sparse file, several hundred directory entries — which is what the read path is walked
-over. `truncate`, `create`, `unlink`, `dirconv`, `crossag`, `deeptree` and
-`feature-matrix` are each the *before* state one suite of write tests needs the kernel
-to have produced, so that what this driver does to them is measured against a volume it
-did not make. `cli` is what the command-line tools are tested on: a v5 and a v4 image,
-each made by `mkfs.xfs -L` and filled by the kernel with a tree meant to reach every way
-XFS stores a file, a manifest of that tree written by the kernel's own driver, and the
-offsets `xfs_db` gives for the bytes the tier breaks in a copy.
-
-`stress` is the set whose contents nobody chose, and it is not in the default list: it
-runs the two stress generators from the filesystem test suite against a mounted
-filesystem and keeps what they leave behind, with a manifest of every path generated
-inside Linux by the kernel's own driver. It is asked for by name because the generators
-are built from source first and that takes tens of minutes — and a set quietly dropped
-by a catch-all is the same shape of problem as an oracle that skips, so
-`scripts/build-fixtures.sh` names `stress` as the one its default list leaves out
-rather than letting "all" mean something narrower than it says.
-
-**Licensing.** The filesystem test suite (fstests) is GPL-2.0. It is cloned, built and
-executed **inside the guest only**; its source and its build artefacts never enter this
-repository, nothing from it is copied, quoted or adapted here, and the two binaries are
-invoked as external programs. Running a program does not make the caller a derivative
-work of it; vendoring its code would. `scripts/guest-stress-tools.sh` records that, and
-pins the build to a dated release tag so a rebuilt VM gets the same generators rather
-than whatever upstream looks like that day.
-
-**Nothing skips on a missing fixture.** The images are gitignored, and a test that
-cannot find the one it needs fails naming `chore fixtures`. It used to print a skip line
-and return `ok`, which reads exactly like a pass: `truncate_oracle` skipped on every CI
-run from the day it was written, and `truncate.rs` sat at 5% line coverage underneath a
-green suite. `scripts/ci-test.sh` is the other half of that guarantee — it fails a run
-whose output matches a skip, and one that executed fewer tests than its floor.
-
-`chore tools` installs what the **host** needs — ripgrep, and Vagrant, QEMU and KVM/HVF
-for the VM — and says what each is for. It deliberately installs no xfsprogs: a
-workstation that has none is a workstation on which no test can quietly ask the wrong
-oracle, and `tests/test_contract.rs` fails the suite if one tries.
-
-The harness's own tasks are available as `chore vm:up`, `vm:down`, `vm:status`,
-`vm:run -- <cmd>`, `vm:exec -- <cmd>`, `vm:provision`, `vm:destroy` and
-`vm:host:check`. `chore test:oracle` and `chore test:kernel` bring the VM up once for
-the whole tier and leave it to the reaper, so thirty test binaries share one boot and
-one multiplexed SSH connection.
+Not done: resizing (`fs.xfs resize` answers `not implemented`), journalled writes to a
+v4 volume, and writing realtime files.
 
 ## Building
 
 ```sh
-cargo build --release
-cargo clippy --all-targets -- -D warnings
+cargo build --release                  # the library: libfs_xfs.a and the rlib
+cargo build --release --features cli   # and the command-line tools
+cargo clippy --all-targets --features cli -- -D warnings
 ```
 
-Builds as both an `rlib` and a `staticlib`, so it links into a Rust dependency graph or
-alongside sibling drivers in a C/Swift/Go consumer. Requires the sibling
+The crate builds as both an `rlib` and a `staticlib`, so it links into a Rust
+dependency graph or alongside sibling drivers in a C, Swift or Go program. The
+toolchain is pinned in `rust-toolchain.toml`. A checkout builds against the sibling
 `../rust-fs-core` checkout, which `chore siblings` clones and moves to the ref pinned
-in `chores.yml`. `chore staticlib` builds the library and its headers into this crate's
-own `dist/`, and `chore artifact` prints the absolute path of that directory — a
-consumer copies its contents rather than being told where cargo puts things.
+in `chores.yml`; the crate published on crates.io depends on `rust-fs-core` from
+crates.io instead. `chore staticlib` builds the library and its headers (`fs_xfs.h`
+and `fs_core.h`) into this crate's own `dist/`, and `chore artifact` prints the
+absolute path of that directory — a consumer copies its contents rather than being
+told where cargo puts things.
+
+The `cli` feature adds the command-line tools and their argument parser and nothing
+else, so the library a consumer links gains no dependency from it.
+
+### Git hooks
 
 Install the git hooks once per clone:
 
@@ -190,11 +143,108 @@ checkout can rewrite the hook that is about to run. They are per-clone
 rather than tracked: re-run the installer in a fresh clone, and after the
 guards are updated.
 
-## Command-line tools
+## Using it
 
-`fs.xfs` looks inside an XFS image or device directly, and within the limits
-below writes to it: no mount, no kernel driver, no VM. It is an escape hatch
-for an errand, not a place to do real filesystem work.
+### From C
+
+```c
+#include <stdio.h>
+#include "fs_xfs.h"
+
+int main(void) {
+    fs_xfs_fs_t *fs = fs_xfs_mount("disk.img");
+    if (!fs) {
+        fprintf(stderr, "mount: %s\n", fs_xfs_last_error());
+        return 1;
+    }
+
+    fs_xfs_dir_iter_t *dir = fs_xfs_dir_open(fs, "/etc");
+    const fs_xfs_dirent_t *e;
+    while (dir && (e = fs_xfs_dir_next(dir)) != NULL)
+        printf("%s\n", e->name);
+    fs_xfs_dir_close(dir);
+
+    char buf[4096];
+    int64_t n = fs_xfs_read_file(fs, "/etc/fstab", buf, 0, sizeof buf);
+    if (n < 0)
+        fprintf(stderr, "read: %s (errno %d)\n", fs_xfs_last_error(), fs_xfs_last_errno());
+    else
+        fwrite(buf, 1, (size_t)n, stdout);
+
+    fs_xfs_umount(fs);
+    return 0;
+}
+```
+
+```sh
+cargo build --release
+cc -Iinclude app.c target/release/libfs_xfs.a -o app
+```
+
+That is the whole link line on macOS; on another platform add the system libraries
+`cargo rustc --release --lib --crate-type staticlib -- --print native-static-libs`
+lists. `chore staticlib` puts the same library and headers in `dist/`. A function returning `int` returns 0 on success and -1 on failure, and one
+returning a pointer returns `NULL`; `fs_xfs_last_error()` and `fs_xfs_last_errno()` then
+give a message and a POSIX errno for the calling thread. Writing needs a handle from
+`fs_xfs_mount_rw` or `fs_xfs_mount_rw_with_fs_core_device`, and `fs_xfs_umount` on a
+writable handle writes everything home. [`include/fs_xfs.h`](include/fs_xfs.h)
+documents every function and its errors.
+
+### From Rust
+
+```toml
+[dependencies]
+rust-fs-xfs = "0.14"
+rust-fs-core = "0.3"
+```
+
+```rust
+use std::sync::Arc;
+
+use fs_core::{BlockDevice, BlockRead, FileDevice};
+use fs_xfs::Filesystem;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read-only: list a directory, read a file, check the volume.
+    let device: Arc<dyn BlockRead> = Arc::new(FileDevice::open("disk.img")?);
+    let fs = Filesystem::mount(device)?;
+    for entry in fs.open("/etc")?.entries()? {
+        println!("{} (inode {})", String::from_utf8_lossy(&entry.name), entry.ino);
+    }
+    let fstab: Vec<u8> = fs.open("/etc/fstab")?.read_all()?;
+    println!("{} bytes", fstab.len());
+    let report = fs_xfs::check::check(&fs);
+    println!("clean: {}", report.is_clean());
+    drop(fs);
+
+    // Read-write: every change is a log record; unmount writes it home.
+    let device: Arc<dyn BlockDevice> = Arc::new(FileDevice::open_rw("disk.img")?);
+    let fs = Filesystem::mount_rw(device)?;
+    let root = fs.root()?.inode().ino;
+    let (ino, _) = fs.create_file(root, b"notes.txt", 0o100_644)?;
+    fs.write(ino, 0, b"hello\n")?;
+    fs.unmount()?;
+    Ok(())
+}
+```
+
+The library is `fs_xfs` and `rust-fs-core`'s is `fs_core`. `Filesystem::open_bytes`
+takes a path as bytes, for names that are not UTF-8. `fs_xfs::repair` plans and
+applies a repair, and `fs_xfs::mkfs::format` makes a filesystem.
+
+### From the command line
+
+The tools are one multi-call binary, `rust-fs-xfs`, and `fs.xfs`, `mkfs.xfs` and
+`fsck.xfs` are links to it; `rust-fs-xfs fs ...` (and `mkfs`, `fsck`) is the same
+program under the one name nothing else on `PATH` can shadow, and `rust-fs-xfs doctor`
+says whether every name `PATH` resolves is this program and, if not, what wins and the
+fix. Each release attaches a tarball for `darwin-arm64` and `linux-x86_64` holding the
+binary, its links, man pages and shell completions ([docs/releases.md](docs/releases.md));
+from a checkout, `chore cli:install` stages the same under `tmp/cli/`.
+
+**`fs.xfs`** works inside an XFS image or device directly: no mount, no kernel driver.
+It is an escape hatch for an errand (get a file out, read the label, check whether the
+log needs replaying), not a place to do real filesystem work: for that, mount it.
 
 ```sh
 fs.xfs disk.img ls /etc              # a directory, as JSON
@@ -205,138 +255,98 @@ fs.xfs disk.img get label --text     # one of them, for a person
 fs.xfs --offset 1048576 whole-disk.img info
 ```
 
-The tools are one multi-call binary, `rust-fs-xfs`, and `fs.xfs` is a symlink
-to it; `rust-fs-xfs fs ...` is the same program under the one name nothing
-else on `PATH` can shadow, and `rust-fs-xfs doctor` says whether every name
-`PATH` resolves is this program and, if not, what wins and the fix.
-
 | verb | what |
 |---|---|
-| `ls [path]` | entries with `name`, `type`, `size`, `mode`, `mtime`, `inode`, and a symlink's `target`; v4 and v5 |
+| `ls [path]` | a directory (`/` by default): each entry's `name`, `type`, `size`, `mode`, `mtime` and `inode`, and a symlink's `target`; v4 and v5 |
 | `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
-| `write <path>` | the bytes on stdin. A new path is a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Every other shape -- appending, shortening, a v4 create, a file larger than any free run -- is refused with the driver's reason (exit 3) and the volume is left as it was |
-| `mkdir <path>` | a directory, mode 0755 (v5) |
-| `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log held records nothing had applied), and `xfs.*` |
-| `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; refuses a volume whose log is not clean |
-| `resize <size>` | answers `not implemented` (exit 3) |
+| `write <path>` | the bytes on stdin. A new path becomes a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Anything else -- appending, shortening, a v4 create, a file too large for one free run -- is refused with the reason (exit 3), and the volume is left as it was |
+| `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5) |
+| `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log holds records nothing has applied yet), and `xfs` or `xfs.<field>` |
+| `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; a volume whose log is not clean is refused |
+| `resize <size>` | answers `not implemented` (exit 3): the library has no resize |
 
-Metadata is JSON on stdout by default, `--text` for people. A failure is
-`{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed,
-2 the command line was wrong, 3 the verb exists and this crate cannot do it.
-`mkfs.xfs` makes a v5 filesystem with the standard formatter's default
-features (checksums, the free inode btree, sparse inode chunks, reflink,
-large timestamps, directory entry file types) on a device or image of at
-least 300 MiB:
+`--offset BYTES` says where the filesystem starts, for a partition inside a whole-disk
+image. Metadata is JSON on stdout by default, `--text` for people. A failure is
+`{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the
+command line was wrong, 3 not implemented or refused.
+
+A journalled write -- a new file, a filled empty file, a directory -- lands as a record
+in the log: the kernel applies it the next time Linux mounts the volume, and `get dirty`
+says `true` until then. The driver writes only to a volume whose log is clean, so the
+next journalled write on the same image is refused until it has been mounted once.
+Reading needs no such wait: `ls` and `read` replay the log in memory.
+
+**`mkfs.xfs`** makes a v5 filesystem with the standard formatter's default features on
+a device or image of at least 300 MiB. The target must already exist at its size,
+unless `--size` is given for an image file that does not exist yet; a JSON report of
+what was written goes to stdout, and progress to stderr.
 
 ```sh
 mkfs.xfs --size 1G -L BACKUP disk.img
 truncate -s 4G disk.img && mkfs.xfs -b size=4096 -d agcount=8 disk.img
+mkfs.xfs -f /dev/sdb1         # replace whatever is there
 mkfs.xfs -N disk.img          # the geometry, written nowhere
 ```
 
-It takes `-b size=` (1, 2 or 4 KiB), `-d agcount=`, `-L`, `-m uuid=`, `-f`,
-`-q` and `-N`. Any other option the standard formatter accepts is refused by
-name rather than ignored, so the filesystem made is the one asked for. A
-device that already holds a filesystem or a partition table is refused
-without `-f`. The layout is the standard formatter's, measured: on the same
-device with the same UUID, every allocation group header and btree root is
-byte-identical to its output, and `tests/cli_mkfs_kernel.rs` has
-`xfs_repair -n` and the kernel accept the result.
+It takes `-b size=` (1, 2 or 4 KiB), `-d agcount=`, `-L`, `-m uuid=`, `-f`, `-q`, `-N`
+and `--size`. Any other option the standard formatter accepts is refused by name rather
+than ignored, so the filesystem made is the one asked for. A device that already holds
+a filesystem or a partition table is refused without `-f`.
 
-`fsck.xfs` checks a volume without changing it, a subset of what
-`xfs_repair -n` checks: the secondary superblocks against the primary, each
-allocation group's headers against its free-space and inode btrees, one owner
-for every block (a block claimed twice is a cross-link unless reflink shares
-it; a block claimed by nothing is lost), every allocated inode, the directory
-tree and link counts, and the superblock's counters. User, group and project
-quota inodes and records are checked for identity, limits and grace timers;
-checked accounting is compared with the allocated inodes' usage. Quota
-records are read through their extent maps even when the quota inode has
-size zero, including sparse records for high IDs.
+**`fsck.xfs`** checks a volume and reports what is wrong with it, writing nothing
+unless a repair is asked for.
 
 ```sh
-fsck.xfs disk.img          # exit 0 clean, 4 problems found, 8 could not check
-fsck.xfs -y disk.img       # repair what a rule owns: exit 1 corrected, 5 with errors left
-fsck.xfs --text disk.img   # one line per finding
-fsck.xfs --dry-run disk.img  # what a repair would change, writing nothing
+fsck.xfs disk.img              # the report, as JSON
+fsck.xfs --text disk.img       # the findings, one per line
+fsck.xfs --dry-run disk.img    # what a repair would change, writing nothing
+fsck.xfs -y disk.img           # repair what a rule owns
+fsck.xfs --offset 1048576 whole.img   # a partition inside a disk image
 ```
 
-JSON reports carry schema version 1, stable finding codes, severity and location.
-The `scan` field distinguishes a complete check from a partial scan or a volume
-that could not be mounted. A partial scan is never clean. See
-[the output contract](docs/fsck-output.md) for the schema and code catalogue.
+`-n` checks only, which is the default. `--dry-run` takes the target for itself, plans
+a repair and prints it under the report's `plan` key. `-y` and `-p` make the same plan
+and apply it; a refused plan writes nothing. The exit status is fsck(8)'s: 0 clean,
+1 errors corrected, 4 errors left (5 when some were corrected and some left), 8 the
+target could not be checked, 16 a wrong command line, which includes `-y` or `-p` asked
+for together with `-n` or `--dry-run`. [docs/fsck-output.md](docs/fsck-output.md) is
+the report's schema, the finding codes and the repair rules.
 
-`--dry-run` plans a repair with `fs_xfs::repair` and prints it without writing
-(#375). `-y` and `-p` make the same plan and apply it (#391). Every range is read
-again first and must still hold the bytes the plan saw, and the volume is then
-checked again from a fresh mount. One rule ships: a single damaged secondary
-superblock is rewritten from the primary. A copy naming another filesystem, or
-more than one damaged copy, refuses the plan, and nothing is written. Asking for
-`-y` or `-p` together with `-n` or `--dry-run` exits 16. It first takes the target exclusively, and it refuses
-with `repair.*` findings a volume it cannot reason about: a feature the checker
-does not validate (such as `rmapbt`), a dirty log, an incomplete scan, or a block
-or directory with two owners. A plan lists every error no rule repairs.
-`tests/cli_superblock_repair_oracle.rs` repairs a copy, then has `xfs_repair -n`
-and `xfs_db` confirm the repair, and shows that a second run writes nothing. `tests/cli_repair_plan_oracle.rs` holds the plan to
-`xfs_repair -n`, requires it to be the same twice, and requires the image
-unchanged. `tests/cli_fsck_oracle.rs` holds it to `xfs_repair -n` on
-twelve clean fixtures and representative corruption families, including golden
-JSON checks for codes, severity, locations and incomplete scans.
+## How it is tested
 
-A journalled write -- a new file, a filled empty file, a directory -- lands as
-a record in the log, as the driver's writes always do: the kernel applies it
-the next time Linux mounts the volume, and `get dirty` says `true` until
-then. The driver writes only to a volume whose log is clean, so the next
-journalled write on the same image is refused until it has been mounted once.
-Reading needs no such wait: `ls` and `read` replay the log in memory.
-
-Build and stage them from a checkout, then test them as installed:
+Unit tests prove the parsers agree with themselves; they cannot prove they agree with
+XFS, because a misreading of the format is baked into the fixture and the parser alike.
+So every structure the driver parses or writes is also checked against something that
+is not this crate: images made by the reference `mkfs.xfs` and read back field by field
+against `xfs_db`; what the driver writes graded by `xfs_repair -n` and mounted by the
+Linux kernel, which replays every log record the driver wrote. Those tools run in one
+Linux guest from
+[fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness),
+the same on a developer's machine and in CI. A test that cannot reach the tool, fixture
+or VM it needs fails rather than skipping, and the parsers are fuzzed.
 
 ```sh
-chore cli:install                          # tmp/cli/bin, and the PATH line to use
-export PATH="$(scripts/cli-install.sh --print-bin-dir):$PATH"
-chore test:cli                             # doctor first, then tests/cli/*.sh
+chore siblings     # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
+chore test:unit    # no tool, no fixture, no VM
+chore test         # everything, exactly as CI runs it
 ```
 
-The binary is behind the `cli` feature (`cargo build --release --features
-cli --bin rust-fs-xfs`), so the library a consumer links gains no
-dependency. Each release attaches `rust-fs-xfs-<version>-<platform>.tar.gz`
-for `darwin-arm64` and `linux-x86_64`: an install prefix (`bin/rust-fs-xfs`,
-`bin/fs.xfs`, section-1 man pages and zsh, bash and fish completions under
-`share/`, `share/rust-fs-xfs/CAVEATS`, `LICENSE`) with the same
-build-provenance attestation as the crate. The pages and completions are
-written by the binary itself (`rust-fs-xfs generate man|completions SHARE`)
-from the argument definitions it parses with, so they cannot describe a flag
-it does not take.
+[docs/testing.md](docs/testing.md) has the tiers, the fixtures and how they are made;
+[docs/on-disk-format.md](docs/on-disk-format.md) has the format details that are easy
+to get wrong, and which bugs they caused here.
 
-## Verifying a release
+## Documentation
 
-From the next release onward, every version published to crates.io is
-also attached to the GitHub release for its tag, with a build-provenance
-attestation signed by this repository's release workflow. It proves the
-crate was built by `.github/workflows/release.yml` from a commit in this
-repository, not uploaded from someone's machine. To check the crates.io
-download of version `X.Y.Z`:
-
-```sh
-curl -sSfLo rust-fs-xfs-X.Y.Z.crate https://static.crates.io/crates/rust-fs-xfs/rust-fs-xfs-X.Y.Z.crate
-gh attestation verify rust-fs-xfs-X.Y.Z.crate \
-  --repo antimatter-studios/rust-fs-xfs \
-  --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
-```
-
-The workflow refuses to attest a `.crate` whose sha256 differs from the
-checksum crates.io records for that version, so the file on the release
-page and the crates.io download are the same bytes.
-
-The command-line tarballs on the same release page are attested by the same
-workflow, and checked the same way:
-
-```sh
-gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
-  --repo antimatter-studios/rust-fs-xfs \
-  --signer-workflow antimatter-studios/rust-fs-xfs/.github/workflows/release.yml
-```
+- [docs/features.md](docs/features.md): every feature and its state.
+- [docs/fsck-output.md](docs/fsck-output.md): `fsck.xfs`'s report, codes and repair.
+- [docs/on-disk-format.md](docs/on-disk-format.md): byte order, checksums and
+  self-describing metadata.
+- [docs/transaction-shapes.md](docs/transaction-shapes.md),
+  [docs/buffer-log-item.md](docs/buffer-log-item.md) and
+  [docs/logged-inode.md](docs/logged-inode.md): what each operation logs, as measured.
+- [docs/testing.md](docs/testing.md): the test contract, tiers and fixtures.
+- [docs/releases.md](docs/releases.md): what a release ships and how to verify it.
+- [AGENTS.md](AGENTS.md): how to work on this repository.
 
 ## Changelog
 
