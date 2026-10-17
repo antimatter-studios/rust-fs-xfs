@@ -150,5 +150,15 @@ for spec in "${IMAGES[@]}"; do
         printf 'inode-crc\t%s\n' "$((ino_byte + 44))"
     } > "xfscli-$name.corrupt"
 
+    # A reference-debugger fixture for ln's format-limit refusal, with a
+    # valid inode CRC. It deliberately has more links than directory
+    # entries, so it is never a consistency-check fixture.
+    if [ "$name" = v5 ]; then
+        cp --sparse=always "$img" xfscli-maxlinks.img
+        xfs_db -x -c "inode $ino" -c 'write -d core.nlinkv2 2147483647' xfscli-maxlinks.img
+        xfs_db -r -c "inode $ino" -c 'p core.nlinkv2' xfscli-maxlinks.img |
+            grep -qx 'core.nlinkv2 = 2147483647'
+    fi
+
     echo "BUILT xfscli-$name (label $label, $(wc -l < "xfscli-$name.manifest") entries)"
 done

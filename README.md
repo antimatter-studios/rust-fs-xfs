@@ -272,6 +272,7 @@ fs.xfs --offset 1048576 whole-disk.img info
 | `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5), leaving the log clean |
 | `rm <path>` | removes a name that is not a directory: a symlink rather than what it points at, and the file with its last name, its blocks freed (v5). Reports `{"path": ..., "removed": true}` |
 | `rmdir <path>` | removes an empty directory (v5), with the same report |
+| `ln [-s] <target> <path>` | adds a hard link to the target inode, or stores the target text literally in a symbolic link with `-s` (v5). Reports `{"path": ..., "linked": true, "inode": N}` and leaves the volume clean |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log holds records nothing has applied yet), and `xfs` or `xfs.<field>` |
 | `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; a volume whose log is not clean is refused |
 | `resize <size>` | answers `not implemented` (exit 3): the library has no resize |
@@ -281,7 +282,7 @@ image. Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the
 command line was wrong, 3 not implemented or refused.
 
-A journalled change -- a new file, a filled empty file, a directory, a removal -- is a
+A journalled change -- a new file, a filled empty file, a directory, a removal, a link -- is a
 record in the log, and the tool then releases the volume clean: the change is written
 home and the log ends with an unmount record, so `get dirty` is `false` afterwards and
 the next write follows on the same image at once. The driver writes only to a volume
@@ -295,6 +296,11 @@ the root, a v4 volume and a log holding records are refused before the image is 
 for writing, so a refused command leaves it byte-identical; a mistake is refused for
 the reason Linux gives. No symlink on the way to the path is followed, and nothing is
 removed recursively. A file whose extents are in a B+tree is refused (exit 3).
+
+`ln` refuses an existing destination, a missing parent or hard-link target, a hard link
+to a directory, the maximum link count, a v4 volume and a dirty log before opening for
+writing. Symbolic targets need not exist; they hold 1 to 1023 bytes, exactly as given.
+Hard links name symlink inodes themselves, and parent symlinks are never followed.
 
 `ls --recursive` lists direct children at depth 1, omitting the starting
 directory; a starting file or symlink is one entry at depth 0. Symlinks are
