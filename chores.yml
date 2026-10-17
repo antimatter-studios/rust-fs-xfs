@@ -730,8 +730,8 @@ tasks:
       # add 108 in test-write.sh and 4 in test-docs.sh (#519).
       # ln adds 104 assertions and two generated-document checks (#521).
       # mv adds 150 in test-mv.sh and 2 in test-docs.sh (#520).
-      # test-mkdir.sh adds 50 assertions (#522), counted from its checks.
-      - 'scripts/ci-test.sh --gate 1222 tmp/logs/cli.log "the cli tier"'
+      # test-mkdir.sh adds 56 assertions (#522), counted from its checks.
+      - 'scripts/ci-test.sh --gate 1228 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/

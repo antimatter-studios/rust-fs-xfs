@@ -33,6 +33,10 @@ fs.xfs "$img" mkdir -p /a/b/d --text >"$SANDBOX/text" 2>/dev/null
 check "text reports an existing chain" test "$(cat "$SANDBOX/text")" = 'already exists /a/b/d'
 fs.xfs "$img" mkdir -p /a/b/e --text >"$SANDBOX/text" 2>/dev/null
 check "text names the directory created" test "$(cat "$SANDBOX/text")" = 'created /a/b/e'
+fs.xfs "$img" mkdir -p /walk/child/../child/leaf >"$SANDBOX/report" 2>"$SANDBOX/error"
+check "a planned directory can be visited again after dot-dot" test $? -eq 0
+jq_check "planned directories are created only once" \
+    '.created == ["/walk", "/walk/child", "/walk/child/leaf"]' "$SANDBOX/report"
 
 # A later obstruction or invalid name must not leave an earlier missing
 # component behind. Symlinks are refused as non-directories, never followed.
@@ -63,6 +67,21 @@ copy_image "$SANDBOX/v4.img" "$SANDBOX/before"
 fs.xfs "$SANDBOX/v4.img" mkdir -p /new/child >"$SANDBOX/report" 2>"$SANDBOX/error"
 check "creating on v4 is refused" test $? -eq 3
 check "v4 refusal changes nothing" cmp -s "$SANDBOX/v4.img" "$SANDBOX/before"
+
+# A read-only replay can resolve paths, but creation on its dirty log is refused.
+dirty="$SHARE/xfsdirty.img"
+if [ -f "$dirty" ]; then
+    copy_image "$dirty" "$SANDBOX/dirty.img"
+    copy_image "$SANDBOX/dirty.img" "$SANDBOX/before"
+    fs.xfs "$SANDBOX/dirty.img" mkdir -p /parents/a/b >"$SANDBOX/report" 2>"$SANDBOX/error"
+    check "parents on a dirty log fails" test $? -eq 1
+    check "dirty-log refusal prints no success" test ! -s "$SANDBOX/report"
+    jq_check "dirty-log refusal explains the log" \
+        '.code == 1 and (.error | test("log holds records"))' "$SANDBOX/error"
+    check "dirty-log refusal changes nothing" cmp -s "$SANDBOX/dirty.img" "$SANDBOX/before"
+else
+    fail ".vm-share/xfsdirty.img is missing; build it with \`chore fixtures -- data\`"
+fi
 
 # Offset remains the start of the filesystem, and bytes before it stay intact.
 disk="$SANDBOX/disk.img"
