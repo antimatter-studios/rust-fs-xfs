@@ -102,6 +102,11 @@ changes behaviour updates it. In summary:
 
 ### Tools
 
+`fs.xfs disk.img stat /etc/hosts` reports a path's identity, type, permissions,
+owner, links, sizes and all four times as seconds plus nanoseconds. Symlinks are
+reported without following them; v4 creation times are null. Output is JSON,
+with XFS metadata under `xfs`, or `--text` for `key: value` lines.
+
 - `fs.xfs` lists, reads, writes and inspects a volume; `mkfs.xfs` formats one;
   `fsck.xfs` checks one and repairs what it can; `rust-fs-xfs doctor` says whether the
   tools on `PATH` are this program. Each has a man page and shell completions.
