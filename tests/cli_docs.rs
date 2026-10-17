@@ -63,6 +63,13 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
             "no fs.xfs-{verb}.1"
         );
     }
+    // roff escapes every hyphen (`\-\-max\-depth`); match the text a reader sees.
+    let ls = std::fs::read_to_string(share.join("man/man1/fs.xfs-ls.1"))
+        .unwrap()
+        .replace("\\-", "-");
+    for option in ["recursive", "max-depth", "limit"] {
+        assert!(ls.contains(option), "ls man page omits {option}");
+    }
 }
 
 #[test]
@@ -87,5 +94,12 @@ fn every_name_has_a_zsh_bash_and_fish_completion() {
             std::fs::read_to_string(share.join(format!("fish/vendor_completions.d/{name}.fish")))
                 .unwrap_or_else(|e| panic!("fish {name}: {e}"));
         assert!(fish.contains(&format!("complete -c {name}")), "fish {name}");
+        if name == "fs.xfs" {
+            for completion in [&zsh, &bash, &fish] {
+                for option in ["recursive", "max-depth", "limit"] {
+                    assert!(completion.contains(option), "completion omits {option}");
+                }
+            }
+        }
     }
 }
