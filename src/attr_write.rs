@@ -355,9 +355,11 @@ impl<'a> Layout<'a> {
         items
     }
 
-    fn write_remote(&self, fs: &Filesystem, ino: u64, start: u64) -> Result<()> {
-        let device = fs.writable_device()?;
+    /// Each remote value's blocks as they go to the device, with their byte
+    /// addresses, for a fork whose blocks start at `start`.
+    fn remote_blocks(&self, fs: &Filesystem, ino: u64, start: u64) -> Vec<(u64, Vec<u8>)> {
         let bs = fs.sb.blocksize as usize;
+        let mut blocks = Vec::new();
         for entry in self.entries.iter().filter(|e| !e.local) {
             for (n, payload) in entry.value.chunks(bs - 56).enumerate() {
                 let mut bytes = vec![0; bs];
@@ -372,12 +374,22 @@ impl<'a> Layout<'a> {
                 bytes[56..56 + payload.len()].copy_from_slice(payload);
                 let crc = crate::superblock::crc32c_with_zeroed_crc(&bytes, 12);
                 bytes[12..16].copy_from_slice(&crc.to_le_bytes());
-                device.write_at(address, &bytes)?;
+                blocks.push((address, bytes));
             }
         }
-        device.flush()?;
-        Ok(())
+        blocks
     }
+}
+
+/// Put remote value blocks on the device, ahead of the record that maps
+/// them: a remote value is not logged.
+fn write_remote(fs: &Filesystem, blocks: &[(u64, Vec<u8>)]) -> Result<()> {
+    let device = fs.writable_device()?;
+    for (address, bytes) in blocks {
+        device.write_at(*address, bytes)?;
+    }
+    device.flush()?;
+    Ok(())
 }
 
 /// The one extent record of a rebuilt fork: `total` blocks from `start`.
@@ -554,7 +566,8 @@ impl Filesystem {
             inline
         } else {
             let layout = layout.as_ref().expect("external layout");
-            let location = self.place_attribute_blocks(&mut allocations, ino, layout.total)?;
+            let location =
+                self.place_attribute_blocks(&mut allocations, ino, layout.total, false)?;
             metadata = layout.metadata(self, ino, location);
             remote_start = Some(location);
             extent_record(location, layout.total)?
@@ -661,10 +674,8 @@ impl Filesystem {
             + inode_ops;
         // All fallible preparation precedes the ordered remote writes.
         if let Some(location) = remote_start {
-            layout
-                .as_ref()
-                .expect("external layout")
-                .write_remote(self, ino, location)?;
+            let layout = layout.as_ref().expect("external layout");
+            write_remote(self, &layout.remote_blocks(self, ino, location))?;
         }
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
@@ -721,17 +732,26 @@ impl Filesystem {
 
     /// Where a rebuilt attribute fork's `total` blocks go: one free run,
     /// in the inode's own group first, then each other group in turn.
+    /// With `settled`, only a run free before the record began (#501),
+    /// for a fork whose remote values go to the device ahead of it.
     fn place_attribute_blocks<'a>(
         &'a self,
         allocations: &mut Allocations<'a>,
         ino: u64,
         total: u32,
+        settled: bool,
     ) -> Result<u64> {
         let preferred = self.sb.split_ino(ino).0;
         for attempt in 0..self.sb.agcount {
             let agno = (preferred + attempt) % self.sb.agcount;
             let group = allocations.group(&self.sb, self.device(), agno)?;
-            match group.take(total, ino as i64, crate::rmap::OFF_ATTR_FORK) {
+            let owner = ino as i64;
+            let taken = if settled {
+                group.take_settled(total, owner, crate::rmap::OFF_ATTR_FORK)
+            } else {
+                group.take(total, owner, crate::rmap::OFF_ATTR_FORK)
+            };
+            match taken {
                 Ok(block) => return Ok((u64::from(agno) << self.sb.agblklog) | u64::from(block)),
                 Err(Error::UnsupportedFeature(message))
                     if message.contains("has no single free run") =>
@@ -976,7 +996,9 @@ pub(crate) enum ParentChange<'a> {
 /// rebuilds one -- a leaf, or a node over leaves, holding every attribute
 /// the fork had, each parent pointer filed under its own hash -- and the
 /// inode item logs the fork's one extent record as `AEXT`, beside each new
-/// block logged whole.
+/// block logged whole. A value stored in blocks of its own is not logged:
+/// [`ParentFork::write_remote`] puts it on the device before the record
+/// commits, in blocks that were free before the record began (#501).
 pub(crate) struct ParentFork {
     /// The whole inode: the caller's core and data fork, and the new
     /// attribute fork with its offset, format, extent count and the block
@@ -990,6 +1012,8 @@ pub(crate) struct ParentFork {
     pub(crate) quota: Option<crate::quota::QuotaChange>,
     /// The new fork's leaf and node blocks.
     items: Vec<BufferItem>,
+    /// The new fork's remote value blocks, with their byte addresses.
+    remote: Vec<(u64, Vec<u8>)>,
     /// A cancellation for each of the old fork's blocks, once released.
     cancels: Vec<BufferItem>,
     ino: u64,
@@ -1033,6 +1057,21 @@ impl ParentFork {
     pub(crate) fn buffers(&self) -> &[BufferItem] {
         &self.items
     }
+
+    /// Put the new fork's remote values on the device (#501). A record
+    /// calls this after everything that can refuse it and before it
+    /// commits, since a remote value is not logged and has to be in place
+    /// when the record that maps it is. Earlier records' buffers are
+    /// pushed first, so that none is written home over a value afterwards.
+    /// The blocks were free before the record began, so one that never
+    /// commits has overwritten nothing anyone reads.
+    pub(crate) fn write_remote(&self, fs: &Filesystem) -> Result<()> {
+        if self.remote.is_empty() {
+            return Ok(());
+        }
+        fs.sync()?;
+        write_remote(fs, &self.remote)
+    }
 }
 
 impl Filesystem {
@@ -1045,16 +1084,18 @@ impl Filesystem {
     /// Nothing is written here. The caller logs [`ParentFork::core`] with
     /// the fork and [`ParentFork::buffer_ops`], calls
     /// [`ParentFork::release`] once every fork of its record has its
-    /// blocks, and adds [`ParentFork::quota`] to its quota changes.
+    /// blocks, adds [`ParentFork::quota`] to its quota changes, and calls
+    /// [`ParentFork::write_remote`] last before it commits.
     ///
     /// # Errors
     ///
     /// [`Error::UnsupportedFeature`] for a fork holding an entry a rebuild
-    /// would not keep, a fork past short form holding a remote value
-    /// (#501), a data fork whose root is laid out by the fork offset (a
-    /// B+tree or a device number) with no room behind it for the attribute
-    /// fork, a rebuilt fork that finds no single free run, and a parent
-    /// pointer to remove that the inode does not have.
+    /// would not keep, a data fork whose root is laid out by the fork
+    /// offset (a B+tree or a device number) with no room behind it for the
+    /// attribute fork, a rebuilt fork that finds no single free run -- for
+    /// one holding a remote value, no run that was free before the record
+    /// began (#501) -- and a parent pointer to remove that the inode does
+    /// not have.
     pub(crate) fn with_parent_pointers<'a>(
         &'a self,
         allocations: &mut Allocations<'a>,
@@ -1142,23 +1183,11 @@ impl Filesystem {
         } else if let Some((fork, at)) = &short {
             (*at, fork.len())
         } else {
-            let rebuilt = Layout::new(
+            layout = Some(Layout::new(
                 &attrs,
                 self.sb.blocksize as usize,
                 self.sb.has_case_insensitive_dirs(),
-            )?;
-            // A remote value is not logged: it goes to the device ahead of
-            // the record that maps it. This record may already have given
-            // blocks back -- a directory laid out again, a replaced inode's
-            // data -- that stay live until it commits, and a value written
-            // into one of them would overwrite them if it never did (#501).
-            if rebuilt.entries.iter().any(|e| !e.local) {
-                return Err(unsupported(&format!(
-                    "inode {ino}: an attribute value stored in blocks of its own is not \
-                     rebuilt beside its parent pointers yet"
-                )));
-            }
-            layout = Some(rebuilt);
+            )?);
             let record = extent::EXTENT_RECORD_SIZE;
             let at = place(record).ok_or_else(|| {
                 unsupported(&format!(
@@ -1182,12 +1211,23 @@ impl Filesystem {
         }
 
         let mut items = Vec::new();
+        let mut remote = Vec::new();
         let mut new_blocks = 0;
         let fork = match (&layout, short) {
             _ if attrs.is_empty() => Vec::new(),
             (Some(layout), _) => {
-                let location = self.place_attribute_blocks(allocations, ino, layout.total)?;
+                // A remote value is not logged: it goes to the device ahead
+                // of the record that maps it. This record may already have
+                // given blocks back -- a directory laid out again, a
+                // replaced inode's data -- that stay live until it commits,
+                // and a value written into one of them would overwrite them
+                // if it never did. So a fork holding one takes only blocks
+                // that were free before the record began (#501).
+                let settled = layout.entries.iter().any(|e| !e.local);
+                let location =
+                    self.place_attribute_blocks(allocations, ino, layout.total, settled)?;
                 items = layout.metadata(self, ino, location);
+                remote = layout.remote_blocks(self, ino, location);
                 new_blocks = u64::from(layout.total);
                 extent_record(location, layout.total)?
             }
@@ -1248,6 +1288,7 @@ impl Filesystem {
             fields,
             quota,
             items,
+            remote,
             cancels: Vec::new(),
             ino,
             old_map,
@@ -1407,6 +1448,122 @@ mod tests {
         assert_eq!(
             fs.get_xattr(&inode, &raw, b"user.keep").unwrap(),
             Some(b"committed".to_vec())
+        );
+    }
+
+    /// A fork rebuilt around a parent pointer keeps a value stored in
+    /// blocks of its own (#501), and puts it only where nothing was before
+    /// the record began. Here the record has already given back a file's
+    /// data, ahead of every other free run long enough for the fork, which
+    /// a plain take would hand out: the data is live until the record
+    /// commits, and the value goes to the device before it does.
+    ///
+    /// The value is the largest there is, seventeen blocks beside the
+    /// leaf, so that no gap a fresh volume has in front of the data is
+    /// long enough for the fork.
+    #[test]
+    fn a_remote_value_beside_parent_pointers_takes_no_block_the_record_gave_back() {
+        let device = formatted_device(4096);
+        let fs = Filesystem::mount_rw(device).unwrap();
+        let root = fs.superblock().rootino;
+        let (data, _) = fs.create_file(root, b"data", 0o100644).unwrap();
+        fs.write(data, 0, &[0x11; 32 * 4096]).unwrap();
+        let (file, _) = fs.create_file(root, b"file", 0o100644).unwrap();
+        let value: Vec<u8> = (0..attr::XFS_ATTR_VALUE_MAX).map(|i| i as u8).collect();
+        fs.set_xattr(file, b"user.big", &value, XattrMode::Create)
+            .unwrap();
+
+        let (inode, raw) = fs.read_inode_raw(data).unwrap();
+        let freed = fs.data_extents(&inode, &raw).unwrap();
+        assert!(!freed.is_empty(), "the data file has blocks");
+        // The data file's blocks, given back as a truncate in the same
+        // record gives them back.
+        fn give_back<'a>(
+            fs: &'a Filesystem,
+            allocations: &mut Allocations<'a>,
+            owner: u64,
+            freed: &[Extent],
+        ) {
+            for extent in freed {
+                let (agno, agblock) = split_fsblock(&fs.sb, extent.startblock);
+                let group = allocations.group(&fs.sb, fs.device(), agno).unwrap();
+                group
+                    .forget_rmap(crate::rmap::Rmap {
+                        startblock: agblock,
+                        blockcount: extent.blockcount as u32,
+                        owner: owner as i64,
+                        offset: extent.startoff
+                            | if extent.unwritten {
+                                crate::rmap::OFF_UNWRITTEN
+                            } else {
+                                0
+                            },
+                    })
+                    .unwrap();
+                group
+                    .give_back(FreeExtent {
+                        startblock: agblock,
+                        blockcount: extent.blockcount as u32,
+                    })
+                    .unwrap();
+            }
+        }
+        let overlaps_freed = |start: u64, count: u64| {
+            freed
+                .iter()
+                .any(|e| start < e.startblock + e.blockcount && e.startblock < start + count)
+        };
+
+        let (_, raw) = fs.read_inode_raw(file).unwrap();
+        let add = [ParentChange::Add {
+            name: b"file",
+            parent: root,
+            generation: 0,
+        }];
+        // What the test is about: a plain take would reuse the data's blocks.
+        let mut plain = Allocations::new();
+        give_back(&fs, &mut plain, data, &freed);
+        let total = fs
+            .with_parent_pointers(&mut Allocations::new(), file, &raw, &add)
+            .map(|fork| extent::parse_list(&fork.fork, 1).unwrap()[0].blockcount)
+            .unwrap();
+        let reused = fs
+            .place_attribute_blocks(&mut plain, file, total as u32, false)
+            .unwrap();
+        assert!(
+            overlaps_freed(reused, total),
+            "premise: a plain take of {total} blocks lands in the freed data {freed:?}, not at \
+             {reused}"
+        );
+
+        let mut allocations = Allocations::new();
+        give_back(&fs, &mut allocations, data, &freed);
+        let fork = fs
+            .with_parent_pointers(&mut allocations, file, &raw, &add)
+            .expect("a remote value beside a parent pointer is rebuilt");
+        let placed = extent::parse_list(&fork.fork, 1).unwrap()[0];
+        assert!(
+            !overlaps_freed(placed.startblock, placed.blockcount),
+            "the rebuilt fork {placed:?} took blocks the record gave back: {freed:?}"
+        );
+        let per_block = fs.sb.blocksize as usize - 56;
+        assert_eq!(
+            fork.remote.len(),
+            value.len().div_ceil(per_block),
+            "the value's remote blocks"
+        );
+        let mut kept = Vec::new();
+        for (address, bytes) in &fork.remote {
+            assert!(
+                (placed.startblock..placed.startblock + placed.blockcount)
+                    .any(|b| fs.block_offset(b) == *address),
+                "the remote block at byte {address} is outside the fork {placed:?}"
+            );
+            kept.extend_from_slice(&bytes[56..56 + be32(bytes, 8) as usize]);
+        }
+        assert!(
+            kept == value,
+            "the value comes through the rebuild unchanged"
         );
     }
 

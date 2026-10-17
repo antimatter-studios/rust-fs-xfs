@@ -486,6 +486,11 @@ impl Filesystem {
         // Kept for the overlay, which needs the same bytes the record
         // carries (#89).
         let logged_fork = disk_fork;
+        // A remote value in a rebuilt attribute fork is on the device
+        // before the record that maps it (#501).
+        if let Some(p) = &parents {
+            p.write_remote(self)?;
+        }
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {

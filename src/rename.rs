@@ -487,6 +487,11 @@ impl Filesystem {
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + inode_ops.len();
 
+        // A remote value in a rebuilt attribute fork is on the device
+        // before the record that maps it (#501).
+        for fork in &forks {
+            fork.write_remote(self)?;
+        }
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {
@@ -672,6 +677,11 @@ impl Filesystem {
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             + 3
             + inode_ops.len();
+        // A remote value in a rebuilt attribute fork is on the device
+        // before the record that maps it (#501).
+        if let Some(p) = &parents {
+            p.write_remote(self)?;
+        }
         let lsn = self.commit_record(|tid| {
             let mut ops = vec![
                 Op {

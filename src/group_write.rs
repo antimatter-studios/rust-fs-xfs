@@ -364,6 +364,26 @@ fn volume_free_blocks(sb: &Superblock, device: &dyn fs_core::BlockRead) -> Resul
     Ok(free)
 }
 
+/// Where the first `want` blocks free in both `a` and `b` start, each a
+/// list of free runs in block order (#501).
+fn first_common_run(a: &[FreeExtent], b: &[FreeExtent], want: u32) -> Option<u32> {
+    let end = |run: &FreeExtent| u64::from(run.startblock) + u64::from(run.blockcount);
+    let (mut i, mut j) = (0, 0);
+    while let (Some(x), Some(y)) = (a.get(i), b.get(j)) {
+        let start = x.startblock.max(y.startblock);
+        if end(x).min(end(y)) >= u64::from(start) + u64::from(want) {
+            return Some(start);
+        }
+        // The run that ends first can overlap nothing further on.
+        if end(x) <= end(y) {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
 pub(crate) struct GroupAlloc<'a> {
     sb: &'a Superblock,
     device: &'a dyn fs_core::BlockRead,
@@ -383,6 +403,10 @@ pub(crate) struct GroupAlloc<'a> {
     cnt_blocks: Vec<u32>,
     /// Free space in block order, as it stands after the takes so far.
     by_block: Vec<FreeExtent>,
+    /// Free space in block order as the group was opened, before this
+    /// record took or gave back anything (#501). A block given back since
+    /// holds what it held until the record commits.
+    settled: Vec<FreeExtent>,
     /// The reverse-mapping tree's records and blocks, where the
     /// filesystem has that tree.
     rmap: Option<(Vec<crate::rmap::Rmap>, Vec<u32>)>,
@@ -544,6 +568,7 @@ impl<'a> GroupAlloc<'a> {
             before,
             bno_blocks,
             cnt_blocks,
+            settled: by_block.clone(),
             by_block,
             rmap,
             refcount,
@@ -619,7 +644,7 @@ impl<'a> GroupAlloc<'a> {
         owner: i64,
         offset: u64,
     ) -> Result<u32> {
-        use crate::alloc_btree::{alloc_extent, longest};
+        use crate::alloc_btree::longest;
 
         let agno = self.agno;
         let align = u64::from(align.max(1));
@@ -645,11 +670,45 @@ impl<'a> GroupAlloc<'a> {
                 longest(&self.by_block)
             )));
         };
+        self.take_at(start, want, owner, offset)
+    }
+
+    /// [`GroupAlloc::take`], from blocks that were free when the group was
+    /// opened and still are (#501).
+    ///
+    /// A block this record gave back is free only once the record commits;
+    /// until then it holds what it held -- a directory block laid out
+    /// again, a replaced inode's data. A write that reaches the device
+    /// ahead of its record, as an attribute's remote value does, must not
+    /// land there: if the record never committed, it would have
+    /// overwritten data still in use. A block that was free before the
+    /// record began holds nothing anyone reads, whether or not it commits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedFeature`] when no run of `want` blocks was free
+    /// before the record and still is, whatever has been given back since.
+    pub(crate) fn take_settled(&mut self, want: u32, owner: i64, offset: u64) -> Result<u32> {
+        let Some(start) = first_common_run(&self.settled, &self.by_block, want) else {
+            return Err(Error::UnsupportedFeature(format!(
+                "allocation group {} has no single free run of {want} blocks that was \
+                 free before this record began — its longest run is {}, and blocks the \
+                 record gave back are not reused before it commits",
+                self.agno,
+                crate::alloc_btree::longest(&self.by_block)
+            )));
+        };
+        self.take_at(start, want, owner, offset)
+    }
+
+    /// Take `want` blocks from `start`, which a free run holds, for
+    /// `owner` at file offset `offset`.
+    fn take_at(&mut self, start: u32, want: u32, owner: i64, offset: u64) -> Result<u32> {
         let taking = FreeExtent {
             startblock: start,
             blockcount: want,
         };
-        alloc_extent(&mut self.by_block, taking)?;
+        crate::alloc_btree::alloc_extent(&mut self.by_block, taking)?;
 
         // The reverse map, where the filesystem has one. Blocks that
         // have just left free space belong to `owner` from here on, and
@@ -1438,6 +1497,74 @@ mod tests {
                 4,
                 "the group header, its two free-space trees and its free list, once each"
             );
+        }
+
+        /// A take that reaches the device ahead of its record gets only
+        /// blocks that were free before the record began (#501). Blocks
+        /// the record gave back -- a run in front of the free one, and
+        /// another that adjoins it and merges with it -- are free only
+        /// once it commits, and a plain take hands them out first.
+        #[test]
+        fn a_settled_take_skips_blocks_the_record_gave_back() {
+            let sb = superblock();
+            let dev = image(&sb);
+
+            let mut alloc = GroupAlloc::open(&sb, &dev, 0).expect("the group opens");
+            alloc
+                .give_back(FreeExtent {
+                    startblock: 20,
+                    blockcount: 10,
+                })
+                .expect("a run in front of the free one");
+            alloc
+                .give_back(FreeExtent {
+                    startblock: FREE_START - 10,
+                    blockcount: 10,
+                })
+                .expect("a run the free one takes in");
+
+            // FREE_START - 10 .. FREE_START + FREE_LEN is one free run now,
+            // but only FREE_LEN of it was free before the record.
+            let refused = alloc.take_settled(FREE_LEN + 5, 131, 0);
+            assert!(
+                matches!(&refused, Err(Error::UnsupportedFeature(m)) if m.contains("has no single free run")),
+                "a run longer than what was free before the record: {refused:?}"
+            );
+            assert_eq!(
+                alloc.take_settled(4, 131, 0).expect("settled take"),
+                FREE_START,
+                "the first blocks free before the record began"
+            );
+            assert_eq!(
+                alloc
+                    .take_settled(FREE_LEN - 4, 131, 0)
+                    .expect("settled take"),
+                FREE_START + 4,
+                "the rest of what was free before the record began"
+            );
+            assert_eq!(
+                alloc.take(4, 131, 0).expect("plain take"),
+                20,
+                "a plain take hands out the blocks the record gave back"
+            );
+        }
+
+        #[test]
+        fn the_first_common_run_is_where_both_lists_are_free() {
+            let run = |startblock, blockcount| FreeExtent {
+                startblock,
+                blockcount,
+            };
+            // In both: 5..10, 20..26, 45..50 and 52..60.
+            let a = [run(0, 10), run(20, 6), run(40, 20)];
+            let b = [run(5, 30), run(45, 5), run(52, 8)];
+            assert_eq!(first_common_run(&a, &b, 5), Some(5));
+            assert_eq!(first_common_run(&a, &b, 6), Some(20));
+            assert_eq!(first_common_run(&a, &b, 7), Some(52));
+            assert_eq!(first_common_run(&a, &b, 8), Some(52));
+            assert_eq!(first_common_run(&b, &a, 8), Some(52));
+            assert_eq!(first_common_run(&a, &b, 9), None);
+            assert_eq!(first_common_run(&a, &[], 1), None);
         }
 
         /// Taking nothing logs nothing, rather than three items whose
