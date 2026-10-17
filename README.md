@@ -268,8 +268,8 @@ fs.xfs --offset 1048576 whole-disk.img info
 | `ls [path]` | a directory (`/` by default): each entry's `name`, `type`, `size`, `mode`, `mtime` and `inode`, and a symlink's `target`; v4 and v5 |
 | `ls --recursive [--max-depth N] [--limit N] [path]` | byte-sorted depth-first entries with volume-absolute `path` and relative `depth`; `-R` is the short form |
 | `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
-| `write <path>` | the bytes on stdin. A new path becomes a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Anything else -- appending, shortening, a v4 create, a file too large for one free run -- is refused with the reason (exit 3), and the volume is left as it was |
-| `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5) |
+| `write <path>` | the bytes on stdin. A new path becomes a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Anything else -- appending, shortening, a v4 create, a file too large for one free run -- is refused with the reason (exit 3), and the volume is left as it was. A journalled write leaves the log clean, so the next write follows at once |
+| `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5), leaving the log clean |
 | `rm <path>` | removes a name that is not a directory: a symlink rather than what it points at, and the file with its last name, its blocks freed (v5). Reports `{"path": ..., "removed": true}` |
 | `rmdir <path>` | removes an empty directory (v5), with the same report |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log holds records nothing has applied yet), and `xfs` or `xfs.<field>` |
@@ -281,16 +281,16 @@ image. Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the
 command line was wrong, 3 not implemented or refused.
 
-A journalled write -- a new file, a filled empty file, a directory -- lands as a record
-in the log: the kernel applies it the next time Linux mounts the volume, and `get dirty`
-says `true` until then. The driver writes only to a volume whose log is clean, so the
-next journalled write on the same image is refused until it has been mounted once.
-Reading needs no such wait: `ls` and `read` replay the log in memory.
+A journalled change -- a new file, a filled empty file, a directory, a removal -- is a
+record in the log, and the tool then releases the volume clean: the change is written
+home and the log ends with an unmount record, so `get dirty` is `false` afterwards and
+the next write follows on the same image at once. The driver writes only to a volume
+whose log is clean, so one Linux left holding records is refused until Linux has
+mounted it again; reading needs no such wait, since `ls` and `read` replay the log in
+memory.
 
-`rm` and `rmdir` are journalled too, but release the volume clean: the change is
-written home and the log ends with an unmount record, so `get dirty` is `false`
-afterwards and the next write need not wait. A missing path, a directory given to
-`rm`, anything but a directory given to `rmdir`, a directory with entries, `.`, `..`,
+For `rm` and `rmdir`, a missing path, a directory given to `rm`, anything but a
+directory given to `rmdir`, a directory with entries, `.`, `..`,
 the root, a v4 volume and a log holding records are refused before the image is opened
 for writing, so a refused command leaves it byte-identical; a mistake is refused for
 the reason Linux gives. No symlink on the way to the path is followed, and nothing is
