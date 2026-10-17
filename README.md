@@ -342,6 +342,13 @@ gh attestation verify rust-fs-xfs-X.Y.Z-darwin-arm64.tar.gz \
 
 The latest releases; every release, with the reasoning behind each change, is in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.14.2 — 2026-10-17
+
+- Volumes with parent pointers are written: every namespace change keeps them, past short form and beside values stored in blocks of their own, and `Filesystem::parent_pointers` reads them.
+- An exchange moves reflinked blocks and edits block-map trees.
+- The repair is reachable through the C ABI: `fs_xfs_repair_with_fs_core_device` plans a repair on an `fs_core` device and, asked to, writes it.
+- The checker leaves a group it cannot read unchecked rather than reporting its inodes lost, and `fsck.xfs` names a target it cannot open in every mode.
+
 ### v0.14.1 — 2026-10-14
 
 - Two files exchange ranges of their data by exchanging blocks (`exchange_range`), on volumes with the exchange-range feature, which are now written.
@@ -399,13 +406,6 @@ The latest releases; every release, with the reasoning behind each change, is in
 - A checkpoint larger than one in-core log buffer is written as several records.
 - A volume with a dirty log mounts, replaying into memory.
 - A directory takes entries after it has outgrown the inode.
-
-### v0.7.0 — 2026-09-06
-
-- Every write path works in a group whose B+trees are more than one block deep.
-- The reverse-mapping tree is read as the interval tree it is.
-- One operation allocates once from a group however many times it takes from it.
-- Freeing part of a shared extent splits the reference-count record rather than refusing, and records that adjoin and say the same thing are merged.
 
 ## License
 

@@ -98,7 +98,7 @@ version = "0.3.13"
 
 [[package]]
 name = "rust-fs-xfs"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "crc32c",
  "rust-fs-core",
