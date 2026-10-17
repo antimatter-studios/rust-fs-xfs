@@ -19,9 +19,11 @@
 //!
 //! The volumes are built without a kernel. A protofile populates them, so
 //! mkfs writes the parent pointers, and `xfs_db -x` adds user attributes
-//! beside them in short form and in leaf form. `xfs_repair -n` must accept
-//! each volume as built, and xfs_db counts the attribute entries the driver
-//! must report.
+//! beside them in short, leaf and node form. `xfs_repair -n` must accept
+//! each volume as built, xfs_db counts the attribute entries the driver
+//! must report, and xfs_db lists the parent pointers in every form, which
+//! the driver's own reading has to match (#488): its `parent` command for a
+//! leaf or node fork, and a short-form fork's own entries otherwise (#513).
 //!
 //! Parent pointers arrived in xfsprogs 6.10 and Debian's is 6.1, so these
 //! tools are not the guest's ordinary ones: `scripts/vm-setup.sh` builds a
@@ -306,6 +308,192 @@ fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every parent pointer xfs_db lists for `path`, as (directory, its
+/// generation, name), sorted: a reading of an inode's pointers that is not
+/// the driver's, whatever form its attribute fork is in (#488).
+///
+/// A leaf or node fork is listed by xfs_db's `parent` command, which walks
+/// a leaf and the whole leaf chain of a node fork. It prints one
+/// `%18llu:0x%08x %3d %.*s` line per pointer, and a line that does not
+/// parse as one fails the test rather than being dropped.
+///
+/// A short-form fork is not, because `parent` misreads it (#513). The
+/// pinned xfsprogs 6.13's `list_sf_pptrs`, in db/namei.c, hands each entry
+/// on with its value at `sfe->nameval + sfe->valuelen`, where the value
+/// starts at `sfe->nameval + sfe->namelen`. Every pointer whose name is not
+/// 12 bytes long then decodes to a record the tool rejects and drops
+/// without a word, whoever wrote the fork, and the command still exits 0.
+/// `print a` decodes the same entries at the right offset (db/attrshort.c,
+/// where libxfs reads them), so a short-form fork is read from its fields.
+fn xfs_db_parents(img: &Path, path: &str) -> Vec<(u64, u32, String)> {
+    let fork = run(parent_oracle("xfs_db")
+        .args(["-r", "-c"])
+        .arg(format!("path {path}"))
+        .args(["-c", "print core.aformat", "-c", "print a"])
+        .arg(img));
+    if fork.contains("core.aformat = 1 (local)") {
+        return xfs_db_short_form_parents(path, &fork);
+    }
+    let out = run(parent_oracle("xfs_db")
+        .args(["-r", "-c"])
+        .arg(format!("path {path}"))
+        .args(["-c", "parent"])
+        .arg(img));
+    let mut got: Vec<(u64, u32, String)> = out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let parsed = || -> Option<(u64, u32, String)> {
+                let (ino, rest) = line.trim_start().split_once(":0x")?;
+                let (generation, rest) = rest.split_once(' ')?;
+                let (len, name) = rest.trim_start().split_once(' ')?;
+                let len: usize = len.parse().ok()?;
+                if name.len() != len {
+                    return None;
+                }
+                Some((
+                    ino.parse().ok()?,
+                    u32::from_str_radix(generation, 16).ok()?,
+                    name.to_string(),
+                ))
+            };
+            parsed().unwrap_or_else(|| {
+                panic!(
+                    "{path}: xfs_db printed a line that is not a parent pointer: {line:?}\n{out}"
+                )
+            })
+        })
+        .collect();
+    got.sort();
+    got
+}
+
+/// The parent pointers in the short-form fork `print a` printed as `out`,
+/// sorted. Each entry prints as `a.sfattr.list[i].<field> = <value>` lines;
+/// a parent pointer is one whose `parent` flag is 1, and its `name`,
+/// `parent_dir.inumber` and `parent_dir.gen` are the pointer. Every entry
+/// the header counts must be printed, and every parent pointer must carry
+/// a 12-byte value, as `parent` itself requires, and a name as long as its
+/// `namelen`; anything else fails the test rather than being dropped.
+fn xfs_db_short_form_parents(path: &str, out: &str) -> Vec<(u64, u32, String)> {
+    #[derive(Default)]
+    struct Entry {
+        namelen: Option<usize>,
+        valuelen: Option<usize>,
+        parent: Option<bool>,
+        name: Option<Vec<u8>>,
+        ino: Option<u64>,
+        generation: Option<u32>,
+    }
+    let count: usize = out
+        .lines()
+        .find_map(|l| l.strip_prefix("a.sfattr.hdr.count = "))
+        .and_then(|c| c.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{path}: xfs_db printed no short-form entry count:\n{out}"));
+    let mut entries = std::collections::BTreeMap::<usize, Entry>::new();
+    for line in out.lines() {
+        let Some(rest) = line.strip_prefix("a.sfattr.list[") else {
+            continue;
+        };
+        let mut parsed = || -> Option<()> {
+            let (index, rest) = rest.split_once("].")?;
+            let (field, value) = rest.split_once(" = ")?;
+            let entry = entries.entry(index.parse().ok()?).or_default();
+            match field {
+                "namelen" => entry.namelen = Some(value.parse().ok()?),
+                "valuelen" => entry.valuelen = Some(value.parse().ok()?),
+                "parent" => entry.parent = Some(value.parse::<u8>().ok()? == 1),
+                "name" => entry.name = Some(xfs_db_unquote(value)?),
+                "parent_dir.inumber" => entry.ino = Some(value.parse().ok()?),
+                "parent_dir.gen" => entry.generation = Some(value.parse().ok()?),
+                _ => {}
+            }
+            Some(())
+        };
+        parsed().unwrap_or_else(|| {
+            panic!("{path}: xfs_db printed a short-form entry line it cannot be read from: {line:?}\n{out}")
+        });
+    }
+    assert!(
+        entries.keys().copied().eq(0..count),
+        "{path}: xfs_db printed entries {:?} of a short-form fork whose header counts {count}:\n{out}",
+        entries.keys().collect::<Vec<_>>()
+    );
+    let mut got: Vec<(u64, u32, String)> = entries
+        .into_iter()
+        .filter(|(_, entry)| entry.parent != Some(false))
+        .map(|(index, entry)| {
+            let pointer = || -> Option<(u64, u32, String)> {
+                let name = entry.name?;
+                if entry.parent? && entry.valuelen? == 12 && name.len() == entry.namelen? {
+                    Some((entry.ino?, entry.generation?, String::from_utf8(name).ok()?))
+                } else {
+                    None
+                }
+            };
+            pointer().unwrap_or_else(|| {
+                panic!("{path}: short-form entry {index} as xfs_db printed it is not a parent pointer:\n{out}")
+            })
+        })
+        .collect();
+    got.sort();
+    got
+}
+
+/// A name as xfs_db's `charns` printer writes it: in double quotes, with
+/// `\`, `'`, `"` and `?` escaped by a backslash, a control byte from 7 to
+/// 13 as a backslash and the letter that byte plus 90 is (`\a` to `\g`),
+/// and any other byte that is not printable as `\` and three octal digits.
+fn xfs_db_unquote(printed: &str) -> Option<Vec<u8>> {
+    let mut bytes = printed.strip_prefix('"')?.strip_suffix('"')?.bytes();
+    let mut name = Vec::new();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            name.push(byte);
+            continue;
+        }
+        let escaped = bytes.next()?;
+        name.push(match escaped {
+            b'\\' | b'\'' | b'"' | b'?' => escaped,
+            b'a'..=b'g' => escaped - 90,
+            b'0'..=b'7' => {
+                let digits = [escaped, bytes.next()?, bytes.next()?];
+                u8::from_str_radix(std::str::from_utf8(&digits).ok()?, 8).ok()?
+            }
+            _ => return None,
+        });
+    }
+    Some(name)
+}
+
+/// The form of `path`'s attribute fork as xfs_db reads it: `local`, or
+/// past short form `leaf` when block 0 is a leaf and `node` when it is a
+/// node, the only attribute block with a level.
+fn xfs_db_attr_form(img: &Path, path: &str) -> &'static str {
+    let core = run(parent_oracle("xfs_db")
+        .args(["-r", "-c"])
+        .arg(format!("path {path}"))
+        .args(["-c", "print core.aformat"])
+        .arg(img));
+    if core.contains("core.aformat = 1 (local)") {
+        return "local";
+    }
+    let block = run(parent_oracle("xfs_db")
+        .args(["-r", "-c"])
+        .arg(format!("path {path}"))
+        .args(["-c", "ablock 0", "-c", "print"])
+        .arg(img));
+    if block.lines().any(|l| l.starts_with("hdr.level = ")) {
+        "node"
+    } else if block.lines().any(|l| l.starts_with("hdr.count = ")) {
+        "leaf"
+    } else {
+        panic!(
+            "{path}: xfs_db reads attribute block 0 as neither a leaf nor a node:\n{core}{block}"
+        )
+    }
+}
+
 /// Each kind of namespace change this driver makes, on the volume `build`
 /// made, after which the pinned `xfs_repair -n` must call it clean and
 /// every name must have exactly the parent pointers its links imply.
@@ -318,36 +506,77 @@ fn check_reads(tag: &str, args: &[&str], bits: u32, writes: Writes) {
 /// - `rename_in_directory`, and `rename` within one directory, rename one.
 /// - `unlink_file` of a last link and `remove_directory` free the inode.
 ///
-/// `/dir/hello.txt` holds 30 user attributes, a leaf-form fork, where a
-/// parent pointer is not written yet: a link to it and a rename of it are
-/// refused, as is unlinking one name of `/multi`, a two-link inode with the
-/// same kind of fork. Each refusal leaves the image byte-for-byte as it
-/// was, and the volume `xfs_repair` grades afterwards agrees.
+/// The first three kinds are made again on inodes whose attribute fork is
+/// past short form (#488), where adding or removing a pointer rebuilds the
+/// fork's blocks: `/dir/hello.txt` with 30 user attributes and `/multi`
+/// with 30 more given by xfs_db, both leaf form; `/bulky`, given 300, more
+/// than one leaf holds, so node form; one rename replacing a name of the
+/// node-form inode with the leaf-form one, both forks rebuilt in one
+/// record; and a file whose second long name does not fit short form, so
+/// the link itself moves its fork to a leaf. Their user attributes have to
+/// come through every rebuild, and xfs_db's own listing of each one's
+/// parent pointers has to match its names.
+///
+/// Still refused before anything is written, with the image byte-for-byte
+/// what it was and the volume `xfs_repair` grades afterwards agreeing:
+/// removing the last name of an inode with attribute blocks (#495), and
+/// linking `/remote`, whose fork past short form holds a 3000-byte value
+/// in blocks of its own (#501).
 fn keep_parent_pointers(tag: &str, img: &Path) {
-    // `/multi` and `/multi-too` are two links to one inode. The driver
-    // makes both while its fork is short form, then xfs_db gives it 30
-    // user attributes, which puts the fork past short form, so unlinking
-    // one of the two names must be refused like the link and the rename.
+    // `/multi` and `/multi-too` are two links to one inode, and `/bulky`
+    // and `/bulky-too` two to another. The driver makes them while their
+    // forks are short form; xfs_db then gives `/multi` 30 user attributes,
+    // a leaf, and `/bulky` 300, a node.
     {
         let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(img).unwrap()))
             .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
         let root = fs.superblock().rootino;
-        let (multi, _) = fs.create_file(root, b"multi", 0o100644).expect("create");
-        fs.link(multi, root, b"multi-too").expect("link");
+        for (first, second) in [
+            ("multi", "multi-too"),
+            ("bulky", "bulky-too"),
+            ("remote", "remote-too"),
+        ] {
+            let (made, _) = fs
+                .create_file(root, first.as_bytes(), 0o100644)
+                .expect("create");
+            fs.link(made, root, second.as_bytes()).expect("link");
+        }
         fs.unmount().expect("unmount");
     }
-    let mut db = parent_oracle("xfs_db").args(["-x", "-c", "path /multi"]);
-    for i in 0..30 {
-        db = db
-            .arg("-c")
-            .arg(format!("attr_set -u name_{i:02} value_{i:02}"));
+    for (path, count) in [("/multi", 30), ("/bulky", 300)] {
+        let mut db = parent_oracle("xfs_db")
+            .args(["-x", "-c"])
+            .arg(format!("path {path}"));
+        for i in 0..count {
+            db = db
+                .arg("-c")
+                .arg(format!("attr_set -u name_{i:03} value_{i:03}"));
+        }
+        run(db.arg(img));
     }
-    run(db.arg(img));
-    assert_eq!(
-        xfs_db_attr_counts(img, "/multi").1,
-        2,
-        "{tag} /multi: xfs_db's count of its parent pointers before the refusal"
-    );
+    // A value past what a leaf keeps beside its name, so stored remotely.
+    run(parent_oracle("xfs_db")
+        .args(["-x", "-c", "path /remote", "-c", "attr_set -u -v 3000 big"])
+        .arg(img));
+    for (path, form) in [
+        ("/dir/hello.txt", "leaf"),
+        ("/multi", "leaf"),
+        ("/bulky", "node"),
+        ("/remote", "leaf"),
+    ] {
+        assert_eq!(
+            xfs_db_attr_form(img, path),
+            form,
+            "{tag} {path}: the attribute fork xfs_db built"
+        );
+    }
+    for path in ["/multi", "/bulky", "/remote"] {
+        assert_eq!(
+            xfs_db_parents(img, path).len(),
+            2,
+            "{tag} {path}: xfs_db's parent pointers before the changes"
+        );
+    }
 
     let fs = Filesystem::mount_rw(Arc::new(FileDevice::open_rw(img).unwrap()))
         .unwrap_or_else(|e| panic!("{tag}: a writable mount must succeed: {e:?}"));
@@ -363,54 +592,82 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
     fs.create_symlink(made, b"sym", b"../top.txt")
         .expect("symlink");
     fs.link(ino("/top.txt"), made, b"top-link").expect("link");
-    // A refusal is decided before anything is written: every byte of the
-    // image, read back from the file, is what it was before the call.
+
+    // PAST SHORT FORM (#488). A leaf-form fork gains a pointer, has one
+    // moved to another directory, and loses one to a replacing rename.
+    fs.link(ino("/dir/hello.txt"), made, b"hello-link")
+        .expect("link an inode whose attribute fork is a leaf");
+    fs.rename(ino("/dir"), b"hello.txt", made, b"hello-moved")
+        .expect("move an inode whose attribute fork is a leaf to another directory");
+    fs.create_file(made, b"replacer", 0o100644).expect("create");
+    fs.rename(made, b"replacer", made, b"hello-link")
+        .expect("replace one of two names of an inode whose attribute fork is a leaf");
+    fs.unlink_file(root, b"multi-too")
+        .expect("unlink one of two names of an inode whose attribute fork is a leaf");
+    // A node-form fork, the same three.
+    fs.link(ino("/bulky"), made, b"bulky-link")
+        .expect("link an inode whose attribute fork is a node");
+    fs.rename(root, b"bulky", made, b"bulky-moved")
+        .expect("move an inode whose attribute fork is a node to another directory");
+    fs.unlink_file(root, b"bulky-too")
+        .expect("unlink one of three names of an inode whose attribute fork is a node");
+    // The leaf-form inode's name replaces one of the node-form inode's:
+    // both forks are rebuilt in one record.
+    fs.rename(made, b"hello-moved", made, b"bulky-link")
+        .expect("a rename whose moved inode and replaced inode both have forks past short form");
+    // Across the boundary. One 200-byte name's pointer fits short form and
+    // two do not, so the second link moves the fork to a leaf; on a second
+    // inode, unlinking the first name again leaves one pointer.
+    let long: Vec<String> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|c| format!("long-{c}-").repeat(25))
+        .collect();
+    let (crossing, _) = fs
+        .create_file(made, long[0].as_bytes(), 0o100644)
+        .expect("create");
+    fs.link(crossing, made, long[1].as_bytes())
+        .expect("a link whose parent pointer moves the attribute fork past short form");
+    let (back, _) = fs
+        .create_file(made, long[2].as_bytes(), 0o100644)
+        .expect("create");
+    fs.link(back, made, long[3].as_bytes())
+        .expect("a link whose parent pointer moves the attribute fork past short form");
+    fs.unlink_file(made, long[2].as_bytes())
+        .expect("unlink one of two names of an inode whose fork crossed to a leaf");
+
+    // Still refused (#495): the last name of an inode with attribute
+    // blocks. A refusal is decided before anything is written: every byte
+    // of the image, read back from the file, is what it was before the call.
     let before = image_digest(img);
     assert!(
         matches!(
-            fs.link(ino("/dir/hello.txt"), made, b"hello-link"),
+            fs.unlink_file(root, b"multi"),
             Err(Error::UnsupportedFeature(_))
         ),
-        "{tag}: a link to an inode whose attributes are past short form must be refused"
-    );
-    assert!(
-        image_digest(img) == before,
-        "{tag}: a refused link changed the image"
-    );
-    // A rename trades the moved inode's pointer for its new name's, so the
-    // same fork refuses it, and neither name changes.
-    let before = image_digest(img);
-    assert!(
-        matches!(
-            fs.rename(ino("/dir"), b"hello.txt", made, b"hello-moved"),
-            Err(Error::UnsupportedFeature(_))
-        ),
-        "{tag}: a rename of an inode whose attributes are past short form must be refused"
-    );
-    assert!(
-        image_digest(img) == before,
-        "{tag}: a refused rename changed the image"
-    );
-    // Unlinking one of two links removes that name's pointer from the same
-    // fork, so it is refused, and both names and the link count stay.
-    let before = image_digest(img);
-    assert!(
-        matches!(
-            fs.unlink_file(root, b"multi-too"),
-            Err(Error::UnsupportedFeature(_))
-        ),
-        "{tag}: an unlink of one of two links to an inode whose attributes are \
-         past short form must be refused"
+        "{tag}: unlinking the last name of an inode with attribute blocks must be refused"
     );
     assert!(
         image_digest(img) == before,
         "{tag}: a refused unlink changed the image"
     );
-    assert_eq!(
-        ino("/multi"),
-        ino("/multi-too"),
-        "{tag}: /multi lost a name"
+    assert!(
+        fs.lookup_path("/multi").is_ok(),
+        "{tag}: a refused unlink removed /multi"
     );
+    // Still refused (#501): a remote value beside the parent pointers.
+    let before = image_digest(img);
+    assert!(
+        matches!(
+            fs.link(ino("/remote"), made, b"remote-link"),
+            Err(Error::UnsupportedFeature(_))
+        ),
+        "{tag}: a link to an inode whose attribute fork holds a remote value must be refused"
+    );
+    assert!(
+        image_digest(img) == before,
+        "{tag}: a refused link changed the image"
+    );
+
     fs.rename(root, b"top.txt", made, b"top-moved.txt")
         .expect("move a file with two links");
     fs.unlink_file(made, b"top-link")
@@ -451,32 +708,44 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
         "{tag}: xfs_repair would change the volume:\n{said}"
     );
 
+    let path = |name: &String| format!("/made/{name}");
+    let crossing_links = [(long[0].as_str(), "/made"), (long[1].as_str(), "/made")];
+    let back_links = [(long[3].as_str(), "/made")];
     let fs = Filesystem::mount(Arc::new(FileDevice::open(img).unwrap())).unwrap();
     for (path, links) in [
-        ("/made", &[("made", "/")][..]),
-        ("/made/renamed.txt", &[("renamed.txt", "/made")]),
-        ("/made/sym", &[("sym", "/made")]),
-        ("/made/top-moved.txt", &[("top-moved.txt", "/made")]),
-        ("/many/entry_first", &[("entry_first", "/many")]),
-        ("/victim-too", &[("victim-too", "/")]),
-        ("/made/victim", &[("victim", "/made")]),
-        ("/made/dir-moved", &[("dir-moved", "/made")]),
+        ("/made".to_string(), &[("made", "/")][..]),
+        ("/made/renamed.txt".into(), &[("renamed.txt", "/made")]),
+        ("/made/sym".into(), &[("sym", "/made")]),
+        ("/made/top-moved.txt".into(), &[("top-moved.txt", "/made")]),
+        ("/many/entry_first".into(), &[("entry_first", "/many")]),
+        ("/victim-too".into(), &[("victim-too", "/")]),
+        ("/made/victim".into(), &[("victim", "/made")]),
+        ("/made/dir-moved".into(), &[("dir-moved", "/made")]),
         (
-            "/made/dir-moved/hello.txt",
-            &[("hello.txt", "/made/dir-moved")],
+            "/made/dir-moved/link".into(),
+            &[("link", "/made/dir-moved")],
         ),
-        ("/made/dir-moved/link", &[("link", "/made/dir-moved")]),
         (
-            "/made/twice",
+            "/made/twice".into(),
             &[("twice", "/made"), ("twice-in-many", "/many")],
         ),
+        // #488: the leaf-form inode, now named only by the rename that
+        // replaced one of the node-form inode's names.
+        ("/made/bulky-link".into(), &[("bulky-link", "/made")]),
+        ("/made/bulky-moved".into(), &[("bulky-moved", "/made")]),
+        ("/made/hello-link".into(), &[("hello-link", "/made")]),
+        ("/multi".into(), &[("multi", "/")]),
+        ("/remote".into(), &[("remote", "/"), ("remote-too", "/")]),
+        (path(&long[0]), &crossing_links),
+        (path(&long[1]), &crossing_links),
+        (path(&long[3]), &back_links),
     ] {
         let file = fs
-            .open(path)
+            .open(&path)
             .unwrap_or_else(|e| panic!("{tag} {path}: {e:?}"));
         let mut got = fs.parent_pointers(file.inode(), file.raw()).unwrap();
         got.sort_by(|a, b| a.name.cmp(&b.name));
-        let want: Vec<ParentPointer> = links
+        let mut want: Vec<ParentPointer> = links
             .iter()
             .map(|(name, parent)| {
                 let parent = fs.open(parent).unwrap();
@@ -487,33 +756,72 @@ fn keep_parent_pointers(tag: &str, img: &Path) {
                 }
             })
             .collect();
+        want.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got, want,
             "{tag} {path}: its parent pointers after the writes"
         );
-    }
-    // The independent count of the same thing: xfs_db, reading the fork.
-    for (path, parents) in [
-        ("/made/top-moved.txt", 1),
-        ("/made/twice", 2),
-        ("/multi", 2),
-    ] {
+        // The independent reading of the same thing: xfs_db, walking the
+        // fork in whatever form it is in.
+        let mut want: Vec<(u64, u32, String)> = want
+            .into_iter()
+            .map(|p| (p.parent, p.generation, String::from_utf8(p.name).unwrap()))
+            .collect();
+        want.sort();
         assert_eq!(
-            xfs_db_attr_counts(img, path).1,
-            parents,
-            "{tag} {path}: xfs_db's count of its parent pointers"
+            xfs_db_parents(img, &path),
+            want,
+            "{tag} {path}: xfs_db's listing of its parent pointers"
+        );
+    }
+    // Every rebuild of a fork past short form kept the user attributes, and
+    // the forks are still in the forms these cases are about.
+    for (path, count, last, form) in [
+        ("/made/bulky-link".to_string(), 30, "user.name_29", "leaf"),
+        ("/multi".into(), 30, "user.name_029", "leaf"),
+        ("/made/bulky-moved".into(), 300, "user.name_299", "node"),
+        (path(&long[0]), 0, "", "leaf"),
+    ] {
+        let file = fs.open(&path).unwrap();
+        let xattrs = fs.list_xattrs(file.inode(), file.raw()).unwrap();
+        assert_eq!(
+            xattrs.len(),
+            count,
+            "{tag} {path}: its user attributes after the writes"
+        );
+        if count > 0 {
+            let value = last.replace("user.name_", "value_");
+            assert_eq!(
+                fs.get_xattr(file.inode(), file.raw(), last.as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(value.as_bytes()),
+                "{tag} {path}: {last}"
+            );
+        }
+        assert_eq!(
+            xfs_db_attr_form(img, &path),
+            form,
+            "{tag} {path}: the form of its attribute fork after the writes"
         );
     }
     for gone in [
-        "/many/entry_000",
-        "/many/entry_001",
-        "/many/entry_002",
-        "/made/empty",
-        "/made/hello-link",
-        "/made/hello-moved",
+        "/many/entry_000".to_string(),
+        "/many/entry_001".into(),
+        "/many/entry_002".into(),
+        "/made/empty".into(),
+        "/dir".into(),
+        "/made/dir-moved/hello.txt".into(),
+        "/made/hello-moved".into(),
+        "/made/replacer".into(),
+        "/made/remote-link".into(),
+        "/multi-too".into(),
+        "/bulky".into(),
+        "/bulky-too".into(),
+        path(&long[2]),
     ] {
         assert!(
-            fs.lookup_path(gone).is_err(),
+            fs.lookup_path(&gone).is_err(),
             "{tag}: {gone} is still there"
         );
     }

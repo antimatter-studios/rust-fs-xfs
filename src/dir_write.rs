@@ -176,21 +176,6 @@ impl Filesystem {
                 )))
             }
         };
-        let allocation_items = allocations.into_items()?;
-        let quota_items = if dir_blocks == dir.nblocks {
-            Vec::new()
-        } else {
-            crate::quota::accounting_items(
-                self,
-                &[crate::quota::QuotaChange {
-                    uid: dir.uid,
-                    gid: dir.gid,
-                    project_id: crate::quota::project_id(&dir_raw),
-                    blocks_fs: dir_blocks as i64 - dir.nblocks as i64,
-                    inodes: 0,
-                }],
-            )?
-        };
 
         // The directory's core changes: its size follows the fork, and
         // its timestamps follow the change.
@@ -213,10 +198,12 @@ impl Filesystem {
         let (_, mut moved_core) = self.read_inode_raw(moved_ino)?;
         bump_changecount(&mut moved_core, self.sb.is_v5());
         stamp_change(&mut moved_core, when, Changed::Status);
-        // The moved inode's parent pointer follows its new name (#373).
-        let mut moved_afork = Vec::new();
+        // The moved inode's parent pointer follows its new name (#373), in
+        // whatever form its attribute fork is in (#488).
+        let mut parents = None;
         if self.sb.features_incompat & crate::superblock::incompat::PARENT != 0 {
-            (moved_core, moved_afork) = self.with_parent_pointers(
+            let mut fork = self.with_parent_pointers(
+                &mut allocations,
                 moved_ino,
                 &moved_core,
                 &[
@@ -231,7 +218,27 @@ impl Filesystem {
                     },
                 ],
             )?;
+            fork.release(self, &mut allocations)?;
+            moved_core = std::mem::take(&mut fork.core);
+            parents = Some(fork);
         }
+        let allocation_items = allocations.into_items()?;
+        let mut quota_changes = Vec::new();
+        if dir_blocks != dir.nblocks {
+            quota_changes.push(crate::quota::QuotaChange {
+                uid: dir.uid,
+                gid: dir.gid,
+                project_id: crate::quota::project_id(&dir_raw),
+                blocks_fs: dir_blocks as i64 - dir.nblocks as i64,
+                inodes: 0,
+            });
+        }
+        quota_changes.extend(parents.as_ref().and_then(|p| p.quota));
+        let quota_items = if quota_changes.is_empty() {
+            Vec::new()
+        } else {
+            crate::quota::accounting_items(self, &quota_changes)?
+        };
 
         let dir_logged = log_dinode_from_disk(&dir_core)
             .map_err(|why| Error::UnsupportedFeature(format!("inode {dir_ino}: {why}")))?;
@@ -241,11 +248,15 @@ impl Filesystem {
         let cluster = self.sb.inode_cluster_bytes();
         let dir_buf = InodeBuffer::containing(self.inode_offset(dir_ino)?, cluster);
         let moved_buf = InodeBuffer::containing(self.inode_offset(moved_ino)?, cluster);
+        let (moved_afork, moved_afields) = parents
+            .as_ref()
+            .map_or((&[][..], 0), |p| (p.fork.as_slice(), p.fields));
         let moved_ops = crate::log_write::inode_ops_with_attr(
             moved_ino,
             &moved_buf,
             moved_logged,
-            &moved_afork,
+            moved_afork,
+            moved_afields,
         );
 
         // The fork travels big-endian inside a native-endian record, and
@@ -259,6 +270,7 @@ impl Filesystem {
         let logged_fork = disk_fork;
         let item_ops = allocation_items.iter().map(|i| i.op_count()).sum::<usize>()
             + dir_items.iter().map(|i| i.op_count()).sum::<usize>()
+            + parents.as_ref().map_or(0, |p| p.buffer_op_count())
             + quota_items.iter().map(|i| i.op_count()).sum::<usize>()
             // The directory's format, core and fork, then the moved inode's
             // format and core, and its attribute fork when its parent pointer
@@ -278,6 +290,9 @@ impl Filesystem {
             ];
             for item in allocation_items.iter().chain(&dir_items) {
                 ops.extend(item.ops());
+            }
+            if let Some(p) = &parents {
+                ops.extend(p.buffer_ops());
             }
             for item in &quota_items {
                 ops.extend(item.ops());
@@ -312,6 +327,9 @@ impl Filesystem {
         // What the record says is now what this mount reads (#89).
         self.logged_buffers(&allocation_items);
         self.logged_buffers(&dir_items);
+        if let Some(p) = &parents {
+            self.logged_buffers(p.buffers());
+        }
         for item in &quota_items {
             item.apply_overlay(self)?;
         }

@@ -109,26 +109,51 @@ struct Layout<'a> {
     total: u32,
 }
 
+/// The hash a parent pointer is filed under (#488), the kernel's
+/// `xfs_parent_hashval`: the hash its name has as a directory entry, case
+/// folded on a volume that folds names, mixed with both halves of the
+/// directory's inode number, so the same name in two directories files
+/// apart. `value` is the pointer's record: that inode number, big-endian,
+/// then the directory's generation. The pinned `xfs_repair -n` recomputes
+/// it for every entry (`tests/parent_exchrange_oracle.rs`).
+fn parent_hash(case_insensitive: bool, name: &[u8], value: &[u8]) -> Result<u32> {
+    if value.len() != 12 {
+        return Err(unsupported(&format!(
+            "a parent pointer's value is twelve bytes, not {}",
+            value.len()
+        )));
+    }
+    let parent = be64(value, 0);
+    Ok(crate::dir_block::hash_folded(case_insensitive, name)
+        ^ (parent >> 32) as u32
+        ^ parent as u32)
+}
+
 impl<'a> Layout<'a> {
-    fn new(attrs: &'a [Xattr], bs: usize) -> Result<Self> {
+    /// `case_insensitive` is whether the volume folds the case of
+    /// directory names, which a parent pointer's hash follows.
+    fn new(attrs: &'a [Xattr], bs: usize, case_insensitive: bool) -> Result<Self> {
         let mut entries = Vec::with_capacity(attrs.len());
         for attr in attrs {
             let (namespace, name) = name_parts(&attr.name)?;
-            // A parent pointer's hash mixes in its directory, which this
-            // writer does not compute yet: a fork holding one is kept only
-            // while it is short form, which has no hashes (#373).
-            if namespace == flags::PARENT {
-                return Err(unsupported(
-                    "an attribute fork holding parent pointers past short form is not written yet",
-                ));
-            }
+            let parent = namespace == flags::PARENT;
+            let hash = if parent {
+                parent_hash(case_insensitive, name, &attr.value)?
+            } else {
+                hashname(name)
+            };
             let local_size = align4(3 + name.len() + attr.value.len());
             let local = local_size < bs / 2 - 16;
+            // The kernel never stores a parent pointer's value remotely,
+            // and twelve bytes beside a 255-byte name always fit a leaf.
+            if parent && !local {
+                return Err(unsupported("a parent pointer is always stored in its leaf"));
+            }
             entries.push(Entry {
                 namespace,
                 name,
                 value: &attr.value,
-                hash: hashname(name),
+                hash,
                 local,
                 record_size: if local {
                     local_size
@@ -153,7 +178,7 @@ impl<'a> Layout<'a> {
             // a leaf with values individually below the local limit.
             if need > bs - 80 {
                 for entry in &mut entries[at..end] {
-                    if !entry.value.is_empty() {
+                    if !entry.value.is_empty() && entry.namespace != flags::PARENT {
                         entry.local = false;
                         entry.record_size = align4(11 + entry.name.len());
                     }
@@ -355,6 +380,18 @@ impl<'a> Layout<'a> {
     }
 }
 
+/// The one extent record of a rebuilt fork: `total` blocks from `start`.
+fn extent_record(start: u64, total: u32) -> Result<Vec<u8>> {
+    Ok(Extent {
+        startoff: 0,
+        startblock: start,
+        blockcount: u64::from(total),
+        unwritten: false,
+    }
+    .to_bytes()?
+    .to_vec())
+}
+
 fn shortform(attrs: &[Xattr], capacity: usize) -> Result<Option<Vec<u8>>> {
     if attrs.is_empty() {
         return Ok(Some(Vec::new()));
@@ -438,7 +475,7 @@ impl Filesystem {
         }
         let (inode, mut raw) = self.read_inode_raw(ino)?;
         let old_map = self.attribute_map(&inode, &raw)?;
-        self.validate_attribute_fork(&inode, &raw, &old_map)?;
+        self.validate_attribute_fork(&inode, &raw, &old_map, false)?;
         let mut attrs = self.stored_xattrs(&inode, &raw)?;
         let existing = attrs.iter().position(|a| a.name == name);
         match (change, existing) {
@@ -499,7 +536,11 @@ impl Filesystem {
             .ok_or_else(|| unsupported("no space for an attribute map beside the data fork"))?;
         let inline = shortform(&attrs, raw.len() - start)?;
         let layout = if inline.is_none() {
-            Some(Layout::new(&attrs, self.sb.blocksize as usize)?)
+            Some(Layout::new(
+                &attrs,
+                self.sb.blocksize as usize,
+                self.sb.has_case_insensitive_dirs(),
+            )?)
         } else {
             None
         };
@@ -513,62 +554,13 @@ impl Filesystem {
             inline
         } else {
             let layout = layout.as_ref().expect("external layout");
-            let preferred = self.sb.split_ino(ino).0;
-            let mut location = None;
-            for attempt in 0..self.sb.agcount {
-                let agno = (preferred + attempt) % self.sb.agcount;
-                let group = allocations.group(&self.sb, self.device(), agno)?;
-                match group.take(layout.total, ino as i64, crate::rmap::OFF_ATTR_FORK) {
-                    Ok(block) => {
-                        location = Some((u64::from(agno) << self.sb.agblklog) | u64::from(block));
-                        break;
-                    }
-                    Err(Error::UnsupportedFeature(message))
-                        if message.contains("has no single free run") =>
-                    {
-                        continue
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            let location = location.ok_or_else(|| {
-                unsupported("no allocation group has a contiguous run for the attribute fork")
-            })?;
+            let location = self.place_attribute_blocks(&mut allocations, ino, layout.total)?;
             metadata = layout.metadata(self, ino, location);
             remote_start = Some(location);
-            Extent {
-                startoff: 0,
-                startblock: location,
-                blockcount: u64::from(layout.total),
-                unwritten: false,
-            }
-            .to_bytes()?
-            .to_vec()
+            extent_record(location, layout.total)?
         };
-        let mut cancels = Vec::new();
         let old_blocks: u64 = old_map.iter().map(|e| e.blockcount).sum();
-        for extent in old_map {
-            let (agno, agblock) = split_fsblock(&self.sb, extent.startblock);
-            let group = allocations.group(&self.sb, self.device(), agno)?;
-            group.forget_rmap(crate::rmap::Rmap {
-                startblock: agblock,
-                blockcount: extent.blockcount as u32,
-                owner: ino as i64,
-                offset: extent.startoff | crate::rmap::OFF_ATTR_FORK,
-            })?;
-            group.give_back(FreeExtent {
-                startblock: agblock,
-                blockcount: extent.blockcount as u32,
-            })?;
-            // Cancel individual blocks: earlier metadata items name one block,
-            // and the recovery cancellation table matches addresses and lengths.
-            for n in 0..extent.blockcount {
-                cancels.push(BufferItem::cancel(
-                    self.block_offset(extent.startblock + n) / 512,
-                    self.sb.blocksize / 512,
-                ));
-            }
-        }
+        let cancels = self.release_attribute_blocks(&mut allocations, ino, &old_map)?;
         let mut items = allocations.into_items()?;
         items.extend(metadata);
         let litino = raw.len() - XFS_DINODE_V3_SIZE;
@@ -592,17 +584,13 @@ impl Filesystem {
         }
         raw[start..start + fork.len()].copy_from_slice(&fork);
         raw[82] = (forkoff / 8) as u8;
-        let count = u32::from(layout.is_some());
+        let count = u16::from(layout.is_some());
         raw[83] = if attrs.is_empty() || layout.is_some() {
             Format::Extents as u8
         } else {
             Format::Local as u8
         };
-        if self.sb.features_incompat & crate::superblock::incompat::NREXT64 != 0 {
-            raw[76..80].copy_from_slice(&count.to_be_bytes());
-        } else {
-            raw[80..82].copy_from_slice(&(count as u16).to_be_bytes());
-        }
+        crate::inode::set_attr_extent_count(&mut raw, count);
         let nblocks = inode
             .nblocks
             .checked_sub(old_blocks)
@@ -731,6 +719,69 @@ impl Filesystem {
         Ok(lsn)
     }
 
+    /// Where a rebuilt attribute fork's `total` blocks go: one free run,
+    /// in the inode's own group first, then each other group in turn.
+    fn place_attribute_blocks<'a>(
+        &'a self,
+        allocations: &mut Allocations<'a>,
+        ino: u64,
+        total: u32,
+    ) -> Result<u64> {
+        let preferred = self.sb.split_ino(ino).0;
+        for attempt in 0..self.sb.agcount {
+            let agno = (preferred + attempt) % self.sb.agcount;
+            let group = allocations.group(&self.sb, self.device(), agno)?;
+            match group.take(total, ino as i64, crate::rmap::OFF_ATTR_FORK) {
+                Ok(block) => return Ok((u64::from(agno) << self.sb.agblklog) | u64::from(block)),
+                Err(Error::UnsupportedFeature(message))
+                    if message.contains("has no single free run") =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(unsupported(
+            "no allocation group has a contiguous run for the attribute fork",
+        ))
+    }
+
+    /// Give an attribute fork's old blocks back to free space and take
+    /// them out of the reverse map. Returns a cancellation for each block,
+    /// so recovery replays no earlier record's image of one over what the
+    /// block holds next.
+    fn release_attribute_blocks<'a>(
+        &'a self,
+        allocations: &mut Allocations<'a>,
+        ino: u64,
+        old_map: &[Extent],
+    ) -> Result<Vec<BufferItem>> {
+        let mut cancels = Vec::new();
+        for extent in old_map {
+            let (agno, agblock) = split_fsblock(&self.sb, extent.startblock);
+            let group = allocations.group(&self.sb, self.device(), agno)?;
+            group.forget_rmap(crate::rmap::Rmap {
+                startblock: agblock,
+                blockcount: extent.blockcount as u32,
+                owner: ino as i64,
+                offset: extent.startoff | crate::rmap::OFF_ATTR_FORK,
+            })?;
+            group.give_back(FreeExtent {
+                startblock: agblock,
+                blockcount: extent.blockcount as u32,
+            })?;
+            // Cancel individual blocks: earlier metadata items name one block,
+            // and the recovery cancellation table matches addresses and lengths.
+            for n in 0..extent.blockcount {
+                cancels.push(BufferItem::cancel(
+                    self.block_offset(extent.startblock + n) / 512,
+                    self.sb.blocksize / 512,
+                ));
+            }
+        }
+        Ok(cancels)
+    }
+
     fn attribute_map(&self, inode: &Inode, raw: &[u8]) -> Result<Vec<Extent>> {
         let Some((start, end)) = inode.attr_fork_range(raw.len()) else {
             return Ok(Vec::new());
@@ -775,9 +826,24 @@ impl Filesystem {
         Ok(extents)
     }
 
-    fn validate_attribute_fork(&self, inode: &Inode, raw: &[u8], extents: &[Extent]) -> Result<()> {
+    /// Refuse a fork this writer would not rebuild faithfully: a block
+    /// whose checksum or identity is wrong, and an entry in a namespace it
+    /// does not know or left incomplete, which a rebuild would drop. A
+    /// parent pointer is one it knows only when `parents` is set (#488),
+    /// for the namespace changes that keep them.
+    fn validate_attribute_fork(
+        &self,
+        inode: &Inode,
+        raw: &[u8],
+        extents: &[Extent],
+        parents: bool,
+    ) -> Result<()> {
         let Some((start, end)) = inode.attr_fork_range(raw.len()) else {
             return Ok(());
+        };
+        let known = |namespace: u8| {
+            namespace & !(flags::ROOT | flags::SECURE) == 0
+                || (parents && namespace == flags::PARENT)
         };
         if inode.aformat == Format::Local {
             let fork = &raw[start..end];
@@ -790,7 +856,7 @@ impl Filesystem {
                 let header = fork
                     .get(at..at + 3)
                     .ok_or_else(|| unsupported("short attribute entry"))?;
-                if header[2] & !(flags::ROOT | flags::SECURE) != 0 {
+                if !known(header[2]) {
                     return Err(unsupported("unrecognized or incomplete stored attribute"));
                 }
                 at += 3 + usize::from(header[0]) + usize::from(header[1]);
@@ -812,7 +878,7 @@ impl Filesystem {
                         return Err(unsupported("attribute leaf entries exceed their block"));
                     }
                     for entry in block[80..80 + count * 8].chunks_exact(8) {
-                        if entry[6] & !(flags::ROOT | flags::SECURE | flags::LOCAL) != 0 {
+                        if !known(entry[6] & !flags::LOCAL) {
                             return Err(unsupported("unrecognized or incomplete stored attribute"));
                         }
                     }
@@ -876,26 +942,101 @@ pub(crate) enum ParentChange<'a> {
     },
 }
 
+/// An inode's attribute fork rebuilt around its changed parent pointers
+/// (#373, #488), prepared against a record's allocations and not yet
+/// written.
+///
+/// A fork that fits short form is logged as `ADATA`, inside the inode item.
+/// One past it is rebuilt in fresh blocks the way an attribute write
+/// rebuilds one -- a leaf, or a node over leaves, holding every attribute
+/// the fork had, each parent pointer filed under its own hash -- and the
+/// inode item logs the fork's one extent record as `AEXT`, beside each new
+/// block logged whole.
+pub(crate) struct ParentFork {
+    /// The whole inode: the caller's core and data fork, and the new
+    /// attribute fork with its offset, format, extent count and the block
+    /// count that goes with it.
+    pub(crate) core: Vec<u8>,
+    /// The attribute fork as the inode item logs it; empty for none.
+    pub(crate) fork: Vec<u8>,
+    /// `XFS_ILOG_ADATA` or `XFS_ILOG_AEXT` for `fork`, 0 when it is empty.
+    pub(crate) fields: u32,
+    /// The owners' quota change for the blocks the fork took or gave back.
+    pub(crate) quota: Option<crate::quota::QuotaChange>,
+    /// The new fork's leaf and node blocks.
+    items: Vec<BufferItem>,
+    /// A cancellation for each of the old fork's blocks, once released.
+    cancels: Vec<BufferItem>,
+    ino: u64,
+    old_map: Vec<Extent>,
+}
+
+impl ParentFork {
+    /// Give the old fork's blocks back. A record calls this only once every
+    /// fork it rebuilds has taken its new blocks: a block freed here and
+    /// handed out again in the same record would be cancelled in that
+    /// record, and recovery would not replay what it newly holds.
+    pub(crate) fn release<'a>(
+        &mut self,
+        fs: &'a Filesystem,
+        allocations: &mut Allocations<'a>,
+    ) -> Result<()> {
+        let old = std::mem::take(&mut self.old_map);
+        self.cancels = fs.release_attribute_blocks(allocations, self.ino, &old)?;
+        Ok(())
+    }
+
+    /// How many operations [`ParentFork::buffer_ops`] adds to a record.
+    pub(crate) fn buffer_op_count(&self) -> usize {
+        self.items
+            .iter()
+            .chain(&self.cancels)
+            .map(BufferItem::op_count)
+            .sum()
+    }
+
+    /// The new blocks, then the old blocks' cancellations.
+    pub(crate) fn buffer_ops(&self) -> Vec<Op> {
+        self.items
+            .iter()
+            .chain(&self.cancels)
+            .flat_map(BufferItem::ops)
+            .collect()
+    }
+
+    /// The new blocks, for the overlay once the record is written.
+    pub(crate) fn buffers(&self) -> &[BufferItem] {
+        &self.items
+    }
+}
+
 impl Filesystem {
     /// Inode `raw` with its parent pointers changed (#373): each of
-    /// `changes` applied in order to its short-form attribute fork, the
-    /// rest of the fork kept, and the fork placed again as an attribute
-    /// write places one. Returns the whole new inode and its attribute
-    /// fork's bytes, for the caller's record to log as `ADATA` beside the
-    /// core. Nothing is written here.
+    /// `changes` applied in order to its attribute fork, every other
+    /// attribute kept, and the fork placed again as an attribute write
+    /// places one. Short form while everything fits it; past it (#488),
+    /// rebuilt in blocks taken from `allocations`.
+    ///
+    /// Nothing is written here. The caller logs [`ParentFork::core`] with
+    /// the fork and [`ParentFork::buffer_ops`], calls
+    /// [`ParentFork::release`] once every fork of its record has its
+    /// blocks, and adds [`ParentFork::quota`] to its quota changes.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedFeature`] for a fork past short form, a fork that
-    /// no longer fits short form, a data fork whose root moves with the
-    /// fork offset (a B+tree or a device number) when the offset would
-    /// move, and a parent pointer to remove that the inode does not have.
-    pub(crate) fn with_parent_pointers(
-        &self,
+    /// [`Error::UnsupportedFeature`] for a fork holding an entry a rebuild
+    /// would not keep, a fork past short form holding a remote value
+    /// (#501), a data fork whose root is laid out by the fork offset (a
+    /// B+tree or a device number) with no room behind it for the attribute
+    /// fork, a rebuilt fork that finds no single free run, and a parent
+    /// pointer to remove that the inode does not have.
+    pub(crate) fn with_parent_pointers<'a>(
+        &'a self,
+        allocations: &mut Allocations<'a>,
         ino: u64,
         raw: &[u8],
         changes: &[ParentChange],
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<ParentFork> {
         // The inode as `raw` has it, data fork included: a caller may have
         // changed the core already (a moved directory's `..`), and its CRC
         // is stamped only when the record is written, so a copy is stamped
@@ -906,14 +1047,8 @@ impl Filesystem {
             .copy_from_slice(&crc.to_le_bytes());
         let parsed = Inode::parse(&probe, &self.sb, ino)?;
         let inode = &parsed;
-        if !(inode.aformat == Format::Local
-            || (inode.aformat == Format::Extents && inode.anextents == 0))
-        {
-            return Err(unsupported(&format!(
-                "inode {ino}: its attribute fork is past short form, and a parent pointer \
-                 is not written there yet"
-            )));
-        }
+        let old_map = self.attribute_map(inode, raw)?;
+        self.validate_attribute_fork(inode, raw, &old_map, true)?;
         let mut attrs = self.stored_xattrs(inode, raw)?;
         for change in changes {
             match change {
@@ -949,14 +1084,9 @@ impl Filesystem {
                 }
             }
         }
-        let fork = shortform(&attrs, usize::MAX)?.ok_or_else(|| {
-            unsupported(&format!(
-                "inode {ino}: its attributes no longer fit a short-form fork beside the \
-                 parent pointer"
-            ))
-        })?;
         let litino = raw.len() - XFS_DINODE_V3_SIZE;
         let current = usize::from(inode.forkoff) * 8;
+        let fixed = matches!(inode.format, Format::Btree | Format::Dev);
         let data_required = match inode.format {
             Format::Local => usize::try_from(inode.size).unwrap_or(usize::MAX),
             Format::Extents => usize::try_from(inode.nextents)
@@ -964,50 +1094,139 @@ impl Filesystem {
                 .saturating_mul(16),
             _ => 0,
         };
-        let forkoff = if attrs.is_empty() {
-            0
-        } else if matches!(inode.format, Format::Btree | Format::Dev) {
-            // The data fork's root is laid out by the fork's size, so the
-            // offset stays where it is, and the fork must fit behind it.
-            if current == 0 || current + fork.len() > litino {
+        // Where an attribute fork of `len` bytes goes. A B+tree root or a
+        // device number is laid out by the offset, so it stays where it
+        // is and the fork must fit behind it; anything else moves as an
+        // attribute write moves it.
+        let place = |len: usize| {
+            if fixed {
+                (current != 0 && current + len <= litino).then_some(current)
+            } else {
+                shortform_forkoff(litino, data_required, len)
+            }
+        };
+        let short = match shortform(&attrs, usize::MAX)? {
+            Some(fork) => place(fork.len()).map(|at| (fork, at)),
+            None => None,
+        };
+        // Past short form: the fork rebuilt in blocks, and only its extent
+        // record in the inode.
+        let mut layout = None;
+        let (forkoff, fork_len) = if attrs.is_empty() {
+            (0, 0)
+        } else if let Some((fork, at)) = &short {
+            (*at, fork.len())
+        } else {
+            let rebuilt = Layout::new(
+                &attrs,
+                self.sb.blocksize as usize,
+                self.sb.has_case_insensitive_dirs(),
+            )?;
+            // A remote value is not logged: it goes to the device ahead of
+            // the record that maps it. This record may already have given
+            // blocks back -- a directory laid out again, a replaced inode's
+            // data -- that stay live until it commits, and a value written
+            // into one of them would overwrite them if it never did (#501).
+            if rebuilt.entries.iter().any(|e| !e.local) {
                 return Err(unsupported(&format!(
-                    "inode {ino}: its parent pointers do not fit behind its data fork's root"
+                    "inode {ino}: an attribute value stored in blocks of its own is not \
+                     rebuilt beside its parent pointers yet"
                 )));
             }
-            current
-        } else {
-            shortform_forkoff(litino, data_required, fork.len()).ok_or_else(|| {
+            layout = Some(rebuilt);
+            let record = extent::EXTENT_RECORD_SIZE;
+            let at = place(record).ok_or_else(|| {
                 unsupported(&format!(
-                    "inode {ino}: no room for its parent pointers beside its data fork"
+                    "inode {ino}: no room for its attribute fork's extent record beside its \
+                     data fork"
                 ))
-            })?
+            })?;
+            (at, record)
         };
-        let mut new = raw.to_vec();
-        if attrs.is_empty() {
-            new[83] = Format::Extents as u8;
-            new[82] = 0;
-            return Ok((new, Vec::new()));
-        }
-        // Behind what the data fork may use, everything is the attribute
-        // fork's: cleared, then the fork at its offset.
         let data_end = XFS_DINODE_V3_SIZE + data_required.max(8).div_ceil(8) * 8;
         let fork_at = XFS_DINODE_V3_SIZE + forkoff;
-        if fork_at < data_end.min(raw.len()) && !matches!(inode.format, Format::Btree | Format::Dev)
-        {
+        if !attrs.is_empty() && fork_at < data_end.min(raw.len()) && !fixed {
             return Err(unsupported(&format!(
                 "inode {ino}: no room for its parent pointers beside its data fork"
             )));
         }
-        new[fork_at.max(XFS_DINODE_V3_SIZE)..].fill(0);
-        new[fork_at..fork_at + fork.len()].copy_from_slice(&fork);
-        new[82] = (forkoff / 8) as u8;
-        new[83] = Format::Local as u8;
-        if self.sb.features_incompat & crate::superblock::incompat::NREXT64 != 0 {
-            new[76..80].copy_from_slice(&0u32.to_be_bytes());
-        } else {
-            new[80..82].copy_from_slice(&0u16.to_be_bytes());
+        if fork_at + fork_len > raw.len() {
+            return Err(unsupported(&format!(
+                "inode {ino}: its attribute fork does not fit in the inode"
+            )));
         }
-        Ok((new, fork))
+
+        let mut items = Vec::new();
+        let mut new_blocks = 0;
+        let fork = match (&layout, short) {
+            _ if attrs.is_empty() => Vec::new(),
+            (Some(layout), _) => {
+                let location = self.place_attribute_blocks(allocations, ino, layout.total)?;
+                items = layout.metadata(self, ino, location);
+                new_blocks = u64::from(layout.total);
+                extent_record(location, layout.total)?
+            }
+            (None, Some((fork, _))) => fork,
+            (None, None) => unreachable!("a fork is short form or rebuilt in blocks"),
+        };
+        let old_blocks: u64 = old_map.iter().map(|e| e.blockcount).sum();
+        let nblocks = inode
+            .nblocks
+            .checked_sub(old_blocks)
+            .and_then(|n| n.checked_add(new_blocks))
+            .ok_or_else(|| {
+                Error::BadSuperblock(format!(
+                    "inode {ino}: attribute blocks exceed the inode's block count"
+                ))
+            })?;
+
+        let mut new = raw.to_vec();
+        let extents = u16::from(layout.is_some());
+        if attrs.is_empty() {
+            new[83] = Format::Extents as u8;
+            new[82] = 0;
+        } else {
+            // Behind what the data fork may use, everything is the
+            // attribute fork's: cleared, then the fork at its offset.
+            new[fork_at..].fill(0);
+            new[fork_at..fork_at + fork.len()].copy_from_slice(&fork);
+            new[82] = (forkoff / 8) as u8;
+            new[83] = if layout.is_some() {
+                Format::Extents as u8
+            } else {
+                Format::Local as u8
+            };
+        }
+        // Where the inode's own flag keeps the count, not the volume's:
+        // an inode this driver made carries no NREXT64 flag (#510).
+        crate::inode::set_attr_extent_count(&mut new, extents);
+        new[64..72].copy_from_slice(&nblocks.to_be_bytes());
+        // The attribute fork's blocks are the inode's, so its owners are
+        // charged for what it gains and credited for what it gives back.
+        let quota = (nblocks != inode.nblocks).then(|| crate::quota::QuotaChange {
+            uid: inode.uid,
+            gid: inode.gid,
+            project_id: crate::quota::project_id(raw),
+            blocks_fs: nblocks as i64 - inode.nblocks as i64,
+            inodes: 0,
+        });
+        let fields = if fork.is_empty() {
+            0
+        } else if layout.is_some() {
+            XFS_ILOG_AEXT
+        } else {
+            XFS_ILOG_ADATA
+        };
+        Ok(ParentFork {
+            core: new,
+            fork,
+            fields,
+            quota,
+            items,
+            cancels: Vec::new(),
+            ino,
+            old_map,
+        })
     }
 }
 
@@ -1204,7 +1423,7 @@ mod tests {
             attribute("trusted.boundary", 2018),
             attribute("security.maximum", 65536),
         ];
-        let layout = Layout::new(&attrs, 4096).unwrap();
+        let layout = Layout::new(&attrs, 4096, false).unwrap();
         let local = layout.entries.iter().find(|e| e.namespace == 0).unwrap();
         let remote = layout
             .entries
@@ -1245,7 +1464,7 @@ mod tests {
             attribute("trusted.same", 3),
             attribute("security.same", 3),
         ]);
-        let layout = Layout::new(&attrs, 512).unwrap();
+        let layout = Layout::new(&attrs, 512, false).unwrap();
         assert!(matches!(layout.blocks[0], Block::Node { level: 2, .. }));
         let count: usize = layout
             .blocks

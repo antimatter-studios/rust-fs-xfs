@@ -314,6 +314,36 @@ pub struct Inode {
     pub crtime: Timestamp,
 }
 
+/// Whether the inode core `core` keeps its extent counts wide: a version 3
+/// core with `XFS_DIFLAG2_NREXT64` in its own `di_flags2`, the test the
+/// kernel's `xfs_dinode_has_large_extent_counts` makes (#510).
+///
+/// The superblock's NREXT64 bit only allows the layout. A slot that never
+/// carried the flag -- every slot of a chunk `mkfs.xfs` or the kernel
+/// initialised, which this driver creates inodes in -- keeps `di_nextents`
+/// at 76 and `di_anextents` at 80 on a volume with the feature, and the
+/// kernel, `xfs_db` and this driver's writers all put them there.
+pub(crate) fn has_large_extent_counts(core: &[u8]) -> bool {
+    use crate::format::log_items::log_dinode::flags2::DI_FLAGS2_NREXT64;
+    core.get(offsets::VERSION)
+        .is_some_and(|&version| version >= 3)
+        && core.len() >= offsets::FLAGS2 + 8
+        && be64(core, offsets::FLAGS2) & DI_FLAGS2_NREXT64 != 0
+}
+
+/// Set the attribute fork's extent count in the inode core `core`, where
+/// [`has_large_extent_counts`] says the core keeps it: `di_big_anextents`,
+/// four bytes at 76, when it is wide, and `di_anextents`, two bytes at 80,
+/// when it is not (#510).
+pub(crate) fn set_attr_extent_count(core: &mut [u8], count: u16) {
+    if has_large_extent_counts(core) {
+        core[offsets::NEXTENTS..offsets::NEXTENTS + 4]
+            .copy_from_slice(&u32::from(count).to_be_bytes());
+    } else {
+        core[offsets::ANEXTENTS..offsets::ANEXTENTS + 2].copy_from_slice(&count.to_be_bytes());
+    }
+}
+
 impl Inode {
     /// Parse the inode expected to have number `ino` from `buf`, which
     /// must hold at least `sb.inodesize` bytes starting at the inode.
@@ -377,10 +407,13 @@ impl Inode {
         let flags2 = if is_v3 { be64(buf, offsets::FLAGS2) } else { 0 };
         let bigtime = flags2 & flags2::BIGTIME != 0;
 
-        // With the 64-bit extent counter feature the fields at 24 and 76
-        // widen, displacing the attribute count. Without it, 24 is
-        // padding and the counts sit at 76 and 80.
-        let nrext64 = sb.features_incompat & crate::superblock::incompat::NREXT64 != 0;
+        // With 64-bit extent counters the fields at 24 and 76 widen,
+        // displacing the attribute count. Without them, 24 is padding and
+        // the counts sit at 76 and 80. WHICH ONE IS THE INODE'S OWN WORD
+        // (#510), not the volume's: the superblock's NREXT64 only permits
+        // the wide layout, and an inode takes it by carrying the flag in
+        // its own `di_flags2`, as `has_large_extent_counts` reads it.
+        let nrext64 = has_large_extent_counts(buf);
         let (nextents, anextents) = if nrext64 {
             (
                 be64(buf, offsets::BIG_NEXTENTS),
@@ -641,7 +674,15 @@ mod tests {
     use crate::superblock::XFS_SB_MAGIC;
 
     fn sb_v5() -> Superblock {
+        sb_v5_with_incompat(0)
+    }
+
+    /// [`sb_v5`] with `incompat` in `sb_features_incompat`.
+    fn sb_v5_with_incompat(incompat: u32) -> Superblock {
         let mut b = vec![0u8; 512];
+        b[crate::superblock::offsets::FEATURES_INCOMPAT
+            ..crate::superblock::offsets::FEATURES_INCOMPAT + 4]
+            .copy_from_slice(&incompat.to_be_bytes());
         b[0..4].copy_from_slice(&XFS_SB_MAGIC.to_be_bytes());
         b[4..8].copy_from_slice(&4096u32.to_be_bytes());
         b[8..16].copy_from_slice(&4000u64.to_be_bytes());
@@ -940,6 +981,64 @@ mod tests {
         let split = XFS_DINODE_V3_SIZE + 160;
         assert_eq!(inode.data_fork_range(512), (XFS_DINODE_V3_SIZE, split));
         assert_eq!(inode.attr_fork_range(512), Some((split, 512)));
+    }
+
+    /// On a volume with NREXT64, an inode keeps its extent counts where
+    /// its own `di_flags2` says (#510). One without the flag -- every inode
+    /// this driver creates, in a slot the kernel initialised -- has them at
+    /// 76 and 80, where the kernel and `xfs_db` read and write them; one
+    /// with it has them at 24 and 76. Reading the narrow one as wide took
+    /// a directory's one extent for none and an attribute fork's for the
+    /// data fork's zero.
+    #[test]
+    fn the_extent_counts_are_where_the_inodes_own_flag_puts_them() {
+        use crate::format::log_items::log_dinode::flags2::DI_FLAGS2_NREXT64;
+        let sb = sb_v5_with_incompat(crate::superblock::incompat::NREXT64);
+        let stamped = |mut buf: Vec<u8>| {
+            let crc = crc32c_with_zeroed_crc(&buf, DI_CRC_OFFSET);
+            buf[DI_CRC_OFFSET..DI_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+            buf
+        };
+
+        let mut narrow = v3_inode(&sb, 128);
+        narrow[offsets::FORMAT] = 2; // extents
+        narrow[offsets::FORKOFF] = 20;
+        narrow[offsets::NEXTENTS..offsets::NEXTENTS + 4].copy_from_slice(&3u32.to_be_bytes());
+        narrow[offsets::ANEXTENTS..offsets::ANEXTENTS + 2].copy_from_slice(&1u16.to_be_bytes());
+        assert!(!has_large_extent_counts(&narrow));
+        let inode = Inode::parse(&stamped(narrow.clone()), &sb, 128).unwrap();
+        assert_eq!(
+            (inode.nextents, inode.anextents),
+            (3, 1),
+            "without the flag"
+        );
+
+        let mut wide = v3_inode(&sb, 128);
+        wide[offsets::FORMAT] = 2;
+        wide[offsets::FORKOFF] = 20;
+        wide[offsets::FLAGS2..offsets::FLAGS2 + 8]
+            .copy_from_slice(&DI_FLAGS2_NREXT64.to_be_bytes());
+        wide[offsets::BIG_NEXTENTS..offsets::BIG_NEXTENTS + 8].copy_from_slice(&5u64.to_be_bytes());
+        wide[offsets::NEXTENTS..offsets::NEXTENTS + 4].copy_from_slice(&2u32.to_be_bytes());
+        assert!(has_large_extent_counts(&wide));
+        let inode = Inode::parse(&stamped(wide.clone()), &sb, 128).unwrap();
+        assert_eq!((inode.nextents, inode.anextents), (5, 2), "with the flag");
+
+        // The attribute count is written where it is read from.
+        set_attr_extent_count(&mut narrow, 7);
+        assert_eq!(be16(&narrow, offsets::ANEXTENTS), 7);
+        assert_eq!(
+            be32(&narrow, offsets::NEXTENTS),
+            3,
+            "the data count is kept"
+        );
+        set_attr_extent_count(&mut wide, 7);
+        assert_eq!(be32(&wide, offsets::NEXTENTS), 7);
+        assert_eq!(
+            be64(&wide, offsets::BIG_NEXTENTS),
+            5,
+            "the data count is kept"
+        );
     }
 
     #[test]
