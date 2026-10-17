@@ -5,8 +5,11 @@ kernel and `xfs_repair`, not by reading the format documentation. The
 matrix that does it is `tests/feature_matrix_oracle.rs`; the fixtures are
 built by `scripts/build-feature-matrix-fixtures.sh`.
 
-**190 combination/operation pairs: 176 written and sound, 9 refused by
-name, 5 not applicable, 0 broken.**
+When this page was written, for 0.7.0 (#72), the matrix counted **190
+combination/operation pairs: 176 written and sound, 9 refused by name,
+5 not applicable, 0 broken.** It has grown since, and each run prints
+its own counts. What is written and refused now is
+[features.md](features.md).
 
 ## The rule
 
@@ -40,9 +43,10 @@ an ordinary volume.
 
 ## Refused, and why
 
-**Writing a v4 filesystem.** Reading one is supported and stays
-supported. Writing is refused because the format is finished, and
-`mkfs.xfs` says so itself:
+**Journalled writes to a v4 filesystem.** Reading one is supported and
+stays supported, and an overwrite of bytes that already exist, which
+changes no metadata, is written in place. Everything that logs is
+refused because the format is finished, and `mkfs.xfs` says so itself:
 
 ```text
 V4 filesystems are deprecated and will not be supported by future versions.
@@ -53,20 +57,26 @@ declared dead — and which newer kernels are dropping support for — is
 not work this driver should do. If that changes, the matrix already has
 the row.
 
-**Shapes no measurement covers**, each refused by name rather than
-guessed:
+**Shapes no measurement covers** are refused by name rather than
+guessed. When this page was written there were five; four have since
+been measured and are written, as [features.md](features.md) records:
 
-- merging an allocation into an adjacent reverse-mapping record (the
-  kernel does this; no operation here can produce the case)
-- freeing part of a shared extent, which would split a refcount record
-- a copy-on-write staging extent over blocks being freed
-- a B+tree more than one level deep, where a record change reshapes a
-  node
-- an inode chunk that needs allocating, and extents spanning allocation
-  groups
+- merging an allocation into the reverse-mapping record it continues:
+  0.7.0 (#75)
+- freeing part of a shared extent, splitting its reference-count
+  record: 0.7.0
+- B+trees more than one block deep, where a record change reshapes a
+  node: 0.7.0 (#84)
+- a new inode chunk: 0.7.0 (#74); an allocation across allocation
+  groups: 0.13.0 (#388)
+
+One is still refused: freeing blocks under a copy-on-write staging
+extent. This driver does not do copy-on-write, so one being there
+means something else is going on, and guessing would be worse than
+stopping.
 
 ## Not applicable
 
-Five pairs: freeing a shared extent on a filesystem formatted
-`reflink=0`, where no extent can be shared. Nothing to exercise, rather
-than something declined.
+In that first count, five pairs: freeing a shared extent on a
+filesystem formatted `reflink=0`, where no extent can be shared.
+Nothing to exercise, rather than something declined.
