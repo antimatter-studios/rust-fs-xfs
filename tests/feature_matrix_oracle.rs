@@ -154,13 +154,12 @@ enum Outcome {
 
 /// The write operations this driver offers, one per fresh image.
 ///
-/// ONE OPERATION PER MOUNT, and that is not tidiness. This driver
-/// refuses a second checkpoint from the same mount -- the disk does not
-/// yet reflect the first, so a second built on top of it would be wrong.
-/// Driving several operations through one mount therefore tests the
-/// first and collects refusals for the rest, which is exactly what the
-/// first version of this test did: it reported six refusals per row and
-/// called the row covered.
+/// Each operation starts from the same fixture so its kernel replay and
+/// `xfs_repair` verdict are independent of earlier operations' changes or
+/// refusals. A fresh image isolates each combination/operation result.
+/// The driver supports multiple journalled operations in one mount through
+/// its overlay; `many_ops_per_mount.rs` checks those sequences against the
+/// kernel and `xfs_repair`.
 const OPS: &[&str] = &[
     "create_file",
     "create_directory",
