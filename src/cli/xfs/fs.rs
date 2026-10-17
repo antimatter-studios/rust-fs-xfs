@@ -55,7 +55,7 @@ fn command() -> Cmd {
              1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
              Writing is partial, and every other shape is refused by name rather than \
              attempted: a new file (v5, one extent), an empty file given contents, a \
-             same-length overwrite in place, mkdir, rm and rmdir (v5). A journalled \
+             same-length overwrite in place, mkdir, rm, rmdir and ln (v5). A journalled \
              change is written home and the log closed with an unmount record before \
              the tool exits, so the volume is clean and the next write can follow at \
              once.",
@@ -240,6 +240,38 @@ fn command() -> Cmd {
                      before the image is opened for writing. The volume is released clean.",
                 ),
         )
+        .subcommand(
+            Cmd::new("ln")
+                .about("Add a hard link, or with -s make a symbolic link (v5 only)")
+                .arg(
+                    Arg::new("symbolic")
+                        .short('s')
+                        .long("symbolic")
+                        .action(ArgAction::SetTrue)
+                        .help("Store TARGETTEXT exactly as given, without resolving it"),
+                )
+                .arg(
+                    Arg::new("link-target")
+                        .value_name("TARGETPATH|TARGETTEXT")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .arg(
+                    Arg::new("path")
+                        .value_name("PATH")
+                        .required(true)
+                        .value_parser(value_parser!(OsString)),
+                )
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img ln /data/a /data/also-a\n  \
+                     fs.xfs disk.img ln -s ../etc/hosts /hosts\n\n\
+                     PATH must be new and its parent must exist. A hard link names the \
+                     target inode (a symlink is not followed); directories and the maximum \
+                     link count are refused. A symbolic target is literal text, 1 to 1023 \
+                     bytes, and need not exist. No parent symlinks are followed. Refusals \
+                     are checked read-only, and the journalled edit is released clean.",
+                ),
+        )
         .subcommand(key_command(
             "get",
             "Report the filesystem's properties, or one of them",
@@ -329,6 +361,16 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         "mkdir" => mkdir(target, offset, path_arg(sub)),
         "rm" => remove(target, offset, path_arg(sub), Removal::Name),
         "rmdir" => remove(target, offset, path_arg(sub), Removal::Directory),
+        "ln" => ln(
+            target,
+            offset,
+            os_bytes(
+                sub.get_one::<OsString>("link-target")
+                    .expect("required target"),
+            ),
+            path_arg(sub),
+            sub.get_flag("symbolic"),
+        ),
         "get" | "info" => get(
             &super::device::mount(target, offset)?,
             sub.get_one::<String>("key").map(String::as_str),
@@ -1032,6 +1074,102 @@ fn mkdir(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
     release_clean(fs, path)?;
     let report = Json::object([("path", Json::from(show(path))), ("inode", Json::from(ino))]);
     Ok(Outcome::report(report).with_text(format!("created {}", show(path))))
+}
+
+/// Add a name through the library's journalled link or symlink operation.
+/// Resolve and validate on a read-only mount before opening for writing.
+fn ln(
+    target: &OsString,
+    offset: u64,
+    source: &[u8],
+    path: &[u8],
+    symbolic: bool,
+) -> Result<Outcome, CliError> {
+    let (parent_path, name) = split_path(path)?;
+    if path.ends_with(b"/") {
+        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+    }
+    if name.len() > usize::from(u8::MAX) || name.contains(&0) {
+        return Err(CliError::refused(
+            "ln: the new name must be 1 to 255 bytes with no NUL",
+        ));
+    }
+    let (parent_ino, source_ino) = {
+        let fs = super::device::mount(target, offset)?;
+        if !fs.superblock().is_v5() {
+            return Err(CliError::refused(
+                "ln: linking writes v5 metadata; a v4 filesystem is not supported",
+            ));
+        }
+        if fs.was_replayed() {
+            return Err(super::device::dirty_log(&target.to_string_lossy()));
+        }
+        let parent = fs
+            .open_bytes(parent_path)
+            .map_err(|e| write_error(path, e))?;
+        if !parent.is_dir() {
+            return Err(xfs_error(parent_path, fs_xfs::Error::NotADirectory));
+        }
+        match parent.open_child(name) {
+            Ok(_) => return Err(xfs_error(path, fs_xfs::Error::AlreadyExists)),
+            Err(fs_xfs::Error::NotFound) => {}
+            Err(e) => return Err(xfs_error(path, e)),
+        }
+        let ino = if symbolic {
+            let max = fs_xfs::format::symlink::XFS_SYMLINK_MAX_TARGET;
+            if source.is_empty() || source.len() > max || source.contains(&0) {
+                return Err(CliError::refused(format!(
+                    "ln: a symlink's target is 1 to {max} bytes with no NUL"
+                )));
+            }
+            None
+        } else {
+            let file = fs.open_bytes(source).map_err(|e| write_error(source, e))?;
+            let inode = file.inode();
+            if source.ends_with(b"/") && !file.is_dir() {
+                return Err(xfs_error(source, fs_xfs::Error::NotADirectory));
+            }
+            if file.is_dir() {
+                return Err(CliError::refused(format!(
+                    "{}: a directory cannot be given another hard link",
+                    show(source)
+                )));
+            }
+            if inode.nlink == 0 {
+                return Err(xfs_error(source, fs_xfs::Error::NotFound));
+            }
+            if inode.nlink >= (1 << 31) - 1 {
+                return Err(CliError::refused(format!(
+                    "{}: inode {} already has {} links, the most it may have",
+                    show(source),
+                    inode.ino,
+                    inode.nlink
+                )));
+            }
+            Some(inode.ino)
+        };
+        (parent.inode().ino, ino)
+    };
+    let fs = super::device::mount_rw(target, offset)?;
+    let ino = match source_ino {
+        Some(ino) => {
+            fs.link(ino, parent_ino, name)
+                .map_err(|e| write_error(path, e))?;
+            ino
+        }
+        None => {
+            fs.create_symlink(parent_ino, name, source)
+                .map_err(|e| write_error(path, e))?
+                .0
+        }
+    };
+    release_clean(fs, path)?;
+    Ok(Outcome::report(Json::object([
+        ("path", Json::from(show(path))),
+        ("linked", Json::from(true)),
+        ("inode", Json::from(ino)),
+    ]))
+    .with_text(format!("linked {}", show(path))))
 }
 
 /// What a removal takes away: `rm` a name that is not a directory,
