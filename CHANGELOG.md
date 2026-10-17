@@ -9,6 +9,134 @@ pull request; a release gathers them into a section here.
 
 ## [Unreleased]
 
+## [0.14.2] — 2026-10-17
+
+### Added
+
+- **An exchange moves reflinked blocks and edits block-map trees (#441).**
+  `Filesystem::exchange_range` no longer refuses a file with shared extents
+  or one whose extents are in a B+tree. Shared blocks keep their reference
+  counts, their reverse-map records overlap one per mapping as the kernel
+  keeps them, and a file that takes a shared block takes the reflink flag.
+  Each file's new extent list is laid out inline or as a B+tree by the
+  kernel's rule, so an exchange can turn either form into the other. The
+  kernel replays both cases on the Debian 13 guest and `xfs_repair -n` calls
+  the volume clean.
+
+- **Volumes with parent pointers are written (#373).** A read-write mount of a
+  parent-pointer volume is no longer refused. Creating a file, directory or
+  symlink, linking, renaming within or between directories, unlinking and
+  removing a directory each add, move or remove the parent pointer their
+  change implies, logged in the same transaction as the directory entry. The
+  pinned `xfs_repair -n` calls the volume clean after each kind of change.
+
+- **Parent pointers are kept in attribute forks past short form (#488).** On a
+  volume with parent pointers, linking, renaming and unlinking one of several
+  names of an inode whose attribute fork is a leaf or a node, or whose new
+  pointer no longer fits short form, are no longer refused. The fork is
+  rebuilt in one free run, with every user attribute it held and each parent
+  pointer filed under the kernel's parent-pointer hash. The new blocks, the
+  old blocks' release and the directory entry go in one transaction. The
+  pinned `xfs_repair -n` and xfs_db's parent listing agree with every name,
+  and the Debian 13 kernel replays the changes from the log.
+
+- **Parent pointers are read (#373).** `Filesystem::parent_pointers` returns
+  each name an inode has in a directory, with that directory's inode number
+  and generation, on a volume with the parent-pointer feature. A rewrite of a
+  short-form attribute fork keeps them, they are never listed or set as
+  attributes, and a fork holding one past short form is refused by the
+  writer rather than rewritten without it. On the parent-pointer volume the
+  reference `mkfs.xfs` builds, every inode's parent pointers are exactly the
+  directory entries that name it.
+
+- **A value stored in blocks of its own is kept beside parent pointers
+  (#501).** On a volume with parent pointers, linking, renaming and
+  unlinking one of several names of an inode whose attribute fork holds a
+  user, trusted or security value too large for its leaf are no longer
+  refused. The value is rebuilt with the fork and, since it is not logged,
+  written before the transaction that maps it, into a run that was free
+  before that transaction began: never into a block the same change gives
+  back, such as a replaced file's data, which stays in use until the
+  transaction commits. The pinned `xfs_repair -n` calls the volume clean,
+  and the Debian 13 kernel replays the changes from the log and reads the
+  value back unchanged.
+
+- **The repair through the C ABI (#477).** `fs_xfs_repair_with_fs_core_device`
+  plans a repair of the volume on an `fs_core` device, with every rule
+  `fsck.xfs -y` has, and with `apply` set writes it. Each change (its
+  offset, length, finding code and rule), each refusal and each unplanned
+  finding is passed to a callback, which can stop the listing and cancel
+  the repair before anything is written. A report says whether a plan was
+  made, how many changes it proposed and wrote, and whether the volume
+  checks clean afterwards. A host that reaches its device through callbacks
+  or a partition slice can now repair a volume as well as check it.
+
+### Fixed
+
+- **An inode's extent counts are read where its own flag keeps them (#510).**
+  On a volume with 64-bit extent counters, an inode without the per-inode
+  `NREXT64` flag in `di_flags2`, which includes every inode this driver
+  creates, keeps its counts at the narrow offsets, as the kernel and xfs_db
+  read and write them. The reader had taken the volume's feature bit instead,
+  so such a directory read as having no blocks once it left its inode, and
+  such a file's attribute fork past short form read as empty. Attribute
+  writes now put the attribute fork's count where the same flag says, too.
+
+- **An entry into a group whose inode btree was not read is walked.**
+  When a group's AGF, AGI, inode btree or an inode btree record cannot be
+  read, an inode in that group reached from a directory is read on its
+  own and, when it is in use, walked like any other: its blocks are
+  claimed, its entries are followed and its links are counted. The check
+  no longer reports such an entry as pointing at an inode in no chunk, a
+  root directory there as unallocated, or the blocks it owns in other
+  groups as lost.
+
+- **The last name of an inode with attribute blocks can be removed (#495).**
+  `unlink_file` of an inode's last name, and a `rename` that replaces one,
+  no longer refuse an inode whose attribute fork has blocks of its own: a
+  leaf, a node, remote values, or a B+tree mapping them. Each block goes back
+  to free space with its reverse-mapping record in the same transaction that
+  frees the inode, its buffer is cancelled, and its owners' quota is
+  credited. On a volume with parent pointers this is any file with a handful
+  of user attributes or two or three long names. The pinned `xfs_repair -n`
+  finds the volume clean after an unmount, and the Debian 13 kernel replays
+  the change from the log.
+
+- **A quota inode in a group whose inode btree was not read is checked,
+  not reported missing.** When a group's AGF, AGI, inode btree or an
+  inode btree record cannot be read, a quota inode in that group is read
+  on its own and checked like any other, and left unchecked when it is
+  not in use, instead of being reported as not a readable allocated
+  inode.
+
+- **Quota usage is not compared when a group's inodes were not all listed.**
+  When a group's AGF, AGI, inode btree or an inode btree record cannot be
+  read, the inodes it holds are missing from the quota usage the check
+  adds up. The check now leaves quota usage unchecked in that case instead
+  of reporting records whose counts include those inodes as wrong.
+
+- **A btree that cannot be walked leaves its group unchecked, not lost.**
+  When a group's free-space, inode, reverse-mapping, refcount or free
+  inode btree, its free list, or a record of its inode btree cannot be
+  read, the check no longer reports that group's blocks as `lost`, no
+  longer compares the free-space btrees, the AGF or the AGI with records
+  it never read, and no longer compares a superblock counter that group
+  could not add to. The scan is still reported partial, with
+  `btree.unreadable`, `ag.agfl.unreadable` or `inobt.record` for the group.
+
+- **A group whose AGF or AGI cannot be read is unchecked, not lost.** The
+  check no longer reports every block of such a group as `lost`, and no
+  longer compares the superblock's inode and free-block counters with
+  totals that group never added to; the scan is still reported partial,
+  with `ag.agf.unreadable` or `ag.agi.unreadable` for the group.
+
+- **`fsck.xfs --dry-run`, `-y` and `-p` on a target that cannot be opened
+  print an error naming it (#490).** A path that does not exist used to
+  print a report on stdout with a plan refused as `repair.not-exclusive`,
+  which says another holder has the target, and nothing on stderr. Every
+  mode now answers as a check does: exit `8`, an error naming the target on
+  stderr, and no report.
+
 ## [0.14.1] — 2026-10-14
 
 ### Added
@@ -1131,6 +1259,7 @@ compatibility boundary. Nothing existing changed — every low-level
 - Inode parsing is cross-validated against the reference XFS debugger.
 - The C ABI, with its tests written alongside it.
 
+[0.14.2]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/antimatter-studios/rust-fs-xfs/compare/v0.12.1...v0.13.0
