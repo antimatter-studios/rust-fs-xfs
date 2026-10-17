@@ -44,8 +44,13 @@ impl Checker<'_> {
             .into_iter()
             .filter(|&ino| ino != 0 && ino != u64::MAX)
             .collect();
-        // Comparing a partial inode walk would manufacture counter mismatches.
-        let complete = inodes.len() == self.allocated.len();
+        // Usage is compared only with a walk that read every inode: one
+        // allocated inode not read, or one group whose inode btree did not
+        // list every chunk (#503), leaves the sums short by an amount
+        // nothing read can say, and comparing them would manufacture
+        // mismatches.
+        let complete = self.inodes_unlisted.is_empty()
+            && self.allocated.iter().all(|ino| inodes.contains_key(ino));
         for mut kind in [Kind::User, Kind::Group, Kind::Project] {
             let ino = kind.inode(&sb);
             let active = sb.qflags & kind.accounting() != 0;

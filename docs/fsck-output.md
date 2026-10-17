@@ -189,7 +189,7 @@ The partial-scan column states whether this finding prevents a complete walk.
 | `quota.flags` | error | no | The superblock's quota flags are not valid for its version. |
 | `quota.inode` | error | no | A quota inode is missing, shared between quota types, not a quota file, maps blocks a quota file cannot have, or holds a record that fails its checksum, UUID, identity or field checks. |
 | `quota.unreadable` | error | yes | A quota inode's extent map or records, or the usage they are checked against, could not be read. |
-| `quota.usage` | error | no | Quota accounting is not what the allocated inodes add up to. |
+| `quota.usage` | error | no | Quota accounting is not what the allocated inodes add up to. It is compared only when every allocated inode was read and every group's inode btree listed all its chunks; otherwise the sums are short by what was not read, and the usage is left unchecked. |
 
 ## Damage coverage
 
