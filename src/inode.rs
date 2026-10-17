@@ -252,8 +252,9 @@ pub(crate) fn stamp_change(core: &mut [u8], when: Timestamp, changed: Changed) {
 pub mod flags {
     /// The inode's extents are on the real-time device.
     pub const REALTIME: u16 = 1 << 0;
-    /// Extent size hint is set.
-    pub const EXTSIZE: u16 = 1 << 3;
+    /// Extent size hint is set, matching the independently measured
+    /// [`crate::format::log_items::log_dinode::flags::DI_FLAG_EXTSIZE`].
+    pub const EXTSIZE: u16 = 1 << 11;
     /// Directory entries are hashed rather than sorted.
     pub const NOSYMLINKS: u16 = 1 << 10;
 }
