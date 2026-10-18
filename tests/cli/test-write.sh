@@ -3,16 +3,17 @@
 # every shape it cannot is refused with its reason -- exit 3 for a shape,
 # exit 1 for a mistake -- with nothing on stdout and the copy unchanged.
 #
-# ONE JOURNALLED WRITE PER COPY. A new file, a filled empty file and a
-# mkdir are log records, and the driver writes only to a volume whose log
-# is clean, so the next journalled write on the same copy is refused until
-# Linux has mounted it once. That refusal is checked here; the chain of
-# writes with the kernel replaying between them is tests/cli_write_kernel.rs.
+# A JOURNALLED WRITE RELEASES THE VOLUME CLEAN. A new file, a filled empty
+# file and a mkdir are log records, and the driver writes only to a volume
+# whose log is clean; each verb then writes its change home and ends the
+# log with an unmount record, so `get dirty` is false afterwards and the
+# next journalled write follows on the same copy with no kernel between.
+# What xfs_repair and the kernel make of such a chain is
+# tests/cli_write_kernel.rs.
 #
-# rm AND rmdir RELEASE THE VOLUME CLEAN: each ends the log with an unmount
-# record, so removals chain on one copy where the writes above cannot, and
-# a volume a write left dirty is refused. What xfs_repair and the kernel
-# make of a removal is tests/cli_rm_kernel.rs.
+# rm AND rmdir RELEASE THE VOLUME CLEAN TOO, so removals chain on one copy
+# as the writes above do, and a volume whose log holds records is refused.
+# What xfs_repair and the kernel make of a removal is tests/cli_rm_kernel.rs.
 source "$(dirname "$0")/lib.sh"
 
 need_fixture xfscli-v5.img xfscli-v4.img
@@ -52,8 +53,8 @@ for size in 0 1 4095 4096 4097 1048576; do
     fs.xfs "$img" ls "/f$size" >"$SANDBOX/ls.json" 2>/dev/null
     jq_check "ls /f$size is a 0644 file of $size bytes" \
         ".[0].type == \"file\" and .[0].size == $size and .[0].mode == \"0644\"" "$SANDBOX/ls.json"
-    check "after write /f$size the log holds the record (dirty)" \
-        test "$(fs.xfs "$img" get dirty --text)" = true
+    check "write /f$size leaves the log clean" \
+        test "$(fs.xfs "$img" get dirty --text)" = false
 done
 
 # A new file in a subdirectory.
@@ -64,6 +65,7 @@ rc=$?
 check "write /sub/nested/deep exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
 check "read /sub/nested/deep is what was written" \
     cmp -s "$SANDBOX/deep" <(fs.xfs "$img" read /sub/nested/deep)
+check "write /sub/nested/deep leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
 
 # An empty file given its contents.
 img="$(fresh "$v5")"
@@ -71,6 +73,7 @@ head -c 6000 /dev/urandom >"$SANDBOX/fill"
 fs.xfs "$img" write /empty <"$SANDBOX/fill" >"$SANDBOX/w.json" 2>/dev/null
 jq_check "write /empty fills it" '.result == "filled" and .bytes == 6000 and .created == false' "$SANDBOX/w.json"
 check "read /empty is what was written" cmp -s "$SANDBOX/fill" <(fs.xfs "$img" read /empty)
+check "filling /empty leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
 
 # A same-length overwrite: in place, no journal, so the log stays clean --
 # on v5 and on v4, where nothing about the metadata changes either.
@@ -100,16 +103,38 @@ fs.xfs "$img" ls / >"$SANDBOX/ls.json" 2>/dev/null
 jq_check "ls / shows d as a 0755 directory" 'any(.[]; .name == "d" and .type == "dir" and .mode == "0755")' "$SANDBOX/ls.json"
 fs.xfs "$img" ls /d >"$SANDBOX/lsd.json" 2>/dev/null
 jq_check "ls /d is empty" '. == []' "$SANDBOX/lsd.json"
+check "mkdir /d leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
 
-# The second journalled write on one copy waits for a replay: exit 1, the
-# reason, nothing on stdout, nothing written.
-cp "$img" "$SANDBOX/before.img" 2>/dev/null || copy_image "$img" "$SANDBOX/before.img"
-fs.xfs "$img" mkdir /d/e >"$SANDBOX/x.out" 2>"$SANDBOX/x.err"
-check "mkdir /d/e before a replay exits 1" test $? -eq 1
-check "mkdir /d/e before a replay prints nothing on stdout" test ! -s "$SANDBOX/x.out"
-jq_check "mkdir /d/e before a replay says the log holds records" \
-    '.code == 1 and (.error | test("log holds records")) and (.error | test("Linux"))' "$SANDBOX/x.err"
-unchanged "mkdir before a replay" "$img" "$SANDBOX/before.img"
+# Journalled writes chain on one copy, with no kernel between them: each
+# finds the log the last one closed, and leaves it closed for the next.
+fs.xfs "$img" mkdir /d/e >"$SANDBOX/m.json" 2>"$SANDBOX/e"
+rc=$?
+check "mkdir /d/e straight after mkdir /d exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
+check "mkdir /d/e leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
+head -c 5000 /dev/urandom >"$SANDBOX/chain1"
+fs.xfs "$img" write /d/e/one <"$SANDBOX/chain1" >"$SANDBOX/w.json" 2>"$SANDBOX/e"
+rc=$?
+check "write /d/e/one straight after mkdir /d/e exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
+jq_check "write /d/e/one is created and journalled" \
+    '.result == "created" and .journalled == true and .bytes == 5000' "$SANDBOX/w.json"
+check "write /d/e/one leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
+head -c 4097 /dev/urandom >"$SANDBOX/chain2"
+fs.xfs "$img" write /d/e/two <"$SANDBOX/chain2" >/dev/null 2>"$SANDBOX/e"
+rc=$?
+check "a second write, /d/e/two, on the same copy exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
+check "write /d/e/two leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
+head -c 3000 /dev/urandom >"$SANDBOX/chain3"
+fs.xfs "$img" write /empty <"$SANDBOX/chain3" >"$SANDBOX/w.json" 2>"$SANDBOX/e"
+rc=$?
+check "filling /empty after the chain exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
+jq_check "filling /empty after the chain is a fill" '.result == "filled"' "$SANDBOX/w.json"
+check "the chain's last write leaves the log clean" test "$(fs.xfs "$img" get dirty --text)" = false
+check "read /d/e/one is what was written" cmp -s "$SANDBOX/chain1" <(fs.xfs "$img" read /d/e/one)
+check "read /d/e/two is what was written" cmp -s "$SANDBOX/chain2" <(fs.xfs "$img" read /d/e/two)
+check "read /empty is what the chain wrote" cmp -s "$SANDBOX/chain3" <(fs.xfs "$img" read /empty)
+fs.xfs "$img" ls /d/e >"$SANDBOX/lse.json" 2>/dev/null
+jq_check "ls /d/e holds the two files the chain wrote" \
+    '([.[].name] | sort) == ["one", "two"]' "$SANDBOX/lse.json"
 
 # refused CODE PATTERN BASE PATH VERB [STDIN-BYTES]: on a fresh copy of
 # BASE, VERB PATH fails with CODE, an error matching PATTERN, nothing on
@@ -157,6 +182,8 @@ check "a write larger than any free run prints nothing on stdout" test ! -s "$SA
 jq_check "a write larger than any free run names the free run" '.code == 3 and (.error | test("free run"))' "$SANDBOX/b.err"
 fs.xfs "$img" ls /big >/dev/null 2>"$SANDBOX/b2.err"
 jq_check "the refused write left no /big behind" '.code == 1 and (.error | test("no such file"))' "$SANDBOX/b2.err"
+check "the refused write's create and unlink leave the log clean" \
+    test "$(fs.xfs "$img" get dirty --text)" = false
 
 # A failing producer leaves the image as it was: stdin is read whole first.
 img="$(fresh "$v5")"
@@ -178,6 +205,8 @@ rc=$?
 check "write through --offset exits 0 ($(cat "$SANDBOX/e"))" test "$rc" -eq 0
 check "read through --offset returns it" \
     test "$(fs.xfs --offset 1048576 "$disk" read /p.txt)" = "in a partition"
+check "write through --offset leaves the log clean" \
+    test "$(fs.xfs --offset 1048576 "$disk" get dirty --text)" = false
 check "the first MiB, outside the partition, is still zeros" \
     test "$(head -c 1048576 "$disk" | tr -d '\0' | wc -c | tr -d ' ')" -eq 0
 
@@ -241,18 +270,30 @@ refused 3 "v4 filesystem is not supported" "$v4" /small.txt rm
 refused 3 "v4 filesystem is not supported" "$v4" /sub/nested rmdir
 refused 3 "B.tree" "$v5" /fragmented.bin rm
 
-# A log a write left holding its record is refused too, as every write
-# verb refuses it.
-img="$(fresh "$v5")"
-printf x | fs.xfs "$img" write /new >/dev/null 2>&1
-copy_image "$img" "$SANDBOX/before.img"
-fs.xfs "$img" rm /small.txt >"$SANDBOX/x.out" 2>"$SANDBOX/x.err"
-check "rm on a volume whose log holds records exits 1" test $? -eq 1
-check "rm on a dirty log prints nothing on stdout" test ! -s "$SANDBOX/x.out"
-jq_check "rm on a dirty log says the log holds records" \
-    '.code == 1 and (.error | test("log holds records"))' "$SANDBOX/x.err"
-unchanged "rm on a dirty log" "$img" "$SANDBOX/before.img"
-rm -f "$SANDBOX/before.img"
+# A log holding records nothing has applied is refused by every write
+# verb: exit 1, the reason, nothing on stdout, nothing written. No verb
+# here leaves such a log any more, so the volume is the kernel's own,
+# shut down while mounted (`chore fixtures -- data` builds it).
+dirty_base="$SHARE/xfsdirty.img"
+if [ -f "$dirty_base" ]; then
+    for verb in rm write mkdir; do
+        img="$(fresh "$dirty_base")"
+        copy_image "$img" "$SANDBOX/before.img"
+        case "$verb" in
+            rm) fs.xfs "$img" rm /d/renamed-1 </dev/null >"$SANDBOX/x.out" 2>"$SANDBOX/x.err" ;;
+            write) printf x | fs.xfs "$img" write /new >"$SANDBOX/x.out" 2>"$SANDBOX/x.err" ;;
+            mkdir) fs.xfs "$img" mkdir /new </dev/null >"$SANDBOX/x.out" 2>"$SANDBOX/x.err" ;;
+        esac
+        check "$verb on a volume whose log holds records exits 1" test $? -eq 1
+        check "$verb on a dirty log prints nothing on stdout" test ! -s "$SANDBOX/x.out"
+        jq_check "$verb on a dirty log says the log holds records" \
+            '.code == 1 and (.error | test("log holds records"))' "$SANDBOX/x.err"
+        unchanged "$verb on a dirty log" "$img" "$SANDBOX/before.img"
+        rm -f "$SANDBOX/before.img" "$img"
+    done
+else
+    fail ".vm-share/xfsdirty.img is missing; build it with \`chore fixtures -- data\`"
+fi
 
 img="$(fresh "$v5")"
 fs.xfs "$img" rm >"$SANDBOX/u.out" 2>"$SANDBOX/u.err"
