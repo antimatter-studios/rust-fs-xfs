@@ -6,14 +6,16 @@
 //! answers `not implemented` with exit status 3, so a script moved between
 //! filesystems fails loudly instead of meaning something else.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Write;
 
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command as Cmd};
 
-use fs_core::cli::{CliError, Json, Outcome, Tool};
+use fs_core::cli::{CliError, Format as CliFormat, Json, Outcome, Tool};
 use fs_xfs::endian::{be16, be32};
 use fs_xfs::format::log_items::log_dinode::offsets;
+use fs_xfs::fs::File;
 use fs_xfs::inode::{FileType, Format, Inode};
 use fs_xfs::Filesystem;
 
@@ -80,6 +82,31 @@ fn command() -> Cmd {
             Cmd::new("ls")
                 .about("List a directory: name, type, size, mode, mtime (and a symlink's target)")
                 .arg(
+                    Arg::new("recursive")
+                        .long("recursive")
+                        .short('R')
+                        .action(ArgAction::SetTrue)
+                        .help("Walk depth first, sorting names as bytes; never follow symlinks"),
+                )
+                .arg(
+                    Arg::new("max-depth")
+                        .long("max-depth")
+                        .value_name("N")
+                        .value_parser(value_parser!(u64))
+                        .requires("recursive")
+                        .help(
+                            "Maximum recursive depth (default: 64); direct children have depth 1",
+                        ),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_name("N")
+                        .value_parser(value_parser!(u64))
+                        .requires("recursive")
+                        .help("Maximum recursive entries (default: 100000)"),
+                )
+                .arg(
                     Arg::new("path")
                         .value_name("PATH")
                         .default_value("/")
@@ -88,7 +115,14 @@ fn command() -> Cmd {
                 .after_help(
                     "Examples:\n  fs.xfs disk.img ls /etc\n  \
                      fs.xfs disk.img ls / | jq -r '.[].name'\n  \
-                     fs.xfs disk.img ls --text /",
+                     fs.xfs disk.img ls --text /\n  \
+                     fs.xfs disk.img ls -R --max-depth 8 --limit 1000 /etc\n\n\
+                     Recursive entries add volume-absolute path and depth. The starting \
+                     directory is omitted; a starting file or symlink has depth 0. A repeated \
+                     directory inode is listed with revisited: true and not entered. If another \
+                     entry would exceed either bound, or a directory cannot be read, the \
+                     collected prefix stays on stdout and an error names the bound or path \
+                     on stderr (exit 1). Exact fits succeed; zero allows no entries or depth.",
                 ),
         )
         .subcommand(
@@ -236,6 +270,15 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
         .copied()
         .unwrap_or(0);
     match verb {
+        "ls" if sub.get_flag("recursive") => {
+            let format = CliFormat::of(matches, &std::env::args_os().collect::<Vec<_>>());
+            ls_recursive(
+                &super::device::mount(target, offset)?,
+                path_arg(sub),
+                sub,
+                format,
+            )
+        }
         "ls" => ls(&super::device::mount(target, offset)?, path_arg(sub)),
         "stat" => stat(&super::device::mount(target, offset)?, path_arg(sub)),
         "read" => read(
@@ -346,10 +389,15 @@ fn entry_text(e: &Json) -> String {
         type_char(&field("type")),
         field("mode"),
         field("size"),
-        field("name")
+        e.get("path")
+            .map(Json::to_text)
+            .unwrap_or_else(|| field("name"))
     );
     if let Some(target) = e.get("target") {
         line.push_str(&format!(" -> {}", target.to_text()));
+    }
+    if e.get("revisited") == Some(&Json::Bool(true)) {
+        line.push_str(" [revisited]");
     }
     line
 }
@@ -537,6 +585,133 @@ fn stat(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
         ]),
     ));
     Ok(Outcome::report(Json::object(fields)))
+}
+
+fn recursive_entry(
+    file: &File<'_>,
+    path: &[u8],
+    depth: u64,
+    revisited: bool,
+) -> Result<Json, CliError> {
+    let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
+    let target = if file.is_symlink() {
+        Some(file.link_target().map_err(|e| xfs_error(path, e))?)
+    } else {
+        None
+    };
+    let Json::Obj(mut fields) = entry(name, file.inode(), target) else {
+        unreachable!("an ls entry is an object")
+    };
+    fields.push(("path".into(), Json::from(show(path))));
+    if std::str::from_utf8(path).is_err() {
+        fields.push((
+            "path_hex".into(),
+            Json::from(path.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        ));
+    }
+    fields.push(("depth".into(), Json::from(depth)));
+    if revisited {
+        fields.push(("revisited".into(), Json::from(true)));
+    }
+    Ok(Json::Obj(fields))
+}
+
+/// Directory iterators live on a heap stack, so a caller-supplied large
+/// depth bound cannot overflow Rust's call stack. The starting inode is
+/// visited before descent; every other directory identity is entered once.
+fn ls_recursive(
+    fs: &Filesystem,
+    path: &[u8],
+    sub: &ArgMatches,
+    format: CliFormat,
+) -> Result<Outcome, CliError> {
+    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    let max_depth = sub.get_one::<u64>("max-depth").copied().unwrap_or(64);
+    let limit = sub.get_one::<u64>("limit").copied().unwrap_or(100_000);
+    let mut start = Vec::new();
+    for component in path
+        .split(|b| *b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+    {
+        start.push(b'/');
+        start.extend_from_slice(component);
+    }
+    if start.is_empty() {
+        start.push(b'/');
+    }
+    let mut entries = Vec::new();
+    let walked = (|| {
+        if !file.is_dir() {
+            if limit == 0 {
+                return Err(CliError::failed(format!(
+                    "--limit 0 reached at {}",
+                    show(&start)
+                )));
+            }
+            entries.push(recursive_entry(&file, &start, 0, false)?);
+            return Ok(());
+        }
+        let children = |file: &File<'_>, at: &[u8]| {
+            let mut children = file.entries().map_err(|e| xfs_error(at, e))?;
+            children.retain(|d| d.name != b"." && d.name != b"..");
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok::<_, CliError>(children.into_iter())
+        };
+        let mut visited = HashSet::from([file.inode().ino]);
+        let first = children(&file, &start)?;
+        let mut stack = vec![(start, 0u64, first)];
+        while let Some((parent, parent_depth, children_iter)) = stack.last_mut() {
+            let Some(child) = children_iter.next() else {
+                stack.pop();
+                continue;
+            };
+            let mut full = parent.clone();
+            if !full.ends_with(b"/") {
+                full.push(b'/');
+            }
+            full.extend_from_slice(&child.name);
+            let depth = *parent_depth + 1;
+            if entries.len() as u64 >= limit {
+                return Err(CliError::failed(format!(
+                    "--limit {limit} reached at {}",
+                    show(&full)
+                )));
+            }
+            if depth > max_depth {
+                return Err(CliError::failed(format!(
+                    "--max-depth {max_depth} reached at {}",
+                    show(&full)
+                )));
+            }
+            let file = fs.open_ino(child.ino).map_err(|e| xfs_error(&full, e))?;
+            let revisited = file.is_dir() && !visited.insert(file.inode().ino);
+            entries.push(recursive_entry(&file, &full, depth, revisited)?);
+            if file.is_dir() && !revisited {
+                let next = children(&file, &full)?;
+                stack.push((full, depth, next));
+            }
+        }
+        Ok(())
+    })();
+    let text = entries
+        .iter()
+        .map(entry_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = Outcome::report(Json::Arr(entries)).with_text(text);
+    match walked {
+        Ok(()) => Ok(report),
+        Err(error) => {
+            // Outcome holds one stream: render the complete partial report
+            // here, then let the shared dispatcher render the error.
+            let partial = fs_core::cli::output::render(TOOL.name, format, Ok(report));
+            let mut out = std::io::stdout().lock();
+            out.write_all(partial.stdout.as_bytes())
+                .and_then(|()| out.flush())
+                .map_err(|e| CliError::failed(format!("write: {e}")))?;
+            Err(error)
+        }
+    }
 }
 
 /// Stream a regular file's bytes. Everything that can be refused up front

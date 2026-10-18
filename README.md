@@ -253,6 +253,7 @@ log needs replaying), not a place to do real filesystem work: for that, mount it
 
 ```sh
 fs.xfs disk.img ls /etc              # a directory, as JSON
+fs.xfs disk.img ls -R --max-depth 8 --limit 1000 /etc
 fs.xfs disk.img read /etc/fstab > fstab
 fs.xfs disk.img write /notes.txt < notes.txt
 fs.xfs disk.img get                  # the properties, as JSON
@@ -263,6 +264,7 @@ fs.xfs --offset 1048576 whole-disk.img info
 | verb | what |
 |---|---|
 | `ls [path]` | a directory (`/` by default): each entry's `name`, `type`, `size`, `mode`, `mtime` and `inode`, and a symlink's `target`; v4 and v5 |
+| `ls --recursive [--max-depth N] [--limit N] [path]` | byte-sorted depth-first entries with volume-absolute `path` and relative `depth`; `-R` is the short form |
 | `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
 | `write <path>` | the bytes on stdin. A new path becomes a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Anything else -- appending, shortening, a v4 create, a file too large for one free run -- is refused with the reason (exit 3), and the volume is left as it was |
 | `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5) |
@@ -280,6 +282,19 @@ in the log: the kernel applies it the next time Linux mounts the volume, and `ge
 says `true` until then. The driver writes only to a volume whose log is clean, so the
 next journalled write on the same image is refused until it has been mounted once.
 Reading needs no such wait: `ls` and `read` replay the log in memory.
+
+`ls --recursive` lists direct children at depth 1, omitting the starting
+directory; a starting file or symlink is one entry at depth 0. Symlinks are
+listed without being followed. A directory inode already visited is listed
+with `revisited: true` and is not entered again. Non-UTF-8 paths retain their
+exact bytes in `path_hex`, as names do in `name_hex`.
+
+The finite defaults are `--max-depth 64` and `--limit 100000`. Exact fits
+succeed and zero is allowed. An entry beyond either bound, or an unreadable
+directory, returns exit 1 naming the bound or stopped path on stderr while
+the collected entries remain on stdout as a complete JSON array (or full
+paths with `--text`). Opening or starting-path failures print no report.
+Plain `ls` is unchanged; `--offset` locates the filesystem within TARGET.
 
 **`mkfs.xfs`** makes a v5 filesystem with the standard formatter's default features on
 a device or image of at least 300 MiB. The target must already exist at its size,
