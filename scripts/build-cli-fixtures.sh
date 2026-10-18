@@ -150,5 +150,27 @@ for spec in "${IMAGES[@]}"; do
         printf 'inode-crc\t%s\n' "$((ino_byte + 44))"
     } > "xfscli-$name.corrupt"
 
+    # A reference-debugger fixture for ln's format-limit refusal, with a
+    # valid inode CRC. It deliberately has more links than directory
+    # entries, so it is never a consistency-check fixture.
+    #
+    # The debugger writes the inode behind the kernel's back, so the log's
+    # newest record of it still says one link at the same change count,
+    # and log_dinode_oracle reads that as a conversion fault (#569). One
+    # kernel mount that touches the file logs the edited core, so the log
+    # and the disk agree again.
+    if [ "$name" = v5 ]; then
+        cp --sparse=always "$img" xfscli-maxlinks.img
+        xfs_db -x -c "inode $ino" -c 'write -d core.nlinkv2 2147483647' xfscli-maxlinks.img
+        mnt=$(mktemp -d)
+        as_root mount -o loop xfscli-maxlinks.img "$mnt"
+        as_root touch "$mnt/small.txt"
+        sync
+        as_root umount "$mnt"
+        rmdir "$mnt"
+        xfs_db -r -c "inode $ino" -c 'p core.nlinkv2' xfscli-maxlinks.img |
+            grep -qx 'core.nlinkv2 = 2147483647'
+    fi
+
     echo "BUILT xfscli-$name (label $label, $(wc -l < "xfscli-$name.manifest") entries)"
 done
