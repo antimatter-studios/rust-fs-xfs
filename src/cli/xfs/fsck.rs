@@ -1,4 +1,4 @@
-//! `fsck.xfs`: check an XFS filesystem without changing it.
+//! `fsck.xfs`: check an XFS filesystem, or repair it with `-y` or `-p`.
 //!
 //! What it checks is this crate's checker (`fs_xfs::check`): the
 //! superblock copies, every allocation group's headers against its
@@ -54,17 +54,19 @@ pub const TOOL: Tool = Tool {
     verb: "fsck",
     section: 8,
     usage_exit: USAGE,
-    about: "Check an XFS filesystem without changing it",
+    about: "Check an XFS filesystem; -y and -p write repairs",
     command,
     run,
 };
 
 fn command() -> Cmd {
     Cmd::new("fsck.xfs")
-        .about("Check an XFS filesystem without changing it")
+        .about(TOOL.about)
         .long_about(
-            "Check an XFS image or device and report what is wrong with it. Nothing is \
-             written, and nothing is repaired.\n\n\
+            "Check an XFS image or device and report what is wrong with it. By default and \
+             with -n, nothing is written, and nothing is repaired. -y and -p apply the repair \
+             plan and write changes; a refused plan writes nothing. The volume is checked \
+             again after a repair.\n\n\
              Checked: the superblock copies against the primary; every allocation group's \
              headers against its free-space, inode and refcount btrees; that every block has \
              exactly one owner (a block claimed twice is a cross-link, a block claimed by \
@@ -80,8 +82,9 @@ fn command() -> Cmd {
              takes the target for itself first (an exclusive lock, and on Linux no mount or \
              loop device using it), refuses volumes it cannot reason about with repair.* \
              findings, and writes nothing.\n\n\
-             Exit status is fsck(8)'s: 0 clean, 4 errors found (and left), 8 the target could \
-             not be checked, 16 a wrong command line.",
+             Exit status is fsck(8)'s: 0 clean, 1 errors corrected, 4 errors left uncorrected, \
+             5 errors corrected and others left uncorrected, 8 the target could not be \
+             checked, 16 a wrong command line. Status 5 combines bits 1 and 4.",
         )
         .arg(
             Arg::new("target")
@@ -130,6 +133,8 @@ fn command() -> Cmd {
              fsck.xfs disk.img                     the report, as JSON\n  \
              fsck.xfs --text disk.img              the findings, one per line\n  \
              fsck.xfs --dry-run disk.img           what a repair would change\n  \
+             fsck.xfs -y disk.img                  apply the repair plan and check again\n  \
+             fsck.xfs -p disk.img                  the same unattended repairs as -y\n  \
              fsck.xfs --offset 1048576 whole.img   a partition inside a disk image",
         )
 }

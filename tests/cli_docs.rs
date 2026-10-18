@@ -73,6 +73,68 @@ fn every_name_has_a_man_page_in_its_section_naming_its_subcommands() {
 }
 
 #[test]
+fn fsck_help_and_manual_describe_repair_writes_and_every_exit_status() {
+    let scratch = generated("fsck");
+    let manual = std::fs::read_to_string(scratch.path().join("man/man8/fsck.xfs.8"))
+        .expect("read fsck.xfs(8)")
+        .replace("\\-", "-");
+    for (name, text) in [
+        (
+            "fsck.xfs --help",
+            stdout(&ok(tool("fsck.xfs").arg("--help"))),
+        ),
+        (
+            "rust-fs-xfs fsck --help",
+            stdout(&ok(entry().args(["fsck", "--help"]))),
+        ),
+        ("fsck.xfs(8)", manual),
+    ] {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for promise in [
+            "By default and with -n, nothing is written",
+            "--dry-run plans a repair",
+            "-y and -p apply the repair plan and write changes",
+        ] {
+            assert!(text.contains(promise), "{name} omits {promise:?}: {text}");
+        }
+        assert!(
+            !text.contains("Nothing is written, and nothing is repaired"),
+            "{name} still promises check-only behaviour in every mode"
+        );
+        let (_, statuses) = text
+            .split_once("Exit status")
+            .expect("exit status contract");
+        // fsck(8)'s bitmask: 5 combines corrected (1) and uncorrected (4).
+        for status in [
+            "0 clean",
+            "1 errors corrected",
+            "4 errors left uncorrected",
+            "5 errors corrected and others left uncorrected",
+            "8 the target could not be checked",
+            "16 a wrong command line",
+        ] {
+            assert!(
+                statuses.contains(status),
+                "{name} omits {status:?}: {statuses}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_fsck_tool_description_discloses_repair_writes() {
+    let help = stdout(&ok(entry().arg("--help")));
+    let description = help
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("fsck"))
+        .expect("the entry point lists fsck");
+    assert!(
+        description.contains("-y and -p write repairs"),
+        "the fsck tool description hides its write modes: {description}"
+    );
+}
+
+#[test]
 fn every_name_has_a_zsh_bash_and_fish_completion() {
     let scratch = generated("completions");
     let share = scratch.path();
