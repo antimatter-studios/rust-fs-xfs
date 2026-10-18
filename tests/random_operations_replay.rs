@@ -7,9 +7,12 @@
 //! - logged: create, mkdir, unlink, rename, truncate to zero, first write;
 //! - in place: write, set attributes, truncate.
 //!
-//! A mount writes at most one checkpoint, so every operation gets its own
-//! mount, and the kernel then mounts and unmounts the image, which replays the
-//! record. `xfs_repair -n` runs after every step. A refused operation is fine;
+//! Every operation gets its own mount so the kernel can replay its record
+//! and `xfs_repair -n` can judge every prefix of the sequence. The kernel
+//! mounts and unmounts the image after every step, then `xfs_repair -n` runs.
+//! Repeated journalled operations in one mount are supported since 0.8.0
+//! (#89) and exercised separately by `many_ops_per_mount.rs`.
+//! A refused operation is fine;
 //! a record the kernel cannot replay, or a volume xfs_repair rejects, is not.
 //! The sequence depends only on the seed, so a failure prints the operations
 //! so far, and the same seed reproduces it.
