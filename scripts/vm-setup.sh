@@ -50,6 +50,11 @@ REPO=/repo
 # THE TWO MUST AGREE; it is checked at the end of this script.
 PARENT_PREFIX=/usr/local/xfsprogs-parent
 PARENT_VERSION=6.13.0
+# The archive's sha256, as kernel.org's sha256sums.asc for the release
+# gives it and as a download of it hashed. Pinned here, not fetched beside
+# the archive from the server whose download it is checking.
+PARENT_SHA256=0459933f93d94c82bc2789e7bd63742273d9d74207cdae67dc3032038da08337
+PARENT_URL="https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-$PARENT_VERSION.tar.xz"
 
 # NO dpkg RECOVERY HERE: a guest whose provision was interrupted comes
 # back with dpkg half way through a transaction, and the harness's
@@ -89,8 +94,30 @@ if ! "$PARENT_PREFIX/sbin/mkfs.xfs" -V 2>/dev/null | grep -q "version $PARENT_VE
         liburcu-dev libinih-dev uuid-dev libblkid-dev libdevmapper-dev \
         autoconf automake libtool gettext make xz-utils g++ >/dev/null
     work="$(mktemp -d /var/tmp/xfsprogs.XXXXXX)"
-    curl -sSfL "https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-$PARENT_VERSION.tar.xz" |
-        tar -xJ -C "$work"
+    # TO A FILE, CHECKED, AND AGAIN IF NEED BE. It was piped straight into
+    # tar once: a merge-queue run lost it to "curl: (35) Recv failure:
+    # Connection reset by peer", tar got half an archive, and the provision
+    # failed before any test ran (#570). The retry is this loop, not
+    # curl's --retry, so that an archive which arrives whole by curl's
+    # account but fails its checksum is fetched again as well.
+    # tests/scripts/vm-setup-download-retry.sh drives it with a curl that
+    # drops its first attempts.
+    archive="$work/xfsprogs-$PARENT_VERSION.tar.xz"
+    attempts=5
+    for attempt in $(seq "$attempts"); do
+        if curl -sSfL --connect-timeout 30 --max-time 600 -o "$archive" "$PARENT_URL"; then
+            got="$(sha256sum "$archive" | cut -d' ' -f1)"
+            [[ "$got" == "$PARENT_SHA256" ]] && break
+            echo "vm-setup: $PARENT_URL arrived with sha256 $got, not $PARENT_SHA256" >&2
+        fi
+        if (( attempt == attempts )); then
+            echo "vm-setup: could not fetch $PARENT_URL with sha256 $PARENT_SHA256 in $attempts attempts" >&2
+            exit 1
+        fi
+        echo "vm-setup: fetching $PARENT_URL failed, attempt $attempt of $attempts; retrying" >&2
+        sleep $((attempt * 5))
+    done
+    tar -xJf "$archive" -C "$work"
     (
         cd "$work/xfsprogs-$PARENT_VERSION"
         make configure >/dev/null
