@@ -258,6 +258,7 @@ fs.xfs disk.img read /etc/fstab > fstab
 fs.xfs disk.img write /notes.txt < notes.txt
 fs.xfs disk.img rm /notes.txt
 fs.xfs disk.img rmdir /backup
+fs.xfs disk.img mv /draft.txt /archive/final.txt
 fs.xfs disk.img get                  # the properties, as JSON
 fs.xfs disk.img get label --text     # one of them, for a person
 fs.xfs --offset 1048576 whole-disk.img info
@@ -273,6 +274,7 @@ fs.xfs --offset 1048576 whole-disk.img info
 | `rm <path>` | removes a name that is not a directory: a symlink rather than what it points at, and the file with its last name, its blocks freed (v5). Reports `{"path": ..., "removed": true}` |
 | `rmdir <path>` | removes an empty directory (v5), with the same report |
 | `ln [-s] <target> <path>` | adds a hard link to the target inode, or stores the target text literally in a symbolic link with `-s` (v5). Reports `{"path": ..., "linked": true, "inode": N}` and leaves the volume clean |
+| `mv <source> <path>` | gives SOURCE the name PATH, in its directory or another (v5). PATH is the new name itself, not a directory to move into; a name already there is replaced as `rename(2)` replaces it, a file by a file and an empty directory by a directory. Reports `{"path": ..., "moved": true}` |
 | `get [key]`, `info [key]` | `fs`, `label`, `total_bytes`, `free_bytes`, `block_size`, `dirty` (the log holds records nothing has applied yet), and `xfs` or `xfs.<field>` |
 | `set label <value>` | writes the label (at most 12 bytes) into the superblock of every allocation group; a volume whose log is not clean is refused |
 | `resize <size>` | answers `not implemented` (exit 3): the library has no resize |
@@ -282,8 +284,8 @@ image. Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the
 command line was wrong, 3 not implemented or refused.
 
-A journalled change -- a new file, a filled empty file, a directory, a removal, a link -- is a
-record in the log, and the tool then releases the volume clean: the change is written
+A journalled change -- a new file, a filled empty file, a directory, a removal, a link,
+a move -- is a record in the log, and the tool then releases the volume clean: the change is written
 home and the log ends with an unmount record, so `get dirty` is `false` afterwards and
 the next write follows on the same image at once. The driver writes only to a volume
 whose log is clean, so one Linux left holding records is refused until Linux has
@@ -301,6 +303,15 @@ removed recursively. A file whose extents are in a B+tree is refused (exit 3).
 to a directory, the maximum link count, a v4 volume and a dirty log before opening for
 writing. Symbolic targets need not exist; they hold 1 to 1023 bytes, exactly as given.
 Hard links name symlink inodes themselves, and parent symlinks are never followed.
+
+For `mv`, a missing SOURCE or parent, the root, `.` and `..` at either end, a name
+longer than 255 bytes, a name ending in `/` on something that is not a directory, a
+directory moved into itself or beneath it, a file over a directory, a directory over
+anything else or over one with entries, a v4 volume and a log holding records are
+refused before the image is opened for writing, for the reason Linux gives
+`rename(2)`. A symlink is moved, never followed, and none on the way to either path is
+followed. A replacement the driver does not make -- a replaced file whose extents are
+in a B+tree -- is refused with its reason (exit 3) before anything is written.
 
 `ls --recursive` lists direct children at depth 1, omitting the starting
 directory; a starting file or symlink is one entry at depth 0. Symlinks are
