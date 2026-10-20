@@ -533,6 +533,12 @@ jobs:
         run: scripts/ci-install-chore.sh
       - name: chore siblings
         run: chore siblings
+      - name: Python YAML dependency for CI behavior tests
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ci-test-venv"
+          "$RUNNER_TEMP/ci-test-venv/bin/python" -m pip install PyYAML
+          echo "$RUNNER_TEMP/ci-test-venv/bin" >> "$GITHUB_PATH"
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

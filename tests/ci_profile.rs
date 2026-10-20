@@ -3535,40 +3535,24 @@ mod core_pin_parser {
 /// a commit nobody had finished testing. And GitHub keeps one pending run per
 /// concurrency group, so a third merge cancels a second one still queued even
 /// with cancelling switched off. So a push is a group of its own, keyed by its
-/// commit, and only a pull request's superseded run is cancelled.
+/// commit, and only an ordinary pull request's superseded run is cancelled.
+/// A `red:` run has its own commit group and survives the fix push. The shell
+/// guard evaluates those expressions for every event instead of pinning their
+/// spelling here as well.
 #[test]
 fn ci_cancels_only_a_pull_requests_superseded_run() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
-    let text = std::fs::read_to_string(&path).expect("read ci.yml");
-    let (mut group, mut cancel) = (None, None);
-    let mut inside = false;
-    for line in text.lines() {
-        if line.starts_with("concurrency:") {
-            inside = true;
-            continue;
-        }
-        if inside {
-            if !line.starts_with(' ') && !line.trim().is_empty() {
-                break;
-            }
-            if let Some(v) = line.trim().strip_prefix("group:") {
-                group = Some(v.trim().to_string());
-            }
-            if let Some(v) = line.trim().strip_prefix("cancel-in-progress:") {
-                cancel = Some(v.trim().to_string());
-            }
-        }
-    }
-    assert_eq!(
-        cancel.as_deref(),
-        Some("${{ github.event_name == 'pull_request' }}"),
-        "ci.yml cancels a run that is not a pull request's"
-    );
-    let group = group.expect("ci.yml declares a concurrency group");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new("bash")
+        .arg(root.join("tests/scripts/test-red-runs-uncancelled.sh"))
+        .current_dir(root)
+        .output()
+        .expect("run the CI concurrency behavior guard");
     assert!(
-        group.contains("github.event.pull_request.number || github.sha"),
-        "ci.yml's concurrency group is shared between pushes, so a queued push run is \
-         cancelled by the next: {group}"
+        output.status.success(),
+        "CI concurrency behavior failed ({}):\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
