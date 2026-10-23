@@ -1109,7 +1109,8 @@ fn write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
 /// A namespace verb's refusal by the volume's current state -- a name that
 /// is not there, a name already taken, a part of the path that is not a
 /// directory, a directory that is not empty -- is the CLI contract's exit 4,
-/// `refused` (diskjockey#413). `Err` hands every other error back.
+/// `refused` (rust-fs-core's `EXIT_REFUSED`). `Err` hands every other error
+/// back.
 fn state_refusal(what: &[u8], e: fs_xfs::Error) -> Result<CliError, fs_xfs::Error> {
     use fs_xfs::Error;
     match e {
