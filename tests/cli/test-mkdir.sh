@@ -60,7 +60,7 @@ jq_check "plain mkdir still reports an inode" '.path == "/plain" and (.inode | t
 for dir in /plain /absent/child; do
     copy_image "$img" "$SANDBOX/before"
     fs.xfs "$img" mkdir "$dir" >"$SANDBOX/report" 2>"$SANDBOX/error"
-    check "plain mkdir $dir still fails" test $? -eq 1
+    check "plain mkdir $dir is refused by the volume's state (exit 4)" test $? -eq 4
     check "plain mkdir refusal changes nothing" cmp -s "$img" "$SANDBOX/before"
 done
 copy_image "$SHARE/xfscli-v4.img" "$SANDBOX/v4.img"

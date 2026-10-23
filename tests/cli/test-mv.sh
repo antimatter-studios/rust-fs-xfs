@@ -130,17 +130,17 @@ mv_refused() {
 }
 
 # Mistakes (exit 1), each for the reason Linux gives.
-mv_refused 1 "no such file" "$v5" /missing /x
-mv_refused 1 "no such file" "$v5" /missing/x /y
-mv_refused 1 "no such file" "$v5" /small.txt /missing/x
-mv_refused 1 "not a directory" "$v5" /small.txt /empty/x
-mv_refused 1 "not a directory" "$v5" /small.txt/ /x
-mv_refused 1 "not a directory" "$v5" /small.txt /x/
-mv_refused 1 "not a directory" "$v5" /sub /small.txt
-mv_refused 1 "not a directory" "$v5" /sub /link-short
+mv_refused 4 "no such file" "$v5" /missing /x
+mv_refused 4 "no such file" "$v5" /missing/x /y
+mv_refused 4 "no such file" "$v5" /small.txt /missing/x
+mv_refused 4 "not a directory" "$v5" /small.txt /empty/x
+mv_refused 4 "not a directory" "$v5" /small.txt/ /x
+mv_refused 4 "not a directory" "$v5" /small.txt /x/
+mv_refused 4 "not a directory" "$v5" /sub /small.txt
+mv_refused 4 "not a directory" "$v5" /sub /link-short
 mv_refused 1 "is a directory" "$v5" /small.txt /sub
-mv_refused 1 "not empty" "$v5" /modes /sub
-mv_refused 1 "not empty" "$v5" /sub/nested /sub
+mv_refused 4 "not empty" "$v5" /modes /sub
+mv_refused 4 "not empty" "$v5" /sub/nested /sub
 mv_refused 1 "invalid argument" "$v5" /sub /sub/x
 mv_refused 1 "invalid argument" "$v5" /sub /sub/nested/x
 mv_refused 1 "cannot be moved or replaced" "$v5" / /x

@@ -65,9 +65,9 @@ refused() {
 }
 refused 1 'not a regular file' "$v5" /sub 0
 refused 1 'not a regular file' "$v5" /link-short 0
-refused 1 'no such file' "$v5" /missing 0
-refused 1 'not a directory' "$v5" /small.txt/ 0
-refused 1 'not a directory' "$v5" /link-short/child 0
+refused 4 'no such file' "$v5" /missing 0
+refused 4 'not a directory' "$v5" /small.txt/ 0
+refused 4 'not a directory' "$v5" /link-short/child 0
 refused 3 'B\\+tree' "$v5" /fragmented.bin 1000000
 refused 3 'v4 filesystem is not supported' "$SHARE/xfscli-v4.img" /small.txt 0
 refused 3 'size|length' "$v5" /small.txt 18446744073709551615

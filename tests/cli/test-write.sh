@@ -167,8 +167,8 @@ refused 3 "v4 filesystem is not supported" "$v4" /empty write 10
 # Mistakes (exit 1).
 refused 1 "no such file" "$v5" /missing/f write 10
 refused 1 "is a directory" "$v5" /sub write 10
-refused 1 "already exists" "$v5" /sub mkdir
-refused 1 "already exists" "$v5" /small.txt mkdir
+refused 4 "already exists" "$v5" /sub mkdir
+refused 4 "already exists" "$v5" /small.txt mkdir
 refused 1 "not a directory" "$v5" /small.txt/x write 1
 
 # Too large for any free run: refused with the driver's reason, and the
@@ -252,18 +252,18 @@ check "a file beside the removed ones still reads its bytes" test "$(fs.xfs "$im
 # Removals refused before the image is opened for writing: exit 1 for a
 # mistake, with the reason Linux gives; exit 3 for a v4 volume and for a
 # shape the driver does not free.
-refused 1 "no such file" "$v5" /missing rm
-refused 1 "no such file" "$v5" /missing rmdir
-refused 1 "no such file" "$v5" /missing/f rm
+refused 4 "no such file" "$v5" /missing rm
+refused 4 "no such file" "$v5" /missing rmdir
+refused 4 "no such file" "$v5" /missing/f rm
 refused 1 "is a directory" "$v5" /sub rm
 refused 1 "is a directory" "$v5" / rm
 refused 1 "is a directory" "$v5" /sub/. rm
-refused 1 "not a directory" "$v5" /small.txt rmdir
-refused 1 "not a directory" "$v5" /link-short rmdir
-refused 1 "not a directory" "$v5" /small.txt/ rm
-refused 1 "not a directory" "$v5" /small.txt/x rm
-refused 1 "not empty" "$v5" /sub rmdir
-refused 1 "not empty" "$v5" /sub/.. rmdir
+refused 4 "not a directory" "$v5" /small.txt rmdir
+refused 4 "not a directory" "$v5" /link-short rmdir
+refused 4 "not a directory" "$v5" /small.txt/ rm
+refused 4 "not a directory" "$v5" /small.txt/x rm
+refused 4 "not empty" "$v5" /sub rmdir
+refused 4 "not empty" "$v5" /sub/.. rmdir
 refused 1 "invalid argument" "$v5" /sub/. rmdir
 refused 1 "root directory" "$v5" / rmdir
 refused 3 "v4 filesystem is not supported" "$v4" /small.txt rm
