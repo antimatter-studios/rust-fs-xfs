@@ -292,7 +292,9 @@ fs.xfs --offset 1048576 whole-disk.img info
 `--offset BYTES` says where the filesystem starts, for a partition inside a whole-disk
 image. Metadata is JSON on stdout by default, `--text` for people. A failure is
 `{"error": "...", "code": N}` on stderr, `N` being the exit status: 1 failed, 2 the
-command line was wrong, 3 not implemented or refused.
+command line was wrong, 3 not implemented or refused, 4 the volume's state refused it
+(`rm`, `rmdir`, `mv`, `ln`, `mkdir` or `truncate` meeting a directory that is not empty,
+a name already there, a missing target or a part of the path that is not a directory).
 
 A journalled change -- a new file, a filled empty file, a directory, a removal, a link,
 a move, a truncate -- is a record in the log, and the tool then releases the volume
