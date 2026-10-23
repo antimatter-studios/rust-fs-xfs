@@ -54,7 +54,10 @@ fn command() -> Cmd {
              Metadata is JSON on stdout (--text for people); `read` and a named `xattr` \
              write raw bytes and `write` reads them from stdin. A failure is \
              {\"error\": \"...\", \"code\": N} on stderr, N being the exit status: \
-             1 failed, 2 wrong command line, 3 not implemented or refused.\n\n\
+             1 failed, 2 wrong command line, 3 not implemented or refused, 4 refused by \
+             the volume's state (rm, rmdir, mv, ln, mkdir or truncate meeting a directory \
+             that is not empty, a name already there, a missing target or a part of the \
+             path that is not a directory).\n\n\
              Writing is partial, and every other shape is refused by name rather than \
              attempted: a new file (v5, one extent), an empty file given contents, a \
              same-length overwrite in place, mkdir, rm, rmdir, ln, mv and truncate (v5). A journalled \
@@ -1103,6 +1106,34 @@ fn write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     }
 }
 
+/// A namespace verb's refusal by the volume's current state -- a name that
+/// is not there, a name already taken, a part of the path that is not a
+/// directory, a directory that is not empty -- is the CLI contract's exit 4,
+/// `refused` (rust-fs-core's `EXIT_REFUSED`). `Err` hands every other error
+/// back.
+fn state_refusal(what: &[u8], e: fs_xfs::Error) -> Result<CliError, fs_xfs::Error> {
+    use fs_xfs::Error;
+    match e {
+        Error::NotFound
+        | Error::AlreadyExists
+        | Error::NotADirectory
+        | Error::DirectoryNotEmpty => {
+            Ok(CliError::refused_by_state(format!("{}: {e}", show(what))))
+        }
+        other => Err(other),
+    }
+}
+
+/// [`xfs_error`] for a namespace verb: its state refusals are exit 4.
+fn state_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+    state_refusal(what, e).unwrap_or_else(|e| xfs_error(what, e))
+}
+
+/// [`write_error`] for a namespace verb: its state refusals are exit 4.
+fn state_write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+    state_refusal(what, e).unwrap_or_else(|e| write_error(what, e))
+}
+
 /// Release a volume a journalled verb has changed, clean: `unmount` writes
 /// the change home, puts the summary counters right and ends the log with
 /// an unmount record (#439), so `get dirty` is false afterwards and the
@@ -1268,13 +1299,13 @@ fn mkdir(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
     let fs = super::device::mount_rw(target, offset)?;
     let parent = fs
         .open_bytes(parent_path)
-        .map_err(|e| xfs_error(parent_path, e))?;
+        .map_err(|e| state_error(parent_path, e))?;
     if !parent.is_dir() {
-        return Err(xfs_error(parent_path, fs_xfs::Error::NotADirectory));
+        return Err(state_error(parent_path, fs_xfs::Error::NotADirectory));
     }
     let (ino, _) = fs
         .create_directory(parent.inode().ino, name, DIR_MODE)
-        .map_err(|e| write_error(path, e))?;
+        .map_err(|e| state_write_error(path, e))?;
     release_clean(fs, path)?;
     let report = Json::object([("path", Json::from(show(path))), ("inode", Json::from(ino))]);
     Ok(Outcome::report(report).with_text(format!("created {}", show(path))))
@@ -1291,7 +1322,7 @@ fn ln(
 ) -> Result<Outcome, CliError> {
     let (parent_path, name) = split_path(path)?;
     if path.ends_with(b"/") {
-        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+        return Err(state_error(path, fs_xfs::Error::NotADirectory));
     }
     if name.len() > usize::from(u8::MAX) || name.contains(&0) {
         return Err(CliError::refused(
@@ -1310,14 +1341,14 @@ fn ln(
         }
         let parent = fs
             .open_bytes(parent_path)
-            .map_err(|e| write_error(path, e))?;
+            .map_err(|e| state_write_error(path, e))?;
         if !parent.is_dir() {
-            return Err(xfs_error(parent_path, fs_xfs::Error::NotADirectory));
+            return Err(state_error(parent_path, fs_xfs::Error::NotADirectory));
         }
         match parent.open_child(name) {
-            Ok(_) => return Err(xfs_error(path, fs_xfs::Error::AlreadyExists)),
+            Ok(_) => return Err(state_error(path, fs_xfs::Error::AlreadyExists)),
             Err(fs_xfs::Error::NotFound) => {}
-            Err(e) => return Err(xfs_error(path, e)),
+            Err(e) => return Err(state_error(path, e)),
         }
         let ino = if symbolic {
             let max = fs_xfs::format::symlink::XFS_SYMLINK_MAX_TARGET;
@@ -1328,10 +1359,12 @@ fn ln(
             }
             None
         } else {
-            let file = fs.open_bytes(source).map_err(|e| write_error(source, e))?;
+            let file = fs
+                .open_bytes(source)
+                .map_err(|e| state_write_error(source, e))?;
             let inode = file.inode();
             if source.ends_with(b"/") && !file.is_dir() {
-                return Err(xfs_error(source, fs_xfs::Error::NotADirectory));
+                return Err(state_error(source, fs_xfs::Error::NotADirectory));
             }
             if file.is_dir() {
                 return Err(CliError::refused(format!(
@@ -1340,7 +1373,7 @@ fn ln(
                 )));
             }
             if inode.nlink == 0 {
-                return Err(xfs_error(source, fs_xfs::Error::NotFound));
+                return Err(state_error(source, fs_xfs::Error::NotFound));
             }
             if inode.nlink >= (1 << 31) - 1 {
                 return Err(CliError::refused(format!(
@@ -1358,12 +1391,12 @@ fn ln(
     let ino = match source_ino {
         Some(ino) => {
             fs.link(ino, parent_ino, name)
-                .map_err(|e| write_error(path, e))?;
+                .map_err(|e| state_write_error(path, e))?;
             ino
         }
         None => {
             fs.create_symlink(parent_ino, name, source)
-                .map_err(|e| write_error(path, e))?
+                .map_err(|e| state_write_error(path, e))?
                 .0
         }
     };
@@ -1413,12 +1446,12 @@ fn mkdir_parents(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome,
         }
         match fs.open_bytes(&current) {
             Ok(file) if file.is_dir() => {}
-            Ok(_) => return Err(xfs_error(&current, fs_xfs::Error::NotADirectory)),
+            Ok(_) => return Err(state_error(&current, fs_xfs::Error::NotADirectory)),
             Err(fs_xfs::Error::NotFound) => {
                 planned.insert(current.clone());
                 missing.push(current.clone());
             }
-            Err(e) => return Err(write_error(&current, e)),
+            Err(e) => return Err(state_write_error(&current, e)),
         }
     }
     if !missing.is_empty() {
@@ -1438,9 +1471,9 @@ fn mkdir_parents(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome,
                 let (parent_path, name) = split_path(directory)?;
                 let parent = fs
                     .open_bytes(parent_path)
-                    .map_err(|e| write_error(parent_path, e))?;
+                    .map_err(|e| state_write_error(parent_path, e))?;
                 fs.create_directory(parent.inode().ino, name, DIR_MODE)
-                    .map_err(|e| write_error(directory, e))?;
+                    .map_err(|e| state_write_error(directory, e))?;
             }
             Ok::<_, CliError>(())
         })();
@@ -1536,24 +1569,26 @@ fn truncate(target: &OsString, offset: u64, path: &[u8], size: u64) -> Result<Ou
     if fs.was_replayed() {
         return Err(super::device::dirty_log(&target.to_string_lossy()));
     }
-    let file = fs.open_bytes(path).map_err(|e| write_error(path, e))?;
+    let file = fs
+        .open_bytes(path)
+        .map_err(|e| state_write_error(path, e))?;
     if path.ends_with(b"/") && !file.is_dir() {
-        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+        return Err(state_error(path, fs_xfs::Error::NotADirectory));
     }
     let ino = file.inode().ino;
     let preview = Filesystem::mount_rw(Arc::new(TruncatePreview {
         source: fs,
         writes: Mutex::new(Vec::new()),
     }))
-    .map_err(|e| write_error(path, e))?;
+    .map_err(|e| state_write_error(path, e))?;
     preview
         .truncate_to(ino, size)
-        .map_err(|e| write_error(path, e))?;
+        .map_err(|e| state_write_error(path, e))?;
     release_clean(preview, path)?;
 
     let fs = super::device::mount_rw(target, offset)?;
     fs.truncate_to(ino, size)
-        .map_err(|e| write_error(path, e))?;
+        .map_err(|e| state_write_error(path, e))?;
     release_clean(fs, path)?;
     Ok(Outcome::report(Json::object([
         ("path", Json::from(show(path))),
@@ -1597,7 +1632,7 @@ fn remove(
         Removal::Name => fs.unlink_file(parent, name),
         Removal::Directory => fs.remove_directory(parent, name),
     }
-    .map_err(|e| write_error(path, e))?;
+    .map_err(|e| state_write_error(path, e))?;
     release_clean(fs, path)?;
     let mut fields = named(path);
     fields.push(("removed", Json::from(true)));
@@ -1632,9 +1667,9 @@ fn last_name(path: &[u8]) -> (&[u8], &[u8], bool) {
 /// The directory `dir` names, which holds `path`'s last name; its errors
 /// name `path`.
 fn parent_dir<'f>(fs: &'f Filesystem, path: &[u8], dir: &[u8]) -> Result<File<'f>, CliError> {
-    let parent = fs.open_bytes(dir).map_err(|e| write_error(path, e))?;
+    let parent = fs.open_bytes(dir).map_err(|e| state_write_error(path, e))?;
     if !parent.is_dir() {
-        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+        return Err(state_error(path, fs_xfs::Error::NotADirectory));
     }
     Ok(parent)
 }
@@ -1667,7 +1702,7 @@ fn removable<'p>(
     }
     let failed = |why: &str| CliError::failed(format!("{}: {why}", show(path)));
     if path.is_empty() {
-        return Err(xfs_error(path, fs_xfs::Error::NotFound));
+        return Err(state_error(path, fs_xfs::Error::NotFound));
     }
     let (dir, name, trailing_slash) = last_name(path);
     if name.is_empty() {
@@ -1683,23 +1718,27 @@ fn removable<'p>(
             return Err(failed("invalid argument: rmdir cannot remove `.`"))
         }
         (Removal::Directory, b"..") => {
-            return Err(xfs_error(path, fs_xfs::Error::DirectoryNotEmpty))
+            return Err(state_error(path, fs_xfs::Error::DirectoryNotEmpty))
         }
         _ => {}
     }
-    let child = parent.open_child(name).map_err(|e| xfs_error(path, e))?;
+    let child = parent.open_child(name).map_err(|e| state_error(path, e))?;
     match removal {
         Removal::Name if child.is_dir() => return Err(failed("is a directory")),
         Removal::Name if trailing_slash => {
-            return Err(xfs_error(path, fs_xfs::Error::NotADirectory))
+            return Err(state_error(path, fs_xfs::Error::NotADirectory))
         }
         Removal::Name => {}
         Removal::Directory if !child.is_dir() => {
-            return Err(xfs_error(path, fs_xfs::Error::NotADirectory))
+            return Err(state_error(path, fs_xfs::Error::NotADirectory))
         }
         Removal::Directory => {
-            if !child.entries().map_err(|e| xfs_error(path, e))?.is_empty() {
-                return Err(xfs_error(path, fs_xfs::Error::DirectoryNotEmpty));
+            if !child
+                .entries()
+                .map_err(|e| state_error(path, e))?
+                .is_empty()
+            {
+                return Err(state_error(path, fs_xfs::Error::DirectoryNotEmpty));
             }
         }
     }
@@ -1732,7 +1771,7 @@ fn mv(target: &OsString, offset: u64, source: &[u8], path: &[u8]) -> Result<Outc
     let names = movable(&super::device::mount(target, offset)?, target, source, path)?;
     let fs = super::device::mount_rw(target, offset)?;
     fs.rename(names.from_dir, names.from, names.to_dir, names.to)
-        .map_err(|e| write_error(source, e))?;
+        .map_err(|e| state_write_error(source, e))?;
     release_clean(fs, path)?;
     let mut fields = named(path);
     fields.push(("moved", Json::from(true)));
@@ -1773,7 +1812,7 @@ fn movable<'a>(
     }
     for given in [source, path] {
         if given.is_empty() {
-            return Err(xfs_error(given, fs_xfs::Error::NotFound));
+            return Err(state_error(given, fs_xfs::Error::NotFound));
         }
     }
     let (from_dir, from, from_slash) = last_name(source);
@@ -1790,7 +1829,7 @@ fn movable<'a>(
     }
     let moved = from_parent
         .open_child(from)
-        .map_err(|e| xfs_error(source, e))?;
+        .map_err(|e| state_error(source, e))?;
     if to.len() > NAME_MAX {
         return Err(CliError::failed(format!(
             "{}: file name too long: a name is at most {NAME_MAX} bytes",
@@ -1799,10 +1838,10 @@ fn movable<'a>(
     }
     if !moved.is_dir() && (from_slash || to_slash) {
         let given = if from_slash { source } else { path };
-        return Err(xfs_error(given, fs_xfs::Error::NotADirectory));
+        return Err(state_error(given, fs_xfs::Error::NotADirectory));
     }
     if moved.is_dir()
-        && on_the_way(fs, to_dir, moved.inode().ino).map_err(|e| xfs_error(path, e))?
+        && on_the_way(fs, to_dir, moved.inode().ino).map_err(|e| state_error(path, e))?
     {
         return Err(CliError::failed(format!(
             "{}: invalid argument: a directory cannot be moved beneath itself, to {}",
@@ -1816,20 +1855,20 @@ fn movable<'a>(
             (false, true) => {
                 return Err(CliError::failed(format!("{}: is a directory", show(path))))
             }
-            (true, false) => return Err(xfs_error(path, fs_xfs::Error::NotADirectory)),
+            (true, false) => return Err(state_error(path, fs_xfs::Error::NotADirectory)),
             (true, true) => {
                 if !existing
                     .entries()
-                    .map_err(|e| xfs_error(path, e))?
+                    .map_err(|e| state_error(path, e))?
                     .is_empty()
                 {
-                    return Err(xfs_error(path, fs_xfs::Error::DirectoryNotEmpty));
+                    return Err(state_error(path, fs_xfs::Error::DirectoryNotEmpty));
                 }
             }
             (false, false) => {}
         },
         Err(fs_xfs::Error::NotFound) => {}
-        Err(e) => return Err(xfs_error(path, e)),
+        Err(e) => return Err(state_error(path, e)),
     }
     Ok(Move {
         from_dir: from_parent.inode().ino,

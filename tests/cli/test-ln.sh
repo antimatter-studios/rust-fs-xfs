@@ -51,14 +51,14 @@ refused() {
     check "ln $* leaves image byte-identical" cmp -s "$base" "$SANDBOX/refused.img"
 }
 v5="$SHARE/xfscli-v5.img"
-refused 1 'already exists' "$v5" /small.txt /empty
-refused 1 'already exists' "$v5" -s anywhere /link-short
-refused 1 'no such file' "$v5" /small.txt /missing/name
-refused 1 'no such file' "$v5" -s anywhere /missing/name
-refused 1 'no such file' "$v5" /missing /new
-refused 1 'not a directory' "$v5" /small.txt /small.txt/name
-refused 1 'not a directory' "$v5" /small.txt /link-short/name
-refused 1 'not a directory' "$v5" /small.txt /new/
+refused 4 'already exists' "$v5" /small.txt /empty
+refused 4 'already exists' "$v5" -s anywhere /link-short
+refused 4 'no such file' "$v5" /small.txt /missing/name
+refused 4 'no such file' "$v5" -s anywhere /missing/name
+refused 4 'no such file' "$v5" /missing /new
+refused 4 'not a directory' "$v5" /small.txt /small.txt/name
+refused 4 'not a directory' "$v5" /small.txt /link-short/name
+refused 4 'not a directory' "$v5" /small.txt /new/
 refused 3 'directory' "$v5" /sub /new
 refused 3 'most.*links|links.*most' "$SHARE/xfscli-maxlinks.img" /small.txt /new
 refused 3 'v4 filesystem is not supported' "$SHARE/xfscli-v4.img" /small.txt /new
