@@ -547,6 +547,16 @@ fn xfs_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     CliError::failed(format!("{}: {e}", show(what)))
 }
 
+/// A reading verb's open: a path that does not exist is rust-fs-core's
+/// `not_found` kind, exit 1, which a script matches whatever the message
+/// says; every other error is the driver's.
+fn read_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+    match e {
+        fs_xfs::Error::NotFound => CliError::not_found(format!("{}: {e}", show(what))),
+        e => xfs_error(what, e),
+    }
+}
+
 fn type_name(t: Option<FileType>) -> &'static str {
     match t {
         Some(FileType::Regular) => "file",
@@ -634,7 +644,7 @@ fn listed(fs: &Filesystem, path: &[u8], name: &[u8], ino: u64) -> Result<Json, C
 }
 
 fn ls(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
-    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    let file = fs.open_bytes(path).map_err(|e| read_error(path, e))?;
     let entries = if file.is_dir() {
         let mut listed_entries = Vec::new();
         for d in file.entries().map_err(|e| xfs_error(path, e))? {
@@ -686,7 +696,7 @@ fn inode_flag_names(mut bits: u64, names: &[&str]) -> Json {
 /// XFS's inode layout is documented in XFS Filesystem Structure, "On-disk
 /// Inode"; cli_stat_kernel holds the decoded values to Linux and xfsprogs.
 fn stat(fs: &Filesystem, path: &[u8]) -> Result<Outcome, CliError> {
-    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    let file = fs.open_bytes(path).map_err(|e| read_error(path, e))?;
     let inode = file.inode();
     let raw = file.raw();
     let v3 = inode.version == 3;
@@ -843,7 +853,7 @@ fn ls_recursive(
     sub: &ArgMatches,
     format: CliFormat,
 ) -> Result<Outcome, CliError> {
-    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    let file = fs.open_bytes(path).map_err(|e| read_error(path, e))?;
     let max_depth = sub.get_one::<u64>("max-depth").copied().unwrap_or(64);
     let limit = sub.get_one::<u64>("limit").copied().unwrap_or(100_000);
     let mut start = Vec::new();
@@ -1012,7 +1022,7 @@ fn xattr(
 /// came before stays on stdout. `-o FILE` writes `FILE.partial` and renames
 /// it, so FILE is never left half written.
 fn read(fs: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outcome, CliError> {
-    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    let file = fs.open_bytes(path).map_err(|e| read_error(path, e))?;
     if file.is_dir() {
         return Err(CliError::failed(format!("{}: is a directory", show(path))));
     }

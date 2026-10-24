@@ -52,7 +52,7 @@ for version in v5 v4; do
     fs.xfs "$img" ls -R /missing >"$SANDBOX/missing.out" 2>"$SANDBOX/missing.err"
     check "$version: missing start exits 1" test $? -eq 1
     check "$version: missing start prints no report" test ! -s "$SANDBOX/missing.out"
-    jq_check "$version: missing start has a structured error" '.code==1' "$SANDBOX/missing.err"
+    jq_check "$version: missing start is the not_found kind" '.code==1 and .kind=="not_found"' "$SANDBOX/missing.err"
     check "$version: listing leaves the image unchanged" cmp -s "$img" "$SANDBOX/before.img"
 done
 

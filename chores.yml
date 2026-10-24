@@ -122,7 +122,9 @@ vars:
   # v7 (one stack per repository) and the stack-base.sh that names its top.
   # v0.3.13 carries the features-check.sh that `chore lint` runs and the
   # features-gather.sh a release commit runs (features.d fragments).
-  FS_CORE_REF: v0.3.17
+  # v0.4.2 has `CliError::not_found`, the kind a reading verb gives a path
+  # that does not exist, builds on Rust 1.89, and carries agent-core v8.
+  FS_CORE_REF: v0.4.2
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run gives the VM and the machine-wide slot back

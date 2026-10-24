@@ -57,7 +57,7 @@ check "stat --text /f names the type" grep -qx 'type: file' "$SANDBOX/f.txt"
 fs.xfs "$img" stat /missing >"$SANDBOX/m.out" 2>"$SANDBOX/m.err"
 check "stat of a missing path exits 1" test $? -eq 1
 check "stat of a missing path prints nothing on stdout" test ! -s "$SANDBOX/m.out"
-jq_check "stat of a missing path says not found" '.code == 1 and (.error | test("no such file"))' "$SANDBOX/m.err"
+jq_check "stat of a missing path is the not_found kind" '.code == 1 and .kind == "not_found"' "$SANDBOX/m.err"
 fs.xfs "$img" stat >"$SANDBOX/u.out" 2>"$SANDBOX/u.err"
 check "stat with no path is a usage error" test $? -eq 2
 check "stat with no path prints nothing on stdout" test ! -s "$SANDBOX/u.out"
