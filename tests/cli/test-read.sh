@@ -83,19 +83,24 @@ $(diff "$SANDBOX/want" "$SANDBOX/got" | head -20)"
         test "$(sha256 <"$SANDBOX/medium.out")" = "$(awk -F'\t' '$1 == "/medium.bin" { print $6 }' "$manifest")"
     check "$name: read -o leaves no .partial behind" test ! -e "$SANDBOX/medium.out.partial"
 
-    # Refusals: status 1, a structured error naming why, nothing on stdout.
-    for case in "/sub:is a directory" "/link-short:is a symlink to small.txt" "/missing:no such file" "/sub/nested/file.txt/x:not a directory"; do
+    # Refusals: status 1, a structured error naming why, nothing on stdout,
+    # and no kind: only a missing path has one.
+    for case in "/sub:is a directory" "/link-short:is a symlink to small.txt" "/sub/nested/file.txt/x:not a directory"; do
         path="${case%%:*}"
         why="${case#*:}"
         fs.xfs "$img" read "$path" >"$SANDBOX/r.out" 2>"$SANDBOX/r.err"
         check "$name: read $path exits 1" test $? -eq 1
         check "$name: read $path prints nothing on stdout" test ! -s "$SANDBOX/r.out"
-        jq_check "$name: read $path says '$why'" ".code == 1 and (.error | test(\"$why\"))" "$SANDBOX/r.err"
+        jq_check "$name: read $path says '$why'" ".code == 1 and (.error | test(\"$why\")) and .kind == null" "$SANDBOX/r.err"
     done
-    fs.xfs "$img" ls /missing >"$SANDBOX/lm.out" 2>"$SANDBOX/lm.err"
-    check "$name: ls of a missing path exits 1" test $? -eq 1
-    check "$name: ls of a missing path prints nothing on stdout" test ! -s "$SANDBOX/lm.out"
-    jq_check "$name: ls of a missing path says so" '.code == 1 and (.error | test("no such file"))' "$SANDBOX/lm.err"
+    # A path that does not exist is rust-fs-core's not_found kind, exit 1,
+    # whatever its message says.
+    for verb in read ls; do
+        fs.xfs "$img" "$verb" /missing >"$SANDBOX/nf.out" 2>"$SANDBOX/nf.err"
+        check "$name: $verb of a missing path exits 1" test $? -eq 1
+        check "$name: $verb of a missing path prints nothing on stdout" test ! -s "$SANDBOX/nf.out"
+        jq_check "$name: $verb of a missing path is the not_found kind" '.code == 1 and .kind == "not_found"' "$SANDBOX/nf.err"
+    done
 done
 
 # A copy whose /small.txt inode fails its CRC (v5): every verb that reads
