@@ -32,16 +32,18 @@ use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgAction, ArgMatches};
 use fs_core::cli::transfer::{
-    import_args_with_tree, import_tree_with_sparse, import_with_sparse, FileSink, ImportOptions,
-    ImportRequest, ImportTreeOptions, SparseOptions, TreeSink,
+    import_args_with_xattrs, import_tree_with_sparse, import_tree_with_xattrs, import_with_sparse,
+    ExtendedAttribute, FileSink, ImportOptions, ImportRequest, ImportTreeOptions, SparseOptions,
+    TreeSink, XattrOptions,
 };
 use fs_core::cli::{CliError, Outcome};
+use fs_xfs::attr_write::XattrMode;
 use fs_xfs::inode::Timestamp;
 use fs_xfs::write::AttrChange;
 use fs_xfs::Filesystem;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::export::bytes_of;
+use super::export::{bytes_of, xattrs_usable};
 use super::fs::{
     release_clean, show, split_path, state_error, state_write_error, write_error, xfs_error,
     DIR_MODE, FILE_MODE,
@@ -49,7 +51,7 @@ use super::fs::{
 
 /// The arguments `import` takes: the shared tree set, and `--verify`.
 pub fn args() -> [Arg; 7] {
-    let [source, path, replace, recursive, depth, preserve] = import_args_with_tree();
+    let [source, path, replace, recursive, depth, preserve] = import_args_with_xattrs();
     [
         source,
         path,
@@ -452,6 +454,24 @@ impl TreeSink for Sink {
             .map_err(|e| write_error(&what, e))?;
         release_clean(fs, &what)
     }
+
+    /// Set one host attribute under the name the host gave it. A name
+    /// outside the user, trusted and security namespaces, or an ACL, is
+    /// refused by the library, and so is the item, never the attribute
+    /// dropped.
+    fn set_extended_attribute(
+        &mut self,
+        path: &Path,
+        attribute: &ExtendedAttribute,
+    ) -> Result<(), CliError> {
+        let what = bytes_of(path);
+        let name = bytes_of(Path::new(&attribute.name));
+        let fs = self.mount_rw()?;
+        let file = fs.open_bytes(&what).map_err(|e| state_error(&what, e))?;
+        fs.set_xattr(file.inode().ino, &name, &attribute.value, XattrMode::Set)
+            .map_err(|e| write_error(&what, e))?;
+        release_clean(fs, &what)
+    }
 }
 
 /// A time as the format stores it: seconds from the epoch, negative before
@@ -479,12 +499,17 @@ pub fn import(target: &OsString, offset: u64, sub: &ArgMatches) -> Result<Outcom
     let tree = ImportTreeOptions::from_matches(sub)?;
     let options = ImportOptions::from_matches(sub)?;
     let sparse = SparseOptions::from_matches(sub)?;
+    let xattrs = XattrOptions::from_matches(sub)?;
+    xattrs_usable(xattrs, tree.recursive, sparse)?;
     let mut sink = Sink::new(target, offset);
     if tree.recursive {
         if options.verify {
             return Err(CliError::usage(
                 "--verify reads one staged file back; it does not apply to --recursive",
             ));
+        }
+        if xattrs.preserve_xattrs {
+            return import_tree_with_xattrs(&request, Some(&mut sink), tree, xattrs);
         }
         return import_tree_with_sparse(&request, Some(&mut sink), tree, sparse);
     }

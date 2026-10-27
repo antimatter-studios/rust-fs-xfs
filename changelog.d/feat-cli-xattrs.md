@@ -1,0 +1,2 @@
+### Added
+- `fs.xfs export --recursive --preserve=xattrs` writes each item's extended attributes to the host, and `fs.xfs import --recursive --preserve=xattrs` stores the host's attributes in the image. An attribute in a namespace XFS cannot hold, or one the host refuses, refuses its item in the shared report and is never dropped; `--preserve=xattrs` without `--recursive`, or with `sparse`, is a usage error.
