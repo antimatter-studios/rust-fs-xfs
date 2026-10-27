@@ -306,3 +306,85 @@ fn an_import_killed_between_persist_and_publish_leaves_the_old_file_and_a_clean_
     }
     panic!("no attempt caught the import between persist and publish");
 }
+
+#[test]
+fn import_preserving_links_and_times_is_what_the_kernel_reads() {
+    let volume = copy(&fixture("xfscli-v5.img"), "links");
+    let image = volume.path().to_str().unwrap();
+    let tree = scratch::dir(SUITE).join(format!("{}-links", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tree);
+    std::fs::create_dir_all(tree.join("d")).unwrap();
+    std::fs::write(tree.join("f1"), b"data\n").unwrap();
+    std::fs::hard_link(tree.join("f1"), tree.join("d/f2")).unwrap();
+    std::fs::hard_link(tree.join("f1"), tree.join("f3")).unwrap();
+    std::os::unix::fs::symlink("f1", tree.join("rel")).unwrap();
+    std::os::unix::fs::symlink("/abs/target", tree.join("abs")).unwrap();
+    for path in ["f1", "d"] {
+        // touch -t reads local time; UTC pins the expected epoch on every host.
+        ok(std::process::Command::new("touch").env("TZ", "UTC").args([
+            "-t",
+            "202001020304.05",
+            tree.join(path).to_str().unwrap(),
+        ]));
+    }
+    let out = ok(tool("fs.xfs").args([
+        image,
+        "import",
+        "--recursive",
+        "--preserve=times,links",
+        tree.to_str().unwrap(),
+        "/t",
+    ]));
+    assert_eq!(json_field(&stdout(&out), "failed"), "0", "{}", stdout(&out));
+    assert_eq!(
+        json_field(&stdout(&out), "refused"),
+        "0",
+        "{}",
+        stdout(&out)
+    );
+
+    let out = kernel_run(&format!(
+        r#"
+        sync; echo 3 > /proc/sys/vm/drop_caches
+        work=$(mktemp -d)
+        trap 'mountpoint -q "$work/m" && umount "$work/m"; rm -rf "$work"' EXIT
+        cp --sparse=always {image} "$work/image"
+        mkdir "$work/m"
+        mount -o loop,nouuid "$work/image" "$work/m" && echo MOUNT_OK
+        for f in t/f1 t/d/f2 t/f3; do echo "LINKS $(stat -c '%h' "$work/m/$f") $(stat -c '%i' "$work/m/$f")"; done
+        echo "REL $(readlink "$work/m/t/rel")"
+        echo "ABS $(readlink "$work/m/t/abs")"
+        for f in t/f1 t/d; do echo "TIMES $(stat -c '%Y %X' "$work/m/$f")"; done
+        umount "$work/m" || echo UMOUNT_FAILED
+        {repair}
+        echo DONE
+        "#,
+        image = guest_quote(image),
+        repair = repair::script("\"$work/image\""),
+    ));
+    assert!(
+        out.contains("MOUNT_OK"),
+        "the kernel would not mount it:\n{out}"
+    );
+    assert!(!out.contains("UMOUNT_FAILED"), "{out}");
+    repair::assert_agreed(&out, "the volume import --preserve=times,links left");
+    let links: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("LINKS "))
+        .collect();
+    assert_eq!(links.len(), 3, "{out}");
+    let inode = |l: &str| l.split(' ').nth(1).unwrap().to_string();
+    assert!(
+        links.iter().all(|l| l.starts_with("3 "))
+            && links.iter().all(|l| inode(l) == inode(links[0])),
+        "the three names are not one inode of link count 3: {links:?}"
+    );
+    assert!(out.lines().any(|l| l == "REL f1"), "{out}");
+    assert!(out.lines().any(|l| l == "ABS /abs/target"), "{out}");
+    let times: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("TIMES "))
+        .collect();
+    assert_eq!(times, ["1577934245 1577934245"; 2], "{out}");
+    let _ = std::fs::remove_dir_all(&tree);
+}

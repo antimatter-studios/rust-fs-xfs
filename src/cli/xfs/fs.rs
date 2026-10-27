@@ -224,8 +224,9 @@ fn command() -> Cmd {
                      never half written. An existing PATH is refused unless --replace, \
                      which replaces it in the one rename. A failed import removes the \
                      staged file and leaves PATH as it was. With --recursive every item \
-                     is reported as completed, skipped, refused or failed. v5 only; \
-                     links, times and sparse files are refused.",
+                     is reported as completed, skipped, refused or failed. --preserve=times,links \
+                     keeps times, hard links and symbolic links. v5 only; sparse files \
+                     are refused.",
                 ),
         )
         .subcommand(
