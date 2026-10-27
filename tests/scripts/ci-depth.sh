@@ -22,7 +22,8 @@ planner = planner_step["run"]
 # GitHub sets every declared step variable, empty when its expression is, so
 # the planner runs here with exactly the declared names and nothing inherited.
 planner_env = {k: "" for k in planner_step.get("env", {})}
-assert {"EVENT", "REF", "MQ_BASE", "MQ_HEAD", "PUSH_BEFORE", "PUSH_AFTER"} <= set(planner_env), planner_env
+assert {"EVENT", "REF", "MQ_BASE", "MQ_HEAD", "PUSH_BEFORE", "PUSH_AFTER",
+        "TITLE"} <= set(planner_env), planner_env
 aggregate = next(s for s in jobs["ci-ok"]["steps"] if "NEEDS" in s.get("env", {}))
 full = set(json.loads(aggregate["env"]["FULL_JOBS"]))
 assert full <= set(jobs), "the aggregate must not exempt nonexistent jobs"
@@ -74,6 +75,15 @@ with tempfile.TemporaryDirectory() as tmp:
         ("unexpected", "", "true"),
     ]:
         assert plan(tmp, event, ref) == ["code=" + decision], (event, ref)
+    # A red pull request is the red evidence, so it runs the VM tiers too;
+    # any other title, "red:" anywhere but the start included, does not.
+    for title, decision in [
+        ("red: a kill is graded after replay", "true"),
+        ("fix: a kill is graded after replay", "false"),
+        ("fix: red: not a prefix", "false"),
+    ]:
+        assert plan(tmp, "pull_request", "refs/pull/1/merge", TITLE=title) == \
+            ["code=" + decision], title
 
 # A real merge group: a temporary repository with a documentation-only commit
 # and a code commit on top, beside the real rust-fs-core sibling the step

@@ -146,15 +146,23 @@ jobs:
           MQ_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.event.after }}
+          TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
           # Pull requests, every stack layer included, run the quick jobs
           # only; the merge queue runs the full pipeline on the tree it is
           # about to land. Any other or unknown event runs everything.
+          # A pull request titled "red:" runs everything too: it holds a
+          # failing test, and its run is the red evidence, which a test in
+          # a VM tier cannot give from the quick jobs (#581).
           range=
           code=
           case "$EVENT" in
-            pull_request) code=false ;;
+            pull_request)
+              case "$TITLE" in
+                red:*) code=true ;;
+                *) code=false ;;
+              esac ;;
             merge_group) [ -z "$MQ_BASE" ] || [ -z "$MQ_HEAD" ] || range="$MQ_BASE...$MQ_HEAD" ;;
             push)
               case "$REF" in
