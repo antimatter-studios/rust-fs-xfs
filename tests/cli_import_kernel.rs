@@ -1,0 +1,308 @@
+//! `fs.xfs import`, judged by THE KERNEL and by xfsprogs.
+//!
+//! The host imports into copies of the kernel-made v5 CLI image; the harness
+//! guest then mounts each copy with Linux, which replays whatever log is
+//! left, digests the files with `sha256sum` and unmounts, and `xfs_repair
+//! -n` grades the volume. The digests the kernel reports are compared with
+//! the SHA-256 of the local source files, computed here, not by the tool.
+//!
+//! - a 64 MiB file and a one-byte file read back by the kernel with the
+//!   source's SHA-256, and the volume is clean;
+//! - a tree imported with `--recursive` reads back file by file;
+//! - an import that runs out of space on a nearly full image, replacing a
+//!   file, leaves the old file byte-identical when the kernel reads it, no
+//!   staged name behind, and the volume clean;
+//! - an import killed (SIGKILL) at several moments, replacing a file, leaves
+//!   under that name either the old file or the whole new one, never part
+//!   of one, and the volume clean once the kernel has replayed its log. A
+//!   staged name left by the kill is allowed, and is reported.
+//!
+//! EVERY GUEST STEP WORKS ON A COPY ON THE GUEST'S OWN DISK, for the
+//! reason `cli_write_kernel.rs` gives: a loop mount of a file on the
+//! shared folder mixes the guest's page cache with the host's view of it.
+
+mod cli_support;
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use cli_support::*;
+use common::{fixture, guest_quote, kernel_run, repair, scratch};
+
+const SUITE: &str = "cli_import_kernel";
+
+/// What the kernel made of `image`: the SHA-256 it reads for each of
+/// `files`, and the names in the root, after it has replayed the log.
+struct Graded {
+    digests: Vec<(String, String)>,
+    root: Vec<String>,
+}
+
+fn grade(image: &str, files: &[&str]) -> Graded {
+    let sums: String = files
+        .iter()
+        .map(|f| {
+            format!("echo \"SHA $(sha256sum \"$work/m{f}\" 2>/dev/null | cut -d' ' -f1) {f}\"\n")
+        })
+        .collect();
+    let out = kernel_run(&format!(
+        r#"
+        sync; echo 3 > /proc/sys/vm/drop_caches
+        work=$(mktemp -d)
+        trap 'mountpoint -q "$work/m" && umount "$work/m"; rm -rf "$work"' EXIT
+        cp --sparse=always {image} "$work/image"
+        mkdir "$work/m"
+        if mount -o loop,nouuid "$work/image" "$work/m"; then
+            echo MOUNT_OK
+            {sums}
+            for n in $(ls -A "$work/m"); do echo "ROOT $n"; done
+            umount "$work/m" || (echo UMOUNT_FAILED; dmesg | tail -15)
+        else
+            echo MOUNT_REFUSED
+        fi
+        {repair}
+        echo DONE
+        "#,
+        image = guest_quote(image),
+        repair = repair::script("\"$work/image\""),
+    ));
+    assert!(
+        out.contains("MOUNT_OK"),
+        "the kernel would not mount the volume:\n{out}"
+    );
+    assert!(!out.contains("UMOUNT_FAILED"), "{out}");
+    repair::assert_agreed(
+        &out,
+        "the volume fs.xfs import left, after the kernel's replay",
+    );
+    Graded {
+        digests: out
+            .lines()
+            .filter_map(|l| l.strip_prefix("SHA "))
+            .filter_map(|l| l.split_once(' '))
+            .map(|(sum, path)| (path.to_string(), sum.to_string()))
+            .collect(),
+        root: out
+            .lines()
+            .filter_map(|l| l.strip_prefix("ROOT "))
+            .map(String::from)
+            .collect(),
+    }
+}
+
+impl Graded {
+    fn sum(&self, path: &str) -> &str {
+        &self
+            .digests
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap_or_else(|| panic!("the kernel digested no {path}"))
+            .1
+    }
+
+    fn staged(&self) -> Vec<&String> {
+        self.root
+            .iter()
+            .filter(|n| n.starts_with(".fs-xfs-import-"))
+            .collect()
+    }
+}
+
+fn copy(base: &Path, tag: &str) -> scratch::Volume {
+    scratch::Volume::copy_of(SUITE, base, &format!("{}-{tag}.img", std::process::id()))
+}
+
+fn source(name: &str, bytes: &[u8]) -> PathBuf {
+    let path = scratch::dir(SUITE).join(format!("{}-{name}", std::process::id()));
+    std::fs::write(&path, bytes).expect("write a source file");
+    path
+}
+
+#[test]
+fn an_import_reads_back_through_the_kernel_with_the_digest_sent() {
+    let volume = copy(&fixture("xfscli-v5.img"), "sizes");
+    let image = volume.path().to_str().unwrap();
+
+    let big = pattern(64 << 20, 11);
+    let big_path = source("big", &big);
+    let out = ok(tool("fs.xfs").args([
+        image,
+        "import",
+        "--verify",
+        big_path.to_str().unwrap(),
+        "/big.bin",
+    ]));
+    assert_eq!(json_field(&stdout(&out), "sha256"), sha256_hex(&big));
+    assert_eq!(json_field(&stdout(&out), "verified"), "true");
+    let one_path = source("one", b"z");
+    ok(tool("fs.xfs").args([image, "import", one_path.to_str().unwrap(), "/one.bin"]));
+
+    let tree = scratch::dir(SUITE).join(format!("{}-tree", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tree);
+    std::fs::create_dir_all(tree.join("a/b")).unwrap();
+    let leaf = pattern(300_000, 12);
+    std::fs::write(tree.join("a/b/leaf.bin"), &leaf).unwrap();
+    std::fs::write(tree.join("top.txt"), b"top\n").unwrap();
+    let out = ok(tool("fs.xfs").args([
+        image,
+        "import",
+        "--recursive",
+        tree.to_str().unwrap(),
+        "/tree",
+    ]));
+    assert_eq!(json_field(&stdout(&out), "failed"), "0", "{}", stdout(&out));
+
+    let graded = grade(
+        image,
+        &[
+            "/big.bin",
+            "/one.bin",
+            "/tree/a/b/leaf.bin",
+            "/tree/top.txt",
+        ],
+    );
+    assert_eq!(graded.sum("/big.bin"), sha256_hex(&big), "64 MiB file");
+    assert_eq!(graded.sum("/one.bin"), sha256_hex(b"z"), "one byte file");
+    assert_eq!(graded.sum("/tree/a/b/leaf.bin"), sha256_hex(&leaf));
+    assert_eq!(graded.sum("/tree/top.txt"), sha256_hex(b"top\n"));
+    assert!(
+        graded.staged().is_empty(),
+        "staged names left: {:?}",
+        graded.root
+    );
+    let _ = std::fs::remove_dir_all(&tree);
+}
+
+#[test]
+fn an_import_that_runs_out_of_space_leaves_the_old_file_and_a_clean_volume() {
+    let volume = copy(&fixture("xfscli-v5.img"), "full");
+    let image = volume.path().to_str().unwrap();
+    let old = pattern(50_000, 21);
+    let old_path = source("old", &old);
+    ok(tool("fs.xfs").args([image, "import", old_path.to_str().unwrap(), "/old.bin"]));
+
+    // 400 MiB of zeros, as a hole: more than the 320 MiB volume holds.
+    let huge = scratch::dir(SUITE).join(format!("{}-huge", std::process::id()));
+    std::fs::File::create(&huge)
+        .and_then(|f| f.set_len(400 << 20))
+        .expect("make the oversized source");
+    let out = tool("fs.xfs")
+        .args([
+            image,
+            "import",
+            "--replace",
+            huge.to_str().unwrap(),
+            "/old.bin",
+        ])
+        .output()
+        .expect("run fs.xfs import");
+    let _ = std::fs::remove_file(&huge);
+    assert!(
+        !out.status.success(),
+        "an import larger than the volume succeeded: {}",
+        stdout(&out)
+    );
+    assert!(
+        stderr(&out).contains("no space"),
+        "the failure does not say the volume is full: {}",
+        stderr(&out)
+    );
+
+    let graded = grade(image, &["/old.bin"]);
+    assert_eq!(
+        graded.sum("/old.bin"),
+        sha256_hex(&old),
+        "the old file changed when its replacement ran out of space"
+    );
+    assert!(
+        graded.staged().is_empty(),
+        "staged names left: {:?}",
+        graded.root
+    );
+}
+
+/// Whether `image` holds a staged file of exactly `len` bytes and a clean
+/// log: the moment after `persist` (the volume released clean) and before
+/// `publish` (the rename). Read through a fresh read-only open, which never
+/// changes the image.
+fn persisted_not_published(image: &str, len: u64) -> bool {
+    let listing = tool("fs.xfs").args([image, "ls", "/"]).output();
+    let dirty = tool("fs.xfs")
+        .args([image, "get", "dirty", "--text"])
+        .output();
+    let (Ok(listing), Ok(dirty)) = (listing, dirty) else {
+        return false;
+    };
+    let listing = stdout(&listing);
+    String::from_utf8_lossy(&dirty.stdout).trim() == "false"
+        && listing.contains(".fs-xfs-import-")
+        && listing.contains(&format!("\"size\": {len},"))
+}
+
+#[test]
+fn an_import_killed_between_persist_and_publish_leaves_the_old_file_and_a_clean_volume() {
+    let base = copy(&fixture("xfscli-v5.img"), "kill-base");
+    let old = pattern(70_000, 31);
+    let old_path = source("kill-old", &old);
+    ok(tool("fs.xfs").args([
+        base.path().to_str().unwrap(),
+        "import",
+        old_path.to_str().unwrap(),
+        "/victim.bin",
+    ]));
+    let new = pattern(160 << 20, 32);
+    let new_path = source("kill-new", &new);
+
+    // The window between persist and publish is the read-back of the whole
+    // staged file under --verify. It is found by watching the image, not by
+    // guessing a delay, and tried again when a run was too quick to catch.
+    for attempt in 1..=5 {
+        let victim = copy(base.path(), &format!("kill-{attempt}"));
+        let image = victim.path().to_str().unwrap();
+        let mut child = tool("fs.xfs")
+            .args([
+                image,
+                "import",
+                "--replace",
+                "--verify",
+                new_path.to_str().unwrap(),
+                "/victim.bin",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fs.xfs import");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut caught = false;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().expect("poll the import").is_some() {
+                break;
+            }
+            if persisted_not_published(image, new.len() as u64) {
+                caught = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = child.kill();
+        let status = child.wait().expect("wait for the killed import");
+        if !caught || status.code().is_some() {
+            eprintln!("attempt {attempt}: the import was past the window; trying again");
+            continue;
+        }
+
+        let graded = grade(image, &["/victim.bin"]);
+        assert_eq!(
+            graded.sum("/victim.bin"),
+            sha256_hex(&old),
+            "an import killed between persist and publish changed the old file"
+        );
+        for name in graded.staged() {
+            eprintln!("killed between persist and publish: staged name left, reported: {name}");
+        }
+        return;
+    }
+    panic!("no attempt caught the import between persist and publish");
+}

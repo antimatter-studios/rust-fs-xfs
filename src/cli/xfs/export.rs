@@ -28,13 +28,13 @@ pub fn args() -> [clap::Arg; 7] {
 }
 
 #[cfg(unix)]
-fn bytes_of(path: &Path) -> Vec<u8> {
+pub(super) fn bytes_of(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
 }
 
 #[cfg(not(unix))]
-fn bytes_of(path: &Path) -> Vec<u8> {
+pub(super) fn bytes_of(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
 }
 

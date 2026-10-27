@@ -211,6 +211,24 @@ fn command() -> Cmd {
                 ),
         )
         .subcommand(
+            Cmd::new("import")
+                .about("Copy a local file, stdin or a directory tree into the image")
+                .args(super::import::args())
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img import backup.tar /backup.tar\n  \
+                     tar c . | fs.xfs disk.img import - /backup.tar --replace\n  \
+                     fs.xfs disk.img import --recursive site /srv/site\n\n\
+                     SOURCE is a local file, or - for stdin. The bytes are written in \
+                     fixed chunks to a staged file beside PATH, the volume is released \
+                     clean, and only then is the staged file renamed to PATH, so PATH is \
+                     never half written. An existing PATH is refused unless --replace, \
+                     which replaces it in the one rename. A failed import removes the \
+                     staged file and leaves PATH as it was. With --recursive every item \
+                     is reported as completed, skipped, refused or failed. v5 only; \
+                     links, times and sparse files are refused.",
+                ),
+        )
+        .subcommand(
             Cmd::new("export")
                 .about("Copy a file, or a directory tree with --recursive, out of the image")
                 .args(super::export::args())
@@ -512,6 +530,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        "import" => super::import::import(target, offset, sub),
         "export" => super::export::export(&super::device::mount(target, offset)?, target, sub),
         "write" => match sub.get_one::<u64>("at") {
             Some(&at) => write_at(target, offset, path_arg(sub), at),
@@ -1142,12 +1161,12 @@ fn read(fs: &Filesystem, path: &[u8], output: Option<&OsString>) -> Result<Outco
 /// What a new file and a new directory are made with. The library takes
 /// the whole `di_mode`, type bits included: a bare `0o644` makes an inode
 /// of no type at all, which the kernel and xfs_repair reject.
-const FILE_MODE: u16 = 0o100_644;
-const DIR_MODE: u16 = 0o040_755;
+pub(super) const FILE_MODE: u16 = 0o100_644;
+pub(super) const DIR_MODE: u16 = 0o040_755;
 
 /// A driver error from a write verb: a shape the driver refuses is exit 3
 /// with the driver's own reason, anything else a failure.
-fn write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+pub(super) fn write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     match e {
         fs_xfs::Error::UnsupportedFeature(_) | fs_xfs::Error::ReadOnly => {
             CliError::refused(format!("{}: {e}", show(what)))
@@ -1175,12 +1194,12 @@ fn state_refusal(what: &[u8], e: fs_xfs::Error) -> Result<CliError, fs_xfs::Erro
 }
 
 /// [`xfs_error`] for a namespace verb: its state refusals are exit 4.
-fn state_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+pub(super) fn state_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     state_refusal(what, e).unwrap_or_else(|e| xfs_error(what, e))
 }
 
 /// [`write_error`] for a namespace verb: its state refusals are exit 4.
-fn state_write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+pub(super) fn state_write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     state_refusal(what, e).unwrap_or_else(|e| write_error(what, e))
 }
 
@@ -1188,7 +1207,7 @@ fn state_write_error(what: &[u8], e: fs_xfs::Error) -> CliError {
 /// the change home, puts the summary counters right and ends the log with
 /// an unmount record (#439), so `get dirty` is false afterwards and the
 /// next write need not wait for Linux to replay it.
-fn release_clean(fs: Filesystem, what: &[u8]) -> Result<(), CliError> {
+pub(super) fn release_clean(fs: Filesystem, what: &[u8]) -> Result<(), CliError> {
     fs.unmount().map_err(|e| {
         CliError::failed(format!(
             "{}: changed in the log, but the volume could not be released clean: {e}",
@@ -1199,7 +1218,7 @@ fn release_clean(fs: Filesystem, what: &[u8]) -> Result<(), CliError> {
 
 /// `path` split into its parent directory and its last component, which
 /// must be a name: not empty, `.` or `..`.
-fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), CliError> {
+pub(super) fn split_path(path: &[u8]) -> Result<(&[u8], &[u8]), CliError> {
     let trimmed = {
         let mut end = path.len();
         while end > 1 && path[end - 1] == b'/' {
