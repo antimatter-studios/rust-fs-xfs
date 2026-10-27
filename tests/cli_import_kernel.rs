@@ -320,7 +320,8 @@ fn import_preserving_links_and_times_is_what_the_kernel_reads() {
     std::os::unix::fs::symlink("f1", tree.join("rel")).unwrap();
     std::os::unix::fs::symlink("/abs/target", tree.join("abs")).unwrap();
     for path in ["f1", "d"] {
-        ok(std::process::Command::new("touch").args([
+        // touch -t reads local time; UTC pins the expected epoch on every host.
+        ok(std::process::Command::new("touch").env("TZ", "UTC").args([
             "-t",
             "202001020304.05",
             tree.join(path).to_str().unwrap(),
@@ -384,6 +385,6 @@ fn import_preserving_links_and_times_is_what_the_kernel_reads() {
         .lines()
         .filter_map(|l| l.strip_prefix("TIMES "))
         .collect();
-    assert_eq!(times, ["1577930645 1577930645"; 2], "{out}");
+    assert_eq!(times, ["1577934245 1577934245"; 2], "{out}");
     let _ = std::fs::remove_dir_all(&tree);
 }

@@ -740,9 +740,14 @@ tasks:
     # test-mv.sh (#520) add three lines each, at most 95 bytes a file:
     # 38 lines / 1,326 bytes. Half as much again is 57 lines / 2,000 bytes.
     # test-write-at.sh (#524) adds three more: 41 lines / 1,421 bytes, inside it.
+    #
+    # 58 lines / 1,933 bytes with sixteen files, test-export.sh (#529),
+    # test-import.sh (#530) and test-import-preserve.sh (#531) among them,
+    # in merge-queue run 40489652389, over the old 57 lines. Half as much
+    # again is 87 lines / 2,900 bytes.
     cmds:
       - 'scripts/build-fixtures.sh --check cli'
-      - '../rust-fs-core/scripts/tier.sh test:cli cli 57 2000 -- scripts/test-cli.sh'
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 87 2900 -- scripts/test-cli.sh'
       # test-stat.sh adds 28 checks to the existing floor (#517).
       # Recursive listing adds 89 assertions to that floor; rm and rmdir
       # add 108 in test-write.sh and 4 in test-docs.sh (#519).
