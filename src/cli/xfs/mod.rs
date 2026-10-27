@@ -3,6 +3,7 @@
 //! plumbing (that is `fs_core::cli`, in rust-fs-core).
 
 pub mod device;
+pub mod export;
 pub mod fs;
 pub mod fsck;
 pub mod mkfs;

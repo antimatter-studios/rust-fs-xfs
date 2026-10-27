@@ -211,6 +211,21 @@ fn command() -> Cmd {
                 ),
         )
         .subcommand(
+            Cmd::new("export")
+                .about("Copy a file, or a directory tree with --recursive, out of the image")
+                .args(super::export::args())
+                .after_help(
+                    "Examples:\n  fs.xfs disk.img export /backup.tar backup.tar\n  \
+                     fs.xfs disk.img export --recursive --preserve=times,links /home home\n  \
+                     fs.xfs disk.img export /backup.tar - | tar t\n\n\
+                     A file is copied in fixed chunks to DEST, a local file published only \
+                     once it is complete, or to stdout for -. An existing DEST is refused \
+                     unless --replace. With --recursive every item of the tree is reported as \
+                     completed, skipped, refused or failed, and the exit status is nonzero \
+                     unless all completed. The image is opened read-only.",
+                ),
+        )
+        .subcommand(
             Cmd::new("write")
                 .about(
                     "Create a file, or overwrite one of the same length, with the bytes on stdin; \
@@ -497,6 +512,7 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
+        "export" => super::export::export(&super::device::mount(target, offset)?, target, sub),
         "write" => match sub.get_one::<u64>("at") {
             Some(&at) => write_at(target, offset, path_arg(sub), at),
             None => write(target, offset, path_arg(sub)),
@@ -563,18 +579,18 @@ fn os_bytes(s: &OsString) -> &[u8] {
     s.to_str().map(str::as_bytes).unwrap_or_default()
 }
 
-fn show(bytes: &[u8]) -> String {
+pub(super) fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn xfs_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+pub(super) fn xfs_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     CliError::failed(format!("{}: {e}", show(what)))
 }
 
 /// A reading verb's open: a path that does not exist is rust-fs-core's
 /// `not_found` kind, exit 1, which a script matches whatever the message
 /// says; every other error is the driver's.
-fn read_error(what: &[u8], e: fs_xfs::Error) -> CliError {
+pub(super) fn read_error(what: &[u8], e: fs_xfs::Error) -> CliError {
     match e {
         fs_xfs::Error::NotFound => CliError::not_found(format!("{}: {e}", show(what))),
         e => xfs_error(what, e),
