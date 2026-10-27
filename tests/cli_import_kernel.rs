@@ -313,15 +313,22 @@ fn an_import_killed_between_persist_and_publish_leaves_the_old_file_and_a_clean_
 
 /// How long `args` takes, uninterrupted, on a copy of `base`: the window
 /// a kill has to land in. A fixed window let a fast runner finish most
-/// imports before the kill, which tested nothing.
+/// imports before the kill, which tested nothing. The shortest of three
+/// runs, because the first reads its source cold and took twice as long
+/// as the runs it was timing (run 40504181720: 89 of 200 killed).
 fn uninterrupted(base: &Path, tag: &str, args: &[&str]) -> Duration {
-    let volume = copy(base, &format!("{tag}-timed"));
-    let started = std::time::Instant::now();
-    ok(tool("fs.xfs")
-        .arg(volume.path())
-        .args(command_of(args))
-        .stdin(stdin_of(args)));
-    started.elapsed()
+    (0..3)
+        .map(|run| {
+            let volume = copy(base, &format!("{tag}-timed-{run}"));
+            let started = std::time::Instant::now();
+            ok(tool("fs.xfs")
+                .arg(volume.path())
+                .args(command_of(args))
+                .stdin(stdin_of(args)));
+            started.elapsed()
+        })
+        .min()
+        .expect("three timed runs")
 }
 
 /// `args` up to a `<`, which names the file given to stdin.
