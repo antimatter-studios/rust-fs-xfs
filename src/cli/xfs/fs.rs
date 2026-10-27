@@ -60,7 +60,8 @@ fn command() -> Cmd {
              path that is not a directory).\n\n\
              Writing is partial, and every other shape is refused by name rather than \
              attempted: a new file (v5, one extent), an empty file given contents, a \
-             same-length overwrite in place, mkdir, rm, rmdir, ln, mv and truncate (v5). A journalled \
+             same-length overwrite in place, bytes written into a file at a position \
+             (write --at), mkdir, rm, rmdir, ln, mv and truncate (v5). A journalled \
              change is written home and the log closed with an unmount record before \
              the tool exits, so the volume is clean and the next write can follow at \
              once.",
@@ -212,7 +213,19 @@ fn command() -> Cmd {
         .subcommand(
             Cmd::new("write")
                 .about(
-                    "Create a file, or overwrite one of the same length, with the bytes on stdin",
+                    "Create a file, or overwrite one of the same length, with the bytes on stdin; \
+                     with --at, write them into a file at a byte",
+                )
+                .arg(
+                    Arg::new("at")
+                        .long("at")
+                        .value_name("BYTES")
+                        .value_parser(value_parser!(u64))
+                        .help(
+                            "Write into the existing file starting at this byte, in place, \
+                             without truncating it (not --offset, which is where the \
+                             filesystem starts in TARGET)",
+                        ),
                 )
                 .arg(
                     Arg::new("path")
@@ -222,12 +235,20 @@ fn command() -> Cmd {
                 )
                 .after_help(
                     "Examples:\n  fs.xfs disk.img write /notes.txt < notes.txt\n  \
-                     fs.xfs src.img read /f | fs.xfs dst.img write /f\n\n\
+                     fs.xfs src.img read /f | fs.xfs dst.img write /f\n  \
+                     fs.xfs disk.img write --at 4096 /data.bin < patch.bin\n\n\
                      A new path becomes a file in one extent (v5 only). An empty file is \
                      given its contents. An existing file of exactly the same length is \
                      overwritten in place. Anything else -- appending, shortening, a v4 \
                      volume, a file too large for one free run -- is refused with the \
-                     reason (exit 3), and the volume is left as it was.",
+                     reason (exit 3), and the volume is left as it was.\n\n\
+                     --at writes stdin into an existing regular file starting at that \
+                     byte, and nothing else of it changes: not its size, not its blocks. \
+                     Writing past the end or into a hole or an unwritten extent is \
+                     refused (exit 3); so are a missing file, a directory and a symlink \
+                     (exit 1). Every refusal a read can decide is made before the image \
+                     is opened for writing. The report is \
+                     {\"path\": ..., \"at\": N, \"bytes\": N, \"size\": N}.",
                 ),
         )
         .subcommand(
@@ -476,7 +497,10 @@ fn run(matches: &ArgMatches) -> Result<Outcome, CliError> {
             path_arg(sub),
             sub.get_one("output"),
         ),
-        "write" => write(target, offset, path_arg(sub)),
+        "write" => match sub.get_one::<u64>("at") {
+            Some(&at) => write_at(target, offset, path_arg(sub), at),
+            None => write(target, offset, path_arg(sub)),
+        },
         "mkdir" if sub.get_flag("parents") => mkdir_parents(target, offset, path_arg(sub)),
         "mkdir" => mkdir(target, offset, path_arg(sub)),
         "truncate" => truncate(
@@ -1300,6 +1324,126 @@ fn write(target: &OsString, offset: u64, path: &[u8]) -> Result<Outcome, CliErro
     ]);
     let text = format!("{how} {} ({bytes} bytes)", show(path));
     Ok(Outcome::report(report).with_text(text))
+}
+
+/// Write everything on stdin into the existing regular file at `path`,
+/// starting at byte `at`, in place: nothing is truncated, grown or
+/// allocated.
+///
+/// The whole input is read before the image is opened, so a failing
+/// producer leaves the image as it was. Everything the write could be
+/// refused for that a read can decide is then decided on a read-only
+/// mount ([`in_place_range`]), so such a refusal never opens the image for
+/// writing. The write itself is the library's `write_at`, which checks
+/// again and refuses the shapes it does not write in place (a reflinked
+/// extent, for one) before it writes anything.
+///
+/// It changes data, not metadata, so it logs no record: the log is left as
+/// clean as the writable mount required it to be, with nothing to release.
+/// An empty input writes nothing and never opens the image for writing.
+fn write_at(target: &OsString, offset: u64, path: &[u8], at: u64) -> Result<Outcome, CliError> {
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut data)
+        .map_err(|e| CliError::failed(format!("read stdin: {e}")))?;
+    let (ino, size) = in_place_range(
+        &super::device::mount(target, offset)?,
+        target,
+        path,
+        at,
+        data.len() as u64,
+    )?;
+    if !data.is_empty() {
+        let fs = super::device::mount_rw(target, offset)?;
+        let file = fs.open_ino(ino).map_err(|e| xfs_error(path, e))?;
+        fs.write_at(file.inode(), file.raw(), at, &data)
+            .map_err(|e| write_error(path, e))?;
+    }
+    let mut fields = named(path);
+    fields.extend([
+        ("at", Json::from(at)),
+        ("bytes", Json::from(data.len() as u64)),
+        ("size", Json::from(size)),
+    ]);
+    Ok(Outcome::report(Json::object(fields)).with_text(format!(
+        "wrote {} bytes into {} at byte {at}",
+        data.len(),
+        show(path)
+    )))
+}
+
+/// The inode and size of the regular file at `path`, once each refusal a
+/// read can decide for writing `len` bytes into it at `at` has been ruled
+/// out: a log holding records, a path that does not resolve, a directory,
+/// a name ending in `/`, a symlink (never followed), anything else that is
+/// not a regular file, and then the shapes an in-place write cannot take,
+/// which are exit 3: a range reaching past the end of the file, and a
+/// block under it that is a hole or in an unwritten extent, since writing
+/// either would change the extent list.
+fn in_place_range(
+    fs: &Filesystem,
+    target: &OsString,
+    path: &[u8],
+    at: u64,
+    len: u64,
+) -> Result<(u64, u64), CliError> {
+    if fs.was_replayed() {
+        return Err(super::device::dirty_log(&target.to_string_lossy()));
+    }
+    let file = fs.open_bytes(path).map_err(|e| xfs_error(path, e))?;
+    if file.is_dir() {
+        return Err(CliError::failed(format!("{}: is a directory", show(path))));
+    }
+    if last_name(path).2 {
+        return Err(xfs_error(path, fs_xfs::Error::NotADirectory));
+    }
+    if file.is_symlink() {
+        let target = file.link_target().map(|t| show(&t)).unwrap_or_default();
+        return Err(CliError::failed(format!(
+            "{}: is a symlink to {target}; write to the target instead",
+            show(path)
+        )));
+    }
+    if !file.is_regular_file() {
+        return Err(xfs_error(path, fs_xfs::Error::NotAFile));
+    }
+    let size = file.len();
+    let end = at
+        .checked_add(len)
+        .filter(|end| *end <= size)
+        .ok_or_else(|| {
+            CliError::refused(format!(
+                "{}: {len} bytes at byte {at} reach past the end of its {size} bytes, and \
+                 write --at writes in place: it neither grows a file nor allocates",
+                show(path)
+            ))
+        })?;
+    if len > 0 {
+        let extents = fs
+            .data_extents(file.inode(), file.raw())
+            .map_err(|e| write_error(path, e))?;
+        let block = u64::from(fs.superblock().blocksize);
+        for file_block in at / block..=(end - 1) / block {
+            match fs_xfs::extent::lookup(&extents, file_block) {
+                None => {
+                    return Err(CliError::refused(format!(
+                        "{}: file block {file_block} is a hole, and filling it would \
+                         allocate blocks, which write --at does not do",
+                        show(path)
+                    )))
+                }
+                Some(extent) if extent.is_unwritten() => {
+                    return Err(CliError::refused(format!(
+                        "{}: file block {file_block} is in an unwritten extent, and \
+                         writing it would change the extent list, which write --at \
+                         does not do",
+                        show(path)
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok((file.inode().ino, size))
 }
 
 /// Create one directory, mode 0755. Its parent must exist, and nothing
