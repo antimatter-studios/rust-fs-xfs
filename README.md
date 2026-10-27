@@ -262,6 +262,7 @@ fs.xfs disk.img ls /etc              # a directory, as JSON
 fs.xfs disk.img ls -R --max-depth 8 --limit 1000 /etc
 fs.xfs disk.img read /etc/fstab > fstab
 fs.xfs disk.img write /notes.txt < notes.txt
+fs.xfs disk.img write --at 4096 /data.bin < patch.bin
 fs.xfs disk.img mkdir -p /backup/2026/october
 fs.xfs disk.img truncate /notes.txt 0
 fs.xfs disk.img rm /notes.txt
@@ -278,6 +279,7 @@ fs.xfs --offset 1048576 whole-disk.img info
 | `ls --recursive [--max-depth N] [--limit N] [path]` | byte-sorted depth-first entries with volume-absolute `path` and relative `depth`; `-R` is the short form |
 | `read <path> [-o FILE]` | the file's raw bytes on stdout, or into FILE; v4 and v5 |
 | `write <path>` | the bytes on stdin. A new path becomes a file in one extent (v5); an empty file is given its contents; a file of exactly the same length is overwritten in place (v4 and v5). Anything else -- appending, shortening, a v4 create, a file too large for one free run -- is refused with the reason (exit 3), and the volume is left as it was. A journalled write leaves the log clean, so the next write follows at once |
+| `write --at <bytes> <path>` | the bytes on stdin, written into an existing regular file from that byte, in place: nothing is truncated, grown or allocated. A range past the end, a hole or an unwritten extent is refused with the reason (exit 3), and so are a missing file, a directory and a symlink (exit 1), all before the image is opened for writing. Reports `{"path": ..., "at": N, "bytes": N, "size": N}` and leaves the log clean (v4 and v5). `--offset` stays the device offset |
 | `mkdir <path>` | a directory, mode 0755, whose parent must exist (v5), leaving the log clean |
 | `mkdir --parents <path>` (`-p`) | every missing directory in one writable mount and clean release (v5). Reports `{"path": ..., "created": [...]}` with only the directories made, as absolute paths. An existing chain succeeds read-only; a file, symlink or invalid name anywhere on the way is refused before any directory is created |
 | `rm <path>` | removes a name that is not a directory: a symlink rather than what it points at, and the file with its last name, its blocks freed (v5). Reports `{"path": ..., "removed": true}` |
