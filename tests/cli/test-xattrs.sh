@@ -34,7 +34,8 @@ if [ "$(uname -s)" = Darwin ]; then
 else
     python3 -I -c 'import os, sys; os.setxattr(sys.argv[1], b"user.colour", b"blue"); os.setxattr(sys.argv[1], b"user.bin", b"\x00\xff")' "$tree/f"
     fs.xfs "$img" import --recursive --preserve=xattrs "$tree" /t >"$SANDBOX/r.json" 2>"$SANDBOX/e"
-    check "import --recursive --preserve=xattrs exits 0 ($(head -c 300 "$SANDBOX/e"))" test $? -eq 0
+    rc=$?
+    check "import --recursive --preserve=xattrs exits 0 ($(head -c 300 "$SANDBOX/e"))" test "$rc" -eq 0
     jq_check "every item completed" '.completed == 2 and .refused == 0 and .failed == 0' "$SANDBOX/r.json"
     check "user.colour reads back" test "$(fs.xfs "$img" xattr /t/f user.colour)" = blue
     fs.xfs "$img" export --recursive --preserve=xattrs /t "$SANDBOX/out" >"$SANDBOX/x.json" 2>/dev/null
