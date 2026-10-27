@@ -114,10 +114,13 @@ fn host_set(path: &Path, attrs: &Attrs) {
     host_python(&script, &[path]);
 }
 
-/// A host directory for one case: not the shared folder, whose file
-/// system need not hold attributes, but the host's own temporary space.
+/// A host directory for one case, on the host's own disk. Not the shared
+/// folder, and not `TMPDIR`: when the suite runs in the guest that is
+/// `/repo/tmp`, on the shared folder, which refuses an empty attribute
+/// value with ENODATA (run 40500633367). `/var/tmp` is the root file
+/// system on the runner and in the guest alike.
 fn host_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("{SUITE}-{}-{tag}", std::process::id()));
+    let dir = Path::new("/var/tmp").join(format!("{SUITE}-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
