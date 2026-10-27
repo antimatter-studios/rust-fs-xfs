@@ -471,8 +471,9 @@ tasks:
       # mkdir --parents adds one Linux-twin case (#522).
       # cli_truncate_kernel adds two length and shared-tail cases (#523).
       # xattr inspection adds one all-forks kernel/getfattr case (#525).
-      # cli_pwrite_kernel adds one (#524), cli_export_kernel one (#529).
-      - 'CI_TEST_FLOOR=54 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      # cli_pwrite_kernel adds one (#524), cli_export_kernel one (#529),
+      # cli_import_kernel three (#530).
+      - 'CI_TEST_FLOOR=57 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:kernel-new:
     desc: 'The kernel tier on the Debian 13 guest: kernel 6.12 reads back what 6.1 cannot mount (parent pointers, exchange-range)'
@@ -515,7 +516,7 @@ tasks:
     # Two rm/rmdir cases (#519) and two fsck help cases (#526) make it 533.
     # The two ln kernel cases (#521) make it 535, and two mv cases (#520) 537.
     # One mkdir --parents case (#522) and two truncate cases (#523) make it 540.
-    # The write --at kernel case (#524) makes it 541, and the export case (#529) 542.
+    # The write --at kernel case (#524) makes it 541, and the export case (#529) 542, and the import cases (#530) 545.
     timeout: 150m
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
@@ -576,8 +577,9 @@ tasks:
         # mkdir --parents adds one Linux-twin case (#522).
         # cli_truncate_kernel adds two length and shared-tail cases (#523).
         # xattr inspection adds one all-forks kernel/getfattr case (#525).
-        # cli_pwrite_kernel adds one (#524), cli_export_kernel one (#529).
-        CI_TEST_FLOOR=543 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
+        # cli_pwrite_kernel adds one (#524), cli_export_kernel one (#529),
+        # cli_import_kernel three (#530).
+        CI_TEST_FLOOR=546 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:
@@ -751,7 +753,8 @@ tasks:
       # test-xattr.sh adds 33 assertions and its generated man pages add 2 (#525).
       # write --at adds 163 in test-write-at.sh (#524).
       # export adds 975 in test-export.sh and 2 in test-docs.sh (#529).
-      - 'scripts/ci-test.sh --gate 2495 tmp/logs/cli.log "the cli tier"'
+      # import adds 56 in test-import.sh and 2 in test-docs.sh (#530).
+      - 'scripts/ci-test.sh --gate 2553 tmp/logs/cli.log "the cli tier"'
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/

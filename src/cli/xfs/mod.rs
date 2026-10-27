@@ -6,4 +6,5 @@ pub mod device;
 pub mod export;
 pub mod fs;
 pub mod fsck;
+pub mod import;
 pub mod mkfs;

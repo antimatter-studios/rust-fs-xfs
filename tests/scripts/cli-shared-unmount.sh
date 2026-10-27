@@ -7,8 +7,8 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if ! awk '
-    /^fn / {
-        name = $2
+    /^(pub(\([a-z]+\))? )?fn / {
+        name = ($1 ~ /^pub/) ? $3 : $2
         sub(/\(.*/, "", name)
     }
     /^[[:space:]]*\/\// { next }

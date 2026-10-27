@@ -1,0 +1,2 @@
+### Added
+- `fs.xfs TARGET import [--recursive] [--replace] [--verify] SOURCE PATH` streams a local file, stdin or a local tree into the image through rust-fs-core's shared import: the bytes go to a staged file beside PATH, the volume is released clean, and the staged file is renamed to PATH only when complete. `--replace` replaces an existing PATH in that one rename, a failed import removes its staged file and leaves PATH as it was, and `--verify` reads the persisted file back before publishing.
