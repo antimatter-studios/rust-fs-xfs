@@ -17,6 +17,11 @@
 //!   never deleted first;
 //! - **abort**: the staged name is unlinked. The final name is not touched.
 //!
+//! `--preserve=links,times` use the sink's optional capabilities: a symbolic
+//! link is created with `create_symlink`, another name for a published file
+//! with `link`, and times are set in place with `set_attributes`. Each is
+//! one operation on a clean volume that is released clean again.
+//!
 //! A crash between persist and publish leaves the old file (or no file)
 //! under the final name and the staged name, `.fs-xfs-import-PID-N.partial`,
 //! beside it: the image is consistent, and the leftover is an ordinary file
@@ -31,7 +36,10 @@ use fs_core::cli::transfer::{
     ImportRequest, ImportTreeOptions, SparseOptions, TreeSink,
 };
 use fs_core::cli::{CliError, Outcome};
+use fs_xfs::inode::Timestamp;
+use fs_xfs::write::AttrChange;
 use fs_xfs::Filesystem;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::export::bytes_of;
 use super::fs::{
@@ -384,6 +392,84 @@ impl TreeSink for Sink {
 
     fn format_name(&self) -> &str {
         "XFS"
+    }
+
+    fn create_symbolic_link(&mut self, path: &Path, target: &Path) -> Result<(), CliError> {
+        let what = bytes_of(path);
+        let (parent_path, name) = split_path(&what)?;
+        checked_name(name)?;
+        let fs = self.mount_rw()?;
+        let parent = fs
+            .open_bytes(parent_path)
+            .map_err(|e| state_error(parent_path, e))?;
+        if !parent.is_dir() {
+            return Err(state_error(parent_path, fs_xfs::Error::NotADirectory));
+        }
+        fs.create_symlink(parent.inode().ino, name, &bytes_of(target))
+            .map_err(|e| state_write_error(&what, e))?;
+        release_clean(fs, &what)
+    }
+
+    fn create_hard_link(&mut self, path: &Path, existing: &Path) -> Result<(), CliError> {
+        let what = bytes_of(path);
+        let (parent_path, name) = split_path(&what)?;
+        checked_name(name)?;
+        let fs = self.mount_rw()?;
+        let other = bytes_of(existing);
+        let file = fs.open_bytes(&other).map_err(|e| state_error(&other, e))?;
+        if !file.is_regular_file() {
+            return Err(CliError::refused(format!(
+                "{}: hard links to regular files only",
+                show(&other)
+            )));
+        }
+        let parent = fs
+            .open_bytes(parent_path)
+            .map_err(|e| state_error(parent_path, e))?;
+        if !parent.is_dir() {
+            return Err(state_error(parent_path, fs_xfs::Error::NotADirectory));
+        }
+        fs.link(file.inode().ino, parent.inode().ino, name)
+            .map_err(|e| state_write_error(&what, e))?;
+        release_clean(fs, &what)
+    }
+
+    fn set_times(
+        &mut self,
+        path: &Path,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> Result<(), CliError> {
+        let what = bytes_of(path);
+        let change = AttrChange {
+            atime: accessed.map(timestamp),
+            mtime: modified.map(timestamp),
+            ..AttrChange::default()
+        };
+        let fs = self.mount_rw()?;
+        let file = fs.open_bytes(&what).map_err(|e| state_error(&what, e))?;
+        fs.set_attributes(file.inode(), &change)
+            .map_err(|e| write_error(&what, e))?;
+        release_clean(fs, &what)
+    }
+}
+
+/// A time as the format stores it: seconds from the epoch, negative before
+/// it, and the nanoseconds past those seconds.
+fn timestamp(time: SystemTime) -> Timestamp {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => Timestamp {
+            sec: after.as_secs() as i64,
+            nsec: after.subsec_nanos(),
+        },
+        Err(before) => {
+            let before = before.duration();
+            let nsec = before.subsec_nanos();
+            Timestamp {
+                sec: -(before.as_secs() as i64) - i64::from(nsec > 0),
+                nsec: if nsec > 0 { 1_000_000_000 - nsec } else { 0 },
+            }
+        }
     }
 }
 
