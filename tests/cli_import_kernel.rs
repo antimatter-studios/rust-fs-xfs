@@ -16,8 +16,10 @@
 //!   under that name either the old file or the whole new one, never part
 //!   of one, and the volume clean once the kernel has replayed its log. A
 //!   staged name left by the kill is allowed, and is reported.
-//! - repeated SIGKILLs during a large replacement leave every image
-//!   replayable, with no partial file and clean allocation counters.
+//! - repeated SIGKILLs during a large replacement, at seeded moments
+//!   inside the time an uninterrupted one takes, leave every image
+//!   replayable and unmountable, with no partial file and clean
+//!   allocation counters; and the same holds for `fs.xfs write` (#581).
 //!
 //! EVERY GUEST STEP WORKS ON A COPY ON THE GUEST'S OWN DISK, for the
 //! reason `cli_write_kernel.rs` gives: a loop mount of a file on the
@@ -309,6 +311,99 @@ fn an_import_killed_between_persist_and_publish_leaves_the_old_file_and_a_clean_
     panic!("no attempt caught the import between persist and publish");
 }
 
+/// How long `args` takes, uninterrupted, on a copy of `base`: the window
+/// a kill has to land in. A fixed window let a fast runner finish most
+/// imports before the kill, which tested nothing.
+fn uninterrupted(base: &Path, tag: &str, args: &[&str]) -> Duration {
+    let volume = copy(base, &format!("{tag}-timed"));
+    let started = std::time::Instant::now();
+    ok(tool("fs.xfs")
+        .arg(volume.path())
+        .args(command_of(args))
+        .stdin(stdin_of(args)));
+    started.elapsed()
+}
+
+/// `args` up to a `<`, which names the file given to stdin.
+fn command_of<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    args.iter().take_while(|a| **a != "<").copied().collect()
+}
+
+/// The source `fs.xfs write` reads, for the loops that run it.
+fn stdin_of(args: &[&str]) -> Stdio {
+    match args.iter().position(|a| *a == "<") {
+        Some(at) => Stdio::from(std::fs::File::open(args[at + 1]).expect("open the write source")),
+        None => Stdio::null(),
+    }
+}
+
+/// SIGKILL `fs.xfs <copy> <args>` at `attempts` seeded moments inside
+/// `window`, have the kernel replay, unmount and `xfs_repair -n` each copy,
+/// and hand each graded copy to `check`. A copy that fails is kept, with
+/// the guest's output in the panic.
+fn kill_loop(
+    base: &Path,
+    tag: &str,
+    args: &[&str],
+    window: Duration,
+    attempts: usize,
+    digests: &[&str],
+    check: impl Fn(usize, &Graded),
+) {
+    let window_ms = (window.as_millis() as u64).max(1);
+    let mut seed = u64::from(std::process::id()) ^ 0x581;
+    let mut killed = 0;
+    for attempt in 0..attempts {
+        let victim = copy(base, &format!("{tag}-{attempt}"));
+        let mut child = tool("fs.xfs")
+            .arg(victim.path())
+            .args(command_of(args))
+            .stdin(stdin_of(args))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fs.xfs");
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        std::thread::sleep(Duration::from_millis((seed >> 16) % window_ms));
+        let (status, was_killed) = match child.try_wait().expect("poll fs.xfs") {
+            Some(status) => (status, false),
+            None => {
+                child.kill().expect("SIGKILL the in-flight fs.xfs");
+                killed += 1;
+                (child.wait().expect("wait for the killed fs.xfs"), true)
+            }
+        };
+        assert!(
+            was_killed || status.success(),
+            "{tag} attempt {attempt}: fs.xfs exited unexpectedly before the kill: {status}"
+        );
+        // The kernel replays the image after each kill, unmounts it, and
+        // xfs_repair -n checks every superblock and allocation counter.
+        let graded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            grade(victim.path().to_str().unwrap(), digests)
+        })) {
+            Ok(graded) => graded,
+            Err(panic) => {
+                let evidence = scratch::dir(SUITE)
+                    .join(format!("{}-{tag}-{attempt}-failed.img", std::process::id()));
+                std::fs::copy(victim.path(), &evidence)
+                    .expect("keep the image that failed kernel replay");
+                eprintln!(
+                    "{tag} attempt {attempt}: kept failed image at {}",
+                    evidence.display()
+                );
+                std::panic::resume_unwind(panic);
+            }
+        };
+        check(attempt, &graded);
+    }
+    assert!(
+        killed >= attempts / 2,
+        "{tag}: only {killed}/{attempts} runs were still going at the kill point \
+         (window {window_ms} ms)"
+    );
+}
+
 #[test]
 fn arbitrary_kills_during_import_leave_a_replayable_volume() {
     const ATTEMPTS: usize = 200;
@@ -325,73 +420,49 @@ fn arbitrary_kills_during_import_leave_a_replayable_volume() {
     let new_path = source("arbitrary-kill-new", &new);
     let old_sum = sha256_hex(&old);
     let new_sum = sha256_hex(&new);
-    let mut seed = u64::from(std::process::id()) ^ 0x581;
-    let mut killed = 0;
+    let args = [
+        "import",
+        "--replace",
+        "--verify",
+        new_path.to_str().unwrap(),
+        "/victim.bin",
+    ];
+    let window = uninterrupted(base.path(), "arbitrary-kill", &args);
+    kill_loop(
+        base.path(),
+        "arbitrary-kill",
+        &args,
+        window,
+        ATTEMPTS,
+        &["/victim.bin"],
+        |attempt, graded| {
+            let actual = graded.sum("/victim.bin");
+            assert!(
+                actual == old_sum || actual == new_sum,
+                "attempt {attempt}: the kernel read a partial replacement, digest {actual}"
+            );
+        },
+    );
+}
 
-    for attempt in 0..ATTEMPTS {
-        let victim = copy(base.path(), &format!("arbitrary-kill-{attempt}"));
-        let mut child = tool("fs.xfs")
-            .args([
-                victim.path().to_str().unwrap(),
-                "import",
-                "--replace",
-                "--verify",
-                new_path.to_str().unwrap(),
-                "/victim.bin",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn fs.xfs import");
-
-        // Vary the kill point across the same 0–1.5 second window that
-        // exposed the intermittent journal inconsistency in #581.
-        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        let delay = Duration::from_millis(seed % 1_500);
-        std::thread::sleep(delay);
-        let (status, was_killed) = match child.try_wait().expect("poll the import") {
-            Some(status) => (status, false),
-            None => {
-                child.kill().expect("SIGKILL the in-flight import");
-                killed += 1;
-                (child.wait().expect("wait for the killed import"), true)
-            }
-        };
-        assert!(
-            was_killed || status.success(),
-            "attempt {attempt}: the import exited unexpectedly before the kill: {status}"
-        );
-
-        // The kernel replays the image after each kill, unmounts it, and
-        // xfs_repair -n checks every superblock and allocation counter.
-        let graded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            grade(victim.path().to_str().unwrap(), &["/victim.bin"])
-        })) {
-            Ok(graded) => graded,
-            Err(panic) => {
-                let evidence = scratch::dir(SUITE).join(format!(
-                    "{}-arbitrary-kill-{attempt}-failed.img",
-                    std::process::id()
-                ));
-                std::fs::copy(victim.path(), &evidence)
-                    .expect("keep the image that failed kernel replay");
-                eprintln!(
-                    "attempt {attempt}: kept failed image at {}",
-                    evidence.display()
-                );
-                std::panic::resume_unwind(panic);
-            }
-        };
-        let actual = graded.sum("/victim.bin");
-        assert!(
-            actual == old_sum || actual == new_sum,
-            "attempt {attempt}: the kernel read a partial replacement, digest {actual}"
-        );
-    }
-
-    assert!(
-        killed >= ATTEMPTS / 2,
-        "only {killed}/{ATTEMPTS} imports were still running at the kill point"
+#[test]
+fn arbitrary_kills_during_write_leave_a_replayable_volume() {
+    const ATTEMPTS: usize = 100;
+    let base = fixture("xfscli-v5.img");
+    let data = pattern(64 << 20, 43);
+    let data_path = source("arbitrary-write", &data);
+    // `fs.xfs write` is not atomic: a kill may leave no file, an empty one
+    // or one partly written. What is checked is the volume, not the file.
+    let args = ["write", "/written.bin", "<", data_path.to_str().unwrap()];
+    let window = uninterrupted(&base, "arbitrary-write", &args);
+    kill_loop(
+        &base,
+        "arbitrary-write",
+        &args,
+        window,
+        ATTEMPTS,
+        &[],
+        |_, _| {},
     );
 }
 
