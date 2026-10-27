@@ -473,7 +473,8 @@ tasks:
       # xattr inspection adds one all-forks kernel/getfattr case (#525).
       # cli_pwrite_kernel adds one (#524), cli_export_kernel one (#529),
       # cli_import_kernel three (#530) and one more for links and times (#531).
-      - 'CI_TEST_FLOOR=58 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
+      # cli_import_kernel adds one arbitrary-kill replay case (#581).
+      - 'CI_TEST_FLOOR=59 ../rust-fs-core/scripts/tier.sh test:kernel kernel 2754 230800 -- scripts/ci-test.sh $(scripts/test-targets.sh kernel)'
 
   test:kernel-new:
     desc: 'The kernel tier on the Debian 13 guest: kernel 6.12 reads back what 6.1 cannot mount (parent pointers, exchange-range)'
@@ -579,7 +580,8 @@ tasks:
         # xattr inspection adds one all-forks kernel/getfattr case (#525).
         # cli_pwrite_kernel adds one (#524), cli_export_kernel one (#529),
         # cli_import_kernel three (#530) and one more for links and times (#531).
-        CI_TEST_FLOOR=547 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
+        # cli_import_kernel adds one arbitrary-kill replay case (#581).
+        CI_TEST_FLOOR=548 ../rust-fs-core/scripts/tier.sh test:vm vm 6314 512000 -- \
           ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:scripts:

@@ -16,6 +16,8 @@
 //!   under that name either the old file or the whole new one, never part
 //!   of one, and the volume clean once the kernel has replayed its log. A
 //!   staged name left by the kill is allowed, and is reported.
+//! - repeated SIGKILLs during a large replacement leave every image
+//!   replayable, with no partial file and clean allocation counters.
 //!
 //! EVERY GUEST STEP WORKS ON A COPY ON THE GUEST'S OWN DISK, for the
 //! reason `cli_write_kernel.rs` gives: a loop mount of a file on the
@@ -305,6 +307,92 @@ fn an_import_killed_between_persist_and_publish_leaves_the_old_file_and_a_clean_
         return;
     }
     panic!("no attempt caught the import between persist and publish");
+}
+
+#[test]
+fn arbitrary_kills_during_import_leave_a_replayable_volume() {
+    const ATTEMPTS: usize = 200;
+    let base = copy(&fixture("xfscli-v5.img"), "arbitrary-kill-base");
+    let old = pattern(70_000, 41);
+    let old_path = source("arbitrary-kill-old", &old);
+    ok(tool("fs.xfs").args([
+        base.path().to_str().unwrap(),
+        "import",
+        old_path.to_str().unwrap(),
+        "/victim.bin",
+    ]));
+    let new = pattern(96 << 20, 42);
+    let new_path = source("arbitrary-kill-new", &new);
+    let old_sum = sha256_hex(&old);
+    let new_sum = sha256_hex(&new);
+    let mut seed = u64::from(std::process::id()) ^ 0x581;
+    let mut killed = 0;
+
+    for attempt in 0..ATTEMPTS {
+        let victim = copy(base.path(), &format!("arbitrary-kill-{attempt}"));
+        let mut child = tool("fs.xfs")
+            .args([
+                victim.path().to_str().unwrap(),
+                "import",
+                "--replace",
+                "--verify",
+                new_path.to_str().unwrap(),
+                "/victim.bin",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fs.xfs import");
+
+        // Vary the kill point across the same 0–1.5 second window that
+        // exposed the intermittent journal inconsistency in #581.
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let delay = Duration::from_millis(seed % 1_500);
+        std::thread::sleep(delay);
+        let (status, was_killed) = match child.try_wait().expect("poll the import") {
+            Some(status) => (status, false),
+            None => {
+                child.kill().expect("SIGKILL the in-flight import");
+                killed += 1;
+                (child.wait().expect("wait for the killed import"), true)
+            }
+        };
+        assert!(
+            was_killed || status.success(),
+            "attempt {attempt}: the import exited unexpectedly before the kill: {status}"
+        );
+
+        // The kernel replays the image after each kill, unmounts it, and
+        // xfs_repair -n checks every superblock and allocation counter.
+        let graded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            grade(victim.path().to_str().unwrap(), &["/victim.bin"])
+        })) {
+            Ok(graded) => graded,
+            Err(panic) => {
+                let evidence = scratch::dir(SUITE).join(format!(
+                    "{}-arbitrary-kill-{attempt}-failed.img",
+                    std::process::id()
+                ));
+                std::fs::copy(victim.path(), &evidence)
+                    .expect("keep the image that failed kernel replay");
+                eprintln!(
+                    "attempt {attempt}: kept failed image at {}",
+                    evidence.display()
+                );
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let actual = graded.sum("/victim.bin");
+        assert!(
+            actual == old_sum || actual == new_sum,
+            "attempt {attempt}: the kernel read a partial replacement, digest {actual}"
+        );
+    }
+
+    assert!(
+        killed >= ATTEMPTS / 2,
+        "only {killed}/{ATTEMPTS} imports were still running at the kill point"
+    );
 }
 
 #[test]
