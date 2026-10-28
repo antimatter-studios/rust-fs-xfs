@@ -3288,7 +3288,7 @@ tasks:
 /// A value that is not a literal version is not a declaration either:
 /// `release.yml` clones `--branch "$FS_CORE_REF"`, which is the
 /// variable declared above it and not a second, independent pin.
-fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
+fn fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let mut in_lock_entry = false;
     for line in text.lines() {
@@ -3387,13 +3387,13 @@ const FILES_THAT_PIN_AM_FS_CORE: &[(&str, usize)] = &[
 /// matching would otherwise report perfect agreement among nothing,
 /// which is the failure this whole file is written against.
 #[test]
-fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
+fn every_declaration_of_the_fs_core_pin_names_the_same_version() {
     let root = manifest_dir();
     let mut declared: Vec<(&str, String, String)> = Vec::new();
     let mut miscounted = Vec::new();
 
     for (rel, expected) in FILES_THAT_PIN_AM_FS_CORE {
-        let found = am_fs_core_versions_declared(&read_or_panic(&root.join(rel)));
+        let found = fs_core_versions_declared(&read_or_panic(&root.join(rel)));
         if found.len() != *expected {
             miscounted.push(format!("{rel}: expected {expected}, found {}", found.len()));
         }
@@ -3438,14 +3438,14 @@ fn every_declaration_of_the_am_fs_core_pin_names_the_same_version() {
 }
 
 mod core_pin_parser {
-    use super::{am_fs_core_versions_declared, as_version};
+    use super::{as_version, fs_core_versions_declared};
 
     /// The real dependency line.
     #[test]
     fn a_path_dependency_declares_its_version() {
         let toml = "rust-fs-core = { path = \"../rust-fs-core\", version = \"0.2.13\" }\n";
         assert_eq!(
-            am_fs_core_versions_declared(toml),
+            fs_core_versions_declared(toml),
             vec![(
                 "the rust-fs-core dependency's `version`".to_string(),
                 "0.2.13".to_string()
@@ -3462,7 +3462,7 @@ mod core_pin_parser {
                     [[package]]\nname = \"rust-fs-xfs\"\nversion = \"0.5.0\"\n\
                     dependencies = [\n \"rust-fs-core\",\n \"crc32c\",\n]\n";
         assert_eq!(
-            am_fs_core_versions_declared(lock),
+            fs_core_versions_declared(lock),
             vec![(
                 "the locked rust-fs-core `version`".to_string(),
                 "0.2.10".to_string()
@@ -3474,14 +3474,14 @@ mod core_pin_parser {
     #[test]
     fn a_neighbouring_package_version_is_not_a_declaration() {
         let lock = "[[package]]\nname = \"rust-fs-xfs\"\nversion = \"0.5.0\"\n";
-        assert!(am_fs_core_versions_declared(lock).is_empty());
+        assert!(fs_core_versions_declared(lock).is_empty());
     }
 
     /// The workflow spelling, with and without the `v`.
     #[test]
     fn the_env_variable_declares_its_version() {
         assert_eq!(
-            am_fs_core_versions_declared("  FS_CORE_REF: v0.2.13\n"),
+            fs_core_versions_declared("  FS_CORE_REF: v0.2.13\n"),
             vec![("`FS_CORE_REF`".to_string(), "0.2.13".to_string())],
         );
     }
@@ -3492,7 +3492,7 @@ mod core_pin_parser {
         let line = "run: git clone --depth 1 --branch v0.2.10 \
                     https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
         assert_eq!(
-            am_fs_core_versions_declared(line),
+            fs_core_versions_declared(line),
             vec![(
                 "the `git clone --branch` ref".to_string(),
                 "0.2.10".to_string()
@@ -3506,7 +3506,7 @@ mod core_pin_parser {
     fn a_comment_naming_a_version_is_not_a_declaration() {
         let yaml = "  # v0.2.11 is the release that packages scripts/output-budget.sh.\n  \
                     # v0.2.10 does not contain it.\n";
-        assert!(am_fs_core_versions_declared(yaml).is_empty());
+        assert!(fs_core_versions_declared(yaml).is_empty());
     }
 
     /// `release.yml` clones `--branch "$FS_CORE_REF"`. That is the
@@ -3515,7 +3515,7 @@ mod core_pin_parser {
     fn a_branch_that_is_a_variable_is_not_a_declaration() {
         let line = "run: git clone --depth 1 --branch \"$FS_CORE_REF\" \
                     https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core\n";
-        assert!(am_fs_core_versions_declared(line).is_empty());
+        assert!(fs_core_versions_declared(line).is_empty());
     }
 
     /// A branch name is not a version. A pin moved to `main` is a pin

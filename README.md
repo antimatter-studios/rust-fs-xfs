@@ -5,6 +5,8 @@ filesystem. It reads v5 and v4 volumes, writes v5 volumes through the log in rec
 the Linux kernel replays, checks and repairs them, and formats new ones. It works on
 an image file or a device directly, with no kernel driver and no mount.
 
+Published on crates.io as `rust-fs-xfs`; the library name is `fs_xfs`.
+
 It is a Rust library (`fs_xfs`), a static library with a stable C ABI (`fs_xfs_*`,
 declared in [`include/fs_xfs.h`](include/fs_xfs.h)) for C, C++, Swift or Go, and a set
 of command-line tools: `fs.xfs`, `mkfs.xfs` and `fsck.xfs`. Block devices come from the
