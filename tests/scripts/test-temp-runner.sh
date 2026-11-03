@@ -24,6 +24,42 @@ wait_for_output() {
     [[ -s "$OUTPUT" ]]
 }
 
+process_is_running() {
+    local state
+    state="$(ps -p "$1" -o stat=)" || return 1
+    [[ -n "$state" && "$state" != *Z* ]]
+}
+
+if ! python3 - "$(declare -f process_is_running)" <<'PY'
+import os
+import subprocess
+import sys
+import time
+
+probe = sys.argv[1] + '\nprocess_is_running "$1"'
+child = os.fork()
+if child == 0:
+    os._exit(0)
+try:
+    for attempt in range(100):
+        state = subprocess.run(['ps', '-p', str(child), '-o', 'stat='],
+                               check=True, capture_output=True, text=True).stdout.strip()
+        if state.startswith('Z'):
+            break
+        time.sleep(0.05)
+    assert state.startswith('Z'), 'process-state control did not create a zombie'
+    os.kill(child, 0)
+    for pid, expected in [(os.getpid(), 0), (child, 1)]:
+        result = subprocess.run(['bash', '-c', probe, 'process-state-control', str(pid)])
+        assert result.returncode == expected, f'process-state control: pid={pid}, expected={expected}, status={result.returncode}'
+finally:
+    os.waitpid(child, 0)
+PY
+then
+    echo "FAIL  process-state check did not distinguish a live process from an exited zombie" >&2
+    exit 1
+fi
+
 mkdir -p "$TEST_BASE"
 FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
     "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
@@ -119,12 +155,25 @@ wait "$WRAPPER_PID"
 STATUS=$?
 set -e
 for _ in $(seq 1 100); do
-    ! kill -0 "$DESCENDANT_PID" 2>/dev/null && break
+    ! process_is_running "$DESCENDANT_PID" && break
     sleep 0.05
 done
-if [[ "$STATUS" -ne 143 || -e "$(cat "$OUTPUT")" ]] || kill -0 "$DESCENDANT_PID" 2>/dev/null; then
+SELECTED="$(cat "$OUTPUT")"
+TERM_FAILED=0
+if [[ "$STATUS" -ne 143 ]]; then
+    echo "FAIL  process-group TERM returned status $STATUS, expected 143" >&2
+    TERM_FAILED=1
+fi
+if [[ -e "$SELECTED" ]]; then
+    echo "FAIL  process-group TERM left the scratch directory: $SELECTED" >&2
+    TERM_FAILED=1
+fi
+if process_is_running "$DESCENDANT_PID"; then
+    echo "FAIL  live descendant survived process-group TERM: pid=$DESCENDANT_PID state=$(ps -p "$DESCENDANT_PID" -o stat=)" >&2
+    TERM_FAILED=1
+fi
+if [[ "$TERM_FAILED" -ne 0 ]]; then
     kill "$DESCENDANT_PID" 2>/dev/null || true
-    echo "FAIL  TERM did not stop the command's process group before cleanup: status=$STATUS" >&2
     exit 1
 fi
 rm -f "$DESCENDANT_PID_FILE"
