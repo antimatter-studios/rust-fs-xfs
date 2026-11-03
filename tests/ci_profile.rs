@@ -206,20 +206,30 @@ fn cargo_test_commands(script: &str) -> Vec<String> {
 /// tier stand in for the debug one. Anything after `--` belongs to the
 /// task rather than to chore, so it is not a task name.
 fn runs_chore_task(script: &str, task: &str) -> Vec<String> {
-    script
-        .lines()
-        .filter_map(|raw| {
-            let line = raw.trim_start();
-            if line.starts_with('#') {
-                return None;
-            }
-            let command = line.split(" #").next().unwrap_or(line).trim();
+    command_lines(script)
+        .filter(|command| {
             shell_commands(command)
                 .iter()
                 .any(|words| chore_task_of(words) == Some(task))
-                .then(|| command.to_string())
         })
+        .map(str::to_string)
         .collect()
+}
+
+/// Each line of `script` that is not a comment, without a trailing comment.
+///
+/// [`shell_commands`] separates commands at control operators only, so a
+/// whole `run:` block handed to it is one command whose program is the
+/// block's first word. A shell ends a command at a newline too, so a script
+/// is read a line at a time.
+fn command_lines(script: &str) -> impl Iterator<Item = &str> {
+    script.lines().filter_map(|raw| {
+        let line = raw.trim_start();
+        if line.starts_with('#') {
+            return None;
+        }
+        Some(line.split(" #").next().unwrap_or(line).trim())
+    })
 }
 
 /// The task one command invokes, if the command is a `chore` run.
@@ -3617,9 +3627,11 @@ fn tier_log_upload_gaps(workflow: &str) -> Vec<String> {
                 let Some(id) = tier.id.as_deref() else {
                     return false;
                 };
-                let runs_a_tier = shell_commands(&tier.run)
-                    .iter()
-                    .any(|words| chore_task_of(words).is_some_and(|task| task.starts_with("test")));
+                let runs_a_tier = command_lines(&tier.run).any(|command| {
+                    shell_commands(command)
+                        .iter()
+                        .any(|words| chore_task_of(words).is_some_and(|t| t.starts_with("test")))
+                });
                 runs_a_tier && condition.contains(&format!("steps.{id}.outcome!='skipped'"))
             });
             if !guarded {
@@ -3718,6 +3730,30 @@ jobs:
         let tier = "      - id: tier\n        run: chore cli:install\n";
         let wf = workflow(tier, "always() && steps.tier.outcome != 'skipped'", "error");
         assert_eq!(gaps(&wf).len(), 1);
+    }
+
+    /// A tier is a tier on any line of its step, not only the first: the
+    /// macOS scripts job checks which Bash it has in the step that runs it.
+    #[test]
+    fn a_tier_after_other_lines_of_its_step_counts() {
+        let tier = "      - id: tier\n        run: |\n          export PATH=\"/bin:$PATH\"\n          chore test:scripts\n";
+        let wf = workflow(tier, "always() && steps.tier.outcome != 'skipped'", "error");
+        assert_eq!(gaps(&wf), Vec::<String>::new());
+    }
+
+    /// Reading a block a line at a time must not count what no shell runs.
+    #[test]
+    fn a_tier_only_named_in_a_multi_line_step_is_reported() {
+        for line in ["# chore test:unit", "echo chore test:unit"] {
+            let tier =
+                format!("      - id: tier\n        run: |\n          true\n          {line}\n");
+            let wf = workflow(
+                &tier,
+                "always() && steps.tier.outcome != 'skipped'",
+                "error",
+            );
+            assert_eq!(gaps(&wf).len(), 1, "{line}");
+        }
     }
 
     /// A tier that ran and wrote no log must still fail the upload.

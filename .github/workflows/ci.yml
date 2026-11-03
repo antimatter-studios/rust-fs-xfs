@@ -253,6 +253,52 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  scripts-darwin:
+    name: scripts-darwin (Bash 3.2)
+    runs-on: macos-15
+    timeout-minutes: 5
+    env:
+      OUTPUT_BUDGET_FAIL_TAIL: "30"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: ripgrep (the script tests search the tree with it)
+        # The macOS image does not carry it, and the script guards fail
+        # without it rather than report PASS having searched nothing.
+        # `scripts/tools.sh --check` verifies what was installed.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install --quiet ripgrep
+          scripts/tools.sh --check
+      - name: Python YAML dependency for shell guards
+        run: |
+          set -euo pipefail
+          command -v jq
+          python3 -m venv "$RUNNER_TEMP/scripts-venv"
+          "$RUNNER_TEMP/scripts-venv/bin/python" -m pip install PyYAML
+          echo "$RUNNER_TEMP/scripts-venv/bin" >> "$GITHUB_PATH"
+      - name: chore test:scripts under macOS Bash 3.2
+        id: scripts
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          export PATH="/bin:$PATH"
+          test "$(command -v bash)" = /bin/bash
+          test "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}" = 3.2
+          bash --version
+          chore test:scripts
+      - name: Keep the shell guard log
+        if: always() && steps.scripts.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-scripts-darwin
+          path: tmp/logs/scripts.log
+          if-no-files-found: error
+
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
     needs: changes
@@ -777,7 +823,7 @@ jobs:
     # permanently pending, with nothing to point at. It is also the only
     # shape in which a job-level `if:` is safe.
     if: always()
-    needs: [changes, unit, fixtures, test, test-kernel-new, test-arm64, test-darwin, suite-in-vm, cli, semver]
+    needs: [changes, unit, scripts-darwin, fixtures, test, test-kernel-new, test-arm64, test-darwin, suite-in-vm, cli, semver]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded
