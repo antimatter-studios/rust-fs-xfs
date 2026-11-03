@@ -33,14 +33,32 @@ cp "$REPO/scripts/test-targets.sh" "$sandbox/scripts/"
     done
 } > "$sandbox/tests/large_oracle.rs"
 
+# A CLASSIFIER THAT DIED CLAIMED NOTHING, which reads exactly like a tier
+# that excluded the suite. Bash 3.2 refused the empty target array of
+# every tier but oracle (#588), and this guard passed on the three errors,
+# so each call has to succeed before what it printed counts as an answer.
+#
+# "$BASH", not `bash`: the classifier runs under the interpreter running
+# this guard. `/bin/bash` here with a newer bash first on PATH would
+# otherwise grade the newer one.
 tiers_claiming() {
-    local tier
+    local tier targets status failed=0
     for tier in unit images oracle kernel; do
-        grep -qx 'large_oracle' <<<"$(bash "$sandbox/scripts/test-targets.sh" "$tier")" && printf '%s ' "$tier"
+        status=0
+        targets="$("$BASH" "$sandbox/scripts/test-targets.sh" "$tier")" || status=$?
+        if [ "$status" -ne 0 ]; then
+            echo "FAIL  test-targets.sh $tier exited $status under bash $BASH_VERSION" >&2
+            failed=1
+            continue
+        fi
+        if grep -qx 'large_oracle' <<<"$targets"; then
+            printf '%s ' "$tier"
+        fi
     done
+    return "$failed"
 }
 
-claimed="$(tiers_claiming)"
+claimed="$(tiers_claiming)" || exit 1
 if [ "$claimed" != "oracle " ]; then
     echo "FAIL  a large suite that calls an oracle is claimed by: '${claimed:-no tier}' (expected: oracle)" >&2
     exit 1
