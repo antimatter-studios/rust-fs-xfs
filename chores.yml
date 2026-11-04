@@ -136,7 +136,9 @@ vars:
   # the exchange-range kernel tier needs for kernel 6.12.
   # v0.5.1: that guest boots on a Linux x86_64 host, where v0.5.0's reset
   # in GRUB with no display device (fs-linux-test-harness#70).
-  LINUX_HARNESS_REF: v0.5.1
+  # v0.5.5 lets a host admit more than one VM (FLTH_SLOT_COUNT). v0.5.6 gives
+  # back what a guest deletes and says what stopped a lost guest.
+  LINUX_HARNESS_REF: v0.5.6
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
