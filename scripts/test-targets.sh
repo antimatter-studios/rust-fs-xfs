@@ -177,7 +177,10 @@ for f in "$REPO"/tests/*.rs; do
         *) echo "usage: test-targets.sh unit|images|stress|oracle|kernel|kernel-new|rest|all" >&2; exit 2 ;;
     esac
 done
+# THE `+` FORM BECAUSE A TIER CAN BE EMPTY. Bash before 4.4 calls an empty
+# array unset, and under `set -u` it refuses "${args[@]}" outright, which
+# is what /bin/bash on a Mac is (#588). This expands to no words on either.
 case "$tier" in
-    unit|rest|all) printf '%s\n' --lib --bins "${args[@]}" ;;
-    *) printf '%s\n' "${args[@]}" ;;
+    unit|rest|all) printf '%s\n' --lib --bins ${args[@]+"${args[@]}"} ;;
+    *) printf '%s\n' ${args[@]+"${args[@]}"} ;;
 esac
