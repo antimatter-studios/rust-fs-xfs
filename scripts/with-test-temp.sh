@@ -41,7 +41,49 @@ forward_signal() {
         kill -s "$signal" -- "-$CHILD_PGID" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT
+group_is_running() {
+    local states status=0
+    kill -0 -- "-$CHILD_PGID" 2>/dev/null || return 1
+    states="$(ps -axo pgid=,stat=)" || return 0
+    printf '%s\n' "$states" | awk -v group="$CHILD_PGID" '
+        $1 == group && $2 !~ /^Z/ { live = 1 }
+        END { exit !live }
+    ' || status=$?
+    [[ "$status" != 1 ]]
+}
+gone_within() {
+    local limit=$((SECONDS + $1))
+    while group_is_running; do
+        (( SECONDS < limit )) || return 1
+        sleep 0.2
+    done
+}
+stop_run() {
+    [[ -n "$CHILD_PGID" ]] || return 0
+    if group_is_running; then
+        kill -s TERM -- "-$CHILD_PGID" 2>/dev/null || true
+        if ! gone_within 5; then
+            echo "with-test-temp.sh: killing what TERM did not stop" >&2
+            kill -s KILL -- "-$CHILD_PGID" 2>/dev/null || true
+            if ! gone_within 5; then
+                echo "with-test-temp.sh: process group $CHILD_PGID is still running; scratch is retained" >&2
+                return 1
+            fi
+        fi
+    fi
+    wait "$CHILD_PID" 2>/dev/null || true
+}
+finish() {
+    local status=$?
+    trap - EXIT
+    if stop_run; then
+        cleanup || status=1
+    else
+        status=1
+    fi
+    exit "${SIGNAL_STATUS:-$status}"
+}
+trap finish EXIT
 trap 'forward_signal HUP 1' HUP
 trap 'forward_signal INT 2' INT
 trap 'forward_signal TERM 15' TERM
@@ -137,7 +179,6 @@ set +e
 wait "$CHILD_PID"
 STATUS=$?
 if [[ -n "$SIGNAL_STATUS" ]]; then
-    wait "$CHILD_PID" 2>/dev/null
     STATUS="$SIGNAL_STATUS"
 fi
 set -e
