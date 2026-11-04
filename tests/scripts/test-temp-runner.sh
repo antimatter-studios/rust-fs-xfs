@@ -4,16 +4,27 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_BASE="$REPO/tmp/runner-policy-test"
 OUTPUT="$REPO/tmp/runner-policy-output.txt"
+DESCENDANT_PID_FILE="$TEST_BASE/descendant.pid"
+STANDIN="$TEST_BASE/standin"
+SLOW_BIN="$TEST_BASE/slow-mktemp"
+STARTING_MARK="$TEST_BASE/starting"
 
 cleanup() {
-    rm -f "$OUTPUT"
-    rmdir "$TEST_BASE" 2>/dev/null || true
+    rm -f "$OUTPUT" "$DESCENDANT_PID_FILE" "$STARTING_MARK" "$SLOW_BIN/mktemp" \
+        "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/fs-linux-test-harness/scripts/vm.sh"
+    rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" \
+        "$STANDIN/fs-linux-test-harness/scripts" "$STANDIN/fs-linux-test-harness" "$STANDIN" \
+        "$SLOW_BIN" "$TEST_BASE" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
+# STARTUP IS BOUNDED BY A MINUTE, not five seconds: this returns the moment
+# the output appears, and on a loaded host a harness session's checks alone
+# have taken more than five seconds. The limit costs time only when it fails.
+STARTUP_POLLS=1200
 wait_for_output() {
     local pid="$1"
-    local attempts=100
+    local attempts="$STARTUP_POLLS"
     while [[ ! -s "$OUTPUT" && "$attempts" -gt 0 ]]; do
         if ! kill -0 "$pid" 2>/dev/null; then
             return 1
@@ -125,58 +136,149 @@ if [[ "$STATUS" -ne 143 || "$ELAPSED" -ge 2 || -e "$SELECTED" ]]; then
     exit 1
 fi
 
+# TERM has to reach what the command started, not only the command. Whichever
+# wrapper is named, the descendant is a real process with no handler of its
+# own, so if it outlives the bounded poll below TERM never reached it: a
+# sleeping process with a fatal signal pending is woken at once, and the
+# failure is reported rather than waited out.
+assert_term_stops_descendant() {
+    local wrapper="$1" base="$2" label="$3"
+    rm -f "$DESCENDANT_PID_FILE"
+    : > "$OUTPUT"
+    FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$base" \
+        DESCENDANT_PID_FILE="$DESCENDANT_PID_FILE" \
+        "$wrapper" sh -c \
+            'printf "%s\n" "$TMPDIR"; sleep 30 & echo "$!" > "$DESCENDANT_PID_FILE"; wait' \
+        > "$OUTPUT" &
+    WRAPPER_PID=$!
+    if ! wait_for_output "$WRAPPER_PID"; then
+        wait "$WRAPPER_PID" 2>/dev/null || true
+        echo "FAIL  $label: descendant test wrapper exited or timed out during startup" >&2
+        exit 1
+    fi
+    for _ in $(seq 1 "$STARTUP_POLLS"); do
+        [[ -s "$DESCENDANT_PID_FILE" ]] && break
+        sleep 0.05
+    done
+    if [[ ! -s "$DESCENDANT_PID_FILE" ]]; then
+        kill -TERM "$WRAPPER_PID" 2>/dev/null || true
+        wait "$WRAPPER_PID" 2>/dev/null || true
+        echo "FAIL  $label: descendant test did not report its pid" >&2
+        exit 1
+    fi
+    DESCENDANT_PID="$(cat "$DESCENDANT_PID_FILE")"
+    kill -TERM "$WRAPPER_PID"
+    set +e
+    wait "$WRAPPER_PID"
+    STATUS=$?
+    set -e
+    for _ in $(seq 1 100); do
+        ! process_is_running "$DESCENDANT_PID" && break
+        sleep 0.05
+    done
+    SELECTED="$(cat "$OUTPUT")"
+    TERM_FAILED=0
+    if [[ "$STATUS" -ne 143 ]]; then
+        echo "FAIL  $label: process-group TERM returned status $STATUS, expected 143" >&2
+        TERM_FAILED=1
+    fi
+    if [[ -e "$SELECTED" ]]; then
+        echo "FAIL  $label: process-group TERM left the scratch directory: $SELECTED" >&2
+        TERM_FAILED=1
+    fi
+    if process_is_running "$DESCENDANT_PID"; then
+        echo "FAIL  $label: live descendant survived process-group TERM: pid=$DESCENDANT_PID state=$(ps -p "$DESCENDANT_PID" -o stat= | tr -d " ") pgid=$(ps -p "$DESCENDANT_PID" -o pgid= | tr -d " ")" >&2
+        TERM_FAILED=1
+    fi
+    if [[ "$TERM_FAILED" -ne 0 ]]; then
+        kill "$DESCENDANT_PID" 2>/dev/null || true
+        exit 1
+    fi
+    rm -f "$DESCENDANT_PID_FILE"
+}
+
+assert_term_stops_descendant "$REPO/scripts/with-test-temp.sh" "$TEST_BASE" "the wrapper as checked out"
+
+# THE SESSION DECIDES THE COMMAND'S PROCESS GROUP, and the wrapper must not
+# depend on which it chose. fs-linux-test-harness v0.5.1 ran the command in the
+# session's own group; v0.5.4 made it a group of its own and still passes a
+# signal to the command alone. Only a host that can run a VM takes this path,
+# so a stand-in for each shape holds it on every host and at every pin.
+mkdir -p "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/fs-linux-test-harness/scripts"
+cp "$REPO/scripts/with-test-temp.sh" "$STANDIN/repo/scripts/with-test-temp.sh"
+cat > "$STANDIN/fs-linux-test-harness/scripts/vm.sh" <<'SESSION'
+#!/usr/bin/env bash
+# `vm.sh session <command...>`: the signal goes to the command and no further.
+[[ "${1:-}" == session ]] || exit 99
+shift
+child=""
+signalled=0
+trap 'signalled=143; [[ -z "$child" ]] || kill -TERM "$child" 2>/dev/null || true' TERM
+[[ "$STANDIN_SESSION_SHAPE" != own-group ]] || set -m
+"$@" <&0 &
+child=$!
+set +m
+while :; do
+    wait "$child"
+    status=$?
+    kill -0 "$child" 2>/dev/null || break
+done
+[[ "$signalled" == 0 ]] || status="$signalled"
+exit "$status"
+SESSION
+chmod +x "$STANDIN/fs-linux-test-harness/scripts/vm.sh"
+for shape in own-group shared-group; do
+    STANDIN_SESSION_SHAPE="$shape" assert_term_stops_descendant \
+        "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/repo/tmp" "a session, command in $shape"
+done
+rm -f "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/fs-linux-test-harness/scripts/vm.sh"
+rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" \
+    "$STANDIN/fs-linux-test-harness/scripts" "$STANDIN/fs-linux-test-harness" "$STANDIN"
+
+# TERM BEFORE THE PROCESS GROUP EXISTS still stops the run. The scratch
+# directory's mktemp is held open for a second so the signal lands while the
+# wrapper is starting, ahead of the command it was asked to run; a signal lost
+# there leaves the wrapper waiting out the whole command, thirty seconds here.
+REAL_MKTEMP="$(command -v mktemp)"
+mkdir -p "$SLOW_BIN"
+cat > "$SLOW_BIN/mktemp" <<SLOW
+#!/bin/sh
+case "\$*" in
+    *fs-xfs-tests*) : > "$STARTING_MARK"; sleep 1 ;;
+esac
+exec "$REAL_MKTEMP" "\$@"
+SLOW
+chmod +x "$SLOW_BIN/mktemp"
 : > "$OUTPUT"
-DESCENDANT_PID_FILE="$TEST_BASE/descendant.pid"
-FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
-    DESCENDANT_PID_FILE="$DESCENDANT_PID_FILE" \
-    "$REPO/scripts/with-test-temp.sh" sh -c \
-        'printf "%s\n" "$TMPDIR"; sleep 30 & echo "$!" > "$DESCENDANT_PID_FILE"; wait' \
+rm -f "$STARTING_MARK"
+PATH="$SLOW_BIN:$PATH" FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
+    "$REPO/scripts/with-test-temp.sh" sh -c 'printf "%s\n" "$TMPDIR"; sleep 30' \
     > "$OUTPUT" &
 WRAPPER_PID=$!
-if ! wait_for_output "$WRAPPER_PID"; then
-    wait "$WRAPPER_PID" 2>/dev/null || true
-    echo "FAIL  descendant test wrapper exited or timed out during startup" >&2
-    exit 1
-fi
-for _ in $(seq 1 100); do
-    [[ -s "$DESCENDANT_PID_FILE" ]] && break
+for _ in $(seq 1 "$STARTUP_POLLS"); do
+    [[ -e "$STARTING_MARK" ]] && break
     sleep 0.05
 done
-if [[ ! -s "$DESCENDANT_PID_FILE" ]]; then
+if [[ ! -e "$STARTING_MARK" ]]; then
     kill -TERM "$WRAPPER_PID" 2>/dev/null || true
     wait "$WRAPPER_PID" 2>/dev/null || true
-    echo "FAIL  descendant test did not report its pid" >&2
+    echo "FAIL  the wrapper never reached its scratch directory's mktemp" >&2
     exit 1
 fi
-DESCENDANT_PID="$(cat "$DESCENDANT_PID_FILE")"
+STARTED="$(date +%s)"
 kill -TERM "$WRAPPER_PID"
 set +e
 wait "$WRAPPER_PID"
 STATUS=$?
 set -e
-for _ in $(seq 1 100); do
-    ! process_is_running "$DESCENDANT_PID" && break
-    sleep 0.05
-done
-SELECTED="$(cat "$OUTPUT")"
-TERM_FAILED=0
-if [[ "$STATUS" -ne 143 ]]; then
-    echo "FAIL  process-group TERM returned status $STATUS, expected 143" >&2
-    TERM_FAILED=1
-fi
-if [[ -e "$SELECTED" ]]; then
-    echo "FAIL  process-group TERM left the scratch directory: $SELECTED" >&2
-    TERM_FAILED=1
-fi
-if process_is_running "$DESCENDANT_PID"; then
-    echo "FAIL  live descendant survived process-group TERM: pid=$DESCENDANT_PID state=$(ps -p "$DESCENDANT_PID" -o stat=)" >&2
-    TERM_FAILED=1
-fi
-if [[ "$TERM_FAILED" -ne 0 ]]; then
-    kill "$DESCENDANT_PID" 2>/dev/null || true
+ELAPSED=$(( $(date +%s) - STARTED ))
+LEFT="$(compgen -G "$TEST_BASE/fs-xfs-tests.*" || true)"
+if [[ "$STATUS" -ne 143 || "$ELAPSED" -ge 20 || -n "$LEFT" ]]; then
+    echo "FAIL  TERM during startup did not stop the run: status=$STATUS elapsed=$ELAPSED left=$LEFT" >&2
     exit 1
 fi
-rm -f "$DESCENDANT_PID_FILE"
+rm -f "$SLOW_BIN/mktemp" "$STARTING_MARK"
+rmdir "$SLOW_BIN"
 
 STARTUP_BLOCKER="$TEST_BASE/not-a-directory"
 : > "$STARTUP_BLOCKER"
