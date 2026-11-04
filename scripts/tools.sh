@@ -22,7 +22,8 @@
 #
 # What the host does need:
 #
-#   ripgrep      the script tests (`chore test:scripts`) search the tree
+#   ripgrep      the script tests (`chore test:scripts`) search the tree;
+#                Linux also uses bindfs and fusermount for a rootless test mount
 #                with it; a check written around a missing rg reports
 #                PASS having matched nothing
 #   the VM       Vagrant, QEMU and KVM/HVF — checked by the harness
@@ -45,12 +46,20 @@ MODE=install
 
 # tool:debian-package:homebrew-formula
 TOOLS="rg:ripgrep:ripgrep"
+HOST_PLATFORM="$(uname -s)"
+if [ "$HOST_PLATFORM" = Linux ]; then
+    TOOLS="$TOOLS bindfs:bindfs:bindfs"
+fi
 
 missing() {
     local entry out=""
     for entry in $TOOLS; do
         command -v "${entry%%:*}" >/dev/null 2>&1 || out="$out $entry"
     done
+    if [ "$HOST_PLATFORM" = Linux ] && ! command -v fusermount3 >/dev/null 2>&1 \
+        && ! command -v fusermount >/dev/null 2>&1; then
+        out="$out fusermount:fuse:fuse"
+    fi
     echo "${out# }"
 }
 

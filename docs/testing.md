@@ -57,6 +57,40 @@ asked to read it cannot open. An exact `FS_XFS_TEST_TMPDIR` is caller-managed;
 `FS_XFS_TEST_TMP_BASE` receives a unique child; both must be inside the repository,
 and the wrapper refuses either outside it.
 
+`chore test:scripts` checks cleanup against a real mounted filesystem without
+sudo. On macOS, the guard creates an 8 MiB HFS+ image in its own `mktemp -d`
+sandbox and attaches it with `hdiutil`, without opening Finder or running an
+automatic filesystem check. On Linux, it uses `bindfs --no-allow-other` to
+mirror an owned, empty backing directory through FUSE, then unmounts with
+`fusermount3` or `fusermount`. Both the
+normal wrapper and a copy with `-xdev` removed run against the real mount:
+the first must preserve the probe, and the second must remove it.
+
+Linux hosts need bindfs, the packaged FUSE mount/unmount helper, and access
+to `/dev/fuse`. `chore tools` supplies the command-line tools through the
+host's package manager. The helper handles the kernel privilege internally;
+the test caller needs neither root nor passwordless sudo. A kernel, container,
+or security policy that denies FUSE provides no usable mount by this route;
+the guard fails explicitly, including outside CI. Unsupported
+platforms, missing tools, failed mounts, and failed probe writes also fail.
+There is no passwordless-sudo fallback, `NOT RUN` result, or CI-only exemption.
+This replaces #592's passwordless-sudo requirement with real unprivileged
+mounts. The existing Linux CI package-install step additionally installs
+bindfs (which supplies its FUSE dependency); no security policy is disabled.
+An attempted user-namespace tmpfs failed on Ubuntu 24.04 with
+`unshare: write failed /proc/self/uid_map: Operation not permitted`, so that
+route is not assumed to work. No guard is excluded from either CI runner,
+and the macOS Bash 3.2 job is unchanged.
+
+Only the sandbox-created image is attached, and detachment uses the device
+returned by that exact attachment. Cleanup validates canonical paths inside
+the owned sandbox before removal and refuses to remove a still-mounted
+directory. Exit and signal traps detach before deleting the image; a failed
+detach leaves the sandbox intact for another cleanup attempt or inspection.
+The regression also injects a failed probe write and a failed first detach,
+requiring failure status, balanced real mounts/detaches, and removal of each
+owned mount directory.
+
 The wrapper also runs the command inside a harness session, so the run owns the VM its
 tests use: the VM comes down and the machine-wide slot is released when the run ends,
 passed, failed or killed, unless it was held up with `chore vm:up`.
