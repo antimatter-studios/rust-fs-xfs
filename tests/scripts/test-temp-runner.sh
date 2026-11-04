@@ -1,23 +1,76 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEST_BASE="$REPO/tmp/runner-policy-test"
-OUTPUT="$REPO/tmp/runner-policy-output.txt"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+MOUNT_PLATFORM="$(uname -s)"
+FUSE_UNMOUNT=""
+if [[ "$MOUNT_PLATFORM" == Linux ]]; then
+    if command -v fusermount3 >/dev/null; then
+        FUSE_UNMOUNT=fusermount3
+    elif command -v fusermount >/dev/null; then
+        FUSE_UNMOUNT=fusermount
+    else
+        echo "FAIL  the rootless mount check needs fusermount3 or fusermount; run 'chore tools'" >&2
+        exit 1
+    fi
+    if ! command -v bindfs >/dev/null; then
+        echo "FAIL  the rootless mount check needs bindfs; run 'chore tools'" >&2
+        exit 1
+    fi
+fi
+mkdir -p "$REPO/tmp"
+TEST_BASE="$(mktemp -d "$REPO/tmp/runner-policy-test.XXXXXX")"
+OUTPUT="$TEST_BASE/output.txt"
 DESCENDANT_PID_FILE="$TEST_BASE/descendant.pid"
 STANDIN="$TEST_BASE/standin"
 SLOW_BIN="$TEST_BASE/slow-mktemp"
 STARTING_MARK="$TEST_BASE/starting"
 MOUNT_LOG="$TEST_BASE/mount.log"
+MOUNT_IMAGE="$TEST_BASE/cleanup.dmg"
+MOUNT_SOURCE="$TEST_BASE/mount-source"
+ATTACH_PLIST="$TEST_BASE/attach.plist"
+MOUNT_IN_PROGRESS=0
+
+inside_sandbox() {
+    python3 - "$TEST_BASE" "$1" <<'PY'
+from pathlib import Path
+import sys
+root, target = map(Path, sys.argv[1:])
+assert root == root.resolve(), f'refusing a symlinked sandbox: {root}'
+assert target == target.resolve(), f'refusing a noncanonical cleanup path: {target}'
+assert target == root or root in target.parents, f'refusing cleanup outside {root}: {target}'
+PY
+}
 
 cleanup() {
+    case "$TEST_BASE" in
+        "$REPO"/tmp/runner-policy-test.*) ;;
+        *) echo "FAIL  refusing cleanup outside the runner sandbox: $TEST_BASE" >&2; return 1 ;;
+    esac
+    inside_sandbox "$TEST_BASE" || return 1
+    if [[ "$MOUNT_IN_PROGRESS" == 1 ]]; then
+        remove_mount_scratch || return 1
+    fi
+    inside_sandbox "$MOUNT_SOURCE" || return 1
     rm -f "$OUTPUT" "$DESCENDANT_PID_FILE" "$STARTING_MARK" "$MOUNT_LOG" "$SLOW_BIN/mktemp" \
-        "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/fs-linux-test-harness/scripts/vm.sh"
+        "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/fs-linux-test-harness/scripts/vm.sh" \
+        "$MOUNT_IMAGE" "$ATTACH_PLIST" "$MOUNT_SOURCE/must-survive-cleanup"
     rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" \
         "$STANDIN/fs-linux-test-harness/scripts" "$STANDIN/fs-linux-test-harness" "$STANDIN" \
-        "$SLOW_BIN" "$TEST_BASE" 2>/dev/null || true
+        "$SLOW_BIN" "$MOUNT_SOURCE" 2>/dev/null || true
+    rmdir "$TEST_BASE" || return 1
 }
-trap cleanup EXIT HUP INT TERM
+cleanup_on_exit() {
+    local exit_status=$?
+    trap - EXIT
+    cleanup || exit_status=1
+    exit "$exit_status"
+}
+trap cleanup_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+inside_sandbox "$TEST_BASE"
 
 # STARTUP IS BOUNDED BY A MINUTE, not five seconds: this returns the moment
 # the output appears, and on a loaded host a harness session's checks alone
@@ -302,31 +355,48 @@ if [[ "$STATUS" -eq 0 ]]; then
 fi
 rm -f "$STARTUP_BLOCKER"
 
-# CLEANUP STOPS AT A MOUNT. The command mounts a tmpfs below its scratch directory
+# CLEANUP STOPS AT A MOUNT. The command mounts a filesystem below its scratch directory
 # and writes a probe into it, and the probe has to outlive the wrapper's cleanup.
 # A probe is only on another filesystem if the mount worked, so a mount or a write
 # that failed gets a status of its own and is never read as a verdict on cleanup.
-# The two systems take different arguments: macOS's mount_tmpfs refuses
-# `-o size=1m` before it looks at privileges, and mount(8) passes it there.
-case "$(uname -s)" in
-    Darwin) MOUNT_TMPFS=(/sbin/mount_tmpfs -o nobrowse -s 1m) ;;
-    *) MOUNT_TMPFS=(mount -t tmpfs -o size=1m tmpfs) ;;
+case "$MOUNT_PLATFORM" in
+    Darwin)
+        if ! hdiutil create -size 8m -fs HFS+ -layout NONE -volname xfs-cleanup-test \
+            "$MOUNT_IMAGE" </dev/null > "$MOUNT_LOG" 2>&1; then
+            echo "FAIL  could not create the owned test image: $(tail -n 3 "$MOUNT_LOG")" >&2
+            exit 1
+        fi
+        MOUNT_COMMAND=(hdiutil attach -plist -nobrowse -noautoopen -noautofsck)
+        ;;
+    Linux)
+        mkdir "$MOUNT_SOURCE"
+        inside_sandbox "$MOUNT_SOURCE"
+        MOUNT_COMMAND=(bindfs --no-allow-other "$MOUNT_SOURCE")
+        ;;
+    *) echo "FAIL  no unprivileged mount check is implemented for $MOUNT_PLATFORM" >&2; exit 1 ;;
 esac
 MOUNT_FAILED=81
 PROBE_FAILED=82
 
 run_wrapper_over_mount() {
     local wrapper="$1" base="$2"
+    MOUNT_IN_PROGRESS=1
     set +e
     FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$base" \
         MOUNT_FAILED="$MOUNT_FAILED" PROBE_FAILED="$PROBE_FAILED" \
+        MOUNT_PLATFORM="$MOUNT_PLATFORM" MOUNT_IMAGE="$MOUNT_IMAGE" ATTACH_PLIST="$ATTACH_PLIST" \
         "$wrapper" sh -c '
             printf "%s\n" "$TMPDIR"
-            mkdir "$TMPDIR/mounted"
-            sudo "$@" "$TMPDIR/mounted" || exit "$MOUNT_FAILED"
+            mkdir "$TMPDIR/mounted" || exit "$MOUNT_FAILED"
+            case "$MOUNT_PLATFORM" in
+                Darwin) "$@" -mountpoint "$TMPDIR/mounted" "$MOUNT_IMAGE" </dev/null > "$ATTACH_PLIST" || exit "$MOUNT_FAILED" ;;
+                Linux) "$@" "$TMPDIR/mounted" || exit "$MOUNT_FAILED" ;;
+            esac
+            python3 -c "import os,sys; assert os.stat(sys.argv[1]).st_dev != os.stat(sys.argv[2]).st_dev, \"mount did not change filesystem device\"" \
+                "$TMPDIR" "$TMPDIR/mounted" || exit "$MOUNT_FAILED"
             touch "$TMPDIR/mounted/must-survive-cleanup" || exit "$PROBE_FAILED"
             exit 23
-        ' mount-probe "${MOUNT_TMPFS[@]}" > "$OUTPUT" 2> "$MOUNT_LOG"
+        ' mount-probe "${MOUNT_COMMAND[@]}" > "$OUTPUT" 2> "$MOUNT_LOG"
     STATUS=$?
     set -e
     SELECTED="$(cat "$OUTPUT")"
@@ -334,55 +404,91 @@ run_wrapper_over_mount() {
     if [[ "$STATUS" -eq "$MOUNT_FAILED" || "$STATUS" -eq "$PROBE_FAILED" ]]; then
         remove_mount_scratch
         if [[ "$STATUS" -eq "$MOUNT_FAILED" ]]; then
-            echo "FAIL  ${MOUNT_TMPFS[*]} did not mount, so cleanup at a mount was not tested: $(tail -n 3 "$MOUNT_LOG")" >&2
+            echo "FAIL  ${MOUNT_COMMAND[*]} did not mount, so cleanup at a mount was not tested: $(tail -n 3 "$MOUNT_LOG")" >&2
         else
-            echo "FAIL  the probe could not be written in the tmpfs, so cleanup at a mount was not tested: $(tail -n 3 "$MOUNT_LOG")" >&2
+            echo "FAIL  the probe could not be written in the mounted filesystem, so cleanup at a mount was not tested: $(tail -n 3 "$MOUNT_LOG")" >&2
         fi
         exit 1
     fi
 }
 
 remove_mount_scratch() {
-    sudo umount "$SELECTED/mounted" 2>/dev/null || true
-    find "$SELECTED" -xdev -depth -mindepth 1 -delete 2>/dev/null || true
-    rmdir "$SELECTED" 2>/dev/null || true
+    local selected device
+    selected="$(cat "$OUTPUT")"
+    if [[ -z "$selected" && ! -s "$ATTACH_PLIST" ]]; then
+        MOUNT_IN_PROGRESS=0
+        return 0
+    fi
+    case "$selected" in
+        "$TEST_BASE"/fs-xfs-tests.*|"$STANDIN"/repo/tmp/fs-xfs-tests.*) ;;
+        *) echo "FAIL  refusing mount cleanup outside the owned scratch base: $selected" >&2; return 1 ;;
+    esac
+    inside_sandbox "$selected" || return 1
+    inside_sandbox "$selected/mounted" || return 1
+    if [[ "$MOUNT_PLATFORM" == Darwin && -s "$ATTACH_PLIST" ]]; then
+        device="$(python3 - "$ATTACH_PLIST" "$selected/mounted" <<'PY'
+import plistlib
+import re
+import sys
+with open(sys.argv[1], 'rb') as source:
+    entity, = plistlib.load(source)['system-entities']
+assert entity['mount-point'] == sys.argv[2], 'attachment does not name the owned mountpoint'
+assert re.fullmatch(r'/dev/disk[0-9]+', entity['dev-entry']), 'unexpected image device'
+print(entity['dev-entry'])
+PY
+)" || return 1
+        if ! hdiutil detach "$device" >> "$MOUNT_LOG" 2>&1; then
+            echo "FAIL  could not detach the owned test image $device: $(tail -n 3 "$MOUNT_LOG")" >&2
+            return 1
+        fi
+        rm -f "$ATTACH_PLIST"
+    elif [[ "$MOUNT_PLATFORM" == Linux && -d "$selected/mounted" ]]; then
+        if ! python3 -c 'import os,sys; assert os.stat(sys.argv[1]).st_dev == os.stat(sys.argv[2]).st_dev' \
+            "$selected" "$selected/mounted" 2>/dev/null; then
+            if ! "$FUSE_UNMOUNT" -u "$selected/mounted" >> "$MOUNT_LOG" 2>&1; then
+                echo "FAIL  could not unmount the owned test filesystem: $(tail -n 3 "$MOUNT_LOG")" >&2
+                return 1
+            fi
+        fi
+    fi
+    if [[ -d "$selected/mounted" ]]; then
+        python3 -c 'import os,sys; assert os.stat(sys.argv[1]).st_dev == os.stat(sys.argv[2]).st_dev, "refusing removal across a remaining mount"' \
+            "$selected" "$selected/mounted" || return 1
+    fi
+    if [[ -d "$selected" ]]; then
+        find "$selected" -xdev -depth -mindepth 1 -delete || return 1
+        rmdir "$selected" || return 1
+    fi
+    MOUNT_IN_PROGRESS=0
 }
 
-if sudo -n true 2>/dev/null; then
-    run_wrapper_over_mount "$REPO/scripts/with-test-temp.sh" "$TEST_BASE"
-    if [[ "$STATUS" -ne 23 || ! -e "$MOUNT_PROBE" ]]; then
-        remove_mount_scratch
-        echo "FAIL  cleanup crossed into a mounted filesystem or changed status: status=$STATUS" >&2
-        exit 1
-    fi
-    sudo umount "$SELECTED/mounted"
-    rmdir "$SELECTED/mounted" "$SELECTED"
-
-    # The check above can fail. The same wrapper without -xdev has to remove the
-    # probe, on this system's find and this system's tmpfs.
-    mkdir -p "$STANDIN/repo/scripts" "$STANDIN/repo/tmp"
-    sed 's/ -xdev / /' "$REPO/scripts/with-test-temp.sh" > "$STANDIN/repo/scripts/with-test-temp.sh"
-    chmod +x "$STANDIN/repo/scripts/with-test-temp.sh"
-    if grep -q -e -xdev "$STANDIN/repo/scripts/with-test-temp.sh"; then
-        echo "FAIL  the control still has -xdev in its cleanup" >&2
-        exit 1
-    fi
-    run_wrapper_over_mount "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/repo/tmp"
-    if [[ "$STATUS" -ne 23 || -e "$MOUNT_PROBE" ]]; then
-        remove_mount_scratch
-        echo "FAIL  cleanup without -xdev left the probe, so the mount check cannot fail: status=$STATUS" >&2
-        exit 1
-    fi
-    sudo umount "$SELECTED/mounted"
-    rmdir "$SELECTED/mounted" "$SELECTED"
-    rm -f "$STANDIN/repo/scripts/with-test-temp.sh"
-    rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" "$STANDIN"
-elif [[ "${GITHUB_ACTIONS:-}" == true ]]; then
-    echo "FAIL  this runner has no passwordless sudo, so cleanup at a mount was not tested" >&2
+run_wrapper_over_mount "$REPO/scripts/with-test-temp.sh" "$TEST_BASE"
+if [[ "$STATUS" -ne 23 || ! -e "$MOUNT_PROBE" ]]; then
+    remove_mount_scratch
+    echo "FAIL  cleanup crossed into a mounted filesystem or changed status: status=$STATUS" >&2
     exit 1
-else
-    echo "NOT RUN  cleanup at a mount needs passwordless sudo, which CI has and this host does not"
 fi
+remove_mount_scratch
+
+# The check above can fail. The same wrapper without -xdev has to remove the
+# probe, on this system's find and this system's mounted filesystem.
+mkdir -p "$STANDIN/repo/scripts" "$STANDIN/repo/tmp"
+sed 's/ -xdev / /' "$REPO/scripts/with-test-temp.sh" > "$STANDIN/repo/scripts/with-test-temp.sh"
+chmod +x "$STANDIN/repo/scripts/with-test-temp.sh"
+if grep -q -e -xdev "$STANDIN/repo/scripts/with-test-temp.sh"; then
+    echo "FAIL  the control still has -xdev in its cleanup" >&2
+    exit 1
+fi
+run_wrapper_over_mount "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/repo/tmp"
+if [[ "$STATUS" -ne 23 || -e "$MOUNT_PROBE" ]]; then
+    remove_mount_scratch
+    echo "FAIL  cleanup without -xdev left the probe, so the mount check cannot fail: status=$STATUS" >&2
+    exit 1
+fi
+remove_mount_scratch
+rm -f "$STANDIN/repo/scripts/with-test-temp.sh"
+rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" "$STANDIN"
+echo "PASS  mount boundary and negative control run without sudo"
 
 EXACT="$TEST_BASE/exact"
 FS_XFS_TEST_TMPDIR="$EXACT" "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
@@ -441,7 +547,7 @@ FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$OUTSIDE" \
     "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT" 2>/dev/null
 STATUS=$?
 set -e
-rmdir "$OUTSIDE" 2>/dev/null || rm -rf "$OUTSIDE"
+rmdir "$OUTSIDE"
 if [[ "$STATUS" -eq 0 ]]; then
     echo "FAIL  a scratch base outside the repository was accepted: $(cat "$OUTPUT")" >&2
     exit 1
