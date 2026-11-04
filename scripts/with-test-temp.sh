@@ -20,6 +20,7 @@ RUN_DIR=""
 CHILD_PID=""
 CHILD_PGID=""
 SIGNAL_STATUS=""
+SIGNAL_NAME=""
 
 cleanup() {
     if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
@@ -35,6 +36,7 @@ forward_signal() {
     local signal="$1"
     local number="$2"
     SIGNAL_STATUS=$((128 + number))
+    SIGNAL_NAME="$signal"
     if [[ -n "$CHILD_PGID" ]] && kill -0 -- "-$CHILD_PGID" 2>/dev/null; then
         kill -s "$signal" -- "-$CHILD_PGID" 2>/dev/null || true
     fi
@@ -43,6 +45,36 @@ trap cleanup EXIT
 trap 'forward_signal HUP 1' HUP
 trap 'forward_signal INT 2' INT
 trap 'forward_signal TERM 15' TERM
+
+# THE RUN OWNS THE VM ITS TESTS USE. The tiers bring the harness VM up
+# before cargo starts, and every test process brings it up if it is down;
+# either boot takes the machine-wide slot, ONE for every repository on the
+# machine. Left to chore's `after_all` reaper, which runs only inside a
+# chore invocation of this repository, a run that reached cargo any other
+# way (scripts/test.sh by hand, ../rust-fs-core/scripts/tier.sh) exited with the VM idle
+# and the slot held, and every other repository's VM work queued behind it
+# until the guest's idle deadline. `vm.sh session` runs the command inside
+# a harness session: the VM comes down and the slot is released when the
+# run ends, passed, failed or killed, and a VM held with `chore vm:up` is
+# left up. In the guest, and on a host that cannot run the VM, it runs the
+# command as it is. Without the harness sibling no test can boot a VM, so
+# there is none to own.
+#
+# THE SESSION RUNS THIS SCRIPT, NOT THE COMMAND. A signal has to reach
+# everything the command started, and only this script's own process group
+# below is known to hold all of it: the harness promises to pass a signal on
+# to its command, and which process group that command is in is its own
+# choice, one it changed between v0.5.1 and v0.5.4. With the session wrapped
+# around this script it does not matter. The harness signals this script,
+# this script signals the group, and the scratch directory goes before the
+# VM does. The marker is an argument so that it dies here, and a wrapper a
+# test starts is a run of its own.
+HARNESS_VM="$REPO/../fs-linux-test-harness/scripts/vm.sh"
+if [[ "${1:-}" == "--inside-session" ]]; then
+    shift
+elif [[ "$#" -gt 0 && "$1" != "--print-temp-dir" && -x "$HARNESS_VM" ]]; then
+    exec "$HARNESS_VM" session "$REPO/scripts/with-test-temp.sh" --inside-session "$@"
+fi
 
 # Inside the repository, or the guest cannot see it. Refused here, where
 # the rule can be explained, rather than in the guest as a missing file.
@@ -84,33 +116,23 @@ fi
 
 export FS_XFS_TEST_TEMP_ACTIVE=1
 
-# THE RUN OWNS THE VM ITS TESTS USE. The tiers bring the harness VM up
-# before cargo starts, and every test process brings it up if it is down;
-# either boot takes the machine-wide slot, ONE for every repository on the
-# machine. Left to chore's `after_all` reaper, which runs only inside a
-# chore invocation of this repository, a run that reached cargo any other
-# way (scripts/test.sh by hand, ../rust-fs-core/scripts/tier.sh) exited with the VM idle
-# and the slot held, and every other repository's VM work queued behind it
-# until the guest's idle deadline. `vm.sh session` runs the command inside
-# a harness session: the VM comes down and the slot is released when the
-# run ends, passed, failed or killed, and a VM held with `chore vm:up` is
-# left up. In the guest, and on a host that cannot run the VM, it runs the
-# command as it is. Without the harness sibling no test can boot a VM, so
-# there is none to own.
-session=()
-HARNESS_VM="$REPO/../fs-linux-test-harness/scripts/vm.sh"
-[[ -x "$HARNESS_VM" ]] && session=("$HARNESS_VM" session)
+# A SIGNAL DURING STARTUP COUNTS. Until the process group exists there is
+# nothing for forward_signal to signal, so it only records the signal, and one
+# recorded by now stops the run here. Starting the command and signalling it
+# afterwards is not the same: a signal that reaches a forked child before its
+# exec lands in the trap handler it inherited from this shell, and is lost.
+[[ -z "$SIGNAL_STATUS" ]] || exit "$SIGNAL_STATUS"
 
 # Job control gives the command and every descendant its own process group.
 # This is portable to the older Bash shipped by macOS, where `setsid` is not
 # available by default.
 set -m
-# The `+` form because an empty array is an unbound variable to bash
-# before 4.4, which is what macOS ships.
-${session[@]+"${session[@]}"} "$@" <&0 &
+"$@" <&0 &
 CHILD_PID=$!
 CHILD_PGID=$CHILD_PID
 set +m
+# One that landed between the check above and the group having a name.
+[[ -z "$SIGNAL_NAME" ]] || kill -s "$SIGNAL_NAME" -- "-$CHILD_PGID" 2>/dev/null || true
 set +e
 wait "$CHILD_PID"
 STATUS=$?
