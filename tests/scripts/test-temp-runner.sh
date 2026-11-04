@@ -8,9 +8,10 @@ DESCENDANT_PID_FILE="$TEST_BASE/descendant.pid"
 STANDIN="$TEST_BASE/standin"
 SLOW_BIN="$TEST_BASE/slow-mktemp"
 STARTING_MARK="$TEST_BASE/starting"
+MOUNT_LOG="$TEST_BASE/mount.log"
 
 cleanup() {
-    rm -f "$OUTPUT" "$DESCENDANT_PID_FILE" "$STARTING_MARK" "$SLOW_BIN/mktemp" \
+    rm -f "$OUTPUT" "$DESCENDANT_PID_FILE" "$STARTING_MARK" "$MOUNT_LOG" "$SLOW_BIN/mktemp" \
         "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/fs-linux-test-harness/scripts/vm.sh"
     rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" \
         "$STANDIN/fs-linux-test-harness/scripts" "$STANDIN/fs-linux-test-harness" "$STANDIN" \
@@ -301,29 +302,86 @@ if [[ "$STATUS" -eq 0 ]]; then
 fi
 rm -f "$STARTUP_BLOCKER"
 
-if sudo -n true 2>/dev/null; then
+# CLEANUP STOPS AT A MOUNT. The command mounts a tmpfs below its scratch directory
+# and writes a probe into it, and the probe has to outlive the wrapper's cleanup.
+# A probe is only on another filesystem if the mount worked, so a mount or a write
+# that failed gets a status of its own and is never read as a verdict on cleanup.
+# The two systems take different arguments: macOS's mount_tmpfs refuses
+# `-o size=1m` before it looks at privileges, and mount(8) passes it there.
+case "$(uname -s)" in
+    Darwin) MOUNT_TMPFS=(/sbin/mount_tmpfs -o nobrowse -s 1m) ;;
+    *) MOUNT_TMPFS=(mount -t tmpfs -o size=1m tmpfs) ;;
+esac
+MOUNT_FAILED=81
+PROBE_FAILED=82
+
+run_wrapper_over_mount() {
+    local wrapper="$1" base="$2"
     set +e
-    FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$TEST_BASE" \
-        "$REPO/scripts/with-test-temp.sh" sh -c '
+    FS_XFS_TEST_TMPDIR= FS_XFS_TEST_TMP_BASE="$base" \
+        MOUNT_FAILED="$MOUNT_FAILED" PROBE_FAILED="$PROBE_FAILED" \
+        "$wrapper" sh -c '
             printf "%s\n" "$TMPDIR"
             mkdir "$TMPDIR/mounted"
-            sudo mount -t tmpfs -o size=1m tmpfs "$TMPDIR/mounted"
-            touch "$TMPDIR/mounted/must-survive-cleanup"
+            sudo "$@" "$TMPDIR/mounted" || exit "$MOUNT_FAILED"
+            touch "$TMPDIR/mounted/must-survive-cleanup" || exit "$PROBE_FAILED"
             exit 23
-        ' > "$OUTPUT" 2>/dev/null
+        ' mount-probe "${MOUNT_TMPFS[@]}" > "$OUTPUT" 2> "$MOUNT_LOG"
     STATUS=$?
     set -e
     SELECTED="$(cat "$OUTPUT")"
     MOUNT_PROBE="$SELECTED/mounted/must-survive-cleanup"
+    if [[ "$STATUS" -eq "$MOUNT_FAILED" || "$STATUS" -eq "$PROBE_FAILED" ]]; then
+        remove_mount_scratch
+        if [[ "$STATUS" -eq "$MOUNT_FAILED" ]]; then
+            echo "FAIL  ${MOUNT_TMPFS[*]} did not mount, so cleanup at a mount was not tested: $(tail -n 3 "$MOUNT_LOG")" >&2
+        else
+            echo "FAIL  the probe could not be written in the tmpfs, so cleanup at a mount was not tested: $(tail -n 3 "$MOUNT_LOG")" >&2
+        fi
+        exit 1
+    fi
+}
+
+remove_mount_scratch() {
+    sudo umount "$SELECTED/mounted" 2>/dev/null || true
+    find "$SELECTED" -xdev -depth -mindepth 1 -delete 2>/dev/null || true
+    rmdir "$SELECTED" 2>/dev/null || true
+}
+
+if sudo -n true 2>/dev/null; then
+    run_wrapper_over_mount "$REPO/scripts/with-test-temp.sh" "$TEST_BASE"
     if [[ "$STATUS" -ne 23 || ! -e "$MOUNT_PROBE" ]]; then
-        sudo umount "$SELECTED/mounted" 2>/dev/null || true
-        find "$SELECTED" -xdev -depth -mindepth 1 -delete 2>/dev/null || true
-        rmdir "$SELECTED" 2>/dev/null || true
+        remove_mount_scratch
         echo "FAIL  cleanup crossed into a mounted filesystem or changed status: status=$STATUS" >&2
         exit 1
     fi
     sudo umount "$SELECTED/mounted"
     rmdir "$SELECTED/mounted" "$SELECTED"
+
+    # The check above can fail. The same wrapper without -xdev has to remove the
+    # probe, on this system's find and this system's tmpfs.
+    mkdir -p "$STANDIN/repo/scripts" "$STANDIN/repo/tmp"
+    sed 's/ -xdev / /' "$REPO/scripts/with-test-temp.sh" > "$STANDIN/repo/scripts/with-test-temp.sh"
+    chmod +x "$STANDIN/repo/scripts/with-test-temp.sh"
+    if grep -q -e -xdev "$STANDIN/repo/scripts/with-test-temp.sh"; then
+        echo "FAIL  the control still has -xdev in its cleanup" >&2
+        exit 1
+    fi
+    run_wrapper_over_mount "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/repo/tmp"
+    if [[ "$STATUS" -ne 23 || -e "$MOUNT_PROBE" ]]; then
+        remove_mount_scratch
+        echo "FAIL  cleanup without -xdev left the probe, so the mount check cannot fail: status=$STATUS" >&2
+        exit 1
+    fi
+    sudo umount "$SELECTED/mounted"
+    rmdir "$SELECTED/mounted" "$SELECTED"
+    rm -f "$STANDIN/repo/scripts/with-test-temp.sh"
+    rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" "$STANDIN"
+elif [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+    echo "FAIL  this runner has no passwordless sudo, so cleanup at a mount was not tested" >&2
+    exit 1
+else
+    echo "NOT RUN  cleanup at a mount needs passwordless sudo, which CI has and this host does not"
 fi
 
 EXACT="$TEST_BASE/exact"

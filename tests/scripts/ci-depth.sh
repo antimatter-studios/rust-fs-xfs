@@ -33,6 +33,22 @@ assert {"fixtures", "test", "test-kernel-new", "suite-in-vm",
         "test-arm64", "test-darwin", "cli"} <= full, full
 assert set(jobs["ci-ok"]["needs"]) == set(jobs) - {"ci-ok"}
 
+scripts = jobs["scripts-darwin"]
+assert scripts["runs-on"] == "macos-15"
+assert scripts["timeout-minutes"] <= 5
+assert not scripts.get("if") and not scripts.get("needs"), "shell guards must run on every PR without fixtures"
+scripts_step = next(step for step in scripts["steps"] if step.get("id") == "scripts")
+before_scripts = scripts["steps"][:scripts["steps"].index(scripts_step)]
+assert any("brew install --quiet ripgrep" in step.get("run", "")
+           and "scripts/tools.sh --check" in step["run"]
+           for step in before_scripts), "the guards fail without rg, and the macOS image has none"
+assert scripts_step["shell"] == "/bin/bash --noprofile --norc -e -o pipefail {0}"
+assert 'export PATH="/bin:$PATH"' in scripts_step["run"]
+assert 'test "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}" = 3.2' in scripts_step["run"]
+assert "chore test:scripts" in scripts_step["run"]
+assert not scripts_step.get("if"), "the complete scripts tier must not be conditional"
+assert "scripts-darwin" not in full, "the aggregate must reject skipped macOS shell guards"
+
 # Derive every intentionally skipped job from the dependency graph. A new
 # full job must be declared, and a quick job must never receive an exemption.
 expected = {n for n, j in jobs.items()
