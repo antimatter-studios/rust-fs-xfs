@@ -65,7 +65,7 @@ PARENT_URL="https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsp
 apt-get update -qq
 apt-get install -y -qq \
     xfsprogs attr acl fdisk util-linux coreutils \
-    curl gcc libc6-dev pkg-config >/dev/null
+    curl gcc libc6-dev pkg-config python3-yaml >/dev/null
 modprobe xfs
 
 # sed, not head: head exits after one line, mkfs.xfs gets SIGPIPE writing
@@ -80,6 +80,8 @@ for tool in mkfs.xfs xfs_db xfs_repair xfs_logprint xfs_io mount losetup sfdisk;
     command -v "$tool" >/dev/null ||
         { echo "vm-setup: $tool is not installed in the guest" >&2; exit 1; }
 done
+python3 -c 'import yaml' ||
+    { echo "vm-setup: the python3 yaml module is not installed in the guest" >&2; exit 1; }
 
 # THE PINNED xfsprogs, for parent pointers and exchange-range. Built into
 # its own prefix on the VM's own disk, so it survives `vm:down` and a
