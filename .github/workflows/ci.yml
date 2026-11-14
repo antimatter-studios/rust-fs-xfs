@@ -321,8 +321,11 @@ jobs:
           key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore fixtures
         run: chore fixtures
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: chore vm:down && ! chore vm:status
       # TARRED, AND TARRED SPARSE. These are two dozen filesystem images
       # of 400 to 500 MB each, almost all of it holes: `tar --sparse`
       # keeps them that way, where handing actions/upload-artifact the
@@ -413,8 +416,11 @@ jobs:
       - name: chore test
         id: tier
         run: chore test
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: chore vm:down && ! chore vm:status
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
@@ -712,8 +718,11 @@ jobs:
           name: tier-logs-suite-in-vm
           path: tmp/logs/*.log
           if-no-files-found: error
-      - name: chore vm:status (the VM is down again)
-        run: '! chore vm:status'
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it, so a guest still up
+        # afterwards means a run leaked its session.
+        run: chore vm:down && ! chore vm:status
 
   cli:
     name: cli (the installed tools, on PATH)

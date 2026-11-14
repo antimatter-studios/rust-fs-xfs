@@ -20,8 +20,8 @@
 # share before it could be run; the harness mounts the repository, so the
 # builders are simply there.
 #
-# The VM comes down when this script exits, however it exits
-# (FLTH_KEEP_VM=1 keeps it up for a quicker next run).
+# The script's use of the shared guest ends when it exits, however it
+# exits; the guest stays up for the next run (`chore vm:down` stops it).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -97,8 +97,8 @@ fi
 
 cd "$REPO"
 mkdir -p "$SHARE"
-# Brings the VM down when this script ends, however it ends, and fails
-# the script if it will not stop.
+# Ends this script's run on the shared guest when the script ends,
+# however it ends.
 # shellcheck source=/dev/null
 . "$HARNESS/scripts/vm-session.sh"
 

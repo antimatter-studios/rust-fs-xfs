@@ -104,6 +104,8 @@ jobs:
       - name: Reproduce every logged inode core from the corpus
         run: ./scripts/ci-test.sh --test log_dinode_oracle
 
-      - name: chore vm:status (the VM is down again)
+      - name: chore vm:down (no run is still using the guest)
+        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
+        # stops it only when no suite is using it.
         if: always()
-        run: chore vm:reap && ! chore vm:status
+        run: chore vm:down && ! chore vm:status

@@ -355,9 +355,8 @@ test reaches a tool any other way.
 The VM belongs to
 [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness),
 a sibling checkout at `../fs-linux-test-harness` that `chore siblings` moves to the tag
-pinned in `chores.yml`. Thirteen VM scripts of this repository's own — `vm.sh`,
-`vm-slot.sh`, `vm-session.sh` and ten `vm-build-*-fixtures.sh` wrappers — went with it;
-its slot lock is the reconciliation of ours with two others. This repository configures
+pinned in `chores.yml`. Thirteen VM scripts of this repository's own went with it, and
+every repository on a host now shares the harness's one guest. This repository configures
 it in `fs-linux-test-harness.toml` and drives it through the tasks the harness supplies,
 included here as `vm`:
 
