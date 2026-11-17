@@ -88,19 +88,15 @@ trap 'forward_signal HUP 1' HUP
 trap 'forward_signal INT 2' INT
 trap 'forward_signal TERM 15' TERM
 
-# THE RUN OWNS THE VM ITS TESTS USE. The tiers bring the harness VM up
-# before cargo starts, and every test process brings it up if it is down;
-# either boot takes the machine-wide slot, ONE for every repository on the
-# machine. Left to chore's `after_all` reaper, which runs only inside a
-# chore invocation of this repository, a run that reached cargo any other
-# way (scripts/test.sh by hand, ../rust-fs-core/scripts/tier.sh) exited with the VM idle
-# and the slot held, and every other repository's VM work queued behind it
-# until the guest's idle deadline. `vm.sh session` runs the command inside
-# a harness session: the VM comes down and the slot is released when the
-# run ends, passed, failed or killed, and a VM held with `chore vm:up` is
-# left up. In the guest, and on a host that cannot run the VM, it runs the
-# command as it is. Without the harness sibling no test can boot a VM, so
-# there is none to own.
+# THE RUN OWNS ITS USE OF THE GUEST. The tiers bring the harness's shared
+# guest up before cargo starts, and every test process brings it up if it is
+# down; every repository on the machine uses that one guest. `vm.sh session`
+# runs the command inside a harness session: the run's files, mounts and
+# processes in the guest are ended when the run ends, passed, failed or
+# killed, and the guest stays up for the next run (`chore vm:down` stops it
+# when nobody is using it). In the guest, and on a host that cannot run the
+# VM, it runs the command as it is. Without the harness sibling no test can
+# boot a VM, so there is none to own.
 #
 # THE SESSION RUNS THIS SCRIPT, NOT THE COMMAND. A signal has to reach
 # everything the command started, and only this script's own process group
