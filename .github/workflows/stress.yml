@@ -130,9 +130,3 @@ jobs:
       # does not.
       - name: Reproduce every logged inode core from the corpus
         run: ./scripts/ci-test.sh --test log_dinode_oracle
-
-      - name: Stop the shared guest (no run is still using it)
-        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
-        # stops it only when no suite is using it.
-        if: always()
-        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
