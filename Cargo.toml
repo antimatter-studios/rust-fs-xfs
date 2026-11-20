@@ -55,11 +55,16 @@ cli = ["dep:clap", "rust-fs-core/cli"]
 # CRC32C (Castagnoli) protects every v5 metadata block. Apache-2.0.
 crc32c = "0.6"
 # Block-device trait surface shared with the sister fs-* drivers and the
-# img-* disk-image readers. From crates.io, at an exact version, so a
+# img-* disk-image readers, and the three API layers (`layers`) that
+# src/layers.rs implements. From crates.io, at an exact version, so a
 # checkout, CI and the published crate all build against the same code.
 # To build against a local checkout instead, patch it in outside this
 # manifest: README `## Building` says how.
-rust-fs-core = "=0.4.3"
+rust-fs-core = { version = "=0.5.1", features = ["layers"] }
+# The candidate detail of the shared salvage verbs (`layers`) serializes, as
+# rust-fs-core's evidence types do. MIT OR Apache-2.0, and already in the
+# tree through rust-fs-core's `layers` feature.
+serde = { version = "1.0", features = ["derive"] }
 # The command-line tools' argument parser, behind `cli` (see the
 # `rust-fs-xfs` target above). No derive: the builder API keeps each
 # tool's command a function the man pages and completions can be made from.

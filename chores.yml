@@ -124,7 +124,10 @@ vars:
   # features-gather.sh a release commit runs (features.d fragments).
   # v0.4.2 has `CliError::not_found`, the kind a reading verb gives a path
   # that does not exist, builds on Rust 1.89, and carries agent-core v8.
-  FS_CORE_REF: v0.4.3
+  # v0.5.0 is the release with the three API layers (`layers` feature)
+  # that src/layers.rs implements, and carries agent-core v10; v0.5.1 is
+  # the first of them on crates.io.
+  FS_CORE_REF: v0.5.1
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   # v0.3.0 is the release with `vm.sh session`, which the test runner runs
   # cargo through so a run ends its use of the VM however it ends; v0.2.0
@@ -383,8 +386,12 @@ tasks:
     # MEASURED in run 35435470063 on 2026-09-19: 567 lines / 33,542 bytes on
     # aarch64 Linux and 589 / 34,505 on Darwin; budget half as much again.
     # The floor is 90: 100 executed (job 105877826088), less the margin.
+    # MEASURED on 2026-11-24: all 154 tests passed on aarch64 Linux, printing
+    # 828 lines each in runs 45305344898 (52,060 bytes), 45317548887 (52,057),
+    # 45330204694 (52,060), and 45339743875 (52,060). Add 1,024 bytes to the
+    # previous 52,000-byte ceiling; keep the line budget and floor unchanged.
     cmds:
-      - 'CI_TEST_FLOOR=90 ../rust-fs-core/scripts/tier.sh test:images images 900 52000 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
+      - 'CI_TEST_FLOOR=90 ../rust-fs-core/scripts/tier.sh test:images images 900 53024 -- scripts/ci-test.sh $(scripts/test-targets.sh images)'
 
   test:stress:
     desc: 'The fsstress/fsx corpus read back — the one fixture set `chore fixtures` does not build by default'

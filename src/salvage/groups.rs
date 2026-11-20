@@ -1,6 +1,6 @@
 //! A group's inode and free-space B+trees, read for salvage.
 
-use super::evidence::{Damage, DamageKind, Extent, Severity};
+use super::evidence::{finding, Damage, DamageKind, Extent, Severity};
 use super::inodes::{self, InodeCandidate, InodeScan};
 use crate::ag::{agf_btree, Agf, Agi};
 use crate::ag_btree;
@@ -68,7 +68,7 @@ fn walk<T>(
                 } else {
                     kind
                 };
-                Damage::new(
+                finding(
                     kind,
                     Severity::Error,
                     Extent::new(at(agblock), block),

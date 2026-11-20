@@ -58,6 +58,7 @@ pub mod group_write;
 pub mod inode;
 pub mod inode_btree;
 mod inode_repair;
+pub mod layers;
 pub mod log;
 pub(crate) mod log_recover;
 pub mod log_write;

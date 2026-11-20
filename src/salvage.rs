@@ -16,9 +16,9 @@
 //! - **Plain data.** Results hold no handle to the source, so they can be
 //!   kept, compared and serialised by a caller.
 //!
-//! The evidence types ([`Extent`], [`Integrity`], [`Damage`]) have the
-//! shape of the format-neutral salvage types the rust-fs drivers share, so
-//! that this crate's own functions map onto them directly.
+//! The evidence types ([`Extent`], [`Integrity`], [`Damage`], [`WalkEnd`])
+//! are rust-fs-core's format-neutral salvage types, which
+//! [`crate::layers`] implements the shared traits with.
 //!
 //! What is here today:
 //!
@@ -50,13 +50,14 @@ mod inodes;
 pub use dirs::{
     directory_entries, rebuild_tree, DirectoryListing, NamedEntry, Parent, Tree, TreeNode,
 };
-pub use evidence::{Damage, DamageKind, Extent, Integrity, Severity};
+pub use evidence::{Damage, DamageKind, Extent, Integrity, Severity, WalkEnd};
 pub use groups::{chunk_location, find_inodes_in_chunks, free_extents, inode_chunks, TreeWalk};
 pub use headers::{
     ag_headers, damage, log_health, read_superblock, scan_superblocks, superblocks, AgHeaders,
     Header, SuperblockCopy, Superblocks, VolumeDamage,
 };
+pub(crate) use inodes::candidate as inodes_candidate;
 pub use inodes::{
     find_inodes, inode_location, inode_number_at, read_inode, read_mapped, walk_extents, ExtentMap,
-    FileExtent, InodeCandidate, InodeScan, InodeState, WalkEnd,
+    FileExtent, InodeCandidate, InodeScan, InodeState,
 };

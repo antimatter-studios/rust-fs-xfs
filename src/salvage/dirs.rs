@@ -1,7 +1,8 @@
 //! Directory entries read for salvage, and the tree rebuilt from them.
 
-use super::evidence::{Damage, DamageKind, Extent, Severity};
-use super::inodes::{self, ExtentMap, InodeCandidate, InodeState, WalkEnd};
+use super::evidence::WalkEnd;
+use super::evidence::{finding, Damage, DamageKind, Extent, Severity};
+use super::inodes::{self, ExtentMap, InodeCandidate, InodeState};
 use crate::dir::{self, DirEntry};
 use crate::inode::{FileType, Format};
 use crate::superblock::Superblock;
@@ -69,7 +70,7 @@ pub fn directory_entries(
         listing.entries = entries.into_iter().map(named).collect();
         if let Some(why) = stopped {
             listing.end = WalkEnd::Broken;
-            listing.damage.push(Damage::new(
+            listing.damage.push(finding(
                 DamageKind::Malformed,
                 Severity::Error,
                 candidate.location,
@@ -94,7 +95,7 @@ pub fn directory_entries(
         let (_, unreadable) = inodes::read_mapped(device, &map, at, &mut buf);
         if !unreadable.is_empty() {
             listing.end = WalkEnd::Unreadable(Extent::new(location, block as u64));
-            listing.damage.push(Damage::new(
+            listing.damage.push(finding(
                 DamageKind::Unreadable,
                 Severity::Error,
                 Extent::new(location, block as u64),
@@ -130,7 +131,7 @@ fn read_block(
     let mut finding = |kind, detail: String| {
         listing
             .damage
-            .push(Damage::new(kind, Severity::Error, place, structure, detail));
+            .push(finding(kind, Severity::Error, place, structure, detail));
     };
     let Some(block) = dir::salvage_data_block(buf, sb) else {
         finding(
