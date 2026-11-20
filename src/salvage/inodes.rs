@@ -585,9 +585,40 @@ pub fn read_mapped(
         let slice = &mut buf[(from - offset) as usize..(to - offset) as usize];
         let source = piece.location.offset + (from - piece.file_offset);
         if device.read_at(source, slice).is_err() {
-            slice.fill(0);
-            unreadable.push(Extent::new(from, to - from));
+            read_by_sector(device, source, from, slice, &mut unreadable);
         }
     }
     (wanted, unreadable)
+}
+
+/// The smallest unit a device fails a read in.
+const SECTOR: u64 = 512;
+
+/// Read `slice` from `source` a sector at a time, after a whole read of it
+/// failed, so one bad sector or the device's end loses only what it must.
+/// Sectors that do not read are zeros, and their file ranges, starting at
+/// file offset `from`, are added to `unreadable`, merged where adjacent.
+fn read_by_sector(
+    device: &dyn BlockRead,
+    source: u64,
+    from: u64,
+    slice: &mut [u8],
+    unreadable: &mut Vec<Extent>,
+) {
+    let mut done = 0usize;
+    while done < slice.len() {
+        let at = source + done as u64;
+        // Up to the next sector boundary of the source.
+        let step = (SECTOR - at % SECTOR).min((slice.len() - done) as u64) as usize;
+        let part = &mut slice[done..done + step];
+        if device.read_at(at, part).is_err() {
+            part.fill(0);
+            let range = Extent::new(from + done as u64, step as u64);
+            match unreadable.last_mut() {
+                Some(last) if last.end() == Some(range.offset) => last.length += range.length,
+                _ => unreadable.push(range),
+            }
+        }
+        done += step;
+    }
 }
