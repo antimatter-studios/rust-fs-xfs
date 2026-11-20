@@ -541,12 +541,12 @@ tasks:
     on_timeout:
       - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
     cmds:
-      # The sibling crates this one builds against are staged on the
-      # share first: the guest is given THIS repository, not the
-      # directory that holds it, so a path dependency on ../rust-fs-core
-      # has nothing to resolve to until it is put there. From the pinned
-      # checkout's HEAD, so what the guest builds against is what
-      # `chore siblings` pinned and nothing uncommitted.
+      # The sibling checkouts the guest reads are staged on the share
+      # first: the guest is given THIS repository, not the directory that
+      # holds it, so ../rust-fs-core (its guest-rust-toolchain.sh) has
+      # nothing to resolve to until it is put there. From the pinned
+      # checkout's HEAD, so what the guest runs is what `chore siblings`
+      # pinned and nothing uncommitted.
       - |
         set -eu
         [ -x ../fs-linux-test-harness/scripts/vm.sh ] || {

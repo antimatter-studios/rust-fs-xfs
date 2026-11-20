@@ -3325,6 +3325,14 @@ fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
                 found.push(("the rust-fs-core dependency's `version`".to_string(), v));
             }
         }
+        // A registry dependency gives its requirement as the whole value,
+        // `rust-fs-core = "=0.4.3"`: the operator is not the version.
+        if let Some(v) = quoted_value_after(line, "rust-fs-core") {
+            let v = v.trim_start_matches(['=', '^', '~']).to_string();
+            if as_version(&v).is_some() {
+                found.push(("the rust-fs-core dependency's requirement".to_string(), v));
+            }
+        }
         if let Some(rest) = line.split_once("FS_CORE_REF:") {
             if let Some(v) = as_version(rest.1) {
                 found.push(("`FS_CORE_REF`".to_string(), v));
@@ -3460,6 +3468,19 @@ mod core_pin_parser {
                 "the rust-fs-core dependency's `version`".to_string(),
                 "0.2.13".to_string()
             )],
+        );
+    }
+
+    /// The dependency on crates.io, at an exact version, is the
+    /// `rust-fs-core` the crate builds against.
+    #[test]
+    fn a_registry_dependency_declares_its_version() {
+        assert_eq!(
+            am_fs_core_versions_declared("rust-fs-core = \"=0.4.3\"\n"),
+            vec![(
+                "the rust-fs-core dependency's requirement".to_string(),
+                "0.4.3".to_string()
+            )]
         );
     }
 

@@ -1,5 +1,7 @@
 # Rust
 target/
+# A local [patch] of rust-fs-core (README `## Building`), never shared.
+/.cargo/config.toml
 **/*.rs.bk
 Cargo.lock.bak
 
