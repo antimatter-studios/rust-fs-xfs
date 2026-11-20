@@ -30,12 +30,21 @@
 //! - [`ag_headers`]: the AGF, AGI and AGFL of one allocation group.
 //! - [`log_health`]: whether the log was left needing replay.
 //! - [`damage`]: all of the above for the whole volume, as one list.
+//! - [`find_inodes`]: inode records found by their magic in a byte range,
+//!   live, free and damaged, and [`read_inode`] for one by number.
+//! - [`walk_extents`]: the storage an inode's data fork claims, kept as far
+//!   as its map can be followed, and [`read_mapped`] to read through it.
 
 mod evidence;
 mod headers;
+mod inodes;
 
 pub use evidence::{Damage, DamageKind, Extent, Integrity, Severity};
 pub use headers::{
     ag_headers, damage, log_health, read_superblock, scan_superblocks, superblocks, AgHeaders,
     Header, SuperblockCopy, Superblocks, VolumeDamage,
+};
+pub use inodes::{
+    find_inodes, inode_location, inode_number_at, read_inode, read_mapped, walk_extents, ExtentMap,
+    FileExtent, InodeCandidate, InodeScan, InodeState, WalkEnd,
 };
