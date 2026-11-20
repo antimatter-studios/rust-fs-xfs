@@ -362,10 +362,13 @@ fn pinned_toolchain() -> String {
 fn manifest_core_version() -> String {
     repo_file("Cargo.toml")
         .lines()
-        .find(|l| l.starts_with("rust-fs-core = "))
-        .and_then(|l| l.split("version = \"").nth(1))
-        .and_then(|v| v.split('"').next())
-        .map(str::to_owned)
+        .find_map(|l| {
+            let v = l.strip_prefix("rust-fs-core = ")?;
+            // `"=0.4.3"` from crates.io, or `{ ..., version = "0.4.3" }`.
+            let v = v.split("version = ").nth(1).unwrap_or(v);
+            let v = v.trim_start().strip_prefix('"')?.split('"').next()?;
+            Some(v.trim_start_matches(['=', '^', '~']).to_owned())
+        })
         .expect("Cargo.toml depends on rust-fs-core with a version")
 }
 

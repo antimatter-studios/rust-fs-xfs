@@ -113,21 +113,6 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      # Clone the sibling repo that satisfies the rust-fs-core path
-      # dependency. `cargo publish` rewrites the path into its registry
-      # equivalent, but the manifest still has to resolve locally first.
-      # PINNED THROUGH THE SHARED VARIABLE, not a literal. This line
-      # said v0.2.7 while the manifest had moved to ^0.2.10, and nothing
-      # noticed: the branch gate reads FS_CORE_REF and was raised with
-      # the manifest, while this one kept a number somebody had typed
-      # once. A drift like that only ever surfaces at the moment of a
-      # release, from a job that has never run against the current
-      # manifest, with a message about a candidate version that did not
-      # match rather than about a stale pin.
-      - name: clone rust-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
-
       # A version already on crates.io cannot be published again, and a
       # re-tag — or a first release published by hand before trusted
       # publishing could be configured — would otherwise fail this job
@@ -176,13 +161,10 @@ jobs:
         if: steps.already.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        # No `--locked`: publish must rewrite the rust-fs-core path
-        # dependency into its registry equivalent in the packaged
-        # lockfile, which `--locked` forbids. The verify build resolves
-        # rust-fs-core from crates.io through the `version` constraint, so
-        # the published artifact is pinned by that constraint rather than
-        # by the local path checkout.
-        run: cargo publish
+        # rust-fs-core comes from crates.io at the exact version
+        # Cargo.toml names, so the packaged crate and its verify build
+        # resolve the same dependency this tree was tested against.
+        run: cargo publish --locked
 
       # Nothing is attested on trust: the file is compared with the
       # checksum crates.io records for this version, so the attestation

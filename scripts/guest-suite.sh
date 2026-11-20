@@ -21,7 +21,7 @@ set -euo pipefail
 [ "${FLTH_GUEST:-}" = 1 ] ||
     { echo "guest-suite.sh runs INSIDE the harness VM ('chore test:vm')." >&2; exit 1; }
 
-# The path dependencies in Cargo.toml, by directory name.
+# The sibling checkouts this script reads, by directory name.
 SIBLINGS="rust-fs-core"
 
 RUST_ROOT=/var/lib/fs-xfs-rust
@@ -30,9 +30,10 @@ export CARGO_HOME="$RUST_ROOT/cargo"
 export CARGO_TARGET_DIR=/var/cache/fs-xfs-target
 export PATH="$CARGO_HOME/bin:$PATH"
 
-# THE SIBLING CRATES. This crate's Cargo.toml has a path dependency on
-# ../rust-fs-core, which on the host is a sibling checkout — and the
-# guest is given this repository, not the directory that holds it. The
+# THE SIBLING CHECKOUTS. This script runs rust-fs-core's
+# guest-rust-toolchain.sh from ../rust-fs-core, which on the host is a
+# sibling checkout — and the guest is given this repository, not the
+# directory that holds it. The
 # harness mounts us at /repo, whose parent IS the guest's root, so
 # `../rust-fs-core` resolves to /rust-fs-core: the task stages the
 # sibling on the share (from its pinned, clean checkout) and this links

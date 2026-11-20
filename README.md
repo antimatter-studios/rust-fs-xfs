@@ -130,10 +130,20 @@ cargo clippy --all-targets --features cli -- -D warnings
 
 The crate builds as both an `rlib` and a `staticlib`, so it links into a Rust
 dependency graph or alongside sibling drivers in a C, Swift or Go program. The
-toolchain is pinned in `rust-toolchain.toml`. A checkout builds against the sibling
-`../rust-fs-core` checkout, which `chore siblings` clones and moves to the ref pinned
-in `chores.yml`; the crate published on crates.io depends on `rust-fs-core` from
-crates.io instead. `chore staticlib` builds the library and its headers (`fs_xfs.h`
+toolchain is pinned in `rust-toolchain.toml`. `rust-fs-core` comes from crates.io at
+the exact version `Cargo.toml` names, so a checkout, CI and the published crate build
+against the same code. The sibling `../rust-fs-core` checkout that `chore siblings`
+moves to the ref pinned in `chores.yml` supplies the shared scripts, not the crate.
+
+To build against a local `rust-fs-core` (a change to it that is not released yet),
+patch it in outside the manifest, in a `.cargo/config.toml` that git ignores:
+
+```toml
+[patch.crates-io]
+rust-fs-core = { path = "../rust-fs-core" }
+```
+
+Cargo then rewrites `Cargo.lock` to the path source; do not commit that. `chore staticlib` builds the library and its headers (`fs_xfs.h`
 and `fs_core.h`) into this crate's own `dist/`, and `chore artifact` prints the
 absolute path of that directory — a consumer copies its contents rather than being
 told where cargo puts things.
