@@ -68,6 +68,7 @@ pub mod refcount;
 mod rename;
 pub mod repair;
 pub mod rmap;
+pub mod salvage;
 pub mod super_write;
 pub mod superblock;
 pub mod truncate;

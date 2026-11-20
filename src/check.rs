@@ -911,53 +911,19 @@ impl Checker<'_> {
                     continue;
                 }
             };
-            let fields: [(&'static str, u64, u64); 12] = [
-                ("blocksize", sb.blocksize.into(), copy.blocksize.into()),
-                ("dblocks", sb.dblocks, copy.dblocks),
-                ("agblocks", sb.agblocks.into(), copy.agblocks.into()),
-                ("agcount", sb.agcount.into(), copy.agcount.into()),
-                ("logstart", sb.logstart, copy.logstart),
-                ("logblocks", sb.logblocks.into(), copy.logblocks.into()),
-                // The kernel turns the attribute and quota bits on in the
-                // primary the first time it needs them, and leaves the
-                // copies as they were: a difference there is history,
-                // not damage.
-                (
-                    "versionnum",
-                    (sb.versionnum & !LATE_VERSION_BITS).into(),
-                    (copy.versionnum & !LATE_VERSION_BITS).into(),
-                ),
-                ("sectsize", sb.sectsize.into(), copy.sectsize.into()),
-                ("inodesize", sb.inodesize.into(), copy.inodesize.into()),
-                (
-                    "features_compat",
-                    sb.features_compat.into(),
-                    copy.features_compat.into(),
-                ),
-                (
-                    "features_ro_compat",
-                    sb.features_ro_compat.into(),
-                    copy.features_ro_compat.into(),
-                ),
-                (
-                    "features_incompat",
-                    sb.features_incompat.into(),
-                    copy.features_incompat.into(),
-                ),
-            ];
-            for (name, primary, secondary) in fields {
-                if primary != secondary {
-                    let location = Location {
-                        ag: Some(ag),
-                        field: Some(name),
-                        ..Location::default()
-                    };
-                    self.find_at(
-                        Code::SbCopyField,
-                        location,
-                        format!("the superblock copy says {name} {secondary}; the primary says {primary}"),
-                    );
-                }
+            for (name, primary, secondary) in sb.geometry_differences(&copy) {
+                let location = Location {
+                    ag: Some(ag),
+                    field: Some(name),
+                    ..Location::default()
+                };
+                self.find_at(
+                    Code::SbCopyField,
+                    location,
+                    format!(
+                        "the superblock copy says {name} {secondary}; the primary says {primary}"
+                    ),
+                );
             }
             if copy.uuid != sb.uuid {
                 self.find(
@@ -2570,11 +2536,6 @@ pub(crate) fn has_inobt_counts(sb: &crate::superblock::Superblock) -> bool {
 pub(crate) fn has_lazy_counters(sb: &crate::superblock::Superblock) -> bool {
     sb.features2 & crate::superblock::features2_flags::LAZYSBCOUNT != 0
 }
-
-/// `sb_versionnum` bits the kernel sets in the primary superblock alone,
-/// on first use: attributes and quotas.
-const LATE_VERSION_BITS: u16 =
-    crate::superblock::version_flags::ATTRBIT | crate::superblock::version_flags::QUOTABIT;
 
 #[cfg(test)]
 mod tests {
