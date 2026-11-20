@@ -115,6 +115,15 @@ env:
   CHORE_VERSION: "0.11.0"
 
 jobs:
+  changes-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   # Does this change need the full pipeline? rust-fs-core's
   # scripts/code-changed.sh reads the change's paths and says false only
   # when every one is documentation (`*.md`, `LICENSE*`, `.claude/**`). The
@@ -125,14 +134,18 @@ jobs:
   # run only when the answer is true, and ci-ok accepts their skip when, and
   # only when, it is false.
   changes:
+    needs: changes-gate
     name: changes (does this need the full pipeline?)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.changes-gate.outputs.runner }}
     outputs:
       code: ${{ steps.c.outputs.code }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -184,11 +197,24 @@ jobs:
           echo "code=$code ($EVENT${range:+ $range})"
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
+  unit-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   unit:
+    needs: unit-gate
     name: unit (no tools, no fixtures)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.unit-gate.outputs.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         # Pinned (CHORE_VERSION) and checked against the release's
         # checksums: the siblings, the tools and the tests all come
@@ -253,9 +279,19 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  scripts-darwin-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick macos-arm64
+
   scripts-darwin:
+    needs: scripts-darwin-gate
     name: scripts-darwin (Bash 3.2)
-    runs-on: macos-15
+    runs-on: ${{ needs.scripts-darwin-gate.outputs.runner }}
     timeout-minutes: 5
     env:
       OUTPUT_BUDGET_FAIL_TAIL: "30"
@@ -299,14 +335,28 @@ jobs:
           path: tmp/logs/scripts.log
           if-no-files-found: error
 
+  fixtures-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
-    needs: changes
+    needs: [changes, fixtures-gate]
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.fixtures-gate.outputs.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -346,14 +396,28 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  test-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: [changes, fixtures]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   test:
     name: test (x86_64, oracles in the VM)
-    needs: [changes, fixtures]
+    needs: [changes, fixtures, test-gate]
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.test-gate.outputs.runner }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -459,14 +523,28 @@ jobs:
   # Its own machine and its own box cache, keyed on that guest, so it never
   # restores the Debian 12 box the other jobs boot. No fixtures: its suites
   # build their own volumes in the guest.
+  test-kernel-new-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: changes
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   test-kernel-new:
     name: test (x86_64, kernel 6.12 in the Debian 13 VM)
-    needs: changes
+    needs: [changes, test-kernel-new-gate]
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.test-kernel-new-gate.outputs.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -518,14 +596,28 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  test-arm64-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: [changes, fixtures]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-arm64
+
   test-arm64:
     name: test (aarch64, no KVM on this runner)
-    needs: [changes, fixtures]
+    needs: [changes, fixtures, test-arm64-gate]
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ needs.test-arm64-gate.outputs.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -579,13 +671,24 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  test-darwin-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: [changes, fixtures]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick macos-arm64
+
   test-darwin:
     name: test-darwin
-    needs: [changes, fixtures]
+    needs: [changes, fixtures, test-darwin-gate]
     if: needs.changes.outputs.code == 'true'
     # arm64 by label, not by whatever macos-latest resolves to: the tests
     # built for aarch64-apple-darwin have to run on the host.
-    runs-on: macos-15
+    runs-on: ${{ needs.test-darwin-gate.outputs.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -667,14 +770,28 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  suite-in-vm-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: [changes, fixtures]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   suite-in-vm:
     name: suite in the guest (the macOS path)
-    needs: [changes, fixtures]
+    needs: [changes, fixtures, suite-in-vm-gate]
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.suite-in-vm-gate.outputs.runner }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -724,14 +841,28 @@ jobs:
         # afterwards means a run leaked its session.
         run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
 
+  cli-gate:
+    if: needs.changes.outputs.code == 'true'
+    needs: [changes, fixtures]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   cli:
     name: cli (the installed tools, on PATH)
-    needs: [changes, fixtures]
+    needs: [changes, fixtures, cli-gate]
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.cli-gate.outputs.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -791,13 +922,23 @@ jobs:
           path: tmp/logs/*.log
           if-no-files-found: error
 
+  semver-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   semver:
+    needs: semver-gate
     # `chore check:semver`: this tree's public API against the newest
     # version on crates.io, refusing a break the version in Cargo.toml does
     # not declare. Why, and what it cannot see, is at the top of
     # ../rust-fs-core/scripts/semver-check.sh.
     name: semver (public API against crates.io)
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.semver-gate.outputs.runner }}
     timeout-minutes: 30
     env:
       # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
@@ -808,6 +949,9 @@ jobs:
       OUTPUT_BUDGET_FAIL_TAIL: "200"
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: Install chore
         run: scripts/ci-install-chore.sh
       - name: chore siblings
@@ -824,6 +968,17 @@ jobs:
         shell: bash
         run: chore check:semver
 
+  ci-ok-gate:
+    if: always()
+    needs: [changes-gate, changes, unit-gate, unit, scripts-darwin-gate, scripts-darwin, fixtures-gate, fixtures, test-gate, test, test-kernel-new-gate, test-kernel-new, test-arm64-gate, test-arm64, test-darwin-gate, test-darwin, suite-in-vm-gate, suite-in-vm, cli-gate, cli, semver-gate, semver]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   ci-ok:
     name: ci-ok
     # THE ONE REQUIRED CHECK (#207). Requiring the gate rather than each
@@ -832,8 +987,8 @@ jobs:
     # permanently pending, with nothing to point at. It is also the only
     # shape in which a job-level `if:` is safe.
     if: always()
-    needs: [changes, unit, scripts-darwin, fixtures, test, test-kernel-new, test-arm64, test-darwin, suite-in-vm, cli, semver]
-    runs-on: ubuntu-latest
+    needs: [changes-gate, changes, unit-gate, unit, scripts-darwin-gate, scripts-darwin, fixtures-gate, fixtures, test-gate, test, test-kernel-new-gate, test-kernel-new, test-arm64-gate, test-arm64, test-darwin-gate, test-darwin, suite-in-vm-gate, suite-in-vm, cli-gate, cli, semver-gate, semver, ci-ok-gate]
+    runs-on: ${{ needs.ci-ok-gate.outputs.runner || 'ubuntu-latest' }}
     steps:
       - name: Every job ran and succeeded
         env:
@@ -843,7 +998,7 @@ jobs:
           CODE: ${{ needs.changes.outputs.code }}
           # The only jobs a quick run may skip. Every other job must succeed
           # on every event.
-          FULL_JOBS: '["fixtures", "test", "test-kernel-new", "test-arm64", "test-darwin", "suite-in-vm", "cli"]'
+          FULL_JOBS: '["fixtures", "test", "test-kernel-new", "test-arm64", "test-darwin", "suite-in-vm", "cli", "fixtures-gate", "test-gate", "test-kernel-new-gate", "test-arm64-gate", "test-darwin-gate", "suite-in-vm-gate", "cli-gate"]'
         run: |
           set -euo pipefail
           case "$CODE" in true|false) ;; *) echo "::error::missing full-pipeline decision"; exit 1 ;; esac

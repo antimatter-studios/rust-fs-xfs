@@ -38,14 +38,27 @@ permissions:
   contents: read
 
 jobs:
+  fuzz-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   fuzz:
+    needs: fuzz-gate
     name: fuzz every parser a hostile image reaches
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.fuzz-gate.outputs.runner }}
     # Thirteen targets at two minutes each is roughly half an hour of
     # fuzzing; the rest is building cargo-fuzz and the targets.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Clone sibling rust-fs-core
         run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
