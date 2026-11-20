@@ -34,9 +34,9 @@ assert {"fixtures", "test", "test-kernel-new", "suite-in-vm",
 assert set(jobs["ci-ok"]["needs"]) == set(jobs) - {"ci-ok"}
 
 scripts = jobs["scripts-darwin"]
-assert scripts["runs-on"] == "macos-15"
+assert scripts["runs-on"] == "${{ needs.scripts-darwin-gate.outputs.runner }}"  # picked by the runner gate, as a macOS runner
 assert scripts["timeout-minutes"] <= 5
-assert not scripts.get("if") and not scripts.get("needs"), "shell guards must run on every PR without fixtures"
+assert not scripts.get("if") and scripts.get("needs") in ("scripts-darwin-gate", ["scripts-darwin-gate"]), "shell guards must run on every PR without fixtures"
 scripts_step = next(step for step in scripts["steps"] if step.get("id") == "scripts")
 before_scripts = scripts["steps"][:scripts["steps"].index(scripts_step)]
 assert any("brew install --quiet ripgrep" in step.get("run", "")
@@ -58,7 +58,7 @@ while True:
     for name, job in jobs.items():
         needs = job.get("needs", [])
         needs = [needs] if isinstance(needs, str) else needs
-        if name != "ci-ok" and set(needs) & expected:
+        if name not in ("ci-ok", "ci-ok-gate") and set(needs) & expected:
             expanded.add(name)
     if expanded == expected:
         break
