@@ -80,6 +80,52 @@ fn salvaged_bytes(device: &FileDevice, sb: &Superblock, ino: u64) -> (Vec<u8>, s
     (bytes, map)
 }
 
+/// A remote symbolic link's target, read through its salvage map.
+///
+/// On a v5 volume every block of the target starts with a 56-byte `XSLM`
+/// header, so the file bytes `read_mapped` returns are header, then the
+/// target, cut short by the header's own length. The target is what the
+/// manifest hashed, so each block gives up its header and holds only the
+/// bytes its header says it does.
+fn remote_symlink_target(
+    device: &FileDevice,
+    sb: &Superblock,
+    map: &salvage::ExtentMap,
+) -> Vec<u8> {
+    use fs_core::BlockRead;
+    use fs_xfs::format::symlink::{offsets, XFS_SYMLINK_HDR_SIZE, XFS_SYMLINK_MAGIC};
+    let block = u64::from(sb.blocksize);
+    let want = map.claimed as usize;
+    let mut target = Vec::new();
+    for extent in &map.extents {
+        let mut at = extent.location.offset;
+        let end = extent.location.offset + extent.location.length.max(block);
+        while target.len() < want && at < end {
+            let mut head = vec![0u8; XFS_SYMLINK_HDR_SIZE];
+            device.read_at(at, &mut head).expect("a symlink block");
+            let v5 =
+                u32::from_be_bytes(head[offsets::MAGIC..offsets::MAGIC + 4].try_into().unwrap())
+                    == XFS_SYMLINK_MAGIC;
+            let (skip, holds) = if v5 {
+                let bytes = u32::from_be_bytes(
+                    head[offsets::BYTES..offsets::BYTES + 4].try_into().unwrap(),
+                );
+                (XFS_SYMLINK_HDR_SIZE, bytes as usize)
+            } else {
+                (0, block as usize)
+            };
+            let take = holds.min(want - target.len());
+            let mut body = vec![0u8; take];
+            device
+                .read_at(at + skip as u64, &mut body)
+                .expect("a symlink block");
+            target.extend_from_slice(&body);
+            at += block;
+        }
+    }
+    target
+}
+
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -136,12 +182,19 @@ fn every_file_reads_back_to_what_linux_hashed() {
                     assert_eq!(bytes.len() as u64, entry.size, "{name}{}", entry.path);
                     assert_eq!(sha256(&bytes), entry.digest, "{name}{}", entry.path);
                 }
-                "link" => assert_eq!(
-                    String::from_utf8_lossy(&bytes),
-                    entry.digest,
-                    "{name}{}",
-                    entry.path
-                ),
+                "link" => {
+                    let target = if map.inline.is_some() {
+                        bytes
+                    } else {
+                        remote_symlink_target(&device, &sb, &map)
+                    };
+                    assert_eq!(
+                        String::from_utf8_lossy(&target),
+                        entry.digest,
+                        "{name}{}",
+                        entry.path
+                    )
+                }
                 other => panic!(
                     "{name}{}: a manifest kind {other} this test does not know",
                     entry.path
