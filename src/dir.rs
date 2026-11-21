@@ -1292,6 +1292,194 @@ fn short_form(
     })
 }
 
+/// What a damage-tolerant read of one directory data block found.
+#[derive(Debug, Default)]
+pub(crate) struct SalvagedBlock {
+    /// Every entry whose record checks out, `.` and `..` included, in
+    /// block order.
+    pub entries: Vec<DirEntry>,
+    /// The directory a v5 block says it belongs to.
+    pub owner: Option<u64>,
+    /// Whether a v5 block's checksum matches; `None` on v4.
+    pub checksum: Option<bool>,
+    /// Records that did not check out: the byte offset in the block, and
+    /// why. The read moves on to the next 8-byte boundary after each.
+    pub skipped: Vec<(usize, String)>,
+}
+
+/// Read a directory data block (or block-form directory) for salvage.
+///
+/// [`parse_data_block`] stops at the first record that does not check
+/// out. This keeps every record that does: an entry is taken when its
+/// name is not empty, it fits in the block, its trailing tag names its own
+/// offset and its inode number is possible, and a free record when its
+/// length and tag agree. Anything else is listed in
+/// [`SalvagedBlock::skipped`] and the read resumes at the next 8-byte
+/// boundary, where every record starts. The v5 header is read, not
+/// required: its checksum result and owner are returned.
+///
+/// `None` when the magic is not a data or block-form directory block of
+/// this volume's version, or `buf` is shorter than a directory block.
+pub(crate) fn salvage_data_block(buf: &[u8], sb: &Superblock) -> Option<SalvagedBlock> {
+    let size = dir_block_size(buf, sb).ok()?;
+    let magic = be32(buf, offsets::dir3_blk::MAGIC);
+    let header = data_hdr_size(magic, sb).ok()?;
+    let mut out = SalvagedBlock::default();
+    if sb.is_v5() {
+        let stored = le32(buf, offsets::dir3_blk::CRC);
+        let computed = crc32c_with_zeroed_crc(&buf[..size], offsets::dir3_blk::CRC);
+        out.checksum = Some(stored == computed);
+        out.owner = Some(be64(buf, offsets::dir3_blk::OWNER));
+    }
+    let end = if is_block_form(magic) {
+        let tail = size - XFS_DIR2_BLOCK_TAIL_SIZE;
+        let index = (be32(buf, tail + offsets::block_tail::COUNT) as usize)
+            .saturating_mul(XFS_DIR2_LEAF_ENTRY_SIZE);
+        if index <= tail.saturating_sub(header) {
+            tail - index
+        } else {
+            out.skipped.push((
+                tail,
+                format!("the hash index claims {index} bytes, more than the block holds"),
+            ));
+            tail
+        }
+    } else {
+        size
+    };
+    let ftype = dir_has_ftype(sb);
+    let mut cur = header;
+    while cur + XFS_DIR2_DATA_ALIGN <= end {
+        if be16(buf, cur + offsets::data_unused::FREETAG) == XFS_DIR2_DATA_FREE_TAG {
+            let len = usize::from(be16(buf, cur + offsets::data_unused::LENGTH));
+            if len != 0
+                && len.is_multiple_of(XFS_DIR2_DATA_ALIGN)
+                && cur + len <= end
+                && usize::from(be16(buf, cur + len - 2)) == cur
+            {
+                cur += len;
+            } else {
+                out.skipped.push((
+                    cur,
+                    format!("free record of length {len} does not check out"),
+                ));
+                cur += XFS_DIR2_DATA_ALIGN;
+            }
+            continue;
+        }
+        let namelen = buf[cur + offsets::data_entry::NAMELEN];
+        let length = data_entry_size(namelen, ftype);
+        let fits = namelen != 0 && end - cur >= DATA_ENTRY_MIN_SIZE && cur + length <= end;
+        if !fits || usize::from(be16(buf, cur + length - 2)) != cur {
+            out.skipped
+                .push((cur, "no entry or free record checks out here".to_string()));
+            cur += XFS_DIR2_DATA_ALIGN;
+            continue;
+        }
+        let ino = be64(buf, cur + offsets::data_entry::INUMBER);
+        if let Err(e) = check_entry_ino(sb, ino, &format!("entry at {cur}")) {
+            out.skipped.push((cur, e.to_string()));
+            cur += XFS_DIR2_DATA_ALIGN;
+            continue;
+        }
+        let name_start = cur + offsets::data_entry::NAME;
+        let name_end = name_start + usize::from(namelen);
+        let ft = if ftype {
+            ftype_from_raw(buf[name_end]).unwrap_or(None)
+        } else {
+            None
+        };
+        out.entries.push(DirEntry {
+            name: buf[name_start..name_end].to_vec(),
+            ino,
+            ftype: ft,
+            offset: cur as u32,
+        });
+        cur += length;
+    }
+    Some(out)
+}
+
+/// Read a short-form directory for salvage: the parent and every entry up
+/// to the first one that does not check out, and why the read stopped
+/// there, if it did.
+///
+/// [`read_short_form`] refuses the whole directory for one bad entry, or
+/// for counts that do not add up. Short form has no record tags to resync
+/// on, so this stops at the first entry it cannot read, and keeps the
+/// ones before it.
+pub(crate) fn salvage_short_form(
+    fork: &[u8],
+    size: u64,
+    sb: &Superblock,
+) -> (Option<u64>, Vec<DirEntry>, Option<String>) {
+    let size = usize::try_from(size).unwrap_or(usize::MAX).min(fork.len());
+    let sf = &fork[..size];
+    if sf.len() < offsets::sf_hdr::PARENT + 4 {
+        return (
+            None,
+            Vec::new(),
+            Some("too short for a short-form header".into()),
+        );
+    }
+    let count = usize::from(sf[offsets::sf_hdr::COUNT]);
+    let wide = sf[offsets::sf_hdr::I8COUNT] != 0;
+    let ino_size = if wide { 8 } else { 4 };
+    let header = offsets::sf_hdr::PARENT + ino_size;
+    if sf.len() < header {
+        return (
+            None,
+            Vec::new(),
+            Some("too short for a short-form header".into()),
+        );
+    }
+    let parent = read_sf_ino(sf, offsets::sf_hdr::PARENT, wide)
+        .ok()
+        .filter(|&ino| check_entry_ino(sb, ino, "parent").is_ok());
+    let ftype = dir_has_ftype(sb);
+    let mut entries = Vec::new();
+    let mut cur = header;
+    for i in 0..count {
+        if sf.len() < cur + offsets::sf_entry::NAME {
+            return (
+                parent,
+                entries,
+                Some(format!("entry {i} starts past the end")),
+            );
+        }
+        let namelen = usize::from(sf[cur + offsets::sf_entry::NAMELEN]);
+        let length = offsets::sf_entry::NAME + namelen + usize::from(ftype) + ino_size;
+        if namelen == 0 || cur + length > sf.len() {
+            return (parent, entries, Some(format!("entry {i} does not fit")));
+        }
+        let name_start = cur + offsets::sf_entry::NAME;
+        let name_end = name_start + namelen;
+        let ino = match read_sf_ino(sf, name_end + usize::from(ftype), wide) {
+            Ok(ino) if check_entry_ino(sb, ino, "entry").is_ok() => ino,
+            _ => {
+                return (
+                    parent,
+                    entries,
+                    Some(format!("entry {i} names no possible inode")),
+                )
+            }
+        };
+        let ft = if ftype {
+            ftype_from_raw(sf[name_end]).unwrap_or(None)
+        } else {
+            None
+        };
+        entries.push(DirEntry {
+            name: sf[name_start..name_end].to_vec(),
+            ino,
+            ftype: ft,
+            offset: u32::from(be16(sf, cur + offsets::sf_entry::OFFSET)),
+        });
+        cur += length;
+    }
+    (parent, entries, None)
+}
+
 #[cfg(test)]
 mod tests {
     //! These fixtures are built in-process, so they prove the parser is
