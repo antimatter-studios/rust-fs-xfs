@@ -28,14 +28,27 @@ env:
   FS_CORE_REF: v0.4.3
 
 jobs:
+  verify-tag-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   # Cheap and release-specific: a tag that disagrees with Cargo.toml
   # would publish a version nobody asked for, and a version number taken
   # by mistake cannot be reclaimed.
   verify-tag:
+    needs: verify-tag-gate
     name: verify tag matches Cargo.toml
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.verify-tag-gate.outputs.runner }}
     steps:
       - uses: actions/checkout@v5
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
       - name: compare tag against the manifest
         shell: bash
         run: |
@@ -91,10 +104,20 @@ jobs:
       core-ref: v0.4.3
       toolchain: 1.95.0
 
+  publish-gate:
+    needs: [verify-tag, gate]
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64
+
   publish:
     name: publish to crates.io
-    needs: [verify-tag, gate]
-    runs-on: ubuntu-latest
+    needs: [verify-tag, gate, publish-gate]
+    runs-on: ${{ needs.publish-gate.outputs.runner }}
     environment: release
     # The only job with any write grant, because it is the only one that
     # needs one: an OIDC token for crates.io trusted publishing and for
@@ -108,6 +131,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-27
         with:

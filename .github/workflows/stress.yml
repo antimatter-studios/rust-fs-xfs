@@ -33,12 +33,25 @@ env:
   CHORE_VERSION: "0.11.0"
 
 jobs:
+  stress-gate:
+    runs-on: antimatter-vps-gate
+    timeout-minutes: 1
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        run: runner-gate pick linux-x64-kvm
+
   stress:
+    needs: stress-gate
     name: read back what fsstress and fsx wrote
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.stress-gate.outputs.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: C toolchain for the gated runner
+        if: runner.environment == 'self-hosted'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Install chore
         run: scripts/ci-install-chore.sh
@@ -103,9 +116,3 @@ jobs:
       # does not.
       - name: Reproduce every logged inode core from the corpus
         run: ./scripts/ci-test.sh --test log_dinode_oracle
-
-      - name: Stop the shared guest (no run is still using it)
-        # The shared guest stays up after a run (harness v0.7.0). `vm:down`
-        # stops it only when no suite is using it.
-        if: always()
-        run: ../fs-linux-test-harness/scripts/vm.sh down && ! chore vm:status
