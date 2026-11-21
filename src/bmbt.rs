@@ -521,6 +521,201 @@ where
     Ok((extents, blocks))
 }
 
+/// What a damage-tolerant walk of an inode's block-map B+tree reached.
+///
+/// [`walk`] stops at the first block that fails a check, which is right
+/// for reading a file and loses every extent past that block for
+/// salvage. [`walk_salvage`] keeps going: it keeps every record it can
+/// decode and lists every block it could not take at its word.
+#[derive(Debug, Default)]
+pub(crate) struct SalvageWalk {
+    /// Records from every leaf reached, in the order visited, which is
+    /// file order where the tree is intact.
+    pub extents: Vec<Extent>,
+    /// The tree's own blocks that were read and used.
+    pub blocks: Vec<u64>,
+    /// What was wrong, and where: the tree block (`None` for the in-inode
+    /// root), the kind of damage, and what was seen.
+    pub problems: Vec<(Option<u64>, crate::salvage::DamageKind, String)>,
+    /// Tree blocks that could not be read.
+    pub unreadable: Vec<u64>,
+    /// A pointer led back to a block already visited.
+    pub cycle: bool,
+}
+
+/// Walk an inode's block-map B+tree for salvage, keeping what can be read.
+///
+/// A block whose magic is wrong, which belongs to another inode or another
+/// volume, records another address, or sits at a level its parent did not
+/// expect is reported and not decoded: its records would be someone
+/// else's. A block that fails only its checksum is reported and decoded,
+/// since that is the damage salvage exists for. A record count larger
+/// than the block holds is cut to what it holds, and a record that does
+/// not decode is skipped. `read_fsblock` returns `None` for a block that
+/// cannot be read.
+pub(crate) fn walk_salvage<F>(
+    fork: &[u8],
+    sb: &Superblock,
+    ino: u64,
+    mut read_fsblock: F,
+) -> SalvageWalk
+where
+    F: FnMut(u64) -> Option<Vec<u8>>,
+{
+    use crate::salvage::DamageKind;
+    let mut out = SalvageWalk::default();
+    let root = match parse_root(fork, ino) {
+        Ok(root) => root,
+        Err(e) => {
+            out.problems
+                .push((None, DamageKind::Malformed, e.to_string()));
+            return out;
+        }
+    };
+    let mut stack: Vec<(u64, u16)> = match pointers(fork, &root, ino, 0) {
+        Ok(pointers) => pointers
+            .into_iter()
+            .rev()
+            .map(|p| (p, root.level - 1))
+            .collect(),
+        Err(e) => {
+            out.problems
+                .push((None, DamageKind::Malformed, e.to_string()));
+            return out;
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    // A tree of nine levels of 4 KiB nodes has far fewer blocks than this
+    // for any real file; the bound is for a tree that has been damaged
+    // into pointing at everything.
+    let mut budget: u32 = 1 << 20;
+    let want_magic = if sb.is_v5() {
+        XFS_BMAP_CRC_MAGIC
+    } else {
+        XFS_BMAP_MAGIC
+    };
+    let header = header_len(sb.is_v5());
+    while let Some((fsblock, expect_level)) = stack.pop() {
+        if !seen.insert(fsblock) {
+            out.cycle = true;
+            out.problems.push((
+                Some(fsblock),
+                DamageKind::Broken,
+                format!("bmbt block {fsblock} is reached a second time"),
+            ));
+            continue;
+        }
+        budget = match budget.checked_sub(1) {
+            Some(left) => left,
+            None => {
+                out.problems.push((
+                    Some(fsblock),
+                    DamageKind::Broken,
+                    "the walk stopped after a million blocks".to_string(),
+                ));
+                break;
+            }
+        };
+        let Some(buf) = read_fsblock(fsblock) else {
+            out.unreadable.push(fsblock);
+            out.problems.push((
+                Some(fsblock),
+                DamageKind::Unreadable,
+                format!("bmbt block {fsblock} could not be read"),
+            ));
+            continue;
+        };
+        let mut problem = |kind, detail: String| out.problems.push((Some(fsblock), kind, detail));
+        if buf.len() < header {
+            problem(
+                DamageKind::Malformed,
+                format!("bmbt block {fsblock} is short"),
+            );
+            continue;
+        }
+        let magic = be32(&buf, offsets::MAGIC);
+        if magic != want_magic {
+            problem(
+                DamageKind::Signature,
+                format!(
+                    "bmbt block {fsblock} has magic {magic:#010x}, expected {want_magic:#010x}"
+                ),
+            );
+            continue;
+        }
+        if sb.is_v5() {
+            let stored = le32(&buf, offsets::CRC);
+            let computed = crc32c_with_zeroed_crc(&buf, offsets::CRC);
+            if stored != computed {
+                problem(
+                    DamageKind::Checksum,
+                    format!("bmbt block {fsblock}: stored CRC {stored:#010x}, computed {computed:#010x}"),
+                );
+            }
+            let owner = be64(&buf, offsets::OWNER);
+            let stated = be64(&buf, offsets::BLKNO);
+            let expected = crate::alloc_btree::blkno_of_fsbno(sb, fsblock);
+            let foreign = if uuid_at(&buf, offsets::UUID) != sb.meta_uuid {
+                Some("belongs to another volume".to_string())
+            } else if owner != ino {
+                Some(format!("belongs to inode {owner}"))
+            } else if stated != expected {
+                Some(format!("records address {stated}, not {expected}"))
+            } else {
+                None
+            };
+            if let Some(why) = foreign {
+                problem(DamageKind::Mismatch, format!("bmbt block {fsblock} {why}"));
+                continue;
+            }
+        }
+        let level = be16(&buf, offsets::LEVEL);
+        if level != expect_level {
+            problem(
+                DamageKind::Malformed,
+                format!(
+                    "bmbt block {fsblock} is at level {level}; its parent expects {expect_level}"
+                ),
+            );
+            continue;
+        }
+        let maxrecs = maxrecs(buf.len() - header);
+        let mut numrecs = be16(&buf, offsets::NUMRECS);
+        if usize::from(numrecs) > maxrecs {
+            problem(
+                DamageKind::Malformed,
+                format!("bmbt block {fsblock} claims {numrecs} records and holds {maxrecs}"),
+            );
+            numrecs = maxrecs as u16;
+        }
+        let node = Node {
+            level,
+            numrecs,
+            body: header,
+            maxrecs,
+        };
+        out.blocks.push(fsblock);
+        if level == 0 {
+            for i in 0..usize::from(numrecs) {
+                let at = header + i * EXTENT_RECORD_SIZE;
+                match Extent::parse(&buf[at..]) {
+                    Ok(extent) => out.extents.push(extent),
+                    Err(e) => problem(
+                        DamageKind::Malformed,
+                        format!("bmbt block {fsblock} record {i}: {e}"),
+                    ),
+                }
+            }
+        } else {
+            match pointers(&buf, &node, ino, fsblock) {
+                Ok(children) => stack.extend(children.into_iter().rev().map(|p| (p, level - 1))),
+                Err(e) => problem(DamageKind::Malformed, e.to_string()),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -405,7 +405,57 @@ impl Inode {
             verify_v3_integrity(buf, sb, ino, "inode")?;
         }
 
-        let flags2 = if is_v3 { be64(buf, offsets::FLAGS2) } else { 0 };
+        let inode = Self::fields(buf, ino, version)?;
+        inode.validate(sb)?;
+        Ok(inode)
+    }
+
+    /// Decode an inode for salvage: the checks [`Inode::parse`] needs to
+    /// know where the fields are, and none of the ones that say whether
+    /// they are right.
+    ///
+    /// The magic, a version the volume allows and defined fork formats are
+    /// still required, because without them the fields are not an inode's.
+    /// The v3 checksum, the inode's own number and UUID, and the structural
+    /// checks are not made: a salvage read reports those beside the fields.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadSuperblock`] when `buf` is shorter than an inode, the
+    /// magic is wrong, the version is not one this volume's inodes have,
+    /// or a fork format is undefined.
+    pub fn decode_unverified(buf: &[u8], sb: &Superblock, ino: u64) -> Result<Self> {
+        let isize = usize::from(sb.inodesize);
+        if buf.len() < isize {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: need {isize} bytes, got {}",
+                buf.len()
+            )));
+        }
+        let magic = be16(buf, offsets::MAGIC);
+        if magic != XFS_DINODE_MAGIC {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: magic {magic:#06x}, expected {XFS_DINODE_MAGIC:#06x}"
+            )));
+        }
+        let version = buf[offsets::VERSION];
+        let allowed = if sb.is_v5() { 3..=3 } else { 1..=2 };
+        if !allowed.contains(&version) {
+            return Err(Error::BadSuperblock(format!(
+                "inode {ino}: version {version} on a {} filesystem",
+                if sb.is_v5() { "v5" } else { "v4" }
+            )));
+        }
+        Self::fields(buf, ino, version)
+    }
+
+    /// The fields of a core whose magic and version have been checked.
+    fn fields(buf: &[u8], ino: u64, version: u8) -> Result<Self> {
+        let flags2 = if version == 3 {
+            be64(buf, offsets::FLAGS2)
+        } else {
+            0
+        };
         let bigtime = flags2 & flags2::BIGTIME != 0;
 
         // With 64-bit extent counters the fields at 24 and 76 widen,
@@ -427,7 +477,7 @@ impl Inode {
             )
         };
 
-        let inode = Inode {
+        Ok(Inode {
             ino,
             mode: be16(buf, offsets::MODE),
             version,
@@ -448,19 +498,16 @@ impl Inode {
             atime: Timestamp::parse(buf, offsets::ATIME, bigtime),
             mtime: Timestamp::parse(buf, offsets::MTIME, bigtime),
             ctime: Timestamp::parse(buf, offsets::CTIME, bigtime),
-            crtime: if is_v3 {
+            crtime: if version == 3 {
                 Timestamp::parse(buf, offsets::CRTIME, bigtime)
             } else {
                 Timestamp { sec: 0, nsec: 0 }
             },
-        };
-
-        inode.validate(sb)?;
-        Ok(inode)
+        })
     }
 
     /// Structural checks that catch a misread core.
-    fn validate(&self, sb: &Superblock) -> Result<()> {
+    pub(crate) fn validate(&self, sb: &Superblock) -> Result<()> {
         let isize = u64::from(sb.inodesize);
 
         // The attribute fork offset is measured in 8-byte units from the
