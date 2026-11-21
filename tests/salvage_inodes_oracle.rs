@@ -163,6 +163,10 @@ fn a_map_block_xfs_db_breaks_is_found_and_repair_agrees() {
         .output()
         .repair_report();
     assert!(
+        !report.contains(common::repair::IGNORED_THE_LOG),
+        "xfs_repair ignored the log (\"valuable metadata changes in a log\"), so its report says nothing about this copy:\n{report}"
+    );
+    assert!(
         report.contains("REPAIR_RC=") && !report.contains("REPAIR_RC=0"),
         "xfs_repair -n found nothing wrong:\n{report}"
     );
