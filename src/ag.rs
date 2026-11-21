@@ -237,29 +237,7 @@ impl Agf {
             )?;
         }
 
-        let agf = Agf {
-            seqno: be32(buf, offsets::common::SEQNO),
-            length: be32(buf, offsets::common::LENGTH),
-            roots: [
-                be32(buf, offsets::agf::ROOTS),
-                be32(buf, offsets::agf::ROOTS + 4),
-                be32(buf, offsets::agf::ROOTS + 8),
-            ],
-            levels: [
-                be32(buf, offsets::agf::LEVELS),
-                be32(buf, offsets::agf::LEVELS + 4),
-                be32(buf, offsets::agf::LEVELS + 8),
-            ],
-            flfirst: be32(buf, offsets::agf::FLFIRST),
-            fllast: be32(buf, offsets::agf::FLLAST),
-            flcount: be32(buf, offsets::agf::FLCOUNT),
-            freeblks: be32(buf, offsets::agf::FREEBLKS),
-            longest: be32(buf, offsets::agf::LONGEST),
-            btreeblks: be32(buf, offsets::agf::BTREEBLKS),
-            rmap_blocks: be32(buf, offsets::agf::RMAP_BLOCKS),
-            refcount_root: be32(buf, offsets::agf::REFCOUNT_ROOT),
-            refcount_level: be32(buf, offsets::agf::REFCOUNT_LEVEL),
-        };
+        let agf = Agf::decode(buf);
 
         // An AG can never be longer than the geometry the superblock
         // declares, and a free-space count larger than the AG itself is
@@ -283,6 +261,42 @@ impl Agf {
             )));
         }
         Ok(agf)
+    }
+
+    /// The fields of an AGF as stored, with no check of any kind: not the
+    /// magic, the checksum, the identity or a single range.
+    ///
+    /// What [`Agf::parse`] decodes once its checks pass, and what a
+    /// salvage read decodes from a header that failed them, to report
+    /// beside the failure. `buf` must hold [`XFS_AGF_SIZE`] bytes.
+    ///
+    /// # Panics
+    ///
+    /// When `buf` is shorter than [`XFS_AGF_SIZE`].
+    pub fn decode(buf: &[u8]) -> Self {
+        Agf {
+            seqno: be32(buf, offsets::common::SEQNO),
+            length: be32(buf, offsets::common::LENGTH),
+            roots: [
+                be32(buf, offsets::agf::ROOTS),
+                be32(buf, offsets::agf::ROOTS + 4),
+                be32(buf, offsets::agf::ROOTS + 8),
+            ],
+            levels: [
+                be32(buf, offsets::agf::LEVELS),
+                be32(buf, offsets::agf::LEVELS + 4),
+                be32(buf, offsets::agf::LEVELS + 8),
+            ],
+            flfirst: be32(buf, offsets::agf::FLFIRST),
+            fllast: be32(buf, offsets::agf::FLLAST),
+            flcount: be32(buf, offsets::agf::FLCOUNT),
+            freeblks: be32(buf, offsets::agf::FREEBLKS),
+            longest: be32(buf, offsets::agf::LONGEST),
+            btreeblks: be32(buf, offsets::agf::BTREEBLKS),
+            rmap_blocks: be32(buf, offsets::agf::RMAP_BLOCKS),
+            refcount_root: be32(buf, offsets::agf::REFCOUNT_ROOT),
+            refcount_level: be32(buf, offsets::agf::REFCOUNT_LEVEL),
+        }
     }
 
     /// Whether the reverse-mapping B+tree is populated for this AG.
@@ -351,23 +365,7 @@ impl Agi {
             )?;
         }
 
-        let mut unlinked = [0u32; XFS_AGI_UNLINKED_BUCKETS];
-        for (i, slot) in unlinked.iter_mut().enumerate() {
-            *slot = be32(buf, offsets::agi::UNLINKED + i * 4);
-        }
-
-        let agi = Agi {
-            seqno: be32(buf, offsets::common::SEQNO),
-            length: be32(buf, offsets::common::LENGTH),
-            count: be32(buf, offsets::agi::COUNT),
-            root: be32(buf, offsets::agi::ROOT),
-            level: be32(buf, offsets::agi::LEVEL),
-            freecount: be32(buf, offsets::agi::FREECOUNT),
-            newino: be32(buf, offsets::agi::NEWINO),
-            free_root: be32(buf, offsets::agi::FREE_ROOT),
-            free_level: be32(buf, offsets::agi::FREE_LEVEL),
-            unlinked,
-        };
+        let agi = Agi::decode(buf);
 
         if agi.freecount > agi.count {
             return Err(Error::BadSuperblock(format!(
@@ -381,6 +379,33 @@ impl Agi {
             )));
         }
         Ok(agi)
+    }
+
+    /// The fields of an AGI as stored, with no check of any kind, as
+    /// [`Agf::decode`] is for the AGF. `buf` must hold [`XFS_AGI_SIZE`]
+    /// bytes.
+    ///
+    /// # Panics
+    ///
+    /// When `buf` is shorter than [`XFS_AGI_SIZE`].
+    pub fn decode(buf: &[u8]) -> Self {
+        let mut unlinked = [0u32; XFS_AGI_UNLINKED_BUCKETS];
+        for (i, slot) in unlinked.iter_mut().enumerate() {
+            *slot = be32(buf, offsets::agi::UNLINKED + i * 4);
+        }
+
+        Agi {
+            seqno: be32(buf, offsets::common::SEQNO),
+            length: be32(buf, offsets::common::LENGTH),
+            count: be32(buf, offsets::agi::COUNT),
+            root: be32(buf, offsets::agi::ROOT),
+            level: be32(buf, offsets::agi::LEVEL),
+            freecount: be32(buf, offsets::agi::FREECOUNT),
+            newino: be32(buf, offsets::agi::NEWINO),
+            free_root: be32(buf, offsets::agi::FREE_ROOT),
+            free_level: be32(buf, offsets::agi::FREE_LEVEL),
+            unlinked,
+        }
     }
 
     /// Whether any inode in this AG is unlinked but still referenced.

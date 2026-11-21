@@ -665,6 +665,106 @@ impl Superblock {
         }
     }
 
+    /// Parse a superblock for salvage: every check [`Superblock::parse`]
+    /// makes on the geometry, and none of the three that say whether the
+    /// volume may be mounted.
+    ///
+    /// A v5 checksum is not verified, `sb_inprogress` is accepted, and an
+    /// `incompat` needs-repair bit is accepted. Each of those is something a
+    /// salvage read reports as damage beside the fields, not a reason to
+    /// have no fields at all. The returned value keeps the bytes as they
+    /// were: `inprogress` and `features_incompat` are not cleared in it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Superblock::parse`], but never [`Error::ChecksumMismatch`] and
+    /// never for needs-repair or an unfinished format. An unknown
+    /// incompatible feature still fails: the layout is not one this
+    /// driver can read, damaged or not.
+    pub fn parse_lenient(buf: &[u8]) -> Result<Self> {
+        if buf.len() < XFS_SB_SIZE {
+            return Self::parse(buf);
+        }
+        let sectsize = usize::from(be16(buf, offsets::SECTSIZE));
+        let mut copy = buf[..sectsize.clamp(XFS_SB_SIZE, buf.len())].to_vec();
+        let incompat_bits = be32(&copy, offsets::FEATURES_INCOMPAT);
+        let is_v5 = be16(&copy, offsets::VERSIONNUM) & XFS_SB_VERSION_NUMBITS == 5;
+        if is_v5 {
+            copy[offsets::FEATURES_INCOMPAT..offsets::FEATURES_INCOMPAT + 4]
+                .copy_from_slice(&(incompat_bits & !incompat::NEEDSREPAIR).to_be_bytes());
+        }
+        let inprogress = copy[offsets::INPROGRESS];
+        copy[offsets::INPROGRESS] = 0;
+        if is_v5 && copy.len() == sectsize {
+            let crc = crc32c_with_zeroed_crc(&copy, offsets::CRC);
+            copy[offsets::CRC..offsets::CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        }
+        let mut sb = Self::parse(&copy)?;
+        sb.inprogress = inprogress;
+        sb.features_incompat = if is_v5 { incompat_bits } else { 0 };
+        Ok(sb)
+    }
+
+    /// Whether a v5 superblock's stored checksum matches its sector.
+    /// `None` for a v4 superblock, which has none, or when `buf` is
+    /// shorter than the sector size it declares.
+    pub fn checksum_matches(buf: &[u8]) -> Option<bool> {
+        if buf.len() < XFS_SB_SIZE || be16(buf, offsets::VERSIONNUM) & XFS_SB_VERSION_NUMBITS != 5 {
+            return None;
+        }
+        let sectsize = usize::from(be16(buf, offsets::SECTSIZE));
+        if sectsize < XFS_SB_SIZE || buf.len() < sectsize {
+            return None;
+        }
+        Some(le32(buf, offsets::CRC) == crc32c_with_zeroed_crc(&buf[..sectsize], offsets::CRC))
+    }
+
+    /// The fields on which every superblock copy must agree with the
+    /// primary, as `(name, self, other)`, for each one that differs.
+    ///
+    /// The kernel sets the attribute and quota version bits in the primary
+    /// alone, the first time it needs them, so those two bits are left out
+    /// of the comparison: a difference there is history, not damage.
+    pub fn geometry_differences(&self, other: &Superblock) -> Vec<(&'static str, u64, u64)> {
+        let late = version_flags::ATTRBIT | version_flags::QUOTABIT;
+        let fields: [(&'static str, u64, u64); 12] = [
+            ("blocksize", self.blocksize.into(), other.blocksize.into()),
+            ("dblocks", self.dblocks, other.dblocks),
+            ("agblocks", self.agblocks.into(), other.agblocks.into()),
+            ("agcount", self.agcount.into(), other.agcount.into()),
+            ("logstart", self.logstart, other.logstart),
+            ("logblocks", self.logblocks.into(), other.logblocks.into()),
+            (
+                "versionnum",
+                (self.versionnum & !late).into(),
+                (other.versionnum & !late).into(),
+            ),
+            ("sectsize", self.sectsize.into(), other.sectsize.into()),
+            ("inodesize", self.inodesize.into(), other.inodesize.into()),
+            (
+                "features_compat",
+                self.features_compat.into(),
+                other.features_compat.into(),
+            ),
+            (
+                "features_ro_compat",
+                self.features_ro_compat.into(),
+                other.features_ro_compat.into(),
+            ),
+            (
+                "features_incompat",
+                self.features_incompat.into(),
+                other.features_incompat.into(),
+            ),
+        ];
+        fields.into_iter().filter(|(_, a, b)| a != b).collect()
+    }
+
+    /// The byte offset of allocation group `ag`'s first sector.
+    pub fn ag_offset(&self, ag: u32) -> u64 {
+        u64::from(ag) * u64::from(self.agblocks) * u64::from(self.blocksize)
+    }
+
     /// Structural sanity checks.
     ///
     /// Each `log2` field must agree with the value it describes. That
