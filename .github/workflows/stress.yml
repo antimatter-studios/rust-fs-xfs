@@ -31,6 +31,15 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CHORE_VERSION: "0.11.0"
+  # The shared guest's size. The harness (v0.8.0 and later) sizes it by a host
+  # resource profile, which on a GitHub-hosted runner is a small guest (2G, 2
+  # CPUs). The suites build and run release test binaries in it, and with that
+  # size the kernel SIGKILLs one (cli_superblock_repair_oracle in the merge
+  # queue, runs 44920185368, 44927412283 and 44935207374) and the arbitrary-kill
+  # tests' calibrated kill window stops matching their runs. The size the suites
+  # were validated on before the profiles is 4G and 4 CPUs.
+  FLTH_SHARED_MEMORY: 4G
+  FLTH_SHARED_CPUS: "4"
 
 jobs:
   stress:
@@ -51,6 +60,11 @@ jobs:
         with:
           toolchain: 1.95.0
 
+      - name: Upstream virtiofsd 1.14.0
+        # Ubuntu 24.04 packages virtiofsd 1.10.0, which never answers a
+        # non-UTF-8 xattr name (fs-linux-test-harness #274). The tag must
+        # match LINUX_HARNESS_REF in chores.yml.
+        uses: antimatter-studios/fs-linux-test-harness/.github/actions/install-virtiofsd@v0.9.1
       - name: KVM, QEMU and Vagrant
         id: vm-host
         run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
