@@ -34,12 +34,16 @@
 //!   live, free and damaged, and [`read_inode`] for one by number.
 //! - [`walk_extents`]: the storage an inode's data fork claims, kept as far
 //!   as its map can be followed, and [`read_mapped`] to read through it.
+//! - [`inode_chunks`] and [`free_extents`]: a group's inode and free-space
+//!   B+trees walked past damaged blocks, and [`find_inodes_in_chunks`] to
+//!   read only the inodes the tree knows of.
 //! - [`directory_entries`]: the names a directory holds, read past records
 //!   that do not check out, and [`rebuild_tree`]: parent claims among a
 //!   set of inode candidates, keeping orphans and conflicts.
 
 mod dirs;
 mod evidence;
+mod groups;
 mod headers;
 mod inodes;
 
@@ -47,6 +51,7 @@ pub use dirs::{
     directory_entries, rebuild_tree, DirectoryListing, NamedEntry, Parent, Tree, TreeNode,
 };
 pub use evidence::{Damage, DamageKind, Extent, Integrity, Severity};
+pub use groups::{chunk_location, find_inodes_in_chunks, free_extents, inode_chunks, TreeWalk};
 pub use headers::{
     ag_headers, damage, log_health, read_superblock, scan_superblocks, superblocks, AgHeaders,
     Header, SuperblockCopy, Superblocks, VolumeDamage,

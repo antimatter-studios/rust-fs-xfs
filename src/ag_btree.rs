@@ -356,6 +356,183 @@ where
     Ok((out, seen.concat()))
 }
 
+/// What a damage-tolerant walk of one of a group's trees reached.
+#[derive(Debug)]
+pub(crate) struct SalvageWalk<T> {
+    /// Records from every leaf reached, in the order visited.
+    pub records: Vec<T>,
+    /// The tree's blocks that were read and used.
+    pub blocks: Vec<u32>,
+    /// What was wrong, and where: the group block, the kind, and what was
+    /// seen.
+    pub problems: Vec<(u32, crate::salvage::DamageKind, String)>,
+    /// A pointer led back to a block already visited.
+    pub cycle: bool,
+}
+
+/// Walk one of a group's trees for salvage, keeping what can be read.
+///
+/// The checks are [`parse_block`]'s, made one at a time: a block whose
+/// magic is wrong, which belongs to another volume or group, records
+/// another address, or sits at a level its parent did not expect is
+/// reported and not decoded. A block that fails only its checksum is
+/// reported and used. A record count larger than the block holds is cut
+/// to what it holds, and a record `decode` refuses is reported and
+/// skipped. `read_agblock` returns `None` for a block that cannot be read.
+pub(crate) fn walk_salvage<T, F, D>(
+    sb: &Superblock,
+    shape: Shape,
+    agno: u32,
+    root: u32,
+    levels: u32,
+    mut read_agblock: F,
+    decode: D,
+) -> SalvageWalk<T>
+where
+    F: FnMut(u32) -> Option<Vec<u8>>,
+    D: Fn(&[u8], usize) -> std::result::Result<T, String>,
+{
+    use crate::salvage::DamageKind;
+    let mut out = SalvageWalk {
+        records: Vec::new(),
+        blocks: Vec::new(),
+        problems: Vec::new(),
+        cycle: false,
+    };
+    let what = shape.name;
+    if levels == 0 || levels > u32::from(MAX_LEVELS) {
+        out.problems.push((
+            root,
+            DamageKind::Malformed,
+            format!("{what} claims {levels} levels"),
+        ));
+        return out;
+    }
+    let header = if sb.is_v5() {
+        V5_HEADER_LEN
+    } else {
+        V4_HEADER_LEN
+    };
+    let Some(want) = (if sb.is_v5() {
+        Some(shape.magic_v5)
+    } else {
+        shape.magic_v4
+    }) else {
+        return out;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![(root, (levels - 1) as u16)];
+    while let Some((agblock, expect_level)) = stack.pop() {
+        if !seen.insert(agblock) {
+            out.cycle = true;
+            out.problems.push((
+                agblock,
+                DamageKind::Broken,
+                format!("{what} block {agblock} is reached a second time"),
+            ));
+            continue;
+        }
+        if seen.len() as u64 > u64::from(sb.agblocks) {
+            break;
+        }
+        let Some(buf) = read_agblock(agblock) else {
+            out.problems.push((
+                agblock,
+                DamageKind::Unreadable,
+                format!("{what} block {agblock} could not be read"),
+            ));
+            continue;
+        };
+        let mut problem = |kind, detail: String| out.problems.push((agblock, kind, detail));
+        if buf.len() < header {
+            problem(
+                DamageKind::Malformed,
+                format!("{what} block {agblock} is short"),
+            );
+            continue;
+        }
+        let magic = be32(&buf, offsets::MAGIC);
+        if magic != want {
+            problem(
+                DamageKind::Signature,
+                format!("{what} block {agblock} has magic {magic:#010x}, expected {want:#010x}"),
+            );
+            continue;
+        }
+        if sb.is_v5() {
+            let stored = le32(&buf, offsets::CRC);
+            let computed = crc32c_with_zeroed_crc(&buf, offsets::CRC);
+            if stored != computed {
+                problem(
+                    DamageKind::Checksum,
+                    format!("{what} block {agblock}: stored CRC {stored:#010x}, computed {computed:#010x}"),
+                );
+            }
+            let owner = be32(&buf, offsets::OWNER);
+            let stated = be64(&buf, offsets::BLKNO);
+            let expected = crate::alloc_btree::expected_blkno(sb, agno, agblock);
+            let foreign = if uuid_at(&buf, offsets::UUID) != sb.meta_uuid {
+                Some("belongs to another volume".to_string())
+            } else if owner != agno {
+                Some(format!("belongs to group {owner}"))
+            } else if stated != expected {
+                Some(format!("records address {stated}, not {expected}"))
+            } else {
+                None
+            };
+            if let Some(why) = foreign {
+                problem(
+                    DamageKind::Mismatch,
+                    format!("{what} block {agblock} {why}"),
+                );
+                continue;
+            }
+        }
+        let level = be16(&buf, offsets::LEVEL);
+        if level != expect_level {
+            problem(
+                DamageKind::Malformed,
+                format!(
+                    "{what} block {agblock} is at level {level}; its parent expects {expect_level}"
+                ),
+            );
+            continue;
+        }
+        let per = if level == 0 {
+            shape.record_len
+        } else {
+            shape.keys_per_entry() * shape.key_len + PTR_LEN
+        };
+        let max = maxrecs(buf.len() - header, per);
+        let mut numrecs = usize::from(be16(&buf, offsets::NUMRECS));
+        if numrecs > max {
+            problem(
+                DamageKind::Malformed,
+                format!("{what} block {agblock} claims {numrecs} records and holds {max}"),
+            );
+            numrecs = max;
+        }
+        out.blocks.push(agblock);
+        if level == 0 {
+            for i in 0..numrecs {
+                match decode(&buf, header + i * shape.record_len) {
+                    Ok(record) => out.records.push(record),
+                    Err(e) => problem(
+                        DamageKind::Malformed,
+                        format!("{what} block {agblock} record {i}: {e}"),
+                    ),
+                }
+            }
+        } else {
+            let first = header + max * shape.keys_per_entry() * shape.key_len;
+            for i in (0..numrecs).rev() {
+                stack.push((be32(&buf, first + i * PTR_LEN), level - 1));
+            }
+        }
+    }
+    out
+}
+
 /// How a tree of `records` records is laid out: how many blocks each
 /// level holds, leaves first, root last.
 ///
