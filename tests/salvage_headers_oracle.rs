@@ -156,6 +156,10 @@ fn repair_calls_it_damaged(image: &Path, tag: &str) -> String {
         .output();
     let report = out.repair_report();
     assert!(
+        !report.contains(common::repair::IGNORED_THE_LOG),
+        "{tag}: xfs_repair ignored the log (\"valuable metadata changes in a log\"), so its report says nothing about this copy:\n{report}"
+    );
+    assert!(
         report.contains("REPAIR_RC=") && !report.contains("REPAIR_RC=0"),
         "{tag}: xfs_repair -n found nothing wrong, so the damage is not damage:\n{report}"
     );
