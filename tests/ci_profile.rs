@@ -1074,7 +1074,7 @@ fn the_pull_request_gate_still_runs_the_debug_unit_task() {
 
 /// The premise behind not counting the `scripts/ci-test.sh` steps.
 ///
-/// Most suites here run through that script, which supplies `--release`
+/// Most suites here run through that script, which supplies `--profile test-opt`
 /// itself, so those workflow lines carry no literal `cargo test` and the
 /// parser does not see them. That is correct today and is the whole
 /// reason the parser needs no rule about them. If the script ever took
@@ -1083,7 +1083,7 @@ fn the_pull_request_gate_still_runs_the_debug_unit_task() {
 /// satisfied. Red is the safe direction, but a stale premise is worth
 /// naming here rather than discovering from a confusing failure.
 #[test]
-fn ci_test_sh_still_supplies_release_itself() {
+fn ci_test_sh_still_supplies_optimized_profile_itself() {
     let path = manifest_dir().join("scripts").join("ci-test.sh");
     let script = read_or_panic(&path);
 
@@ -1106,14 +1106,27 @@ fn ci_test_sh_still_supplies_release_itself() {
 
     for line in &invocations {
         assert!(
-            line.contains("--release"),
-            "{}: `{line}` no longer pins `--release`. The parser does not \
+            line.contains("--profile test-opt"),
+            "{}: `{line}` no longer pins `--profile test-opt`. The parser does not \
              count the workflow's ci-test.sh steps because the script chose \
              the profile; if the caller can choose it now, those steps may \
              be real debug runs and the parser must learn to read them.",
             path.display()
         );
     }
+
+    let manifest = read_or_panic(&manifest_dir().join("Cargo.toml"));
+    let profile = manifest
+        .split("[profile.test-opt]")
+        .nth(1)
+        .expect("Cargo.toml must define profile.test-opt")
+        .split('[')
+        .next()
+        .unwrap();
+    let settings: Vec<&str> = profile.lines().map(str::trim).collect();
+    assert!(settings.contains(&"inherits = \"release\""));
+    assert!(settings.contains(&"lto = false"));
+    assert!(settings.contains(&"codegen-units = 16"));
 }
 
 // ======================================================================
@@ -2550,7 +2563,7 @@ jobs:
 
     /// The `ci-test.sh` steps, which are how most suites in this
     /// repository run. They are not debug runs: the script adds
-    /// `--release`. Nothing in the parser says so — they simply carry no
+    /// `--profile test-opt`. Nothing in the parser says so — they simply carry no
     /// `cargo test` — and this pins that they stay uncounted, so a later
     /// "helpful" widening of the pattern to `cargo|ci-test` cannot start
     /// reporting a release run as a debug one.
@@ -2566,7 +2579,7 @@ jobs:
         assert_eq!(
             runs_with_overflow_checks(via_the_script),
             Vec::<String>::new(),
-            "ci-test.sh supplies --release itself, so these are release runs"
+            "ci-test.sh supplies an optimized profile itself, so these are not debug runs"
         );
     }
 }
