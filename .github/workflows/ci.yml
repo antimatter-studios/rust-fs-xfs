@@ -122,6 +122,9 @@ env:
   # were validated on before the profiles is 4G and 4 CPUs.
   FLTH_SHARED_MEMORY: 4G
   FLTH_SHARED_CPUS: "4"
+  # ci-ok-gate only picks ci-ok's runner and carries `if: always()` like ci-ok;
+  # it is not a job whose result the aggregate judges.
+  CI_GATE_NON_GATING: ci-ok-gate
 
 jobs:
   changes-gate:
