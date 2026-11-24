@@ -61,8 +61,8 @@ command -v cargo >/dev/null ||
     { echo "guest-suite.sh: no cargo in the guest after the toolchain install." >&2; exit 1; }
 
 # THROUGH ci-test.sh, like every other way of running this suite: it
-# supplies --locked --release itself, refuses a run whose output says it
-# skipped, and refuses one that executed fewer tests than its floor. A
+# supplies --locked and --profile test-opt itself, refuses a run whose output
+# says it skipped, and refuses one that executed fewer tests than its floor. A
 # guest run is the path a Mac takes to reach these tests at all, so it is
 # the last place that should be graded more loosely than the rest.
 #

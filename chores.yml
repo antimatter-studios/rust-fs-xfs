@@ -354,7 +354,7 @@ tasks:
     # it, and not so much that it stops measuring anything.
     #
     # IT DOES NOT GO THROUGH ci-test.sh's RUN MODE, and that is not an
-    # exemption from the gate. That mode pins `--release` (which
+    # exemption from the gate. That mode pins `--profile test-opt` (which
     # tests/ci_profile.rs holds it to, because the workflow parser relies
     # on it), so the debug tier runs cargo itself and hands the log tier.sh
     # wrote to `ci-test.sh --gate`: the same skip pattern, the same

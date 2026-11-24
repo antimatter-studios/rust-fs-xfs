@@ -3,10 +3,10 @@
 # no-debug-assert.sh — an invariant that does not run is a comment.
 #
 # The build that ships is `cargo build --release`, and `debug_assert!`
-# compiles out of it. CI's suites run `--release` too; the one debug run
-# is ci.yml's `cargo test --lib` overflow gate, which exercises the
-# library's unit tests and not a volume anyone writes. So a
-# `debug_assert!` guarding what gets written to disk is not an invariant
+# compiles out of it. CI's suites run `--profile test-opt`, which
+# inherits release and compiles it out too; the one debug run is ci.yml's `cargo
+# test --lib` overflow gate, which exercises the library's unit tests and not a
+# volume anyone writes. So a `debug_assert!` guarding what gets written to disk is not an invariant
 # of the code users run, and the two that guarded the depth stamped into
 # the AGF and AGI went unrun in every shipped build of the write path.
 #
