@@ -3,91 +3,82 @@
 The rust-fs drivers share three layers of read API, so a program can treat
 every format the same way:
 
-| Layer | What it does |
-|---|---|
-| **Volume** | Open a device, read its geometry and superblock, and report its health. |
-| **Primitive** | Read-only, damage-tolerant access to the on-disk structures, and the salvage verbs built on them. |
-| **File** | Browse, read and copy files on a healthy volume. |
+| Layer | What it does | rust-fs-core trait | Here |
+|---|---|---|---|
+| **Volume** | Open a device, read its geometry and superblocks, report its health | `VolumeAPI`, `OpenVolume` | `layers::XfsVolume` |
+| **Primitive** | Read-only, damage-tolerant access to the on-disk structures, and the salvage verbs | `PrimitiveAPI`, `SalvageAdapter` | `layers::XfsVolume`, `layers::XfsSalvage`, `salvage` |
+| **File** | Browse, read and copy files on a healthy volume | `FileAPI` | `layers::XfsVolume` |
 
-The traits for these layers live in `rust-fs-core`. This page maps what
-this crate already has onto them, and lists what each layer still needs.
-It is the plan for implementing them; the layers that exist are marked.
+The traits and the evidence types (`Extent`, `Damage`, `Candidate`,
+`ExtentWalk`, `Tree`, `Plan`) come from rust-fs-core's `layers` feature.
+Only what is common to every format is there. The XFS structures stay in
+this crate, in `fs_xfs::salvage`, and the traits are implemented on top of
+them in `fs_xfs::layers`.
 
-Nothing in any of the three layers writes to the device. The writable
-surface (`Filesystem::mount_rw` and the `write`, `create`, `unlink` and
-`repair` modules) stays this crate's own and is not part of them.
+Nothing in any of the three layers writes to the device. Every source is a
+`BlockRead`, which has no write path. The writable surface
+(`Filesystem::mount_rw` and the `write`, `create`, `unlink` and `repair`
+modules) stays this crate's own and is not part of the layers.
 
 ## Volume
 
-| Need | This crate today |
+| Trait method | XFS |
 |---|---|
-| Open a device, read-only | `Filesystem::mount(Arc<dyn BlockRead>)`, `mount_with_cache`, `mount_with_realtime` |
-| Recognise the format | `Superblock::parse` refuses a wrong magic with `Error::NotXfs` |
-| Geometry | `Superblock`: `blocksize`, `sectsize`, `agcount`, `agblocks`, `dblocks`, `inodesize`, `dirblocksize()`, log placement |
-| Superblock | `Filesystem::superblock()` |
-| Health | `log::inspect` (`Empty`, `CleanlyUnmounted`, `NeedsReplay`), `Filesystem::was_replayed()`, and the full checker `check::check` |
-
-A dirty log is replayed **in memory**: `Filesystem::mount` reads the log
-with `log_recover::replay` into an `overlay::Overlay`, and every later read
-goes through it. The device is never written. A log that needs replay and
-carries `log_incompat` bits is refused rather than half-replayed.
-
-Missing: a mount that does not need a valid primary superblock. Today a
-volume whose primary superblock fails its CRC or its geometry checks
-cannot be opened at all; the Volume layer of a damaged volume has to fall
-back to a secondary copy.
+| `OpenVolume::probe` | The primary superblock's magic; `Damaged` when it is there and the sector does not check out |
+| `OpenVolume::open` | The strict mount, `Filesystem::mount`: a dirty log is replayed in memory, never onto the source |
+| `OpenVolume::open_for_salvage` | The superblock copies and the geometry chosen from them (`salvage::superblocks`), and the strict mount when it succeeds |
+| `geometry` | Sector size, block size, `dblocks`, label and UUID, from the chosen geometry |
+| `superblock`, `superblocks` | The chosen geometry; every copy with its integrity |
+| `support` | Files when the strict mount succeeded; the salvage capabilities; a realtime device or an external log named as unsupported |
+| `health` | `salvage::damage`: superblock copies, every group's AGF, AGI and AGFL, and the log. A damaged copy alone makes the volume `Degraded` |
 
 ## Primitive
 
-These read the structures one at a time, without a mount, and do not stop
-at the first bad checksum or broken link. Each result says what could be
-read and what was wrong with it.
+The shared part is `structures` and the salvage verbs. The XFS primitives
+under them are `fs_xfs::salvage`:
 
-| Structure | This crate today | Damage-tolerant form needed |
-|---|---|---|
-| Superblock, every AG copy | `Superblock::parse`, `parse_copy` (strict: CRC, geometry, feature bits) | Read each copy, record CRC and geometry failures as damage, and keep the copy |
-| AGF, AGI, AGFL | `ag::Agf::parse`, `ag::Agi::parse` (strict), `Filesystem::read_agf`/`read_agi` | Raw header plus integrity and identity (UUID, AG number) checks as findings |
-| Free-space B+trees | `alloc_btree::walk_from_agf`, `Filesystem::free_extents` | Walk that keeps records from blocks it can read and reports the rest |
-| Inode B+trees | `inode_btree::walk_from_agi`, `inode_btree::Trees` | As above |
-| Inodes | `Inode::parse` (strict CRC and identity), `Filesystem::read_inode_raw` | An inode scan by magic over any byte range, with CRC and identity as integrity flags |
-| Extent lists and BMBT | `extent::parse_list`, `bmbt::walk`, `bmbt::leaf_records_unverified` | An extent walk that keeps every extent reached and says why it stopped |
-| Directories | `dir::parse_data_block`, `parse_block_form`, `parse_leaf`, `parse_node`, `read_short_form` | Entries from every readable directory block, with the owning inode where the block names one |
-| Log | `log::inspect`, `log::head`, `log_recover::replay` | The log's state as a health finding |
-
-### Salvage verbs
-
-The salvage verbs are the format-neutral surface built on the primitives.
-For XFS they mean:
-
-| Verb | XFS meaning |
+| Structure | `fs_xfs::salvage` |
 |---|---|
-| Find candidates | Scan a byte range for inode records (magic `IN`), reporting live and free inodes, and CRC and identity failures as integrity, never dropping a record for them |
-| Walk extents | Follow an inode's data fork: inline data, the extent list, or the BMBT, keeping every extent reached |
-| Rebuild the tree | Parent claims from directory entries (short-form, block, leaf and node directories) and from `..`, keeping orphans and conflicting parents |
-| Report damage | Superblock copies that disagree or fail their CRC, AG headers that fail their checks, and a log that needs replay |
-| Read by extent | Bounded reads of byte ranges on the source |
-| Materialize from a plan | Copy a file's extents, as a plan lists them, to a caller's sink |
-| Capabilities | XFS frees an inode's extents before it frees the inode, so a deleted file's data is not mapped: deleted candidates are reported, and deleted extents are listed as missing |
+| Superblock, every AG copy | `superblocks`, `read_superblock`, `scan_superblocks` |
+| AGF, AGI, AGFL | `ag_headers` |
+| Free-space and inode B+trees | `free_extents`, `inode_chunks`, `find_inodes_in_chunks` |
+| Inodes | `find_inodes`, `read_inode` |
+| Extent lists and block-map B+trees | `walk_extents`, `read_mapped` |
+| Directories | `directory_entries`, `rebuild_tree` (with names) |
+| Log | `log_health` |
 
-Every verb takes the source as `&dyn BlockRead`, which has no write path.
+Each one reads past a failed checksum or a wrong identity where the bytes
+allow, and returns what it read with the damage beside it.
+
+| Salvage verb | XFS |
+|---|---|
+| Find candidates | Inode records by magic in any byte range, live and free, each with its checksum and identity checked |
+| Walk extents | The data fork: inline data, the extent list or the block-map B+tree, as file-ordered `WalkExtent`s with their file offsets; a gap is a hole and an unwritten extent is uninitialized, so `ExtentWalk::plan()` rebuilds a sparse file in place |
+| Rebuild the tree | Parent claims from every live directory's entries, each with the entry's name as bytes, one claim per hard link. A claim from a directory that is not among the candidates is left out |
+| Report damage | As `health` |
+| Read by extent | Bounded reads of the source |
+| Materialize from a plan | rust-fs-core's, over extent, zero and byte steps |
+| Capabilities | Missing: deleted extents (XFS frees a file's blocks before its inode), cluster steps (no cluster chains), encoded extents (no compression) and geometry hypotheses (the superblock copies and a scan stand in for one) |
 
 ## File
 
-| Need | This crate today |
+| Trait method | XFS |
 |---|---|
-| Root and lookup | `Filesystem::root`, `lookup_path`, `open`, `open_ino` |
-| List a directory | `Filesystem::read_dir`, `list_path` |
-| Metadata | `Inode`: mode, size, times, link count, file type |
-| Read | `Filesystem::read_at`, `read_file`, `read_path` |
-| Symbolic links | `Filesystem::read_link` |
+| `root`, `read_dir`, `metadata` | The strict mount's root inode, directory reads and inode cores; a node is an inode number |
+| `read_at`, `read_link` | `Filesystem::read_at`, `Filesystem::read_link` |
+| `names_match` | Exact, or ASCII case-insensitive on a volume made with `-n version=ci`; `DirEntry::bytes` holds the stored name, so a name that is not UTF-8 is looked up by `lookup_bytes` |
 
-The File layer is a thin wrapper over what exists.
+## Checked by
 
-## Order of work
+- `tests/layers_conformance.rs`: rust-fs-core's `check_healthy` on every
+  fixture, `check_damaged` and the salvage set (`conformance::salvage::run`)
+  on damaged copies, and every file of the data fixtures read through the
+  File layer to the size and SHA-256 Linux gave it.
+- `tests/salvage_*.rs` and `tests/salvage_*_oracle.rs`: the XFS primitives
+  against `xfs_db`, `xfs_repair -n` and the kernel's manifests.
 
-1. The damage-tolerant primitives and the salvage verbs, as this crate's
-   own functions, each checked against `xfs_db` on images `mkfs.xfs` and
-   the kernel made, and on damaged copies of them.
-2. When `rust-fs-core` publishes the traits, implement them on top. The
-   crate's own salvage functions stay for one release as deprecated
-   wrappers.
+## What was not moved
+
+`Filesystem` and the rest of the crate's own API stay as they were: they are
+the strict read and write surface the layers are built on, not an API the
+layers replace, so nothing is deprecated.

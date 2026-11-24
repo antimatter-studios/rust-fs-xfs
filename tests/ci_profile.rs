@@ -3322,6 +3322,8 @@ fn am_fs_core_versions_declared(text: &str) -> Vec<(String, String)> {
         }
         if line.contains("rust-fs-core") {
             if let Some(v) = quoted_value_after(line, "version") {
+                // `version = "=0.5.1"`: the operator is not the version.
+                let v = v.trim_start_matches(['=', '^', '~']).to_string();
                 found.push(("the rust-fs-core dependency's `version`".to_string(), v));
             }
         }

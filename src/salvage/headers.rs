@@ -1,6 +1,6 @@
 //! Superblocks, allocation group headers and the log, read for salvage.
 
-use super::evidence::{Damage, DamageKind, Extent, Integrity, Severity};
+use super::evidence::{finding, Damage, DamageKind, Extent, Integrity, Severity};
 use crate::ag::XFS_AGI_SIZE;
 use crate::ag::{self, Agf, Agi, XFS_AGFL_MAGIC, XFS_AGF_MAGIC, XFS_AGF_SIZE, XFS_AGI_MAGIC};
 use crate::agfl;
@@ -88,7 +88,7 @@ pub fn read_superblock(device: &dyn BlockRead, ag: Option<u32>, offset: u64) -> 
     };
     let mut buf = vec![0u8; MIN_SECTOR as usize];
     if let Err(e) = device.read_at(offset, &mut buf) {
-        copy.damage.push(Damage::new(
+        copy.damage.push(finding(
             DamageKind::Unreadable,
             severity,
             copy.location,
@@ -112,7 +112,7 @@ fn decode_superblock(
 ) {
     let magic = be32(&buf, sb_offsets::MAGIC);
     if magic != XFS_SB_MAGIC {
-        copy.damage.push(Damage::new(
+        copy.damage.push(finding(
             DamageKind::Signature,
             severity,
             copy.location,
@@ -132,7 +132,7 @@ fn decode_superblock(
                 buf = whole;
                 copy.location.length = u64::from(sectsize);
             }
-            Err(e) => copy.damage.push(Damage::new(
+            Err(e) => copy.damage.push(finding(
                 DamageKind::Unreadable,
                 severity,
                 Extent::new(copy.location.offset, u64::from(sectsize)),
@@ -144,7 +144,7 @@ fn decode_superblock(
     copy.integrity = match Superblock::checksum_matches(&buf) {
         Some(true) => Integrity::Verified,
         Some(false) => {
-            copy.damage.push(Damage::new(
+            copy.damage.push(finding(
                 DamageKind::Checksum,
                 severity,
                 copy.location,
@@ -162,7 +162,7 @@ fn decode_superblock(
     match Superblock::parse_lenient(&buf) {
         Ok(sb) => {
             if sb.is_v5() && sb.features_incompat & incompat::NEEDSREPAIR != 0 {
-                copy.damage.push(Damage::new(
+                copy.damage.push(finding(
                     DamageKind::Recorded,
                     severity,
                     copy.location,
@@ -173,7 +173,7 @@ fn decode_superblock(
             // mkfs leaves sb_inprogress set in every copy but the primary,
             // so only the primary is damaged by it.
             if sb.inprogress != 0 && copy.ag == Some(0) {
-                copy.damage.push(Damage::new(
+                copy.damage.push(finding(
                     DamageKind::Recorded,
                     severity,
                     copy.location,
@@ -183,7 +183,7 @@ fn decode_superblock(
             }
             copy.superblock = Some(sb);
         }
-        Err(e) => copy.damage.push(Damage::new(
+        Err(e) => copy.damage.push(finding(
             DamageKind::Malformed,
             severity,
             copy.location,
@@ -230,7 +230,7 @@ pub fn superblocks(device: &dyn BlockRead) -> Superblocks {
                 Severity::Warning
             };
             for (name, chosen, theirs) in geometry.geometry_differences(sb) {
-                damage.push(Damage::new(
+                damage.push(finding(
                     DamageKind::Mismatch,
                     severity,
                     copy.location,
@@ -239,7 +239,7 @@ pub fn superblocks(device: &dyn BlockRead) -> Superblocks {
                 ));
             }
             if sb.uuid != geometry.uuid {
-                damage.push(Damage::new(
+                damage.push(finding(
                     DamageKind::Mismatch,
                     severity,
                     copy.location,
@@ -589,9 +589,8 @@ fn read_header<T>(
         value: None,
         damage: Vec::new(),
     };
-    let finding = |kind, detail: String| {
-        Damage::new(kind, Severity::Error, location, structure.clone(), detail)
-    };
+    let finding =
+        |kind, detail: String| finding(kind, Severity::Error, location, structure.clone(), detail);
     let mut buf = vec![0u8; sectsize.max(size)];
     if let Err(e) = device.read_at(offset, &mut buf[..sectsize]) {
         header
@@ -722,14 +721,14 @@ pub fn log_health(device: &dyn BlockRead, sb: &Superblock) -> Vec<Damage> {
     );
     match log::inspect(device, sb) {
         Ok(LogState::Empty | LogState::CleanlyUnmounted) => Vec::new(),
-        Ok(LogState::NeedsReplay) => vec![Damage::new(
+        Ok(LogState::NeedsReplay) => vec![finding(
             DamageKind::Recorded,
             Severity::Notice,
             location,
             "log",
             "the volume was not unmounted cleanly: the log holds changes to replay",
         )],
-        Err(e) => vec![Damage::new(
+        Err(e) => vec![finding(
             DamageKind::Unreadable,
             Severity::Warning,
             location,

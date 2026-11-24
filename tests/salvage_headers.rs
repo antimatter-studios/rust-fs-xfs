@@ -142,7 +142,7 @@ fn undamaged_fixtures_agree_with_xfs_db_and_report_nothing() {
             assert_eq!(copy.integrity, want, "{name}: superblock {:?}", copy.ag);
         }
         assert_eq!(report.groups.len() as u64, number(&dump, "agcount"));
-        let all: Vec<String> = report.all().map(ToString::to_string).collect();
+        let all: Vec<String> = report.all().map(|d| format!("{d:?}")).collect();
         assert!(all.is_empty(), "{name}: {all:#?}");
     }
 }

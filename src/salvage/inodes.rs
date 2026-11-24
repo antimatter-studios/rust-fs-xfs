@@ -1,6 +1,6 @@
 //! Inodes found in raw bytes, and the storage each one claims.
 
-use super::evidence::{Damage, DamageKind, Extent, Integrity, Severity};
+use super::evidence::{finding, Damage, DamageKind, Extent, Integrity, Severity, WalkEnd};
 use crate::bmbt;
 use crate::endian::{be16, be64, le32, uuid_at};
 use crate::extent::{Extent as Record, EXTENT_RECORD_SIZE};
@@ -106,11 +106,11 @@ fn looks_like_inode(sb: &Superblock, record: &[u8]) -> bool {
 
 /// Check and decode the record `buf`, which sits at `location` and should
 /// be inode `ino`.
-fn candidate(sb: &Superblock, ino: u64, location: Extent, buf: &[u8]) -> InodeCandidate {
+pub(crate) fn candidate(sb: &Superblock, ino: u64, location: Extent, buf: &[u8]) -> InodeCandidate {
     let structure = format!("inode {ino}");
     let mut damage = Vec::new();
     let mut finding = |kind, detail: String| {
-        damage.push(Damage::new(
+        damage.push(finding(
             kind,
             Severity::Error,
             location,
@@ -251,23 +251,6 @@ pub struct FileExtent {
     pub unwritten: bool,
 }
 
-/// Why an extent walk ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WalkEnd {
-    /// Every part of the map was read and taken at its word. A sparse
-    /// file's holes are not a break.
-    Complete,
-    /// Part of the map could not be used: a block of its tree failed a
-    /// check, or a record did not decode.
-    Broken,
-    /// A record named blocks outside the volume.
-    OutOfRange,
-    /// The map's tree led back to a block already visited.
-    Cycle,
-    /// A block of the map could not be read.
-    Unreadable(Extent),
-}
-
 /// The storage an inode claims, as far as its map could be followed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtentMap {
@@ -320,7 +303,7 @@ pub fn walk_extents(
     let mut buf = vec![0u8; isize];
     if let Err(e) = device.read_at(candidate.location.offset, &mut buf) {
         map.end = WalkEnd::Unreadable(candidate.location);
-        map.damage.push(Damage::new(
+        map.damage.push(finding(
             DamageKind::Unreadable,
             Severity::Error,
             candidate.location,
@@ -333,7 +316,7 @@ pub fn walk_extents(
     let fork = &buf[start.min(fork_end)..fork_end];
     if inode.is_realtime() && matches!(inode.format, Format::Extents | Format::Btree) {
         map.end = WalkEnd::Broken;
-        map.damage.push(Damage::new(
+        map.damage.push(finding(
             DamageKind::Missing,
             Severity::Warning,
             candidate.location,
@@ -347,7 +330,7 @@ pub fn walk_extents(
             let length = inode.size.min(fork.len() as u64);
             if inode.size > fork.len() as u64 {
                 map.end = WalkEnd::Broken;
-                map.damage.push(Damage::new(
+                map.damage.push(finding(
                     DamageKind::Malformed,
                     Severity::Error,
                     candidate.location,
@@ -400,7 +383,7 @@ pub fn walk_extents(
                     }
                     kind
                 };
-                map.damage.push(Damage::new(
+                map.damage.push(finding(
                     kind,
                     Severity::Error,
                     location,
@@ -437,7 +420,7 @@ fn extent_list(
     let room = (fork.len() / EXTENT_RECORD_SIZE) as u64;
     let count = if nextents > room {
         map.end = worse(map.end, WalkEnd::Broken);
-        map.damage.push(Damage::new(
+        map.damage.push(finding(
             DamageKind::Malformed,
             Severity::Error,
             candidate.location,
@@ -454,7 +437,7 @@ fn extent_list(
             Ok(record) => out.push(record),
             Err(e) => {
                 map.end = worse(map.end, WalkEnd::Broken);
-                map.damage.push(Damage::new(
+                map.damage.push(finding(
                     DamageKind::Malformed,
                     Severity::Error,
                     candidate.location,
@@ -483,7 +466,7 @@ fn place(
     for record in records {
         if !sb.extent_in_bounds(record.startblock, record.blockcount) {
             map.end = worse(map.end, WalkEnd::OutOfRange);
-            map.damage.push(Damage::new(
+            map.damage.push(finding(
                 DamageKind::Malformed,
                 Severity::Error,
                 candidate.location,
@@ -498,7 +481,7 @@ fn place(
         let file_offset = record.startoff.saturating_mul(block);
         if file_offset < covered {
             map.end = worse(map.end, WalkEnd::Broken);
-            map.damage.push(Damage::new(
+            map.damage.push(finding(
                 DamageKind::Malformed,
                 Severity::Error,
                 candidate.location,
