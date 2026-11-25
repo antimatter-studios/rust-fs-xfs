@@ -637,10 +637,14 @@ tasks:
     # fifteen shell tests, including the two feature-matrix guards (#359).
     # Full output: tmp/logs/359-scripts-budget-red.log. The budget is half
     # as much again, with bytes rounded up to the next hundred.
+    #
+    # MEASURED, 2026-11-25, on CI: 79 lines / 4,562 bytes on arm64 macOS
+    # (and 73 lines on Linux) after adding the target-dir shell test (#625).
+    # The cap is raised to 80 lines / 4,700 bytes from that run.
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 72 4300 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 80 4700 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
