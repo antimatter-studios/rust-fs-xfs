@@ -36,4 +36,37 @@ assert_target_dir 'absolute build.target-dir' "$REPO/tmp/staticlib-config-absolu
 assert_target_dir 'relative build.target-dir' "$REPO/tmp/staticlib-config-relative" \
     --config 'build.target-dir="tmp/staticlib-config-relative"'
 
+# An archive left in the default target/ by an older build must not ship. The
+# copy runs with CARGO_TARGET_DIR set, so the stale file sits where the task
+# used to read from, and the fresh one sits where Cargo wrote.
+triple="$(rustc -vV | sed -n 's/^host: //p')"
+stale="$REPO/target/$triple/release/libfs_xfs.a"
+fresh="$REPO/tmp/staticlib-stale-target/$triple/release/libfs_xfs.a"
+out="$REPO/tmp/staticlib-stale-dist/libfs_xfs.a"
+stale_backup=''
+if [[ -e "$stale" ]]; then
+    stale_backup="$(mktemp)"
+    cp -p "$stale" "$stale_backup"
+fi
+restore_stale() {
+    if [[ -n "$stale_backup" ]]; then
+        mv "$stale_backup" "$stale"
+    else
+        rm -f "$stale"
+    fi
+}
+trap restore_stale EXIT
+
+mkdir -p "$(dirname "$stale")" "$(dirname "$fresh")" "$(dirname "$out")"
+printf 'stale\n' > "$stale"
+printf 'fresh\n' > "$fresh"
+CARGO_TARGET_DIR="$REPO/tmp/staticlib-stale-target"
+export CARGO_TARGET_DIR
+# The same copy source chores.yml runs for `chore staticlib`.
+cp "$("$REPO/scripts/cargo-target-dir.sh")/$triple/release/libfs_xfs.a" "$out"
+cmp -s "$out" "$fresh" || {
+    echo 'FAIL  stale: shipped archive differs from Cargo output' >&2
+    exit 1
+}
+
 printf '%s\n' 'PASS  staticlib resolves Cargo target directories from metadata'
