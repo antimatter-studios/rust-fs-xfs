@@ -637,10 +637,14 @@ tasks:
     # fifteen shell tests, including the two feature-matrix guards (#359).
     # Full output: tmp/logs/359-scripts-budget-red.log. The budget is half
     # as much again, with bytes rounded up to the next hundred.
+    #
+    # MEASURED, 2026-11-25, on CI: 79 lines / 4,562 bytes on arm64 macOS
+    # (and 73 lines on Linux) after adding the target-dir shell test (#625).
+    # The cap is raised to 80 lines / 4,700 bytes from that run.
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 72 4300 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 80 4700 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
@@ -820,6 +824,7 @@ tasks:
       - Cargo.toml
       - 'src/**/*.rs'
       - 'include/*.h'
+      - scripts/cargo-target-dir.sh
       # fs_core.h is a source of ours because we ship it (see the cp below).
       # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do —
       # it is the same path Cargo.toml resolves rust-fs-core from.
@@ -839,7 +844,7 @@ tasks:
       - 'rustup target add {{.TRIPLE}}'
       - 'cargo build --release --target {{.TRIPLE}}'
       - 'mkdir -p "{{.OUT}}/include"'
-      - 'cp target/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a "{{.OUT}}/lib{{.LIBNAME}}.a"'
+      - 'cp "$(scripts/cargo-target-dir.sh)/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a" "{{.OUT}}/lib{{.LIBNAME}}.a"'
       - 'cp include/{{.LIBNAME}}.h "{{.OUT}}/include/{{.LIBNAME}}.h"'
       # Shipping fs_core.h is ours: the header we emit #includes it, so a
       # consumer handed only fs_xfs.h cannot compile.
