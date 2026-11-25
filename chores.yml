@@ -641,10 +641,15 @@ tasks:
     # MEASURED, 2026-11-25, on CI: 79 lines / 4,562 bytes on arm64 macOS
     # (and 73 lines on Linux) after adding the target-dir shell test (#625).
     # The cap is raised to 80 lines / 4,700 bytes from that run.
+    #
+    # MEASURED, 2026-11-25, on CI run 45625256590 (job 139243882491), arm64
+    # macOS, Bash 3.2, PR #626 head 8e0b0a6: 86 lines / 4,932 bytes after
+    # adding the staticlib stale-archive shell test (its header and PASS line).
+    # The cap is raised to 88 lines / 5,080 bytes from that run.
     cmds:
       - |
         set -eu
-        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 80 4700 -- bash -c '
+        bash ../rust-fs-core/scripts/tier.sh test:scripts scripts 88 5080 -- bash -c '
           set -eu
           for t in tests/scripts/*.sh; do
             echo "== $t"
