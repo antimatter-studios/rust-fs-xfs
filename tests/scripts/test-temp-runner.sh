@@ -29,6 +29,8 @@ MOUNT_LOG="$TEST_BASE/mount.log"
 MOUNT_IMAGE="$TEST_BASE/cleanup.dmg"
 MOUNT_SOURCE="$TEST_BASE/mount-source"
 ATTACH_PLIST="$TEST_BASE/attach.plist"
+BUSY_BIN="$TEST_BASE/busy-bin"
+DETACH_COUNT="$TEST_BASE/detach-count"
 MOUNT_IN_PROGRESS=0
 
 inside_sandbox() {
@@ -54,10 +56,11 @@ cleanup() {
     inside_sandbox "$MOUNT_SOURCE" || return 1
     rm -f "$OUTPUT" "$DESCENDANT_PID_FILE" "$STARTING_MARK" "$MOUNT_LOG" "$SLOW_BIN/mktemp" \
         "$STANDIN/repo/scripts/with-test-temp.sh" "$STANDIN/fs-linux-test-harness/scripts/vm.sh" \
-        "$MOUNT_IMAGE" "$ATTACH_PLIST" "$MOUNT_SOURCE/must-survive-cleanup"
+        "$MOUNT_IMAGE" "$ATTACH_PLIST" "$MOUNT_SOURCE/must-survive-cleanup" \
+        "$BUSY_BIN/hdiutil" "$DETACH_COUNT"
     rmdir "$STANDIN/repo/scripts" "$STANDIN/repo/tmp" "$STANDIN/repo" \
         "$STANDIN/fs-linux-test-harness/scripts" "$STANDIN/fs-linux-test-harness" "$STANDIN" \
-        "$SLOW_BIN" "$MOUNT_SOURCE" 2>/dev/null || true
+        "$SLOW_BIN" "$BUSY_BIN" "$MOUNT_SOURCE" 2>/dev/null || true
     rmdir "$TEST_BASE" || return 1
 }
 cleanup_on_exit() {
@@ -367,6 +370,26 @@ case "$MOUNT_PLATFORM" in
             exit 1
         fi
         MOUNT_COMMAND=(hdiutil attach -plist -nobrowse -noautoopen -noautofsck)
+        # macOS 27.2 refuses a plain detach as "Resource busy" for a moment after
+        # the volume was used. This stand-in refuses the first two plain detaches
+        # that way and passes everything else to the real hdiutil.
+        REAL_HDIUTIL="$(command -v hdiutil)"
+        mkdir "$BUSY_BIN"
+        cat > "$BUSY_BIN/hdiutil" <<SH
+#!/usr/bin/env bash
+if [[ "\${1:-}" == detach && "\${2:-}" != -force ]]; then
+    count=\$(cat "$DETACH_COUNT" 2>/dev/null || echo 0)
+    count=\$((count + 1))
+    echo "\$count" > "$DETACH_COUNT"
+    if [[ "\$count" -le 2 ]]; then
+        echo 'hdiutil: couldn'\''t eject "disk4" - Resource busy' >&2
+        exit 1
+    fi
+fi
+exec "$REAL_HDIUTIL" "\$@"
+SH
+        chmod +x "$BUSY_BIN/hdiutil"
+        PATH="$BUSY_BIN:$PATH"
         ;;
     Linux)
         mkdir "$MOUNT_SOURCE"
@@ -437,7 +460,17 @@ assert re.fullmatch(r'/dev/disk[0-9]+', entity['dev-entry']), 'unexpected image 
 print(entity['dev-entry'])
 PY
 )" || return 1
-        if ! hdiutil detach "$device" >> "$MOUNT_LOG" 2>&1; then
+        # A plain detach can be refused as busy for a moment after use, so retry
+        # it a bounded number of times before failing.
+        local detach_attempt detached=0
+        for detach_attempt in 1 2 3 4 5; do
+            if hdiutil detach "$device" >> "$MOUNT_LOG" 2>&1; then
+                detached=1
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$detached" != 1 ]]; then
             echo "FAIL  could not detach the owned test image $device: $(tail -n 3 "$MOUNT_LOG")" >&2
             return 1
         fi
@@ -469,6 +502,14 @@ if [[ "$STATUS" -ne 23 || ! -e "$MOUNT_PROBE" ]]; then
     exit 1
 fi
 remove_mount_scratch
+# The busy stand-in refused two plain detaches, so the owned image was detached
+# on the third attempt, and the scratch directory went with it.
+if [[ "$MOUNT_PLATFORM" == Darwin ]]; then
+    if [[ "$(cat "$DETACH_COUNT")" != 3 || -e "$MOUNT_PROBE" ]]; then
+        echo "FAIL  the busy image was not detached by retrying: detach attempts=$(cat "$DETACH_COUNT")" >&2
+        exit 1
+    fi
+fi
 
 # The check above can fail. The same wrapper without -xdev has to remove the
 # probe, on this system's find and this system's mounted filesystem.
