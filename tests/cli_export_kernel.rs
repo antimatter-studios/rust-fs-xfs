@@ -43,10 +43,7 @@ fn digests(dir: &Path) -> BTreeMap<String, String> {
                 walk(root, &path, into);
             } else {
                 let rel = path.strip_prefix(root).unwrap().to_str().unwrap();
-                into.insert(
-                    format!("/{rel}"),
-                    sha256_hex(&std::fs::read(&path).expect("read an exported file")),
-                );
+                into.insert(format!("/{rel}"), common::image::sha256_file(&path));
             }
         }
     }
@@ -124,7 +121,7 @@ fn export_delivers_the_files_the_kernel_digested_and_fails_what_it_cannot_read()
         let out = ok(tool("fs.xfs").args([image, "export", path, dest.to_str().unwrap()]));
         let want = &kernel[path.trim_start_matches("/exp")];
         assert_eq!(
-            sha256_hex(&std::fs::read(&dest).expect("the exported file")),
+            common::image::sha256_file(&dest),
             *want,
             "export {path} is not the file the kernel digested"
         );

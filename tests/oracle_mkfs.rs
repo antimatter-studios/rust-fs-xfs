@@ -142,7 +142,7 @@ fn expect_field(oracle: &HashMap<String, String>, field: &str, ours: u64, label:
 
 /// Parse the superblock at offset 0 of `img` with this driver.
 fn parse_ours(img: &Path) -> Superblock {
-    let bytes = std::fs::read(img).expect("read image");
+    let bytes = common::image::head(img);
     Superblock::parse(&bytes).unwrap_or_else(|e| panic!("this driver failed to parse: {e}"))
 }
 
@@ -369,7 +369,7 @@ fn agrees_with_bigtime_and_large_extent_counters() {
 #[test]
 fn rejects_superblock_with_inprogress_set() {
     let img = mkfs(300, &[]);
-    let mut bytes = std::fs::read(&img).unwrap();
+    let mut bytes = common::image::head(&img);
     bytes[126] = 1; // sb_inprogress
     assert!(
         Superblock::parse(&bytes).is_err(),
@@ -384,16 +384,18 @@ fn rejects_superblock_with_inprogress_set() {
 #[test]
 fn agf_and_agi_parse_for_every_allocation_group() {
     let img = mkfs(600, &["-d", "agcount=8"]);
-    let bytes = std::fs::read(&img).unwrap();
+    let image = common::image::Image::open(&img);
     let sb = parse_ours(&img);
     let sector = usize::from(sb.sectsize);
 
     for ag in 0..sb.agcount {
         let ag_start = (u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize)) as usize;
         // Sector 0 is the superblock, 1 the AGF, 2 the AGI.
-        let agf = fs_xfs::ag::Agf::parse(&bytes[ag_start + sector..], &sb, ag)
+        let agf_sector = image.at((ag_start + sector) as u64, sector);
+        let agi_sector = image.at((ag_start + 2 * sector) as u64, sector);
+        let agf = fs_xfs::ag::Agf::parse(&agf_sector, &sb, ag)
             .unwrap_or_else(|e| panic!("AGF for ag {ag}: {e}"));
-        let agi = fs_xfs::ag::Agi::parse(&bytes[ag_start + 2 * sector..], &sb, ag)
+        let agi = fs_xfs::ag::Agi::parse(&agi_sector, &sb, ag)
             .unwrap_or_else(|e| panic!("AGI for ag {ag}: {e}"));
 
         assert_eq!(agf.seqno, ag);

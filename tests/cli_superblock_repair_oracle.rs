@@ -16,6 +16,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::{first_difference_outside, Snapshot};
 use common::{fixture, oracle, scratch};
 
 const SUITE: &str = "cli_superblock_repair_oracle";
@@ -118,7 +119,7 @@ fn one_damaged_copy_is_rewritten_and_the_reference_agrees() {
             "{name}: xfs_repair -n finds nothing wrong after {commands:?}:\n{}",
             report.repair_report()
         );
-        let before = std::fs::read(image).unwrap();
+        let before = Snapshot::of(image);
 
         let (code, said) = fsck_y(image);
         assert_eq!(code, Some(1), "{name}: fsck.xfs -y did not repair:\n{said}");
@@ -134,22 +135,21 @@ fn one_damaged_copy_is_rewritten_and_the_reference_agrees() {
         );
 
         // Only the copy changed: every file's blocks read as they did.
-        let repaired = std::fs::read(image).unwrap();
+        let repaired = Snapshot::of(image);
         let (at, len) = copy_range(image, ag);
-        assert_eq!(repaired.len(), before.len());
-        let outside = |v: &[u8]| [v[..at].to_vec(), v[at + len..].to_vec()].concat();
-        assert!(
-            outside(&repaired) == outside(&before),
-            "{name}: fsck.xfs -y changed bytes outside group {ag}'s superblock copy"
-        );
+        let ignored = at as u64..(at + len) as u64;
+        if let Some(difference) = first_difference_outside(before.path(), repaired.path(), ignored)
+        {
+            panic!(
+                "{name}: fsck.xfs -y changed bytes outside group {ag}'s superblock copy: \
+                 {difference}"
+            );
+        }
 
         // And again: nothing to do.
         let (code, said) = fsck_y(image);
         assert_eq!(code, Some(0), "{name}: a second fsck.xfs -y:\n{said}");
-        assert!(
-            std::fs::read(image).unwrap() == repaired,
-            "{name}: a second fsck.xfs -y wrote"
-        );
+        repaired.assert_unchanged(image, &format!("{name}: a second fsck.xfs -y wrote"));
     }
 }
 
@@ -186,12 +186,9 @@ fn a_foreign_copy_or_two_damaged_copies_are_refused_and_nothing_is_written() {
             "{name}: xfs_repair -n does not say what this case expects of {commands:?}:\n{}",
             report.repair_report()
         );
-        let before = std::fs::read(image).unwrap();
+        let before = Snapshot::of(image);
         let (code, said) = fsck_y(image);
         assert_eq!(code, Some(4), "{name}: fsck.xfs -y did not refuse:\n{said}");
-        assert!(
-            std::fs::read(image).unwrap() == before,
-            "{name}: a refused repair wrote"
-        );
+        before.assert_unchanged(image, &format!("{name}: a refused repair wrote"));
     }
 }

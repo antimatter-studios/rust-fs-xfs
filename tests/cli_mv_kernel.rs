@@ -20,6 +20,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::Snapshot;
 use common::{guest_quote, kernel_run, repair, scratch};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -354,7 +355,7 @@ fn mv_refuses_what_the_kernel_refuses() {
         "#,
         image = guest_quote(&img),
     ));
-    let before = std::fs::read(&img).expect("read the image");
+    let before = Snapshot::of(&img);
 
     let mut tried = Vec::new();
     for line in out.lines().filter_map(|l| l.strip_prefix("REFUSAL ")) {
@@ -374,9 +375,9 @@ fn mv_refuses_what_the_kernel_refuses() {
         assert!(got.stdout.is_empty(), "{what}; stdout: {}", stdout(&got));
         assert!(err.contains(&format!("\"code\": {code}")), "{what}");
         assert!(err.contains(want), "{what}; expected {want:?}");
-        assert!(
-            std::fs::read(&img).expect("read the image") == before,
-            "mv {label} was refused and still changed the image"
+        before.assert_unchanged(
+            &img,
+            &format!("mv {label} was refused and still changed the image"),
         );
         tried.push(label.to_string());
     }

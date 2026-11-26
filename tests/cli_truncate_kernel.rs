@@ -4,6 +4,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::sha256_file;
 use common::{guest_quote, kernel_run, repair, scratch};
 
 const SUITE: &str = "cli_truncate_kernel";
@@ -120,7 +121,7 @@ fn a_cut_inside_a_shared_block_is_refused_without_changing_either_file() {
         image = guest_quote(img),
     ));
     assert!(built.contains("BUILT_OK"), "{built}");
-    let before = sha256_hex(&std::fs::read(img).unwrap());
+    let before = sha256_file(img);
     let out = tool("fs.xfs")
         .args([img, "truncate", "/copy", "4196"])
         .output()
@@ -128,7 +129,7 @@ fn a_cut_inside_a_shared_block_is_refused_without_changing_either_file() {
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     assert!(out.stdout.is_empty());
     assert!(stderr(&out).contains("reflinked"), "{}", stderr(&out));
-    assert_eq!(sha256_hex(&std::fs::read(img).unwrap()), before);
+    assert_eq!(sha256_file(img), before);
     let out = kernel_run(&format!(
         r#"
         set -eu

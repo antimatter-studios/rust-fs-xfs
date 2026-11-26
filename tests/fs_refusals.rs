@@ -483,62 +483,16 @@ fn a_reverse_mapping_filesystem_is_writable_and_stays_consistent() {
 // Read-only-compatible features
 // ---------------------------------------------------------------------
 
-/// A writable device over a `Vec<u8>`, so a fixture can be edited in
-/// memory without touching the file on disk.
-struct MemDev {
-    bytes: std::sync::Mutex<Vec<u8>>,
-}
-
-impl MemDev {
-    fn arc(bytes: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self {
-            bytes: std::sync::Mutex::new(bytes),
-        })
-    }
-}
-
-impl BlockRead for MemDev {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
-        let b = self.bytes.lock().unwrap();
-        let start = offset as usize;
-        let end = start + buf.len();
-        if end > b.len() {
-            return Err(fs_core::Error::ShortRead {
-                offset,
-                want: buf.len(),
-                got: b.len().saturating_sub(start),
-            });
-        }
-        buf.copy_from_slice(&b[start..end]);
-        Ok(())
-    }
-    fn size_bytes(&self) -> u64 {
-        self.bytes.lock().unwrap().len() as u64
-    }
-}
-
-impl fs_core::BlockDevice for MemDev {
-    fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
-        let mut b = self.bytes.lock().unwrap();
-        let start = offset as usize;
-        b[start..start + buf.len()].copy_from_slice(buf);
-        Ok(())
-    }
-    fn is_writable(&self) -> bool {
-        true
-    }
-}
-
 /// A copy of a fixture with `bits` added to `sb_features_ro_compat` and
 /// the superblock's checksum restored, so the volume is well-formed and
 /// differs only in the feature mask.
-fn fixture_with_ro_compat(bits: u32) -> Arc<MemDev> {
+fn fixture_with_ro_compat(bits: u32) -> Arc<ScratchOverlay> {
     // `sb_features_ro_compat` is at offset 212, and the superblock is
     // the first sector.
     const FEATURES_RO_COMPAT: usize = 212;
 
     let img = any_fixture();
-    let mut bytes = std::fs::read(&img).expect("read the fixture");
+    let mut bytes = common::image::head(&img);
     let sectsize = u16::from_be_bytes([bytes[102], bytes[103]]) as usize;
 
     let existing = u32::from_be_bytes(
@@ -549,7 +503,11 @@ fn fixture_with_ro_compat(bits: u32) -> Arc<MemDev> {
     bytes[FEATURES_RO_COMPAT..FEATURES_RO_COMPAT + 4]
         .copy_from_slice(&(existing | bits).to_be_bytes());
     fs_xfs::super_write::stamp_crc(&mut bytes[..sectsize]);
-    MemDev::arc(bytes)
+    // The edit stays in the overlay: the fixture on disk is not touched.
+    let device = ScratchOverlay::over(&img);
+    fs_core::BlockDevice::write_at(&device, 0, &bytes[..sectsize])
+        .expect("write the edited superblock into the overlay");
+    Arc::new(device)
 }
 
 /// A volume carrying a feature this driver does not maintain can be
@@ -604,8 +562,7 @@ fn an_unmaintained_ro_compat_bit_refuses_a_writable_mount() {
 #[test]
 fn a_default_volume_still_mounts_for_writing() {
     let img = any_fixture();
-    let bytes = std::fs::read(&img).expect("read the fixture");
-    let dev = MemDev::arc(bytes);
+    let dev = Arc::new(ScratchOverlay::over(&img));
     match Filesystem::mount_rw(dev) {
         Ok(_) => {}
         // A dirty log is a different refusal and not this test's
