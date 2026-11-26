@@ -236,10 +236,10 @@ fn every_tier_runs_through_the_skip_and_floor_gate() {
     }
     // Two tiers cannot use ci-test.sh's run mode, and each hands the log
     // tier.sh wrote to `ci-test.sh --gate`, which applies the same pattern
-    // and the same floor: the unit tier, because that mode pins `--release`
-    // and the unit tier is the debug one, and the cli tier, because what it
-    // runs is the installed tools rather than cargo. Each is gated exactly
-    // once, on its own log.
+    // and the same floor: the unit tier, because that mode pins an
+    // optimised profile and the unit tier is the debug one, and the cli tier,
+    // because what it runs is the installed tools rather than cargo. Each is
+    // gated exactly once, on its own log.
     for (tier, log) in [("unit", "tmp/logs/unit.log"), ("cli", "tmp/logs/cli.log")] {
         let gated: Vec<&str> = chores
             .lines()

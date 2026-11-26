@@ -45,7 +45,7 @@
 # `--gate` is both halves applied to a log a tier has already written,
 # for the one tier that cannot use the run mode: `chore test:unit` builds
 # in the DEBUG profile, where an arithmetic overflow traps, and the run
-# mode pins `--release`.
+# mode pins `--profile test-opt`.
 #
 # THE FLOOR IS PASSED IN THE ENVIRONMENT, NOT AS AN ARGUMENT, and that is
 # not a style choice. An option between the script and `--test` makes the
@@ -116,7 +116,7 @@ if [ "${1:-}" = "--floor-check" ]; then
 fi
 
 # BOTH HALVES, ON A LOG A TIER ALREADY WROTE. The run mode below pins
-# `--release`, which the debug tier cannot use — the whole point of that
+# `--profile test-opt`, which the debug tier cannot use — the whole point of that
 # tier is a profile where an arithmetic overflow traps — so it runs cargo
 # itself and hands the log here. ../rust-fs-core/scripts/tier.sh writes every tier's
 # output to tmp/logs/<tier>.log in full, so there is a log to hand over
@@ -233,7 +233,7 @@ fi
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 kept=$(mktemp)
 trap 'rm -f "$kept"' EXIT
-"$REPO/scripts/with-test-temp.sh" cargo test --locked --release --features cli "$@" -- --nocapture 2>&1 |
+"$REPO/scripts/with-test-temp.sh" cargo test --locked --profile test-opt --features cli "$@" -- --nocapture 2>&1 |
     tee "$kept" && status=0 || status=${PIPESTATUS[0]}
 out=$(cat "$kept")
 
