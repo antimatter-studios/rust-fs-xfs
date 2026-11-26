@@ -425,7 +425,12 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ${{ needs.test-gate.outputs.runner }}
     timeout-minutes: 150
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/max-rss.sh
+      MAX_RSS_LOG: ${{ github.workspace }}/tmp/max-rss.log
     steps:
+      - name: GNU time for the peak memory figures
+        run: command -v /usr/bin/time || { sudo apt-get update && sudo apt-get install -y time; }
       - uses: actions/checkout@v4
       - name: C toolchain for the gated runner
         if: runner.environment == 'self-hosted'
@@ -497,6 +502,9 @@ jobs:
       - name: chore test
         id: tier
         run: chore test
+      - name: Peak memory of the test programs
+        if: always()
+        run: sort -rn "$MAX_RSS_LOG" | head -n 30
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
@@ -630,7 +638,12 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ${{ needs.test-arm64-gate.outputs.runner }}
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/max-rss.sh
+      MAX_RSS_LOG: ${{ github.workspace }}/tmp/max-rss.log
     steps:
+      - name: GNU time for the peak memory figures
+        run: command -v /usr/bin/time || { sudo apt-get update && sudo apt-get install -y time; }
       - uses: actions/checkout@v4
       - name: C toolchain for the gated runner
         if: runner.environment == 'self-hosted'
@@ -674,6 +687,9 @@ jobs:
       # same bytes the x86_64 job's guest reads.
       - name: chore test:images
         run: chore test:images
+      - name: Peak memory of the test programs
+        if: always()
+        run: sort -rn "$MAX_RSS_LOG" | head -n 30
       - name: Keep the tier logs
         # A tier writes its whole output to tmp/logs/<tier>.log and prints a
         # verdict naming it; on a runner that file is deleted minutes later,
