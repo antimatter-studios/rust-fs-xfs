@@ -27,6 +27,8 @@
 
 mod cli_support;
 mod common;
+#[path = "common/kill_window.rs"]
+mod kill_window;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,6 +36,7 @@ use std::time::Duration;
 
 use cli_support::*;
 use common::{fixture, guest_quote, kernel_run, repair, scratch};
+use kill_window::KillWindow;
 
 const SUITE: &str = "cli_import_kernel";
 
@@ -357,11 +360,13 @@ fn kill_loop(
     digests: &[&str],
     check: impl Fn(usize, &Graded),
 ) {
-    let window_ms = (window.as_millis() as u64).max(1);
+    let mut window = KillWindow::new(window);
+    let timed_ms = window.millis();
     let mut seed = u64::from(std::process::id()) ^ 0x581;
     let mut killed = 0;
     for attempt in 0..attempts {
         let victim = copy(base, &format!("{tag}-{attempt}"));
+        let started = std::time::Instant::now();
         let mut child = tool("fs.xfs")
             .arg(victim.path())
             .args(command_of(args))
@@ -371,9 +376,12 @@ fn kill_loop(
             .spawn()
             .expect("spawn fs.xfs");
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        std::thread::sleep(Duration::from_millis((seed >> 16) % window_ms));
+        std::thread::sleep(window.delay(seed));
         let (status, was_killed) = match child.try_wait().expect("poll fs.xfs") {
-            Some(status) => (status, false),
+            Some(status) => {
+                window.finished_within(started.elapsed());
+                (status, false)
+            }
             None => {
                 child.kill().expect("SIGKILL the in-flight fs.xfs");
                 killed += 1;
@@ -407,7 +415,8 @@ fn kill_loop(
     assert!(
         killed >= attempts / 2,
         "{tag}: only {killed}/{attempts} runs were still going at the kill point \
-         (window {window_ms} ms)"
+         (window {timed_ms} ms when timed, {} ms at the end)",
+        window.millis()
     );
 }
 
