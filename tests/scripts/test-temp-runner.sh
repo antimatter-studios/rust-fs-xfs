@@ -373,11 +373,14 @@ case "$MOUNT_PLATFORM" in
         # macOS 27.2 refuses a plain detach as "Resource busy" for a moment after
         # the volume was used. This stand-in refuses the first two plain detaches
         # that way and passes everything else to the real hdiutil.
-        REAL_HDIUTIL="$(command -v hdiutil)"
+        # What this stand-in wraps has a name of its own: test-temp-unprivileged.sh
+        # runs this script behind a stand-in that reads an exported REAL_HDIUTIL, and
+        # assigning that name here pointed it at itself until the host could not fork.
+        BUSY_NEXT_HDIUTIL="$(command -v hdiutil)"
         mkdir "$BUSY_BIN"
         cat > "$BUSY_BIN/hdiutil" <<SH
 #!/usr/bin/env bash
-if [[ "\${1:-}" == detach && "\${2:-}" != -force ]]; then
+if [[ "\${1:-}" == detach && " \$* " != *" -force "* ]]; then
     count=\$(cat "$DETACH_COUNT" 2>/dev/null || echo 0)
     count=\$((count + 1))
     echo "\$count" > "$DETACH_COUNT"
@@ -386,7 +389,7 @@ if [[ "\${1:-}" == detach && "\${2:-}" != -force ]]; then
         exit 1
     fi
 fi
-exec "$REAL_HDIUTIL" "\$@"
+exec "$BUSY_NEXT_HDIUTIL" "\$@"
 SH
         chmod +x "$BUSY_BIN/hdiutil"
         PATH="$BUSY_BIN:$PATH"
@@ -435,8 +438,27 @@ run_wrapper_over_mount() {
     fi
 }
 
+# Detaches an image this test attached. A plain detach can be refused as busy for a
+# moment after use, so that answer alone is retried, five attempts in all. Status 0:
+# it detached. Status 2: it stayed busy and was forced off, so nothing stays
+# attached. Status 1: it was refused for another reason, or the force failed too.
+detach_owned_image() {
+    local device="$1" attempt answer
+    for attempt in 1 2 3 4 5; do
+        if answer="$(hdiutil detach "$device" 2>&1)"; then
+            printf '%s\n' "$answer" >> "$MOUNT_LOG"
+            return 0
+        fi
+        printf '%s\n' "$answer" >> "$MOUNT_LOG"
+        [[ "$answer" == *'Resource busy'* ]] || return 1
+        [[ "$attempt" == 5 ]] || sleep 1
+    done
+    hdiutil detach "$device" -force >> "$MOUNT_LOG" 2>&1 || return 1
+    return 2
+}
+
 remove_mount_scratch() {
-    local selected device
+    local selected device detached
     selected="$(cat "$OUTPUT")"
     if [[ -z "$selected" && ! -s "$ATTACH_PLIST" ]]; then
         MOUNT_IN_PROGRESS=0
@@ -460,18 +482,12 @@ assert re.fullmatch(r'/dev/disk[0-9]+', entity['dev-entry']), 'unexpected image 
 print(entity['dev-entry'])
 PY
 )" || return 1
-        # A plain detach can be refused as busy for a moment after use, so retry
-        # it a bounded number of times before failing.
-        local detach_attempt detached=0
-        for detach_attempt in 1 2 3 4 5; do
-            if hdiutil detach "$device" >> "$MOUNT_LOG" 2>&1; then
-                detached=1
-                break
-            fi
-            sleep 1
-        done
-        if [[ "$detached" != 1 ]]; then
-            echo "FAIL  could not detach the owned test image $device: $(tail -n 3 "$MOUNT_LOG")" >&2
+        detached=0
+        detach_owned_image "$device" || detached=$?
+        if [[ "$detached" != 0 ]]; then
+            # Forced off is detached: the next cleanup has only the scratch to remove.
+            [[ "$detached" != 2 ]] || rm -f "$ATTACH_PLIST"
+            echo "FAIL  could not detach the owned test image $device without force: $(tail -n 3 "$MOUNT_LOG")" >&2
             return 1
         fi
         rm -f "$ATTACH_PLIST"
@@ -507,6 +523,25 @@ remove_mount_scratch
 if [[ "$MOUNT_PLATFORM" == Darwin ]]; then
     if [[ "$(cat "$DETACH_COUNT")" != 3 || -e "$MOUNT_PROBE" ]]; then
         echo "FAIL  the busy image was not detached by retrying: detach attempts=$(cat "$DETACH_COUNT")" >&2
+        exit 1
+    fi
+    # An image that stays busy is forced off, and that is still a failure. Functions
+    # stand in for hdiutil and sleep, in this subshell alone: nothing is attached.
+    FORCED=0
+    (
+        hdiutil() {
+            printf '%s\n' "$*" >> "$DETACH_COUNT"
+            [[ "$*" != *-force* ]] || return 0
+            echo 'hdiutil: couldn'\''t eject "disk999" - Resource busy' >&2
+            return 1
+        }
+        sleep() { :; }
+        : > "$DETACH_COUNT"
+        detach_owned_image /dev/disk999
+    ) || FORCED=$?
+    if [[ "$FORCED" != 2 || "$(grep -c . "$DETACH_COUNT")" != 6 ||
+        "$(tail -n 1 "$DETACH_COUNT")" != 'detach /dev/disk999 -force' ]]; then
+        echo "FAIL  an image that stayed busy was not forced off after five attempts: status=$FORCED calls=$(cat "$DETACH_COUNT")" >&2
         exit 1
     fi
 fi
