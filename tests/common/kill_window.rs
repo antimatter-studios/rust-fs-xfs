@@ -27,6 +27,12 @@ impl KillWindow {
         Duration::from_millis((seed >> 16) % self.millis)
     }
 
-    /// A run was already finished `elapsed` after its spawn.
-    pub fn finished_within(&mut self, _elapsed: Duration) {}
+    /// A run was already finished `elapsed` after its spawn, so the work now
+    /// takes less than that. The window moves halfway to it, never outward:
+    /// one unusually quick run does not draw every later kill into the start
+    /// of the work, and repeated ones converge on how long it takes.
+    pub fn finished_within(&mut self, elapsed: Duration) {
+        let elapsed = (elapsed.as_millis() as u64).min(self.millis);
+        self.millis = ((self.millis + elapsed) / 2).max(1);
+    }
 }
