@@ -305,7 +305,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
 
     // THE IMAGE IS STILL DIRTY, and the driver is about to read it as it
     // is: the log's records were never applied to it.
-    let before = md5_digest(&std::fs::read(&image).unwrap());
+    let before = common::image::sha256_file(&image);
     let path = image.to_str().unwrap().to_string();
     let dev = Arc::new(FileDevice::open(&path).unwrap());
     let fs = Filesystem::mount(dev as Arc<dyn BlockRead>)
@@ -314,7 +314,7 @@ fn a_dirty_volume_mounts_and_reads_as_the_kernel_reads_it() {
     drop(fs);
 
     assert_eq!(
-        md5_digest(&std::fs::read(&image).unwrap()),
+        common::image::sha256_file(&image),
         before,
         "a read-only mount wrote to the volume"
     );

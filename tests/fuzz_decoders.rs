@@ -51,6 +51,10 @@
 //! the same reason `scripts/ci-test.sh` asserts one: a suite that
 //! stopped generating work would otherwise pass faster than ever.
 
+#[allow(dead_code)]
+#[path = "common/image.rs"]
+mod image;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -297,7 +301,7 @@ fn bmbt_leaf_extents(b: &[u8]) -> fs_xfs::Result<Vec<extent::Extent>> {
 #[test]
 fn the_bmbt_target_reads_the_records_behind_the_header() {
     let leaf = one_seed("bmbt");
-    let records = std::fs::read(corpus_root().join("extent_list/bmbt-leaf-records.bin"))
+    let records = image::small_file(corpus_root().join("extent_list/bmbt-leaf-records.bin"))
         .expect("the extent_list seed derived from the bmbt leaf");
     let expected = extent::parse_list(&records, (records.len() / 16) as u64)
         .expect("the leaf's records parse on their own");
@@ -351,7 +355,7 @@ fn seeds(corpus: &str) -> Vec<(String, Vec<u8>)> {
         .unwrap_or_else(|e| panic!("reading the corpus directory {}: {e}", dir.display()))
         .map(|entry| {
             let path = entry.expect("corpus directory entry").path();
-            let bytes = std::fs::read(&path)
+            let bytes = image::small_file(&path)
                 .unwrap_or_else(|e| panic!("reading the seed {}: {e}", path.display()));
             let name = path
                 .file_name()
@@ -801,7 +805,7 @@ fn the_derived_seeds_are_what_their_sources_derive() {
             std::fs::write(&path, &bytes).expect("writing the derived seed");
             continue;
         }
-        let committed = std::fs::read(&path).unwrap_or_else(|e| {
+        let committed = image::small_file(&path).unwrap_or_else(|e| {
             panic!(
                 "fuzz/corpus/{dir}/{name} is not there ({e}); rebuild it with \
                  {WRITE_DERIVED_SEEDS}=1 cargo test --test fuzz_decoders derived",

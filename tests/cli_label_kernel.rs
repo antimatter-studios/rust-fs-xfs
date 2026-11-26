@@ -15,6 +15,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::Snapshot;
 use common::{assert_xfs_repair_clean, fixture, guest_quote, kernel_run, oracle};
 
 /// The label in AG `ag`'s superblock, as `xfs_db -r -c 'sb N' -c 'print
@@ -139,7 +140,7 @@ fn refused_and_unchanged(name: &str, label: &str, says: &str) {
     let scratch = scratch_dir(&format!("label-refused-{name}"));
     let path = scratch.path().join(name);
     std::fs::copy(fixture(name), &path).expect("copy the fixture");
-    let before = std::fs::read(&path).unwrap();
+    let before = Snapshot::of(&path);
     let out = tool("fs.xfs")
         .arg(&path)
         .args(["set", "label", label])
@@ -154,9 +155,9 @@ fn refused_and_unchanged(name: &str, label: &str, says: &str) {
         "{name}: the refusal does not say {says:?}: {}",
         stderr(&out)
     );
-    assert!(
-        std::fs::read(&path).unwrap() == before,
-        "{name}: the refused label changed the image"
+    before.assert_unchanged(
+        &path,
+        &format!("{name}: the refused label changed the image"),
     );
 }
 

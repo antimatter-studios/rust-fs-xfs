@@ -4,6 +4,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::{sha256_file, small_file};
 use common::{guest_quote, kernel_run, oracle, scratch};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -68,7 +69,7 @@ PY
         "#,
         image = guest_quote(img),
     ));
-    let before = sha256_hex(&std::fs::read(img).unwrap());
+    let before = sha256_file(img);
     for (shape, magic) in [
         ("local", "1 (local)"),
         ("leaf", "0x3bee"),
@@ -139,10 +140,10 @@ PY
             .arg(&dest));
         assert!(out.stdout.is_empty());
         assert_eq!(
-            std::fs::read(&dest).unwrap(),
+            small_file(&dest).unwrap(),
             expected[b"user.binary".as_slice()]
         );
         assert!(!dest.with_extension("value.partial").exists());
     }
-    assert_eq!(sha256_hex(&std::fs::read(img).unwrap()), before);
+    assert_eq!(sha256_file(img), before);
 }

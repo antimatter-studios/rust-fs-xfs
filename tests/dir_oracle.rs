@@ -40,13 +40,13 @@
 //! compared against no image at all reported the same green as one
 //! compared against all of them.
 
+use common::image::Image;
 use fs_core::FileDevice;
 use fs_xfs::dir::{self, DirEntry};
 use fs_xfs::endian::be64;
 use fs_xfs::inode::{FileType, Format, Inode};
 use fs_xfs::superblock::Superblock;
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -96,22 +96,28 @@ fn fsb_to_byte(sb: &Superblock, fsb: u64) -> u64 {
     (ag * u64::from(sb.agblocks) + block) * u64::from(sb.blocksize)
 }
 
-/// Read an image's superblock and root inode, and hand back the byte
-/// range of the inode's data fork **within the image**.
+/// Read an image's superblock and root inode, and hand back the bytes of
+/// the inode's data fork.
 ///
 /// `Inode::data_fork_range` is relative to the start of the inode
-/// record, so it has to be shifted by the inode's own offset before it
-/// can index the image. Getting that wrong reads a neighbouring inode's
-/// fork, which is exactly the kind of plausible-looking garbage this
-/// crate's identity checks exist to catch.
-fn root_dir_fork(bytes: &[u8], label: &str) -> (Superblock, Inode, Range<usize>) {
-    let sb = Superblock::parse(bytes)
+/// record, so it indexes the inode's own bytes, read from the inode's
+/// offset in the image. Getting that offset wrong reads a neighbouring
+/// inode's fork, which is exactly the kind of plausible-looking garbage
+/// this crate's identity checks exist to catch.
+fn root_dir_fork(image: &Image, label: &str) -> (Superblock, Inode, Vec<u8>) {
+    let sb = Superblock::parse(&image.head())
         .unwrap_or_else(|e| panic!("{label}: failed to parse the superblock: {e}"));
     let off = inode_offset(&sb, sb.rootino);
-    let inode = Inode::parse(&bytes[off..], &sb, sb.rootino)
+    let raw = read_inode(image, &sb, off);
+    let inode = Inode::parse(&raw, &sb, sb.rootino)
         .unwrap_or_else(|e| panic!("{label}: failed to parse the root inode: {e}"));
     let (start, end) = inode.data_fork_range(usize::from(sb.inodesize));
-    (sb, inode, off + start..off + end)
+    (sb, inode, raw[start..end].to_vec())
+}
+
+/// The bytes of the inode at `off`.
+fn read_inode(image: &Image, sb: &Superblock, off: usize) -> Vec<u8> {
+    image.at(off as u64, usize::from(sb.inodesize))
 }
 
 // ---------------------------------------------------------------------
@@ -265,8 +271,8 @@ fn root_directory_agrees_with_xfs_db() {
         let Some(dump_path) = dump_path else {
             continue;
         };
-        let bytes = std::fs::read(img).expect("read image");
-        let (sb, inode, fork) = root_dir_fork(&bytes, label);
+        let image = Image::open(img);
+        let (sb, inode, fork) = root_dir_fork(&image, label);
         let dump = parse_rootdump(&std::fs::read_to_string(dump_path).expect("read rootdump"));
 
         expect(dump.rootino, sb.rootino, "rootino", label, &mut 0);
@@ -276,7 +282,7 @@ fn root_directory_agrees_with_xfs_db() {
             "{label}: this comparison only covers short-form directories"
         );
 
-        let parsed = dir::read_short_form(&inode, &bytes[fork], &sb)
+        let parsed = dir::read_short_form(&inode, &fork, &sb)
             .unwrap_or_else(|e| panic!("{label}: failed to parse the root directory: {e}"));
 
         let mut checked = 0usize;
@@ -353,7 +359,8 @@ fn root_directory_agrees_with_xfs_db() {
             // This is the cross-check the file type exists for, and it
             // fails loudly if the byte were read from the wrong place.
             let off = inode_offset(&sb, ours.ino);
-            let target = Inode::parse(&bytes[off..], &sb, ours.ino).unwrap_or_else(|e| {
+            let raw = read_inode(&image, &sb, off);
+            let target = Inode::parse(&raw, &sb, ours.ino).unwrap_or_else(|e| {
                 panic!(
                     "{at}: entry names inode {} which does not parse: {e}",
                     ours.ino
@@ -398,8 +405,8 @@ fn root_directory_parses_on_real_images() {
     let mut examined = 0usize;
     let mut spilled = 0usize;
     for (label, img, _dump_path) in &images {
-        let bytes = std::fs::read(img).expect("read image");
-        let (sb, inode, fork) = root_dir_fork(&bytes, label);
+        let image = Image::open(img);
+        let (sb, inode, fork) = root_dir_fork(&image, label);
 
         assert!(
             inode.is_dir(),
@@ -480,7 +487,7 @@ fn root_directory_parses_on_real_images() {
         // untested however many images there are.
         spilled += check_subdirectories(img, label);
 
-        let parsed = dir::read_short_form(&inode, &bytes[fork], &sb)
+        let parsed = dir::read_short_form(&inode, &fork, &sb)
             .unwrap_or_else(|e| panic!("{label}: failed to parse the root directory: {e}"));
 
         // `..` of the root is the root, on every XFS filesystem.
@@ -648,8 +655,8 @@ fn directory_blocks_in_real_images_parse_and_verify() {
         if dump_path.is_none() {
             continue;
         }
-        let bytes = std::fs::read(img).expect("read image");
-        let sb = Superblock::parse(&bytes).expect("parse superblock");
+        let image = Image::open(img);
+        let sb = Superblock::parse(&image.head()).expect("parse superblock");
         if !sb.is_v5() {
             // Without the self-describing header a scan cannot tell a
             // real directory block from four coincidental bytes.
@@ -678,13 +685,15 @@ fn directory_blocks_in_real_images_parse_and_verify() {
         let mut coincidences = 0usize;
 
         let mut off = 0usize;
-        while off + dirblocksize <= bytes.len() {
+        let mut buffer = vec![0u8; dirblocksize];
+        while (off + dirblocksize) as u64 <= image.len() {
             let at = off;
             off += blocksize;
             if log.contains(&(at as u64)) {
                 continue;
             }
-            let block = &bytes[at..at + dirblocksize];
+            image.read_into(at as u64, &mut buffer);
+            let block: &[u8] = &buffer;
             let daddr = (at / 512) as u64;
 
             let magic32 = u32::from_be_bytes(block[0..4].try_into().unwrap());
@@ -772,7 +781,8 @@ fn directory_blocks_in_real_images_parse_and_verify() {
         // it names.
         for fb in &found {
             let off = inode_offset(&sb, fb.owner);
-            let owner_inode = Inode::parse(&bytes[off..], &sb, fb.owner).unwrap_or_else(|e| {
+            let raw = read_inode(&image, &sb, off);
+            let owner_inode = Inode::parse(&raw, &sb, fb.owner).unwrap_or_else(|e| {
                 panic!(
                     "{label}: a directory block claims owner {} which does not parse: {e}",
                     fb.owner
@@ -840,9 +850,8 @@ fn real_root_directory_rejects_wrong_claims() {
     let images = images();
     let (label, img, _) = images.first().expect("at least one fixture image");
 
-    let bytes = std::fs::read(img).expect("read image");
-    let (sb, inode, range) = root_dir_fork(&bytes, label);
-    let fork = &bytes[range];
+    let (sb, inode, fork) = root_dir_fork(&Image::open(img), label);
+    let fork = fork.as_slice();
 
     let mut not_a_dir = inode.clone();
     not_a_dir.mode = 0o100_644;
@@ -893,8 +902,7 @@ fn real_root_directory_rejects_wrong_claims() {
 #[test]
 fn v4_fixture_advertises_ftype_outside_the_incompat_mask() {
     let img = common::fixture("xfs-nocrc.img");
-    let bytes = std::fs::read(&img).expect("read image");
-    let sb = Superblock::parse(&bytes).expect("parse superblock");
+    let sb = Superblock::parse(&common::image::head(&img)).expect("parse superblock");
 
     assert_eq!(sb.version(), 4, "xfs-nocrc is meant to be a v4 filesystem");
     assert_eq!(
@@ -943,8 +951,7 @@ fn renaming_refuses_a_v4_filesystem() {
     let tmp = std::env::temp_dir().join("xfs-nocrc-rename-gate.img");
     std::fs::copy(&img, &tmp).expect("copy fixture");
 
-    let bytes = std::fs::read(&tmp).expect("read image");
-    let sb = Superblock::parse(&bytes).expect("parse superblock");
+    let sb = Superblock::parse(&common::image::head(&tmp)).expect("parse superblock");
     assert_eq!(
         sb.version(),
         4,

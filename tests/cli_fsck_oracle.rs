@@ -31,6 +31,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::Snapshot;
 use common::{fixture, oracle, scratch};
 use saphyr::{LoadableYamlNode, Yaml};
 
@@ -908,13 +909,10 @@ fn a_repair_of_a_clean_volume_writes_nothing_and_asking_for_both_is_refused() {
         &format!("{}-y.img", std::process::id()),
     );
     let path = copy.path().to_str().unwrap();
-    let before = std::fs::read(path).unwrap();
+    let before = Snapshot::of(path);
     let out = tool("fsck.xfs").args(["-y", path]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "fsck.xfs -y: {}", stderr(&out));
-    assert!(
-        std::fs::read(path).unwrap() == before,
-        "fsck.xfs -y changed a clean volume"
-    );
+    before.assert_unchanged(path, "fsck.xfs -y changed a clean volume");
     for both in [["-n", "-y"], ["-y", "--dry-run"]] {
         let out = tool("fsck.xfs").args(both).arg(path).output().unwrap();
         assert_eq!(

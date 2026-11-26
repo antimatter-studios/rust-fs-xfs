@@ -231,8 +231,8 @@ fn a_destroyed_primary_is_replaced_by_a_copy_found_by_scanning() {
 fn a_copy_that_disagrees_is_reported_against_the_geometry() {
     let copy = damaged_copy("xfs-default.img", "copy-agblocks");
     let dump = sbdump(&fixture("xfs-default.sbdump"));
-    let sb = fs_xfs::Superblock::parse(&std::fs::read(fixture("xfs-default.img")).unwrap()[..512])
-        .unwrap();
+    let sb =
+        fs_xfs::Superblock::parse(&common::image::head(fixture("xfs-default.img"))[..512]).unwrap();
     let at = sb.ag_offset(2);
     // sb_logblocks of copy 2 changed and its checksum
     // re-stamped, so only the comparison with the other copies can find it.
@@ -272,8 +272,8 @@ fn a_copy_that_disagrees_is_reported_against_the_geometry() {
 #[test]
 fn damaged_group_headers_are_reported_and_still_decoded() {
     let copy = damaged_copy("xfs-default.img", "headers");
-    let image = std::fs::read(fixture("xfs-default.img")).unwrap();
-    let sb = fs_xfs::Superblock::parse(&image[..512]).unwrap();
+    let head = common::image::head(fixture("xfs-default.img"));
+    let sb = fs_xfs::Superblock::parse(&head[..512]).unwrap();
     let sector = u64::from(sb.sectsize);
     // AGF 1: its magic.
     invert(copy.path(), sb.ag_offset(1) + sector, 1);
@@ -320,17 +320,13 @@ fn a_log_that_needs_replay_is_a_notice() {
         "xfs_repair -n's verdict on the fixture"
     );
     let image = fixture("xfsdirty.img");
-    let before = std::fs::read(&image).unwrap();
+    let before = common::image::Snapshot::of(&image);
     let report = salvage::damage(&open(&image));
     let log: Vec<_> = report.log.iter().collect();
     assert_eq!(log.len(), 1, "{log:#?}");
     assert_eq!(log[0].kind, DamageKind::Recorded);
     assert_eq!(log[0].severity, Severity::Notice);
-    assert_eq!(
-        std::fs::read(&image).unwrap(),
-        before,
-        "nothing was written"
-    );
+    before.assert_unchanged(&image, "nothing was written");
 }
 
 /// A device that is not XFS at all has no geometry and no copies beyond

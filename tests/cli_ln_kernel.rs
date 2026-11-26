@@ -5,6 +5,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::Snapshot;
 use common::{fixture, guest_quote, kernel_run, repair, scratch};
 
 const SUITE: &str = "cli_ln_kernel";
@@ -75,7 +76,7 @@ fn the_kernel_and_cli_refuse_the_reference_debuggers_maximum_link_count() {
     let copy =
         scratch::Volume::copy_of(SUITE, &image, &format!("{}-limit.img", std::process::id()));
     let img = copy.path().to_str().unwrap();
-    let before = std::fs::read(img).unwrap();
+    let before = Snapshot::of(img);
     let out = tool("fs.xfs")
         .args([img, "ln", "/small.txt", "/new"])
         .output()
@@ -83,10 +84,7 @@ fn the_kernel_and_cli_refuse_the_reference_debuggers_maximum_link_count() {
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     assert!(out.stdout.is_empty());
     assert!(stderr(&out).contains("2147483647"), "{}", stderr(&out));
-    assert!(
-        std::fs::read(img).unwrap() == before,
-        "refusal changed the image"
-    );
+    before.assert_unchanged(img, "refusal changed the image");
     let out = kernel_run(&format!(
         r#"
         set -eu

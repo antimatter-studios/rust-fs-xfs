@@ -26,6 +26,7 @@ mod common;
 
 use fs_xfs::capi::*;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 /// Errno values the ABI documents. Spelled out rather than imported so
@@ -810,7 +811,8 @@ fn null_output_pointers_fail_instead_of_crashing() {
 // ---------------------------------------------------------------------
 
 struct FileContext {
-    bytes: Vec<u8>,
+    /// The image the callback reads, a range at a time.
+    image: Option<std::fs::File>,
     /// Set to make every read fail, to prove failures surface.
     fail: bool,
 }
@@ -825,29 +827,28 @@ unsafe extern "C" fn ctx_read(
     if ctx.fail {
         return -1;
     }
-    let start = offset as usize;
-    let end = start.saturating_add(length as usize);
-    if end > ctx.bytes.len() {
-        return -1;
+    // SAFETY: the library asks for `length` bytes into a buffer of that size.
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), length as usize) };
+    let read = ctx
+        .image
+        .as_ref()
+        .map(|image| image.read_exact_at(buf, offset));
+    if matches!(read, Some(Ok(()))) {
+        0
+    } else {
+        -1
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            ctx.bytes[start..end].as_ptr(),
-            buf.cast::<u8>(),
-            end - start,
-        )
-    };
-    0
 }
 
 #[test]
 fn mounts_over_a_caller_supplied_reader() {
     let img = common::fixture(IMAGE);
+    let image = std::fs::File::open(&img).unwrap();
+    let size = image.metadata().unwrap().len();
     let ctx = Box::new(FileContext {
-        bytes: std::fs::read(&img).unwrap(),
+        image: Some(image),
         fail: false,
     });
-    let size = ctx.bytes.len() as u64;
     let cfg = fs_xfs_blockdev_cfg_t {
         read: Some(ctx_read),
         context: Box::into_raw(ctx) as *mut c_void,
@@ -879,7 +880,7 @@ fn mounts_over_a_caller_supplied_reader() {
 #[test]
 fn a_failing_callback_surfaces_as_an_error() {
     let ctx = Box::new(FileContext {
-        bytes: vec![0u8; 4096],
+        image: None,
         fail: true,
     });
     let cfg = fs_xfs_blockdev_cfg_t {

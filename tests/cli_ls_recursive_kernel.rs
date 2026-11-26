@@ -3,6 +3,7 @@ mod cli_support;
 mod common;
 
 use cli_support::*;
+use common::image::sha256_file;
 use common::{guest_quote, kernel_run, scratch};
 use fs_xfs::{inode::Format, Filesystem};
 use std::collections::BTreeMap;
@@ -68,7 +69,7 @@ fn agrees(name: &str, options: &str) {
     }
     assert_eq!(expected.len(), 12, "find must cover the entire tree");
     let img = image.path().to_str().unwrap();
-    let before = sha256_hex(&std::fs::read(img).unwrap());
+    let before = sha256_file(img);
     let output = stdout(&ok(tool("fs.xfs").args([img, "ls", "-R", "/"])));
     assert_eq!(
         output,
@@ -121,7 +122,7 @@ fn agrees(name: &str, options: &str) {
         "/empty",
     ])));
     assert_eq!(empty.trim(), "[]", "zero bounds accept an empty directory");
-    assert_eq!(sha256_hex(&std::fs::read(img).unwrap()), before);
+    assert_eq!(sha256_file(img), before);
     if name == "v4.img" {
         faults(&image);
     }
@@ -185,7 +186,7 @@ fn faults(source: &scratch::Volume) {
             assert!(found, "fault must replace an existing name");
         }
         let img = image.path().to_str().unwrap();
-        let before = sha256_hex(&std::fs::read(img).unwrap());
+        let before = sha256_file(img);
         let out = tool("fs.xfs")
             .args([img, "ls", "-R", "--limit", "30", "--max-depth", "10", "/"])
             .output()
@@ -204,7 +205,7 @@ fn faults(source: &scratch::Volume) {
                 "/z/deep"
             }));
         }
-        assert_eq!(sha256_hex(&std::fs::read(img).unwrap()), before);
+        assert_eq!(sha256_file(img), before);
     }
     assert!(deep.is_dir());
 }

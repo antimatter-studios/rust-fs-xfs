@@ -197,7 +197,7 @@ fn agrees_with_xfs_db_on_every_field() {
 
     let mut total_fields = 0usize;
     for (label, img, dump) in &fixtures {
-        let bytes = std::fs::read(img).expect("read image");
+        let bytes = common::image::head(img);
         let sb = Superblock::parse(&bytes)
             .unwrap_or_else(|e| panic!("{label}: this driver failed to parse a real image: {e}"));
         let oracle = parse_sbdump(&std::fs::read_to_string(dump).expect("read sbdump"));
@@ -333,16 +333,18 @@ fn ag_headers_parse_on_real_images() {
     let fixtures = fixtures();
 
     for (label, img, _) in &fixtures {
-        let bytes = std::fs::read(img).expect("read image");
-        let sb = Superblock::parse(&bytes).expect("parse superblock");
+        let image = common::image::Image::open(img);
+        let sb = Superblock::parse(&image.head()).expect("parse superblock");
         let sector = usize::from(sb.sectsize);
 
         for ag in 0..sb.agcount {
             let base = (u64::from(ag) * u64::from(sb.agblocks) * u64::from(sb.blocksize)) as usize;
             // Sector 0 is the superblock, sector 1 the AGF, sector 2 the AGI.
-            let agf = fs_xfs::ag::Agf::parse(&bytes[base + sector..], &sb, ag)
+            let agf_sector = image.at((base + sector) as u64, sector);
+            let agi_sector = image.at((base + 2 * sector) as u64, sector);
+            let agf = fs_xfs::ag::Agf::parse(&agf_sector, &sb, ag)
                 .unwrap_or_else(|e| panic!("{label} ag {ag}: AGF: {e}"));
-            let agi = fs_xfs::ag::Agi::parse(&bytes[base + 2 * sector..], &sb, ag)
+            let agi = fs_xfs::ag::Agi::parse(&agi_sector, &sb, ag)
                 .unwrap_or_else(|e| panic!("{label} ag {ag}: AGI: {e}"));
 
             assert_eq!(agf.seqno, ag, "{label}: AGF {ag} self-identifies wrongly");
@@ -373,9 +375,8 @@ fn ag_headers_parse_on_real_images() {
 fn real_ag_headers_reject_wrong_index() {
     let fixtures = fixtures();
     let Some((label, img, _)) = fixtures.iter().find(|(_, p, _)| {
-        std::fs::read(p)
+        Superblock::parse(&common::image::head(p))
             .ok()
-            .and_then(|b| Superblock::parse(&b).ok())
             .map(|sb| sb.agcount > 1)
             .unwrap_or(false)
     }) else {
@@ -386,11 +387,11 @@ fn real_ag_headers_reject_wrong_index() {
         );
     };
 
-    let bytes = std::fs::read(img).unwrap();
-    let sb = Superblock::parse(&bytes).unwrap();
+    let image = common::image::Image::open(img);
+    let sb = Superblock::parse(&image.head()).unwrap();
     let sector = usize::from(sb.sectsize);
     // AG 0's AGF, deliberately parsed as though it came from AG 1.
-    let res = fs_xfs::ag::Agf::parse(&bytes[sector..], &sb, 1);
+    let res = fs_xfs::ag::Agf::parse(&image.at(sector as u64, sector), &sb, 1);
     assert!(
         matches!(res, Err(fs_xfs::Error::BlockIdentityMismatch { .. })),
         "{label}: AG 0's AGF was accepted as AG 1's — the identity check is not working"
@@ -464,10 +465,11 @@ fn root_inode_agrees_with_xfs_db() {
         }
         let label = img.file_stem().unwrap().to_string_lossy().into_owned();
 
-        let bytes = std::fs::read(&img).expect("read image");
-        let sb = Superblock::parse(&bytes).expect("parse superblock");
+        let image = common::image::Image::open(&img);
+        let sb = Superblock::parse(&image.head()).expect("parse superblock");
         let off = inode_offset(&sb, sb.rootino);
-        let inode = fs_xfs::inode::Inode::parse(&bytes[off..], &sb, sb.rootino)
+        let raw = image.at(off as u64, usize::from(sb.inodesize));
+        let inode = fs_xfs::inode::Inode::parse(&raw, &sb, sb.rootino)
             .unwrap_or_else(|e| panic!("{label}: failed to parse the root inode: {e}"));
 
         let oracle = parse_inodedump(&std::fs::read_to_string(&dump_path).unwrap());
@@ -551,10 +553,11 @@ fn root_inode_agrees_with_xfs_db() {
 #[test]
 fn real_inode_rejects_wrong_number() {
     let img = common::fixture("xfs-default.img");
-    let bytes = std::fs::read(&img).unwrap();
-    let sb = Superblock::parse(&bytes).unwrap();
+    let image = common::image::Image::open(&img);
+    let sb = Superblock::parse(&image.head()).unwrap();
     let off = inode_offset(&sb, sb.rootino);
-    let res = fs_xfs::inode::Inode::parse(&bytes[off..], &sb, sb.rootino + 1);
+    let raw = image.at(off as u64, usize::from(sb.inodesize));
+    let res = fs_xfs::inode::Inode::parse(&raw, &sb, sb.rootino + 1);
     assert!(
         matches!(res, Err(fs_xfs::Error::BlockIdentityMismatch { .. })),
         "the root inode was accepted under the wrong inode number"

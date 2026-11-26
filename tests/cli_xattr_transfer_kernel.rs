@@ -253,7 +253,10 @@ for line in sys.stdin.buffer.read().splitlines():
     assert_eq!(json_field(&report, "refused"), "0", "{report}");
     assert_eq!(host_attrs(&dest.join("d/f"), "f"), kernel_file);
     assert_eq!(host_attrs(&dest.join("d"), "d"), kernel_dir);
-    assert_eq!(std::fs::read(dest.join("d/f")).unwrap(), b"data\n");
+    assert_eq!(
+        common::image::small_file(dest.join("d/f")).unwrap(),
+        b"data\n"
+    );
     let _ = std::fs::remove_dir_all(&host);
 }
 

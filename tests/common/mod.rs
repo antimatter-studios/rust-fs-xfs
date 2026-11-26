@@ -75,6 +75,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+pub mod image;
+
 /// Where `scripts/vm-setup.sh` installs the xfsprogs build that knows
 /// parent pointers (6.10 and newer; Debian 12 ships 6.1).
 ///
